@@ -128,6 +128,10 @@ namespace
 }
 
 
+void ps2NotifyGsCsrEdge();
+uint64_t ps2CurrentEeCycle();
+bool ps2ScheduleGsInterruptCheck(uint64_t delayCycles);
+
 namespace
 {
     thread_local bool t_onGsWorker = false;
@@ -218,6 +222,115 @@ bool GS::shouldQueue() const
     return m_asyncEnabled && !t_onGsWorker;
 }
 
+void GS::postCpuEvent(GsCpuEvent event, uint64_t value, uint64_t delayCycles)
+{
+    if (!m_privRegs)
+        return;
+    const uint64_t now = ps2CurrentEeCycle();
+    if (delayCycles != 0u && !ps2ScheduleGsInterruptCheck(delayCycles))
+        delayCycles = 0u;
+    if (const uint32_t raised = ps2GsPostEvent(*m_privRegs, event, static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32),
+                                               now + delayCycles, now);
+        raised != 0u)
+    {
+        g_gsCsrRaisedEdges.fetch_or(raised);
+        ps2NotifyGsCsrEdge();
+    }
+}
+
+// The CPU sees each frame finished as soon as it is sent; past one frame of lag it waits for the GS
+// thread, so the display stays current and slow drawing turns into skipped frames.
+void GS::waitForGsFrames()
+{
+    constexpr uint64_t kMaxFramesAhead = 1u;
+    std::unique_lock<std::mutex> lock(m_queueMutex);
+    ++m_finishesQueued;
+    m_queueIdle.wait(lock, [this]()
+                     { return m_finishesQueued - m_finishesDrawn <= kMaxFramesAhead || m_stopWorker; });
+}
+
+// The GS thread draws queued packets later in host time, but the CPU must see SIGNAL, FINISH and
+// LABEL when it sends them, as if the GS were infinitely fast: post them before queueing (the
+// worker then skips them). Only packed A+D can address these registers.
+namespace
+{
+    // The GS reaches a register some time after the EE sends it: the VU1/GS work before it. Games
+    // pace their threads on these events (their handlers wake the main thread while lower-priority
+    // threads ran), so delivering them as soon as they are sent starves those threads.
+    constexpr uint64_t kGsEventLatencyCycles = 200000u;
+    constexpr uint64_t kGsBytesPerEeCycle = 1u;
+
+    uint64_t envCycles(const char *name, uint64_t fallback)
+    {
+        const char *value = std::getenv(name);
+        return value && *value ? std::strtoull(value, nullptr, 0) : fallback;
+    }
+
+    // PS2X_GS_EVENT_LATENCY / PS2X_GS_EVENT_BYTES_PER_CYCLE override the model.
+    uint64_t gsEventDelay(uint32_t offsetBytes)
+    {
+        static const uint64_t latency = envCycles("PS2X_GS_EVENT_LATENCY", kGsEventLatencyCycles);
+        static const uint64_t bytesPerCycle = std::max<uint64_t>(envCycles("PS2X_GS_EVENT_BYTES_PER_CYCLE", kGsBytesPerEeCycle), 1u);
+        return latency + offsetBytes / bytesPerCycle;
+    }
+}
+
+void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
+{
+    uint32_t offset = 0;
+    while (offset + 16u <= sizeBytes)
+    {
+        const uint64_t tagLo = loadLE64(data + offset);
+        const uint64_t tagHi = loadLE64(data + offset + 8u);
+        offset += 16u;
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+        if (nreg == 0u)
+            nreg = 16u;
+        if (flg == GIF_FMT_PACKED)
+        {
+            for (uint32_t loop = 0; loop < nloop; ++loop)
+            {
+                for (uint32_t r = 0; r < nreg; ++r)
+                {
+                    if (offset + 16u > sizeBytes)
+                        return;
+                    if (((tagHi >> (r * 4u)) & 0xFu) == 0xEu)
+                    {
+                        const uint64_t lo = loadLE64(data + offset);
+                        const uint64_t delay = gsEventDelay(offset);
+                        switch (static_cast<uint8_t>(loadLE64(data + offset + 8u) & 0xFFu))
+                        {
+                        case GS_REG_SIGNAL:
+                            postCpuEvent(GsCpuEvent::Signal, lo, delay);
+                            break;
+                        case GS_REG_FINISH:
+                            postCpuEvent(GsCpuEvent::Finish, lo, delay);
+                            waitForGsFrames();
+                            break;
+                        case GS_REG_LABEL:
+                            postCpuEvent(GsCpuEvent::Label, lo, delay);
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                    offset += 16u;
+                }
+            }
+        }
+        else if (flg == GIF_FMT_REGLIST)
+        {
+            offset += ((nloop * nreg + 1u) & ~1u) * 8u;
+        }
+        else
+        {
+            offset += nloop * 16u;
+        }
+    }
+}
+
 void GS::enqueue(QueuedCommand &&command)
 {
     std::unique_lock<std::mutex> lock(m_queueMutex);
@@ -241,9 +354,11 @@ void GS::workerLoop()
     if (m_parallelRequested && !m_parallel)
     {
         GSParallelRenderer::Callbacks callbacks;
-        callbacks.signal = [this](uint64_t value) { raiseSignal(value); };
-        callbacks.finish = [this]() { raiseFinish(); };
-        callbacks.label = [this](uint64_t value) { setLabel(value); };
+        callbacks.finish = [this]()
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            ++m_finishesDrawn;
+        };
         m_parallel = GSParallelRenderer::create(m_localMemorySize, callbacks);
         if (!m_parallel)
             std::fprintf(stderr, "[gs-parallel] unavailable, drawing on the CPU\n");
@@ -381,6 +496,7 @@ void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         processGIFPacket(data, sizeBytes);
         return;
     }
+    postQueuedCpuEvents(data, sizeBytes);
     QueuedCommand command;
     command.kind = QueuedCommand::Kind::GifPacket;
     command.bytes.assign(data, data + sizeBytes);
@@ -1232,6 +1348,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     // Validation only looks at the packet, so the EE can still fall back when it fails.
     if (!data || sizeBytes < 16u || !m_backend || !validatePackedGifPacket(data, sizeBytes))
         return false;
+    postQueuedCpuEvents(data, sizeBytes);
     QueuedCommand command;
     command.kind = QueuedCommand::Kind::NativePackedGifPacket;
     command.bytes.assign(data, data + sizeBytes);
@@ -1598,7 +1715,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     // paraLLEl-GS: in queue order, without waiting (0x59-0x5f mirror display registers, no drawing state).
-    if (m_parallelRequested && shouldQueue() && (regAddr < 0x59u || regAddr > 0x5fu))
+    if (m_parallelRequested && shouldQueue() && (regAddr < 0x59u || regAddr > 0x5fu) && regAddr != GS_REG_SIGNAL &&
+        regAddr != GS_REG_FINISH && regAddr != GS_REG_LABEL)
     {
         QueuedCommand command;
         command.kind = QueuedCommand::Kind::Register;
@@ -1615,7 +1733,6 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 }
 
 // Defined in ps2_runtime.cpp: wakes the EE scheduler so GS interrupts are dispatched promptly.
-void ps2NotifyGsCsrEdge();
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
@@ -2014,7 +2131,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_SIGNAL:
-        raiseSignal(value);
+        if (!t_onGsWorker)
+            postCpuEvent(GsCpuEvent::Signal, value, gsEventDelay(0u));
         break;
     case GS_REG_FINISH:
         if (m_backend)
@@ -2022,10 +2140,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
-        raiseFinish();
+        if (!t_onGsWorker)
+        {
+            postCpuEvent(GsCpuEvent::Finish, value, gsEventDelay(0u));
+        }
+        if (t_onGsWorker)
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            ++m_finishesDrawn;
+        }
         break;
     case GS_REG_LABEL:
-        setLabel(value);
+        if (!t_onGsWorker)
+            postCpuEvent(GsCpuEvent::Label, value, gsEventDelay(0u));
         break;
     case 0x59:
         if (m_privRegs)
@@ -2143,42 +2270,6 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         m_backend->UploadImage(data, sizeBytes);
 }
 
-
-void GS::raiseSignal(uint64_t value)
-{
-    if (!m_privRegs)
-        return;
-    uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-    uint32_t mask = static_cast<uint32_t>(value >> 32);
-    uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
-    lo = (lo & ~mask) | (id & mask);
-    m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
-    if ((m_privRegs->csr.fetch_or(0x1) & 0x1) == 0)
-    {
-        g_gsCsrRaisedEdges.fetch_or(0x1);
-        ps2NotifyGsCsrEdge();
-    }
-}
-
-void GS::raiseFinish()
-{
-    if (m_privRegs && (m_privRegs->csr.fetch_or(0x2) & 0x2) == 0)
-    {
-        g_gsCsrRaisedEdges.fetch_or(0x2);
-        ps2NotifyGsCsrEdge();
-    }
-}
-
-void GS::setLabel(uint64_t value)
-{
-    if (!m_privRegs)
-        return;
-    uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-    uint32_t mask = static_cast<uint32_t>(value >> 32);
-    uint32_t hi = static_cast<uint32_t>(m_privRegs->siglblid >> 32);
-    hi = (hi & ~mask) | (id & mask);
-    m_privRegs->siglblid = (static_cast<uint64_t>(hi) << 32) | (m_privRegs->siglblid & 0xFFFFFFFF);
-}
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
