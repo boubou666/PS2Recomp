@@ -116,6 +116,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_dmacTailOrder = 1000;
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
+    m_pendingDmacCauses = 0u;
     m_currentThreadId = 0;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
@@ -1298,6 +1299,7 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
     if (cause < 32u)
     {
         uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+        const bool wasEnabled = (mask & (1u << cause)) != 0u;
         if (enabled)
         {
             mask |= 1u << cause;
@@ -1305,6 +1307,20 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
         else
         {
             mask &= ~(1u << cause);
+        }
+        // Unmasking a channel whose transfer completed while it was masked raises its interrupt now,
+        // as the hardware does while D_STAT CIS stays set. Twisted Metal: Black's hier renderer
+        // masks VIF1 around each kick (DisableDmac/EnableDmac); the runtime finishes the transfer
+        // inside the kick, and dropping that completion left its object queue waiting forever.
+        if (dmac && enabled && !wasEnabled && (m_pendingDmacCauses & (1u << cause)) != 0u)
+        {
+            m_pendingDmacCauses &= ~(1u << cause);
+            constexpr uint32_t kDStat = 0x1000E010u;
+            const bool statusStillSet = cause >= 10u || (m_runtime.memory().readIORegister(kDStat) & (1u << cause)) != 0u;
+            if (statusStillSet)
+            {
+                dispatchIrq(true, cause);
+            }
         }
     }
     return KE_OK;
@@ -1316,6 +1332,10 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        if (dmac)
+        {
+            m_pendingDmacCauses |= 1u << cause;
+        }
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;

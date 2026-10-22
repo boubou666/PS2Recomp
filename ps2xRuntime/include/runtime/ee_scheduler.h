@@ -482,6 +482,9 @@ private:
     std::atomic<std::chrono::steady_clock::rep> m_nextDeadlineHostTicks{0};
     uint32_t m_hostCatchUpPoll = 0;
     bool m_wallClockCatchUp = true;
+    // DMAC completions raised while their channel was masked (D_STAT CIS set, CIM clear): the
+    // interrupt fires once the channel is enabled again, unless the game cleared CIS meanwhile.
+    uint32_t m_pendingDmacCauses = 0;
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
