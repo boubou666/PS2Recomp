@@ -1792,13 +1792,17 @@ namespace
     }
 
     // The guest-visible structs keep the libgraph layout, because games DMA these packets
-    // themselves and patch them (Twisted Metal: Black rewrites giftag1 at +0x50 before sending
-    // a sceGsLoadImage through its own GIF chain):
+    // themselves and patch them in place:
     //   sceGsLoadImage  (0x60): giftag0 (A+D, NLOOP 4) | BITBLTBUF | TRXPOS | TRXREG | TRXDIR | giftag1 (IMAGE)
-    //   sceGsStoreImage (0x60): giftag0 (A+D, NLOOP 5) | BITBLTBUF | TRXPOS | TRXREG | FINISH | TRXDIR
-    // Six quadwords each (TMB's fontInit lays its two sceGsLoadImage 0x60 bytes apart).
+    //   sceGsStoreImage (0x70): vifcode[4] | giftag (A+D, NLOOP 5) | BITBLTBUF | TRXPOS | TRXREG | FINISH | TRXDIR
+    // The store packet starts with VIF codes because libgraph sends it through VIF1 (PATH2) and
+    // then turns the VIF1 FIFO around. Twisted Metal: Black lays its two sceGsLoadImage 0x60 apart
+    // (fontInit), keeps an array of sceGsStoreImage with a 0x70 stride and patches TRXPOS at +0x30
+    // for each lens flare (particleLensFlareTestZbuffer), and rewrites giftag1 at +0x50 of a
+    // sceGsLoadImage before sending it through its own GIF chain (blitToFrameBuffer).
     static constexpr uint32_t kGsLoadImageSize = 0x60u;
-    static constexpr uint32_t kGsStoreImageSize = 0x60u;
+    static constexpr uint32_t kGsStoreImageSize = 0x70u;
+    static constexpr uint32_t kGsStoreImageGsOffset = 0x10u; // past vifcode[4]
 
     static bool writeGsImage(uint8_t *rdram, uint32_t addr, const GsImageMem &img, bool store)
     {
@@ -1811,41 +1815,45 @@ namespace
         const uint64_t psm = static_cast<uint64_t>(img.psm & 0x3Fu);
         const uint64_t x = static_cast<uint64_t>(img.x & 0x7FFu);
         const uint64_t y = static_cast<uint64_t>(img.y & 0x7FFu);
+        const uint64_t trxreg = static_cast<uint64_t>(img.width & 0xFFFu) | (static_cast<uint64_t>(img.height & 0xFFFu) << 32);
 
         uint64_t q[14] = {};
-        q[0] = static_cast<uint64_t>(store ? 5u : 4u) | (1ULL << 60); // NLOOP, EOP=0, PACKED, NREG=1
-        q[1] = 0xEULL;                                               // A+D
         if (store)
         {
-            q[2] = bp | (bw << 16) | (psm << 24) | (1ULL << 48); // source in VRAM, host DBW=1
-            q[4] = x | (y << 16);                                 // SSAX/SSAY
+            // vifcode[4]: NOP, NOP, FLUSHA, DIRECT 6 quadwords (the GIF packet that follows).
+            q[0] = 0ULL;
+            q[1] = 0x13000000ULL | (0x50000006ULL << 32);
+            q[2] = 5ULL | (1ULL << 15) | (1ULL << 60); // NLOOP 5, EOP, PACKED, NREG=1
+            q[3] = 0xEULL;                              // A+D
+            q[4] = bp | (bw << 16) | (psm << 24) | (1ULL << 48); // source in VRAM, host DBW=1
+            q[5] = 0x50ULL;                                       // BITBLTBUF
+            q[6] = x | (y << 16);                                 // SSAX/SSAY
+            q[7] = 0x51ULL;                                       // TRXPOS
+            q[8] = trxreg;
+            q[9] = 0x52ULL;  // TRXREG
+            q[10] = 0ULL;
+            q[11] = 0x61ULL; // FINISH
+            q[12] = 1ULL;    // TRXDIR local -> host
+            q[13] = 0x53ULL;
+            std::memcpy(ptr, q, kGsStoreImageSize);
+            return true;
         }
-        else
-        {
-            q[2] = (1ULL << 16) | (bp << 32) | (bw << 48) | (psm << 56); // host SBW=1, dest in VRAM
-            q[4] = (x << 32) | (y << 48);                                // DSAX/DSAY
-        }
-        q[3] = 0x50ULL; // BITBLTBUF
-        q[5] = 0x51ULL; // TRXPOS
-        q[6] = static_cast<uint64_t>(img.width & 0xFFFu) | (static_cast<uint64_t>(img.height & 0xFFFu) << 32);
+
+        q[0] = 4ULL | (1ULL << 60); // NLOOP 4, EOP=0, PACKED, NREG=1
+        q[1] = 0xEULL;              // A+D
+        q[2] = (1ULL << 16) | (bp << 32) | (bw << 48) | (psm << 56); // host SBW=1, dest in VRAM
+        q[3] = 0x50ULL;                                              // BITBLTBUF
+        q[4] = (x << 32) | (y << 48);                                // DSAX/DSAY
+        q[5] = 0x51ULL;                                              // TRXPOS
+        q[6] = trxreg;
         q[7] = 0x52ULL; // TRXREG
-        if (store)
-        {
-            q[8] = 0ULL;
-            q[9] = 0x61ULL; // FINISH
-            q[10] = 1ULL;   // TRXDIR local -> host
-            q[11] = 0x53ULL;
-        }
-        else
-        {
-            q[8] = 0ULL; // TRXDIR host -> local
-            q[9] = 0x53ULL;
-            const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
-            const uint32_t qwc = (rowBytes * static_cast<uint32_t>(img.height) + 15u) / 16u;
-            q[10] = static_cast<uint64_t>(qwc & 0x7FFFu) | (1ULL << 15) | (2ULL << 58); // IMAGE, EOP
-            q[11] = 0ULL;
-        }
-        std::memcpy(ptr, q, store ? kGsStoreImageSize : kGsLoadImageSize);
+        q[8] = 0ULL;    // TRXDIR host -> local
+        q[9] = 0x53ULL;
+        const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
+        const uint32_t qwc = (rowBytes * static_cast<uint32_t>(img.height) + 15u) / 16u;
+        q[10] = static_cast<uint64_t>(qwc & 0x7FFFu) | (1ULL << 15) | (2ULL << 58); // IMAGE, EOP
+        q[11] = 0ULL;
+        std::memcpy(ptr, q, kGsLoadImageSize);
         return true;
     }
 
@@ -1854,10 +1862,11 @@ namespace
         const uint8_t *ptr = getConstMemPtr(rdram, addr);
         if (!ptr)
             return false;
+        const uint32_t base = store ? kGsStoreImageGsOffset : 0u;
         uint64_t bitbltbuf = 0, trxpos = 0, trxreg = 0;
-        std::memcpy(&bitbltbuf, ptr + 0x10, sizeof(bitbltbuf));
-        std::memcpy(&trxpos, ptr + 0x20, sizeof(trxpos));
-        std::memcpy(&trxreg, ptr + 0x30, sizeof(trxreg));
+        std::memcpy(&bitbltbuf, ptr + base + 0x10, sizeof(bitbltbuf));
+        std::memcpy(&trxpos, ptr + base + 0x20, sizeof(trxpos));
+        std::memcpy(&trxreg, ptr + base + 0x30, sizeof(trxreg));
         if (store)
         {
             out.vram_addr = static_cast<uint16_t>(bitbltbuf & 0x3FFFu);

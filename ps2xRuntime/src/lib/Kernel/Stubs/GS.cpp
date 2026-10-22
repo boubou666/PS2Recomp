@@ -745,8 +745,11 @@ namespace ps2_stubs
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
 
-        ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
-        runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        // Never let a bad TRXREG write past guest RAM.
+        const uint32_t dstPhysical = dstAddr & PS2_RAM_MASK;
+        const uint32_t copyBytes = std::min<uint32_t>(totalImageBytes, PS2_RAM_SIZE - std::min<uint32_t>(dstPhysical, PS2_RAM_SIZE));
+        ps2TraceGuestRangeWrite(rdram, dstAddr, copyBytes, "sceGsExecStoreImage", ctx);
+        runtime->gs().consumeLocalToHostBytes(dst, copyBytes);
         runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);

@@ -15,6 +15,11 @@ namespace ps2_stubs
     // the queued pictures, makes sceMpegIsEnd/sceMpegIsRefBuffEmpty report the end, and wakes
     // a thread blocked in sceMpegGetPicture.
     void abortMpegPlayback(PS2Runtime *runtime, uint32_t mpegAddr);
+    // The game fed all of a movie's data: decode what is buffered, then let sceMpegIsEnd report the
+    // end once the queued pictures are drained. libmpeg players end a stream by appending a
+    // sequence_end_code to the IPU ring (the ezmpeg sample's videoDecFlush) and may never read
+    // the PSS's trailing program end code; game overrides call this at that point.
+    void endMpegPlaybackInput(PS2Runtime *runtime, uint32_t mpegAddr);
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

@@ -539,6 +539,8 @@ namespace ps2_stubs
             // stop reading at the file size and only call sceCdStStop after sceMpegIsEnd, so
             // the runtime never sees a CD stream EOF for them (Twisted Metal: Black's movies).
             bool sawProgramEnd = false;
+            // Set by endMpegPlaybackInput: the game has fed everything it will feed.
+            bool inputFinished = false;
             uint64_t cdStreamGeneration = 0u;
             bool waitingForVideoSequenceHeader = true;
             std::vector<uint8_t> videoSequenceSyncBuffer;
@@ -1941,6 +1943,25 @@ namespace ps2_stubs
         }
     }
 
+    void endMpegPlaybackInput(PS2Runtime *runtime, uint32_t mpegAddr)
+    {
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            playback.inputFinished = true;
+            if (playback.sawInput && !playback.streamEnded)
+            {
+                finishPlaybackStream(mpegAddr, playback);
+            }
+            wake = true;
+        }
+        if (runtime && wake)
+        {
+            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+        }
+    }
+
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
@@ -2567,7 +2588,7 @@ namespace ps2_stubs
         // runtime's CD stream: the end of the MPEG stream itself is all there is.
         const bool runtimeStream = g_mpeg_stub_state.cdStreamGeneration != 0u;
         const bool producerEnded =
-            !runtimeStream || playback.aborted || playback.sawProgramEnd ||
+            !runtimeStream || playback.aborted || playback.sawProgramEnd || playback.inputFinished ||
             (g_mpeg_stub_state.currentCdStreamEofSeen &&
              playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration);
         const bool ended = producerEnded &&
@@ -2622,6 +2643,7 @@ namespace ps2_stubs
                 resetState.streamEnded = true;
                 resetState.sawProgramEnd = playback.sawProgramEnd;
                 resetState.aborted = playback.aborted;
+                resetState.inputFinished = playback.inputFinished;
                 resetState.cdStreamGeneration = playback.cdStreamGeneration;
             }
             playback = std::move(resetState);
