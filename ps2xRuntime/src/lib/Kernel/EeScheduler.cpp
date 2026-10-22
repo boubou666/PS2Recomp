@@ -396,7 +396,30 @@ void EeScheduler::postTask(std::function<void()> task)
 
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
-    accountCycles(cycles);
+    static const bool profile = []
+    {
+        const char *value = std::getenv("PS2X_EE_PROFILE");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    if (profile)
+    {
+        const uint64_t before = m_eeCycle;
+        const uint64_t spin = m_runtime.memory().pendingTimerSpinCycles();
+        accountCycles(cycles);
+        if (const GuestThread *thread = currentThread())
+        {
+            // Odd keys: cycles owed to timer polls (see PS2Memory::readIORegister).
+            std::lock_guard lock(m_guestProfileMutex);
+            const uint32_t pc = thread->activeContext().pc;
+            m_guestProfile[pc] += m_eeCycle - before - std::min(spin, m_eeCycle - before);
+            if (spin != 0u)
+                m_guestProfile[pc | 1u] += std::min(spin, m_eeCycle - before);
+        }
+    }
+    else
+    {
+        accountCycles(cycles);
+    }
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -415,7 +438,12 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     // Guest code that runs slower than real time (busy-wait loops) would otherwise stretch
     // VBlank and timer events; once the host deadline has passed, fast-forward to the event.
-    if (m_wallClockCatchUp && nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u)
+    static const bool hostCatchUp = []
+    {
+        const char *value = std::getenv("PS2X_EE_CATCHUP");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    if (m_wallClockCatchUp && hostCatchUp && nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u)
     {
         const auto hostDeadline = std::chrono::steady_clock::time_point(
             std::chrono::steady_clock::duration(m_nextDeadlineHostTicks.load(std::memory_order_acquire)));
@@ -455,10 +483,25 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+std::vector<std::pair<uint32_t, uint64_t>> EeScheduler::takeGuestProfile()
+{
+    std::vector<std::pair<uint32_t, uint64_t>> result;
+    {
+        std::lock_guard lock(m_guestProfileMutex);
+        result.assign(m_guestProfile.begin(), m_guestProfile.end());
+        m_guestProfile.clear();
+    }
+    std::sort(result.begin(), result.end(), [](const auto &left, const auto &right)
+              { return left.second > right.second; });
+    return result;
+}
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles) + m_runtime.memory().takeTimerSpinCycles();
     m_eeCycle += elapsed;
+    if (GuestThread *thread = m_currentThreadId != 0 ? currentThread() : nullptr)
+        thread->cycles += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
     m_iopEeCycles += elapsed;
@@ -1579,6 +1622,7 @@ void EeScheduler::publishSnapshot()
     next.eeCycle = m_eeCycle;
     next.sliceEndCycle = m_sliceEndCycle;
     next.nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    next.idleCycles = m_idleCycles;
     next.runningThreadId = m_currentThreadId;
     next.threads.reserve(m_threads.size());
     for (const auto &[id, item] : m_threads)
@@ -1606,6 +1650,7 @@ void EeScheduler::publishSnapshot()
         snapshot.suspendCount = item.suspendCount;
         snapshot.wakeupCount = item.wakeupCount;
         snapshot.invocationDepth = static_cast<uint32_t>(item.invocations.size());
+        snapshot.cycles = item.cycles;
         next.threads.push_back(snapshot);
     }
     std::sort(next.threads.begin(), next.threads.end(), [](const auto &left, const auto &right)
@@ -2217,6 +2262,7 @@ void EeScheduler::waitForEvent()
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
         lock.unlock();
+        m_idleCycles += elapsed;
         uint64_t remaining = elapsed;
         while (remaining > 0u)
         {
