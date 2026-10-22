@@ -98,6 +98,19 @@ namespace
 
     std::atomic<uint32_t> s_debugGifPacketCount{0};
     std::atomic<uint32_t> s_debugGsRegisterCount{0};
+
+    // PS2X_GS_LOG_LIMIT=<n> raises the cap on the [gs:gif] / [gs:reg] diagnostic logs (default
+    // 48 packets and 128 interesting registers), so an upload that happens later in the boot can
+    // still be seen without a rebuild.
+    uint32_t debugLogLimit(uint32_t defaultLimit)
+    {
+        static const long configured = []
+        {
+            const char *value = std::getenv("PS2X_GS_LOG_LIMIT");
+            return (value && *value) ? std::strtol(value, nullptr, 10) : -1L;
+        }();
+        return configured >= 0 ? static_cast<uint32_t>(configured) : defaultLimit;
+    }
     std::atomic<uint32_t> s_debugGsPackedVertexCount{0};
     std::atomic<uint32_t> s_debugGsVertexKickCount{0};
     std::atomic<uint32_t> s_debugCopyRegCount{0};
@@ -836,7 +849,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
-        if (packetIndex < 48u)
+        if (packetIndex < debugLogLimit(48u))
         {
             const uint64_t tagLo = loadLE64(data);
             const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
@@ -1354,7 +1367,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         if (interestingReg)
         {
             const uint32_t debugIndex = s_debugGsRegisterCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 128u)
+            if (debugIndex < debugLogLimit(128u))
             {
                 RUNTIME_LOG("[gs:reg] idx=" << debugIndex
                                             << " reg=0x" << std::hex << static_cast<uint32_t>(regAddr)
