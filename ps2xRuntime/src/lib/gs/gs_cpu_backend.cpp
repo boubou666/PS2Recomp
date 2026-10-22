@@ -457,6 +457,18 @@ namespace
         constexpr uint32_t kStaticPresentsBeforeUnblend = 8u;
         constexpr uint32_t kMaxMeanDifference = 6u; // per sampled pixel, sum of RGB, after level removal
 
+        // PS2X_FRAME_STABILIZE=0 presents frames unblended (line doubling only), for comparison.
+        static const bool s_stabilize = []
+        {
+            const char *value = std::getenv("PS2X_FRAME_STABILIZE");
+            return !(value && *value == '0');
+        }();
+        if (!s_stabilize)
+        {
+            applyFrameModeLineDouble(pixels, width, sourceHeight, targetHeight);
+            return;
+        }
+
         const size_t rowBytes = kHostFrameWidth * 4u;
         const size_t usedBytes = rowBytes * sourceHeight;
         std::vector<uint8_t> other;

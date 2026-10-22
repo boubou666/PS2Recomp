@@ -771,16 +771,37 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // sceGsPutDrawEnv(sceGifTag *giftag): libgraph DMAs the giftag and the NLOOP quadwords that
+    // follow it to the GIF (sceDmaSendN(gif, giftag, NLOOP + 1)). The packet is usually the
+    // drawing environment of a sceGsDBuff/DBuffDc (16 A+D registers), optionally followed by its
+    // clear packet (NLOOP 22): games pick one or the other by patching NLOOP, as Twisted Metal:
+    // Black's ieGsPutDrawEnv does every frame. Reading a fixed 8 register pairs from the giftag
+    // address applied the giftag itself as a register, dropped TEST_1, and never ran the clear.
     void sceGsPutDrawEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t envAddr = getRegU32(ctx, 4);
-        GsRegPairMem pairs[8]{};
-        if (!readGsRegPairs(rdram, envAddr, pairs, 8u))
+        const uint32_t giftagAddr = getRegU32(ctx, 4);
+        const uint8_t *tag = getConstMemPtr(rdram, giftagAddr);
+        if (!runtime || !tag)
         {
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsRegPairs(runtime, pairs, 8u);
+        uint64_t tagLo = 0;
+        std::memcpy(&tagLo, tag, sizeof(tagLo));
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        if (!runtime->syncCoreSubsystems())
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
+        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
+        auto &mem = runtime->memory();
+        mem.writeIORegister(GIF_CHANNEL + 0x10u, giftagAddr);
+        mem.writeIORegister(GIF_CHANNEL + 0x20u, (nloop + 1u) & 0xFFFFu);
+        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+        mem.processPendingTransfers();
         setReturnS32(ctx, 0);
     }
 
@@ -866,11 +887,43 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // sceGsSetDefClear(sceGsClear *cp, short ztest, short x, short y, short w, short h,
+    //                  u_long r, u_long g, u_long b, u_long a, u_int z)
+    // Fills the 6 A+D pairs of a libgraph clear packet: TEST (Z always), PRIM sprite, RGBAQ, two
+    // XYZ2 corners, TEST restored to `ztest`. x/y are primitive coordinates (callers pass
+    // 2048 - w/2, 2048 - h/2). Games DMA the packet themselves, so it has to be real: Twisted
+    // Metal: Black's ieGsSetDefDBuffDc builds its per-frame clear with it, and the empty stub left
+    // the frame and Z buffer uncleared (2D text with Z = max survived under every later 3D frame).
     void sceGsSetDefClear(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
-        (void)ctx;
         (void)runtime;
+        const uint32_t clearAddr = getRegU32(ctx, 4);
+        const uint32_t ztest = getRegU32(ctx, 5) & 0x3u;
+        const int32_t x = static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFFu);
+        const int32_t y = static_cast<int16_t>(getRegU32(ctx, 7) & 0xFFFFu);
+        const int32_t w = static_cast<int16_t>(getRegU32(ctx, 8) & 0xFFFFu);
+        const int32_t h = static_cast<int16_t>(getRegU32(ctx, 9) & 0xFFFFu);
+        const uint32_t r = getRegU32(ctx, 10) & 0xFFu;
+        const uint32_t g = getRegU32(ctx, 11) & 0xFFu;
+        // EE ABI: arguments past the eight register slots sit in 8-byte slots at the caller's sp.
+        const uint32_t b = readStackU32(rdram, ctx, 0u) & 0xFFu;
+        const uint32_t a = readStackU32(rdram, ctx, 8u) & 0xFFu;
+        const uint32_t z = readStackU32(rdram, ctx, 16u);
+
+        GsClearMem clear{};
+        const uint64_t rgbaq = static_cast<uint64_t>(r | (g << 8) | (b << 16) | (a << 24)) |
+                               (static_cast<uint64_t>(0x3F800000u) << 32);
+        clear.testa = {makeTest(0u), GS_REG_TEST_1};
+        clear.prim = {makeClearPrim(false), GS_REG_PRIM};
+        clear.rgbaq = {rgbaq, GS_REG_RGBAQ};
+        clear.xyz2a = {makeClearXyz(x, y) | (static_cast<uint64_t>(z) << 32), GS_REG_XYZ2};
+        clear.xyz2b = {makeClearXyz(x + w, y + h) | (static_cast<uint64_t>(z) << 32), GS_REG_XYZ2};
+        clear.testb = {makeTest(ztest), GS_REG_TEST_1};
+
+        if (uint8_t *dst = getMemPtr(rdram, clearAddr))
+        {
+            std::memcpy(dst, &clear, sizeof(clear));
+        }
         setReturnS32(ctx, 0);
     }
 

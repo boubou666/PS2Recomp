@@ -10,6 +10,16 @@
 #include <limits>
 #include <stdexcept>
 
+bool latchPresentationOnVBlank()
+{
+    static const bool onVBlank = []
+    {
+        const char *value = std::getenv("PS2X_LATCH_ON_HOST");
+        return !(value && *value == '1');
+    }();
+    return onVBlank;
+}
+
 namespace
 {
     constexpr int KE_OK = 0;
@@ -1916,6 +1926,38 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
     {
+        // Latch the frame the host shows here, at the guest's vblank edge, while every guest
+        // thread is parked: the display shows what the game drew for the frame that just ended.
+        // Latching from the host loop whenever it notices the new tick (PS2X_LATCH_ON_HOST=1,
+        // the old behaviour) lands at an arbitrary point of the next guest frame; games that
+        // clear and redraw a layer every frame (Twisted Metal: Black's UI layer) then showed it
+        // cleared but not yet redrawn.
+        // Only latch once the game has finished its frame, i.e. a thread is blocked waiting for this
+        // vblank (sceGsSyncV, WaitVSync...). A game running below the field rate is still drawing
+        // when other vblanks pass; latching those shows a half-drawn layer every other frame. Games
+        // that never wait that way still get a latch every kMaxVBlanksWithoutLatch vblanks.
+        if (latchPresentationOnVBlank())
+        {
+            constexpr uint32_t kMaxVBlanksWithoutLatch = 3u;
+            static uint32_t s_vblanksWithoutLatch = 0u;
+            bool frameComplete = false;
+            for (const auto &[id, candidate] : m_threads)
+            {
+                (void)id;
+                if ((candidate.status == EeThreadStatus::Waiting || candidate.status == EeThreadStatus::WaitingSuspended) &&
+                    candidate.wait.reason == EeWaitReason::VSync &&
+                    std::get<EeVSyncWait>(candidate.wait.payload).afterTick <= m_vsyncTick)
+                {
+                    frameComplete = true;
+                    break;
+                }
+            }
+            if (frameComplete || ++s_vblanksWithoutLatch >= kMaxVBlanksWithoutLatch)
+            {
+                m_runtime.gs().latchHostPresentationFrame();
+                s_vblanksWithoutLatch = 0u;
+            }
+        }
         ++m_vsyncTick;
         // The IOP clock only advances with the EE cycles the recompiled code accounts, far
         // fewer than real time, while vblanks follow the host's clock. Catch the IOP up to the

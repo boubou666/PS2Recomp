@@ -467,6 +467,8 @@ namespace
     }
 }
 
+bool latchPresentationOnVBlank(); // Kernel/EeScheduler.cpp
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -484,7 +486,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        // The guest's vblank latches the frame (EeScheduler::processEvent); the host only latches
+        // the very first frame, or every frame when PS2X_LATCH_ON_HOST=1.
+        if (!s_hasLatchedInitialFrame || !latchPresentationOnVBlank())
+        {
+            rt->gs().latchHostPresentationFrame();
+        }
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
