@@ -401,6 +401,16 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+# The runtime (ps2_runtime_macros.h, GS/VU paths) uses SSE4.1/AVX2 intrinsics. MSVC gets
+# /arch:AVX2 from EnableFastReleaseMode, but GCC/Clang need the target flag in every config
+# or the always_inline intrinsics fail to compile. PUBLIC so the runner and generated code
+# see the same ISA.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86|i[3-6]86" AND NOT MSVC AND NOT PS2X_IS_ARM_TARGET)
+    set(PS2X_X86_MARCH "x86-64-v3" CACHE STRING
+        "-march value for the runtime and recompiled code on GCC/Clang (x86-64-v3 = AVX2/FMA/BMI)")
+    target_compile_options(ps2_runtime PUBLIC "-march=${PS2X_X86_MARCH}")
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1
