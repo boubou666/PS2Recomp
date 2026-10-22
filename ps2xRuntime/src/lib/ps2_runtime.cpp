@@ -2680,9 +2680,17 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // The PS2 always drove a 4:3 TV, whatever its internal resolution: 640x448/512 frames and
+        // 256-line progressive modes (Twisted Metal: Black's 640x256 match) fill the same picture.
+        // PS2X_PIXEL_ASPECT=1 keeps square pixels instead.
+        static const bool s_squarePixels = []
+        {
+            const char *value = std::getenv("PS2X_PIXEL_ASPECT");
+            return value && *value == '1';
+        }();
+        const float displayAspect = s_squarePixels ? srcWidth / srcHeight : 4.0f / 3.0f;
+        const float dstWidth = std::min(screenWidth, screenHeight * displayAspect);
+        const float dstHeight = dstWidth / displayAspect;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
