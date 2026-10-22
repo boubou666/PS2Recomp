@@ -12,6 +12,7 @@
 #include <immintrin.h>
 #endif
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 namespace
 {
@@ -245,8 +247,18 @@ void GS::waitForGsFrames()
     constexpr uint64_t kMaxFramesAhead = 1u;
     std::unique_lock<std::mutex> lock(m_queueMutex);
     ++m_finishesQueued;
+    ++m_lagStats.frames;
+    const auto start = std::chrono::steady_clock::now();
     m_queueIdle.wait(lock, [this]()
                      { return m_finishesQueued - m_finishesDrawn <= kMaxFramesAhead || m_stopWorker; });
+    m_lagStats.waitNanoseconds += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+GS::LagStats GS::takeLagStats()
+{
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    return std::exchange(m_lagStats, LagStats{});
 }
 
 // The GS thread draws queued packets later in host time, but the CPU must see SIGNAL, FINISH and
@@ -348,7 +360,7 @@ void GS::enqueue(QueuedCommand &&command)
 
 void GS::workerLoop()
 {
-    ThreadNaming::SetCurrentThreadName("gs");
+    ThreadNaming::SetCurrentThreadName("GSFrontend");
     t_onGsWorker = true;
 #if defined(PS2X_HAVE_PARALLEL_GS)
     if (m_parallelRequested && !m_parallel)
