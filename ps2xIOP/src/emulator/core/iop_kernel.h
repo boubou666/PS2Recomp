@@ -70,6 +70,14 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        // For running code on behalf of a thread outside its own timeslice (RPC server functions).
+        [[nodiscard]] IopThread *thread(int id) noexcept
+        {
+            const auto it = m_threads.find(id);
+            return it == m_threads.end() ? nullptr : &it->second;
+        }
+        [[nodiscard]] IopThread *currentThread() const noexcept { return m_currentThread; }
+        void setCurrentThread(IopThread *thread) noexcept { m_currentThread = thread; }
         // One line per thread (state, pc, entry, priority, wait object) for debug snapshots.
         [[nodiscard]] std::vector<std::string> describeThreads() const;
 

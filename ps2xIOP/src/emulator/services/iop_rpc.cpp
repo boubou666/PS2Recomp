@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -23,6 +24,7 @@ namespace ps2x::iop::detail
     {
         m_servers.clear();
         m_cmdHandlers.clear();
+        m_queueThreads.clear();
         m_nextDmaId = 1u;
         m_sifInitialized = false;
     }
@@ -264,7 +266,8 @@ namespace ps2x::iop::detail
         case 18:
             setV0(0);
             return true;
-        case 19: // SetRpcQueue
+        case 19: // SetRpcQueue(queue, thread)
+            m_queueThreads[cpu.gpr[4]] = static_cast<int>(cpu.gpr[5]);
             setV0(cpu.gpr[4]);
             return true;
         case 20:
@@ -323,12 +326,33 @@ namespace ps2x::iop::detail
             }
         }
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
+        static const bool traceRpc = []
+        {
+            const char *value = std::getenv("PS2X_IOP_TRACE_RPC");
+            return value && *value == '1';
+        }();
+        if (traceRpc)
+            std::fprintf(stderr, "[iop:rpc] sid=0x%x fno=%u mode=%u send=%u recv=%u -> server 0x%x (inline)\n", request.sid,
+                         request.function, request.mode, request.send.size, request.receive.size, server.function);
+        // Run the server function as the thread that serves its queue, like sceSifRpcLoop does:
+        // 989snd's bank load records GetThreadId() and sleeps until its loader thread wakes it.
+        const auto queueThread = m_queueThreads.find(server.queue);
+        uint32_t returnPointer = queueThread != m_queueThreads.end()
+                                     ? executor.executeGuestFunctionAsThread(server.function,
+                                                                             request.function,
+                                                                             server.buffer,
+                                                                             request.send.size,
+                                                                             0u,
+                                                                             server.gp,
+                                                                             queueThread->second)
+                                     : executor.executeGuestFunction(server.function,
+                                                                     request.function,
+                                                                     server.buffer,
+                                                                     request.send.size,
+                                                                     0u,
+                                                                     server.gp);
+        if (traceRpc)
+            std::fprintf(stderr, "[iop:rpc] sid=0x%x fno=%u returned 0x%x\n", request.sid, request.function, returnPointer);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)

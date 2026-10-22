@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
@@ -497,7 +499,21 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
-            runCpu(cpu, budget);
+            const uint32_t executed = runCpu(cpu, budget);
+            if (!cpu.stopped)
+            {
+                // The function did not return: it blocked (an inline call cannot wait for other
+                // threads) or ran out of budget. Its caller receives whatever v0 holds.
+                static const bool trace = []
+                {
+                    const char *value = std::getenv("PS2X_IOP_TRACE_RPC");
+                    return value && *value == '1';
+                }();
+                if (trace)
+                    std::fprintf(stderr, "[iop:call] 0x%x did not return: %s after %u instructions, pc=0x%x ra=0x%x v0=0x%x\n",
+                                 address, cpu.yielded ? "blocked" : "budget exhausted", executed, cpu.pc, cpu.gpr[31],
+                                 cpu.gpr[2]);
+            }
             return cpu.gpr[2];
         }
 
@@ -509,6 +525,121 @@ namespace ps2x::iop::detail
                                       uint32_t gp) override
         {
             return callFunction(address, a0, a1, a2, a3, gp);
+        }
+
+        [[nodiscard]] bool threadRunnable(const IopThread &thread) const noexcept
+        {
+            return thread.state == IopThreadState::Ready || thread.state == IopThreadState::Running ||
+                   (thread.state == IopThreadState::Delay && thread.wakeCycle <= totalCycles);
+        }
+
+        // Run the other threads (and the interrupt/timer/SIF services) until `owner` is runnable
+        // again or `deadline` passes. Never schedules `owner` itself: its real CPU context sits in
+        // sceSifRpcLoop while the RPC function runs on a separate call frame.
+        [[nodiscard]] bool runOthersUntilRunnable(IopThread &owner, uint64_t deadline)
+        {
+            while (!threadRunnable(owner))
+            {
+                if (totalCycles >= deadline)
+                    return false;
+                spu2.advanceTo(totalCycles);
+                servicePendingDmaInterrupts();
+                servicePendingSifCommands();
+                servicePendingGuestCallbacks();
+                timrman.serviceDue(totalCycles, *this);
+                vblank.serviceDue(totalCycles, *this);
+                if (threadRunnable(owner))
+                    break;
+                uint64_t nextDelayWake = UINT64_MAX;
+                IopThread *next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+                if (!next)
+                {
+                    uint64_t nextWake = std::min(deadline, nextDelayWake);
+                    for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                        nextWake = std::min(nextWake, completionCycle);
+                    if (!pendingGuestCallbacks.empty())
+                        nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                    nextWake = timrman.nextEventCycle(nextWake);
+                    nextWake = vblank.nextEventCycle(nextWake);
+                    nextWake = std::min(nextWake, spu2.nextEventCycle());
+                    totalCycles = std::max(totalCycles + 1u, nextWake);
+                    continue;
+                }
+                const uint64_t before = totalCycles;
+                runCpu(next->cpu, kDefaultSlice);
+                kernel.endTimeslice(*next, kThreadReturnSentinel);
+                if (totalCycles == before)
+                    ++totalCycles;
+            }
+            return true;
+        }
+
+        uint32_t executeGuestFunctionAsThread(uint32_t address,
+                                              uint32_t a0,
+                                              uint32_t a1,
+                                              uint32_t a2,
+                                              uint32_t a3,
+                                              uint32_t gp,
+                                              int threadId) override
+        {
+            IopThread *owner = kernel.thread(threadId);
+            if (owner == nullptr || owner == kernel.currentThread())
+                return callFunction(address, a0, a1, a2, a3, gp);
+
+            struct CallDepthGuard
+            {
+                uint32_t &depth;
+                ~CallDepthGuard() { --depth; }
+            };
+            const uint32_t depth = callDepth++;
+            const CallDepthGuard depthGuard{callDepth};
+            CpuState cpu{};
+            cpu.pc = address;
+            cpu.gpr[4] = a0;
+            cpu.gpr[5] = a1;
+            cpu.gpr[6] = a2;
+            cpu.gpr[7] = a3;
+            cpu.gpr[28] = gp;
+            cpu.gpr[29] = (depth < kCallStackCapacity ? kCallStackLimit - depth * kCallStackSize : kCallStackBase) - 32u;
+            cpu.gpr[31] = kCallReturnSentinel;
+
+            // Bound the wait in IOP time so a server that never gets woken cannot hang the EE.
+            constexpr uint64_t kMaxBlockedCycles = 36'864'000ull * 20ull; // 20 s of IOP clock
+            IopThread *previous = kernel.currentThread();
+            const IopThreadState ownerState = owner->state;
+            const uint64_t deadline = totalCycles + kMaxBlockedCycles;
+            uint32_t blocks = 0u;
+            bool timedOut = false;
+            kernel.setCurrentThread(owner);
+            owner->state = IopThreadState::Running;
+            for (;;)
+            {
+                runCpu(cpu, kMaxCallInstructions);
+                if (cpu.stopped || !cpu.yielded)
+                    break;
+                cpu.yielded = false;
+                ++blocks;
+                if (!runOthersUntilRunnable(*owner, deadline))
+                {
+                    timedOut = true;
+                    break;
+                }
+                kernel.setCurrentThread(owner);
+                owner->state = IopThreadState::Running;
+            }
+            owner->state = ownerState; // back to its sceSifRpcLoop wait
+            kernel.setCurrentThread(previous);
+
+            static const bool trace = []
+            {
+                const char *value = std::getenv("PS2X_IOP_TRACE_RPC");
+                return value && *value == '1';
+            }();
+            if (trace && (blocks != 0u || !cpu.stopped))
+                std::fprintf(stderr, "[iop:call] 0x%x as thread %d: %s after %u block(s), v0=0x%x\n", address, threadId,
+                             cpu.stopped ? "returned" : (timedOut ? "gave up waiting" : "budget exhausted"), blocks,
+                             cpu.gpr[2]);
+            return cpu.gpr[2];
         }
 
         uint32_t executeGuestFunctionWithBudget(uint32_t address,

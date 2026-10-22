@@ -8,6 +8,16 @@
 
 #include <algorithm>
 
+static bool iopTraceRpc()
+{
+    static const bool enabled = []
+    {
+        const char *value = std::getenv("PS2X_IOP_TRACE_RPC");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
 namespace ps2x::iop::detail
 {
     namespace
@@ -429,12 +439,18 @@ namespace ps2x::iop::detail
             }
             else if (ordinal == 9)
                 setV0(-419);
-            else if (m_currentThread != nullptr)
+            else
             {
-                m_currentThread->state = IopThreadState::Semaphore;
-                m_currentThread->waitId = id;
-                cpu.yielded = true;
-                setV0(0);
+                if (iopTraceRpc())
+                    std::fprintf(stderr, "[iop:sema] WaitSema(%d) would block: current thread %d pc=0x%x ra=0x%x\n", id,
+                                 m_currentThread ? m_currentThread->id : -1, cpu.pc, cpu.gpr[31]);
+                if (m_currentThread != nullptr)
+                {
+                    m_currentThread->state = IopThreadState::Semaphore;
+                    m_currentThread->waitId = id;
+                    cpu.yielded = true;
+                    setV0(0);
+                }
             }
             return true;
         }

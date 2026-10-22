@@ -39,6 +39,20 @@ namespace ps2x::iop::detail
         {
             return executeGuestFunction(address, a0, a1, a2, a3, gp);
         }
+        // Runs `address` as thread `threadId` (the RPC server thread of a sceSifRpcLoop): the code
+        // sees that thread as current and may block on it (SleepThread, WaitSema...); other
+        // threads run until it is woken. Falls back to executeGuestFunction for unknown threads.
+        [[nodiscard]] virtual uint32_t executeGuestFunctionAsThread(uint32_t address,
+                                                                    uint32_t a0,
+                                                                    uint32_t a1,
+                                                                    uint32_t a2,
+                                                                    uint32_t a3,
+                                                                    uint32_t gp,
+                                                                    int threadId)
+        {
+            (void)threadId;
+            return executeGuestFunction(address, a0, a1, a2, a3, gp);
+        }
     };
 
     class IopRpcBridge
@@ -84,6 +98,7 @@ namespace ps2x::iop::detail
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
         std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers;
+        std::unordered_map<uint32_t, int> m_queueThreads; // sceSifSetRpcQueue: queue -> server thread
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
     };
