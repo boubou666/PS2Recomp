@@ -2634,8 +2634,10 @@ namespace ps2_stubs
         uint32_t inner = *reinterpret_cast<uint32_t *>(base + 0x40);
         if (inner == 0u)
             return;
-        mpegGuestWrite32(rdram, param_1 + 0x00u, 0u);
-        mpegGuestWrite32(rdram, param_1 + 0x04u, 0u);
+        // sceMpeg.width/height (+0x00/+0x04) keep the last decoded sequence size across a reset,
+        // as in libmpeg; only frameCount (+0x08) restarts. Twisted Metal: Black builds DISPLAY2
+        // from them every frame (setPMODE): zeroed, DH became height - 1 = -1 and circuit 2
+        // showed 2048 lines of VRAM below the movie (a band of texture garbage on the title).
         mpegGuestWrite32(rdram, param_1 + 0x08u, 0u);
         mpegGuestWrite32(rdram, inner + 0x00, 0u);
         mpegGuestWrite32(rdram, inner + 0x04, 0u);
