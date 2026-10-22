@@ -531,6 +531,14 @@ namespace ps2_stubs
             bool sawSequenceEnd = false;
             bool streamEnded = false;
             bool decoderFailed = false;
+            // Set by abortMpegPlayback: the game gave up on the movie (skip button), so the
+            // producer will never reach EOF. Counts as producer EOF for sceMpegIsEnd.
+            bool aborted = false;
+            // An MPEG program end code (0x000001B9) closed the PSS. Also counts as producer EOF:
+            // games that open the CD stream without an end LBN (sceCdStStart with 0xFFFFFFFF)
+            // stop reading at the file size and only call sceCdStStop after sceMpegIsEnd, so
+            // the runtime never sees a CD stream EOF for them (Twisted Metal: Black's movies).
+            bool sawProgramEnd = false;
             uint64_t cdStreamGeneration = 0u;
             bool waitingForVideoSequenceHeader = true;
             std::vector<uint8_t> videoSequenceSyncBuffer;
@@ -1263,6 +1271,7 @@ namespace ps2_stubs
                 if (streamId == kMpegProgramEnd)
                 {
                     playback.streamEnded = true;
+                    playback.sawProgramEnd = true;
                     playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
                     flushDecoderIfEnded(playback);
                     erasePssPrefix(playback, buffer.size());
@@ -1915,6 +1924,23 @@ namespace ps2_stubs
         }
     }
 
+    void abortMpegPlayback(PS2Runtime *runtime, uint32_t mpegAddr)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            playback.aborted = true;
+            playback.sawInput = true;
+            playback.streamEnded = true;
+            playback.decodedFrames.clear();
+            playback.presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
+        }
+        if (runtime)
+        {
+            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+        }
+    }
+
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
@@ -2541,7 +2567,7 @@ namespace ps2_stubs
         // runtime's CD stream: the end of the MPEG stream itself is all there is.
         const bool runtimeStream = g_mpeg_stub_state.cdStreamGeneration != 0u;
         const bool producerEnded =
-            !runtimeStream ||
+            !runtimeStream || playback.aborted || playback.sawProgramEnd ||
             (g_mpeg_stub_state.currentCdStreamEofSeen &&
              playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration);
         const bool ended = producerEnded &&
@@ -2594,6 +2620,8 @@ namespace ps2_stubs
             {
                 resetState.sawInput = true;
                 resetState.streamEnded = true;
+                resetState.sawProgramEnd = playback.sawProgramEnd;
+                resetState.aborted = playback.aborted;
                 resetState.cdStreamGeneration = playback.cdStreamGeneration;
             }
             playback = std::move(resetState);

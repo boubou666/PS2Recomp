@@ -9,6 +9,12 @@ namespace ps2_stubs
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);
+    // End an HLE playback the game abandoned before its stream ended. libmpeg games abort by
+    // feeding a sequence_end_code to the IPU (e.g. the ezmpeg sample's videoDecFlush), which
+    // never reaches the host decoder: game overrides call this at that point instead. Drops
+    // the queued pictures, makes sceMpegIsEnd/sceMpegIsRefBuffEmpty report the end, and wakes
+    // a thread blocked in sceMpegGetPicture.
+    void abortMpegPlayback(PS2Runtime *runtime, uint32_t mpegAddr);
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
