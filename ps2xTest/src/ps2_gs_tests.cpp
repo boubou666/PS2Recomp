@@ -159,14 +159,10 @@ namespace
         runtime->requestStop();
     }
 
-    void writeGsImageTest(uint8_t *rdram, uint32_t addr, const GsImageMem &image)
+    // The libgraph sceGsLoadImage / sceGsStoreImage packets, as sceGsSetDefLoadImage/StoreImage write them.
+    void writeGsImageTest(uint8_t *rdram, uint32_t addr, const GsImageMem &image, bool store)
     {
-        std::memcpy(rdram + addr, &image, sizeof(image));
-    }
-
-    void writeGsImageTest(std::vector<uint8_t> &rdram, uint32_t addr, const GsImageMem &image)
-    {
-        writeGsImageTest(rdram.data(), addr, image);
+        writeGsImage(rdram, addr, image, store);
     }
 
     void writePSMT4Texel(std::vector<uint8_t> &vram, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint8_t index)
@@ -4240,6 +4236,7 @@ void register_ps2_gs_tests()
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
             uint8_t *const rdram = runtime.memory().getRDRAM();
             constexpr uint32_t kImageAddr = 0x4000u;
+            constexpr uint32_t kStoreImageAddr = 0x4100u;
             constexpr uint32_t kSrcAddr = 0x5000u;
             constexpr uint32_t kDstAddr = 0x6000u;
 
@@ -4251,7 +4248,8 @@ void register_ps2_gs_tests()
                 0xD0u, 0xE0u, 0xF0u, 0xFFu,
             };
 
-            writeGsImageTest(rdram, kImageAddr, image);
+            writeGsImageTest(rdram, kImageAddr, image, false);
+            writeGsImageTest(rdram, kStoreImageAddr, image, true);
             std::memcpy(rdram + kSrcAddr, pixels, sizeof(pixels));
 
             R5900Context loadCtx{};
@@ -4280,7 +4278,7 @@ void register_ps2_gs_tests()
                                     "sceGsExecLoadImage should free its temporary GIF packet");
 
             R5900Context storeCtx{};
-            setRegU32(storeCtx, 4, kImageAddr);
+            setRegU32(storeCtx, 4, kStoreImageAddr);
             setRegU32(storeCtx, 5, kDstAddr);
             ps2_stubs::sceGsExecStoreImage(rdram, &storeCtx, &runtime);
             t.Equals(static_cast<int32_t>(getRegU32Test(storeCtx, 2)), 0,
