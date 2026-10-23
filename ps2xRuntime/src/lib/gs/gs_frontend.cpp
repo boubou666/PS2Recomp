@@ -173,6 +173,12 @@ GS::~GS()
         m_worker.join();
 }
 
+bool GS::fifoEmpty() const
+{
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    return m_queue.empty() && !m_workerBusy;
+}
+
 namespace
 {
     // PS2X_GS_RECORD=<file> (+ PS2X_GS_RECORD_AT=<sec> from process start, PS2X_GS_RECORD_SECONDS=<sec>, default 10):
@@ -284,6 +290,29 @@ namespace
         return {envCycles("PS2X_GS_PIXEL_CYCLES", defaults.cyclesPer1024Pixels),
                 envCycles("PS2X_GS_PRIM_CYCLES", defaults.cyclesPerPrimitive)};
     }
+}
+
+namespace
+{
+    // EE cycle at which the GS finishes drawing what was sent so far.
+    std::atomic<uint64_t> g_gsBusyUntil{0};
+}
+
+bool ps2GsDrawing()
+{
+    const uint64_t now = ps2CurrentEeCycle();
+    return now != 0u && now < g_gsBusyUntil.load(std::memory_order_acquire);
+}
+
+void GS::noteQueuedDrawing()
+{
+    const uint64_t total = m_drawEstimate.totalCycles();
+    const uint64_t added = total - m_notedDrawingCycles;
+    m_notedDrawingCycles = total;
+    if (added == 0u)
+        return;
+    const uint64_t start = std::max(g_gsBusyUntil.load(std::memory_order_relaxed), ps2CurrentEeCycle());
+    g_gsBusyUntil.store(start + added, std::memory_order_release);
 }
 
 // PS2X_GS_EVENT_LATENCY overrides the base latency.
@@ -529,6 +558,7 @@ void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         return;
     }
     postQueuedCpuEvents(data, sizeBytes);
+    noteQueuedDrawing();
     QueuedCommand command;
     command.kind = QueuedCommand::Kind::GifPacket;
     command.bytes.assign(data, data + sizeBytes);
@@ -663,6 +693,8 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     waitForIdle();
     m_drawEstimate = GsDrawEstimate{};
     m_drawEstimate.setRates(gsDrawRates());
+    m_notedDrawingCycles = 0;
+    g_gsBusyUntil.store(0u, std::memory_order_release);
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
@@ -1383,6 +1415,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!data || sizeBytes < 16u || !m_backend || !validatePackedGifPacket(data, sizeBytes))
         return false;
     postQueuedCpuEvents(data, sizeBytes);
+    noteQueuedDrawing();
     QueuedCommand command;
     command.kind = QueuedCommand::Kind::NativePackedGifPacket;
     command.bytes.assign(data, data + sizeBytes);
