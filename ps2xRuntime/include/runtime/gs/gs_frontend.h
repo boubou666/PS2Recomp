@@ -13,6 +13,7 @@
 #include <mutex>
 #include <vector>
 
+#include "runtime/gs/gs_draw_estimate.h"
 #include "runtime/gs/gs_backend.h"
 
 class GSParallelRenderer;
@@ -212,6 +213,7 @@ private:
     void storePresentationFrame(PresentationFrame &&frame);
     void postCpuEvent(GsCpuEvent event, uint64_t value, uint64_t delayCycles);
     void postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes);
+    uint64_t gsEventDelay();
     void waitForGsFrames();
     void enqueue(QueuedCommand &&command);
     void workerLoop();
@@ -267,6 +269,7 @@ private:
     std::deque<QueuedCommand> m_queue;
     size_t m_queuedBytes = 0;
     // FINISH writes queued for / drawn by the GS thread: bounds how many frames it may lag.
+    GsDrawEstimate m_drawEstimate;
     uint64_t m_finishesQueued = 0;
     uint64_t m_finishesDrawn = 0;
     LagStats m_lagStats;
