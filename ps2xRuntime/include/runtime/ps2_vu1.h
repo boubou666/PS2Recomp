@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 class GS;
 class PS2Memory;
@@ -60,16 +61,9 @@ public:
                 GS &gs, PS2Memory *memory = nullptr,
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
-    VU1State &state() { return m_state; }
-    const VU1State &state() const { return m_state; }
-
-    // Called with every PATH1 packet an XGKICK completes (recording and replay tooling).
-    using PacketObserver = std::function<void(const uint8_t *data, uint32_t size)>;
-    void setPacketObserver(PacketObserver observer) { m_packetObserver = std::move(observer); }
-    // For callers running code that PS2Memory does not track: drop decoded instructions after changing it.
-    void invalidateDecodedCode() { ++m_externalCodeGeneration; }
-
-private:
+    // ---- Pair decoding and stepping, shared by run() and microcode compiled ahead of time ----
+    // (ps2_vu_aot generates C++ that calls stepPair() with a constexpr decodePair() of each instruction pair;
+    // see ps2_vu1_inline.h.)
     enum Pipeline : uint8_t
     {
         PipelineNone = 0,
@@ -124,6 +118,63 @@ private:
         uint8_t suppressedLowerVf = 0;
     };
 
+    enum class StepResult : uint8_t
+    {
+        Continue, // next pair
+        Stop,     // cycle budget spent, reserved instruction or stop request
+        Ended     // E bit (after its delay slot) or D/T halt
+    };
+
+    struct RunContext
+    {
+        uint8_t *vuData = nullptr;
+        uint32_t dataSize = 0;
+        uint32_t codeSize = 0;
+        GS *gs = nullptr;
+        PS2Memory *memory = nullptr;
+        uint64_t budgetEnd = 0;
+    };
+
+    static constexpr InstructionUsage decodeUpperUsage(uint32_t upper);
+    static constexpr InstructionUsage decodeLowerUsage(Unit unit, uint32_t lower);
+    static constexpr DecodedInstructionPair decodePair(Unit unit, uint32_t lower, uint32_t upper);
+    // One instruction pair at m_state.pc, as one iteration of run()'s loop.
+    StepResult stepPair(const DecodedInstructionPair &decoded, const RunContext &context);
+    // run()'s loop condition, checked before every pair.
+    bool canIssue(const RunContext &context) const
+    {
+        return m_cycle < context.budgetEnd && !m_stopRequested && m_state.pc + 8u <= context.codeSize;
+    }
+
+    // A fragment of microcode compiled ahead of time: pairs [firstPair, firstPair + pairCount) of code memory, valid
+    // while those bytes hash to codeHash. pairs[i] runs pair firstPair + i, as stepPair() does.
+    using CompiledEntry = StepResult (*)(VU1Interpreter &vu, const RunContext &context);
+    struct CompiledFragment
+    {
+        uint32_t firstPair = 0;
+        uint32_t pairCount = 0;
+        uint64_t codeHash = 0;
+        const CompiledEntry *pairs = nullptr;
+    };
+    static void registerCompiledFragment(const CompiledFragment &fragment);
+    static constexpr uint64_t codeHash(const uint8_t *code, uint32_t size)
+    {
+        uint64_t hash = 0xCBF29CE484222325ull; // FNV-1a
+        for (uint32_t index = 0; index < size; ++index)
+            hash = (hash ^ code[index]) * 0x100000001B3ull;
+        return hash;
+    }
+
+    VU1State &state() { return m_state; }
+    const VU1State &state() const { return m_state; }
+
+    // Called with every PATH1 packet an XGKICK completes (recording and replay tooling).
+    using PacketObserver = std::function<void(const uint8_t *data, uint32_t size)>;
+    void setPacketObserver(PacketObserver observer) { m_packetObserver = std::move(observer); }
+    // For callers running code that PS2Memory does not track: drop decoded instructions after changing it.
+    void invalidateDecodedCode() { ++m_externalCodeGeneration; }
+
+private:
     struct FlagPipelineEntry
     {
         uint64_t readyCycle = 0;
@@ -258,15 +309,30 @@ private:
     PacketObserver m_packetObserver;
     uint64_t m_externalCodeGeneration = 0;
 
+    // Compiled fragments matching the current code memory, by pair index (empty: none apply).
+    std::vector<CompiledEntry> m_compiledByPair;
+    const uint8_t *m_compiledCode = nullptr;
+    uint64_t m_compiledStamp = 0;
+    bool m_compiledChecked = false;
+    void refreshCompiledFragments(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp);
+
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
              GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    // stepPair's body; kLogInFlight keeps the previous value of the registers each pair writes (time-sliced runs).
+    template <bool kLogInFlight>
+#if defined(_MSC_VER) && !defined(__clang__)
+    __forceinline
+#else
+    __attribute__((always_inline)) inline
+#endif
+    StepResult stepPairImpl(const DecodedInstructionPair &decoded, const RunContext &context);
+    StepResult stepPairLogged(const DecodedInstructionPair &decoded, const RunContext &context);
+    void stallUntilReady(const DecodedInstructionPair &decoded, uint64_t readyCycle, uint64_t budgetEnd);
 
-    InstructionUsage decodeUpperUsage(uint32_t upper) const;
-    InstructionUsage decodeLowerUsage(uint32_t lower) const;
-    static void addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
-    static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
-    static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
+    static constexpr void addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+    static constexpr void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+    static constexpr uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
     const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory,
                                                                  uint32_t pc);
@@ -278,6 +344,9 @@ private:
     void applyDestAcc(const float *result, uint8_t dest);
     void applyFmacDest(float *dst, float *result, uint8_t dest);
     void applyFmacDestAcc(float *result, uint8_t dest);
+    bool fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status, uint32_t &sticky) const;
+    void fmacFlags(float *result, uint8_t dest);
+    void fmacFlagsSlow(float *result, uint8_t dest);
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
     bool calculateFmacExactResult(uint32_t component, long double &result) const;
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
@@ -293,10 +362,12 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    void commitScalarPipelines();
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
     void progressXgkick(uint64_t cycles);
+    void progressXgkickActive(uint64_t cycles);
     void resetXgkick();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;

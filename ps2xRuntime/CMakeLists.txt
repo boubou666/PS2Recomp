@@ -399,8 +399,6 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
-    src/lib/vu/ps2_vu1_upper.cpp
-    src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
 
@@ -605,6 +603,11 @@ endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
+    # The runtime library holds the interpreters (VU0/VU1, IOP) and the software rasterizer: -O3 for it even in
+    # RelWithDebInfo (-O2). The generated code keeps the configuration's level (it is too large for -O3 builds).
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(ps2_runtime PRIVATE -O3)
+    endif()
     EnableFastReleaseMode(ps2EntryRunner)
 
     if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)

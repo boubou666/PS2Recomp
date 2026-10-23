@@ -140,6 +140,18 @@ In module mode the recompiler:
 
 At run time, an address with no main ELF function is resolved in the overlay module whose guard bytes match guest memory at its load address, so the code that runs always matches the image the game loaded. Game overrides can install a faster resolver with `ps2_overlays::setResidentResolver`, and patch a specific module with `ps2_overlays::replaceModuleFunction` (see `ps2xRuntime/include/ps2_overlay_modules.h`).
 
+### VU1 microcode
+
+The runtime interprets VU0/VU1 microprograms. `ps2_vu_aot` (built with the recompiler) compiles the VU1 microcode found in the ELF ahead of time:
+
+```bash
+./ps2_vu_aot your_game.elf generated/vu1
+```
+
+It scans the ELF for VIF `MPG` uploads and writes one C++ file per microcode fragment; compile them into the game executable. Each instruction pair calls the interpreter's `stepPair()` with a `constexpr` decode, so the semantics are the interpreter's and the compiler folds away the decoding. At run time a fragment replaces the interpreter only while VU1 code memory holds its exact bytes at its address; `PS2X_VU_AOT=0` disables it. Compile the generated files with `-O3` and without debug info.
+
+`ps2_vu1_replay` checks the interpreter, and the compiled microcode linked into a copy of it, against runs recorded in the game with `PS2X_VU1_RECORD=<file>` (`PS2X_VU1_RECORD_AT=<sec>`, `PS2X_VU1_RECORD_COUNT=<runs>`).
+
 ### Runtime
 
 To execute the recompiled code.

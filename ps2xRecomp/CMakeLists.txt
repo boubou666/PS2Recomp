@@ -120,6 +120,11 @@ PRIVATE
     ps2_recomp_lib
 )
 
+# Ahead-of-time compiler for the VU1 microcode in a game ELF. It only uses the runtime's VU headers (the
+# constexpr pair decoder), so it builds with the other tools; its output is compiled into the game.
+add_executable(ps2_vu_aot src/vu_aot/ps2_vu_aot.cpp)
+target_include_directories(ps2_vu_aot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ps2xRuntime/include)
+
 install(TARGETS ps2_recomp ps2_recomp_lib
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
