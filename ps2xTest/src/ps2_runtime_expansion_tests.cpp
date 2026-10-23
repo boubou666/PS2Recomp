@@ -1077,6 +1077,17 @@ void register_ps2_runtime_expansion_tests()
                      "a double in a3 is the whole register, and the next one comes from t0");
         });
 
+        tc.Run("SQRT.S takes its operand from ft", [](TestCase &t)
+        {
+            R5900Decoder decoder;
+            CodeGenerator generator({}, {});
+            // sqrt.s $f1, $f12 as Twisted Metal: Black's mathfNormalize encodes it (fs field 0, ft field 12).
+            const Instruction inst = decoder.decodeInstruction(0x1db9bcu, 0x460c0044u);
+            const std::string generated = generator.translateInstruction(inst);
+            t.IsTrue(generated.find("ctx->f[1] = FPU_SQRT_S(ctx->f[12])") != std::string::npos,
+                     "SQRT.S fd, ft should compute sqrt(ft): " + generated);
+        });
+
         tc.Run("multiply-add matrix writes rd only when R5900 requires it", [](TestCase &t)
         {
             R5900Decoder decoder;
