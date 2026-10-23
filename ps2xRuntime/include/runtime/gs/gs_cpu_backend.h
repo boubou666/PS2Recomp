@@ -51,6 +51,10 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // The current CLUT (GS::saveDrawingState / loadDrawingState); waits for queued drawing.
+    std::vector<uint8_t> SaveClutState();
+    void LoadClutState(const uint8_t *data, size_t size);
+
 private:
     bool m_asyncAllowed = true;
     void ResetUnlocked();
@@ -78,7 +82,13 @@ private:
     // that touches VRAM drains the queue first.
     struct QueuedPrimitive;
     struct DecodedTexture;
+    struct PaletteCache;
+    struct ClutHistory;
     struct DecodedTextureCache;
+    // Serial of a CLUT's contents: the same contents loaded again get their earlier serial back, so the textures and
+    // palettes cached for them stay valid (games reload the same CLUT before almost every primitive).
+    uint64_t ClutSerialOf(ClutHistory &history, const std::array<uint16_t, 512> &clut);
+    const uint32_t *PaletteFor(PaletteCache &cache, const TextureSampler &sampler);
     uint32_t FetchTexel(const TextureSampler &sampler, GSMem::TexturePageCache &cache, int u, int v);
     void DecodeTile(DecodedTexture &texture, const TextureSampler &sampler, GSMem::TexturePageCache &cache, uint32_t tile);
     DecodedTexture *FindDecodedTexture(DecodedTextureCache &cache, const TextureSampler &sampler);
@@ -89,7 +99,8 @@ private:
     void StartWorkersUnlocked();
     void DrainUnlocked() const;
     // VRAM written by the caller after a drain: the next primitive sampling it gets a barrier,
-    // so workers drop decoded textures that predate the write.
+    // so workers drop decoded textures that predate the write. Without workers, it records
+    // every write in m_writesSinceTextureFlush.
     void NoteDirectWrite(std::pair<uint32_t, uint32_t> blocks);
     void NotePendingRange(std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::pair<uint32_t, uint32_t> range);
     void NoteBarrierRange(std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::pair<uint32_t, uint32_t> range);
@@ -141,8 +152,11 @@ private:
     std::vector<std::array<uint16_t, 512>> m_workerCluts;
     std::vector<uint64_t> m_workerClutSerials;
     std::vector<GSMem::TexturePageCache> m_texturePageCaches; // [0] caller (CLUT loads), [1 + i] worker i
-    std::vector<DecodedTextureCache> m_decodedCaches;           // same indexing, used by workers only
-    uint64_t m_clutSerial = 1;                                  // bumped whenever m_clut changes
+    std::vector<DecodedTextureCache> m_decodedCaches;           // same indexing
+    std::vector<PaletteCache> m_paletteCaches;                  // same indexing
+    std::vector<ClutHistory> m_clutHistories;                   // same indexing
+    uint64_t m_clutSerial = 1;                                  // identifies the contents of m_clut (ClutSerialOf)
+    std::atomic<uint64_t> m_nextClutSerial{2};
 
     std::vector<QueuedPrimitive> m_queue; // ring of primitives
     std::atomic<uint64_t> m_queueTail{0}; // primitives queued so far
@@ -159,7 +173,22 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> m_zWritesSinceBarrier;
     // Texture ranges read since the last barrier: a queued write over them gets a barrier.
     mutable std::vector<std::pair<uint32_t, uint32_t>> m_readsSinceBarrier;
+    // The same, without what cannot conflict through the top byte of 32-bit words: 24-bit color and depth writes keep
+    // it, and the T8H/T4HL/T4HH texture formats read only it. Writes that can change it, reads of more than it.
+    std::vector<std::pair<uint32_t, uint32_t>> m_topByteWritesSinceBarrier;
+    mutable std::vector<std::pair<uint32_t, uint32_t>> m_wideReadsSinceBarrier;
+    void ClearBarrierListsUnlocked();
+    // The last CLUT load queued, while repeating it would read the same bytes (LoadClut).
+    void NoteClutSourceWrite(std::pair<uint32_t, uint32_t> blocks);
+    bool m_lastClutLoadValid = false;
+    GSTex0Reg m_lastClutTex0{};
+    GSTexClutReg m_lastClutTexclut{};
+    std::pair<uint32_t, uint32_t> m_lastClutSource{};
     bool m_barrierRequested = false;
+    // Without workers: VRAM written since the last TEXFLUSH (all of it once the list is full), where decoded textures
+    // could differ from what the page cache returns.
+    std::vector<std::pair<uint32_t, uint32_t>> m_writesSinceTextureFlush;
+    bool m_textureWrittenSinceFlush = false;
     // Queued items wrote VRAM since m_texturePageCaches[0] (CLUT loads) was last emptied.
     bool m_callerCacheStale = false;
     // Z buffers written since the last barrier, with the color layout that decided which
