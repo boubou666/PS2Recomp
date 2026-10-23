@@ -290,6 +290,15 @@ namespace
     }
 }
 
+// Lane flags of a sum at FLT_MAX or above (sum: as a double), from the long double result as fmacFlagsSlow does.
+uint8_t VU1Interpreter::fmacSumAtFloatMaxFlags(float &value, uint32_t lane, double sum) const
+{
+    long double exactResult = 0.0L;
+    if (calculateFmacExactResult(lane, exactResult))
+        return normalizeFmacExactResult(value, exactResult);
+    return classifyExactResult(value, sum);
+}
+
 void VU1Interpreter::fmacFlagsSlow(float *result, uint8_t dest)
 {
     const FmacOperation operation = decodeFmacOperation(m_currentUpperInstruction);
@@ -825,7 +834,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
                              uint32_t startPC, uint32_t top, uint32_t itop,
-                             uint32_t maxCycles)
+                             uint32_t maxCycles, bool runToCompletion)
 {
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
@@ -842,7 +851,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
-    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, runToCompletion);
 }
 
 void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
@@ -902,7 +911,7 @@ void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t co
 
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
-                         GS &gs, PS2Memory *memory, uint32_t maxCycles)
+                         GS &gs, PS2Memory *memory, uint32_t maxCycles, bool runToCompletion)
 {
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
@@ -916,8 +925,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     commitReadyPipelines(); // afterwards every clock advance commits what became ready
     revealInFlightWrites();
     // Only short time slices can stop with writes in flight that a caller then inspects; run-to-completion
-    // budgets (VIF MSCAL/MSCNT) skip the logging.
-    m_logInFlight = maxCycles < (1u << 20);
+    // budgets (VIF MSCAL/MSCNT, VU0 microprograms) skip the logging.
+    const bool timeSlice = !runToCompletion && maxCycles < (1u << 20);
+    m_logInFlight = timeSlice;
     if (!m_logInFlight)
         m_inFlightCount = 0u;
 
@@ -959,7 +969,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     // Small budgets are deliberate time slices; a run-to-completion budget that expires means a
     // runaway program.
-    if (!programEnded && m_cycle >= budgetEnd && maxCycles >= (1u << 20))
+    if (!programEnded && m_cycle >= budgetEnd && !timeSlice)
     {
         static uint32_t s_budgetWarnings = 0u;
         if (s_budgetWarnings < 8u)

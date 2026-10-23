@@ -885,7 +885,9 @@ PS2X_VU_INLINE void VU1Interpreter::applyDestAcc(const float *result, uint8_t de
 
 // MAC/status flags of an FMAC result. A written lane with exponent 2..253 is far from zero, the denormal range and
 // FLT_MAX: only its sign flag can be set, and products of product-sums in that range only add sticky sign and zero
-// flags. Anything else needs the exact result: fmacFlagsSlow.
+// flags. The other lanes (zero results above all) take the exact result as a double, which classifies them like
+// fmacFlagsSlow, or for sums at FLT_MAX its long double; an out-of-range product of a product-sum goes to
+// fmacFlagsSlow.
 PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status,
                                                   uint32_t &sticky) const
 {
@@ -911,9 +913,9 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
     sticky = 0u;
     uint32_t zeroLanes = 0u, underflowLanes = 0u, overflowLanes = 0u;
     uint32_t signLanes = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(bits))) & active & ~outOfRange;
-    if (outOfRange != 0u || kind == FmacKind::None)
+    if (kind == FmacKind::None)
         return false;
-    if (productSum)
+    if (productSum || outOfRange != 0u)
     {
         alignas(16) float left[4];
         alignas(16) float right[4];
@@ -965,6 +967,83 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
             sticky = (zeroProducts != 0u ? 0x1u : 0u) | (productNegative != 0u ? 0x2u : 0u);
         }
 
+        if (outOfRange != 0u)
+        {
+#if defined(__AVX2__)
+            const __m256d leftWide = _mm256_cvtps_pd(leftVector);
+            const __m256d rightWide = _mm256_cvtps_pd(rightVector);
+            __m256d exact;
+            switch (kind)
+            {
+            case FmacKind::Add:
+                exact = _mm256_add_pd(leftWide, rightWide);
+                break;
+            case FmacKind::Sub:
+                exact = _mm256_sub_pd(leftWide, rightWide);
+                break;
+            case FmacKind::Mul:
+            case FmacKind::CrossMul:
+                exact = _mm256_mul_pd(leftWide, rightWide);
+                break;
+            default:
+            {
+                alignas(16) float accumulator[4];
+                normalizeVector(m_state.acc, accumulator);
+                const __m256d accWide = _mm256_cvtps_pd(_mm_load_ps(accumulator));
+                const __m256d product = _mm256_mul_pd(leftWide, rightWide);
+                exact = kind == FmacKind::Madd ? _mm256_add_pd(accWide, product) : _mm256_sub_pd(accWide, product);
+                break;
+            }
+            }
+            if (cross) // the w lane's exact result is 0
+                exact = _mm256_blend_pd(exact, _mm256_setzero_pd(), 0x8);
+            const __m256d magnitude = _mm256_andnot_pd(_mm256_set1_pd(-0.0), exact);
+            const __m256d floatMax = _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::max()));
+            const __m256d floatMin = _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::min()));
+            const bool exactProduct = kind == FmacKind::Mul || kind == FmacKind::CrossMul;
+            // Sums at FLT_MAX or above take the long double result (fmacSumAtFloatMaxFlags), the others the double.
+            const uint32_t atFloatMax =
+                exactProduct ? 0u
+                             : static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, floatMax, _CMP_GE_OQ))) & outOfRange;
+            const uint32_t classified = outOfRange & ~atFloatMax;
+            const uint32_t isZero =
+                static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, _mm256_setzero_pd(), _CMP_EQ_OQ))) & classified;
+            const uint32_t isTiny =
+                static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, floatMin, _CMP_LT_OQ))) & classified & ~isZero;
+            const uint32_t isHuge =
+                static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, floatMax, _CMP_GT_OQ))) & classified;
+            const uint32_t exactNegative = static_cast<uint32_t>(_mm256_movemask_pd(exact)) & classified;
+            signLanes |= exactNegative;
+            zeroLanes = isZero | isTiny;
+            underflowLanes = isTiny;
+            overflowLanes = isHuge;
+            // normalizeFmacExactResult: zero and underflow become a signed zero, overflow +-FLT_MAX.
+            for (uint32_t lanes = zeroLanes | overflowLanes; lanes != 0u; lanes &= lanes - 1u)
+            {
+                const uint32_t lane = static_cast<uint32_t>(_tzcnt_u32(lanes));
+                uint32_t value = ((exactNegative >> lane) & 1u) != 0u ? 0x80000000u : 0u;
+                if (((overflowLanes >> lane) & 1u) != 0u)
+                    value |= 0x7F7FFFFFu;
+                std::memcpy(&result[lane], &value, sizeof(value));
+            }
+            if (atFloatMax != 0u)
+            {
+                alignas(32) double sums[4];
+                _mm256_store_pd(sums, exact);
+                for (uint32_t lanes = atFloatMax; lanes != 0u; lanes &= lanes - 1u)
+                {
+                    const uint32_t lane = static_cast<uint32_t>(_tzcnt_u32(lanes));
+                    const uint32_t flags = fmacSumAtFloatMaxFlags(result[lane], lane, sums[lane]);
+                    zeroLanes |= (flags & 1u) << lane;
+                    signLanes |= ((flags >> 1) & 1u) << lane;
+                    underflowLanes |= ((flags >> 2) & 1u) << lane;
+                    overflowLanes |= ((flags >> 3) & 1u) << lane;
+                }
+            }
+#else
+            return false;
+#endif
+        }
     }
 
     mac = static_cast<uint32_t>(kReverse4[zeroLanes]) | (static_cast<uint32_t>(kReverse4[signLanes]) << 4) |

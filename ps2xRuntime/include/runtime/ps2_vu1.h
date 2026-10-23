@@ -50,11 +50,14 @@ public:
 
     void reset();
 
+    // A budget under 2^20 cycles is a time slice: the run can stop with writes in flight, which it keeps out of the
+    // visible state until the next run. runToCompletion makes maxCycles a safety limit instead (no in-flight
+    // bookkeeping, which slows every instruction pair).
     void execute(uint8_t *vuCode, uint32_t codeSize,
                  uint8_t *vuData, uint32_t dataSize,
                  GS &gs, PS2Memory *memory = nullptr,
                  uint32_t startPC = 0, uint32_t top = 0, uint32_t itop = 0,
-                 uint32_t maxCycles = 65536);
+                 uint32_t maxCycles = 65536, bool runToCompletion = false);
 
     void resume(uint8_t *vuCode, uint32_t codeSize,
                 uint8_t *vuData, uint32_t dataSize,
@@ -318,7 +321,7 @@ private:
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
-             GS &gs, PS2Memory *memory, uint32_t maxCycles);
+             GS &gs, PS2Memory *memory, uint32_t maxCycles, bool runToCompletion = false);
     // stepPair's body; kLogInFlight keeps the previous value of the registers each pair writes (time-sliced runs).
     template <bool kLogInFlight>
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -347,6 +350,7 @@ private:
     bool fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status, uint32_t &sticky) const;
     void fmacFlags(float *result, uint8_t dest);
     void fmacFlagsSlow(float *result, uint8_t dest);
+    uint8_t fmacSumAtFloatMaxFlags(float &value, uint32_t lane, double sum) const;
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
     bool calculateFmacExactResult(uint32_t component, long double &result) const;
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
