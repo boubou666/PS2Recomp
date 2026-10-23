@@ -2025,7 +2025,7 @@ void PS2Memory::processPendingTransfers()
             queueVif1Job(std::move(job));
             return;
         }
-        submitGifPacket(GifPathId::Path3, data, size, false);
+        submitGifPacket(GifPathId::Path3, data, size, false, false, true);
     };
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
@@ -2042,7 +2042,7 @@ void PS2Memory::processPendingTransfers()
                 queueVif1Job(std::move(job));
                 continue;
             }
-            submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
+            submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false, false, true);
         }
         else if (p.qwc > 0)
         {
@@ -2316,7 +2316,7 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
     {
         if (m_gifArbiter)
-            m_gifArbiter->submit(GifPathId::Path3, packetData, packetSize, false);
+            m_gifArbiter->submit(GifPathId::Path3, packetData, packetSize, false, true);
         else if (m_gifPacketCallback)
             m_gifPacketCallback(packetData, packetSize);
     };
@@ -2332,7 +2332,8 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
-void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
+void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl,
+                                bool dmaTransfer)
 {
     if (!data || sizeBytes < 16)
         return;
@@ -2349,7 +2350,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     }
 
     if (m_gifArbiter)
-        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl, dmaTransfer);
     else if (m_gifPacketCallback)
         m_gifPacketCallback(data, sizeBytes);
 
@@ -2376,7 +2377,7 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 
         m_seenGifCopy = true;
         m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-        submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, chunk);
+        submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, chunk, true, false, true);
 
         bytesLeft -= chunk;
         srcPhysAddr += chunk;

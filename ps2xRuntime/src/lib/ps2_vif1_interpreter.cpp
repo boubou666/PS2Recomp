@@ -881,7 +881,7 @@ void PS2Memory::vif1WorkerMain()
             processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
             break;
         case Vif1Job::Kind::Path3:
-            submitGifPacket(GifPathId::Path3, job.data.data(), static_cast<uint32_t>(job.data.size()), false);
+            submitGifPacket(GifPathId::Path3, job.data.data(), static_cast<uint32_t>(job.data.size()), false, false, true);
             break;
         case Vif1Job::Kind::PrivWrite32:
             write32(job.address, static_cast<uint32_t>(job.value));
