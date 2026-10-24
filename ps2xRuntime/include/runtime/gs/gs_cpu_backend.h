@@ -74,8 +74,19 @@ private:
     void DrawSprite(const GSPrimitiveBatch &batch, const RasterContext &raster);
     void DrawTriangle(const GSPrimitiveBatch &batch, const RasterContext &raster);
     void DrawLine(const GSPrimitiveBatch &batch, const RasterContext &raster);
-    void WritePixel(const PixelPipeline &pipeline, int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
+    // depthTested: the caller already did the depth test (with nothing written since), so it is skipped here.
+    void WritePixel(const PixelPipeline &pipeline, int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog,
+                    bool depthTested = false);
+    // WritePixel(..., depthTested = true) for the lanes set in live of a block of eight pixels from (x0, y), in lane
+    // order. All the block's framebuffer reads come before its stores (see needsPixelOrder). Colours are 0..255 per
+    // lane and are modified.
+    void WritePixelBlock(const PixelPipeline &pipeline, int x0, int y, uint32_t live, const uint32_t *z, int32_t *r, int32_t *g,
+                         int32_t *b, int32_t *a, const int32_t *fog);
     uint32_t SampleTexture(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v);
+    // SampleTexture for the lanes of a block of eight pixels set in live (s, t, q or u, v per lane); out[i] of the other
+    // lanes is left unspecified.
+    void SampleTextureBlock(const TextureSampler &sampler, GSMem::TexturePageCache &cache, const float *s, const float *t,
+                            const float *q, const uint16_t *u, const uint16_t *v, uint32_t live, uint32_t *out);
 
     // Submit queues primitives; worker threads draw them in order, each on the VRAM blocks it
     // owns, so every word sees the same write order as a serial rasterizer. Anything else

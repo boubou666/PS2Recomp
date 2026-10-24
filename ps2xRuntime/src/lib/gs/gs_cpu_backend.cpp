@@ -606,6 +606,9 @@ namespace
     constexpr int64_t kDecodedMinPixels = 1024;
     // Drawn immediately, a texture decoded once serves every pixel: worth it for smaller primitives.
     constexpr int64_t kDecodedMinPixelsSerial = 64;
+    // Triangles are shaded this many neighbouring pixels of a row at a time, each stage a loop over the lanes that the
+    // compiler can vectorise.
+    constexpr int kLanes = 8;
 
     inline void cpuRelax()
     {
@@ -1004,6 +1007,28 @@ namespace
         return rectTouchesPages(written, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, u0, u1, v0, v1);
     }
 
+    // Whether shading a block of pixels, reading all they need before storing any of them, could change the result:
+    // the primitive samples what it draws (checkSampling), or reads or writes a depth buffer its colour writes may
+    // overlap. (Pixels of one buffer are distinct words, or distinct halves of words that are stored alone.)
+    bool needsPixelOrder(const GSPrimitiveBatch &batch, const PrimitiveBlocks &blocks, bool checkSampling)
+    {
+        const auto &ctx = batch.state.context;
+        if (((ctx.test >> 17) & 3u) >= 2u || blocks.writesZ)
+        {
+            std::pair<uint32_t, uint32_t> z = blocks.z;
+            if (!blocks.writesZ)
+            {
+                int firstRow = 0;
+                int lastRow = 0;
+                primitiveRows(batch, firstRow, lastRow);
+                z = rowBlocks(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, firstRow, lastRow);
+            }
+            if (blocksOverlap(blocks.frame, z))
+                return true;
+        }
+        return checkSampling && readsOwnWrites(batch, blocks);
+    }
+
     // PS2X_GS_LOG_SERIAL=1: logs the first primitives drawn serially because they sample their own
     // target, with the rectangles the check used.
     void logSerialPrimitive(const GSPrimitiveBatch &batch)
@@ -1134,6 +1159,8 @@ struct GSCpuBackend::RasterContext
     const BlockLayout *layout = nullptr;
     uint32_t frameBase = 0; // block, page aligned
     uint32_t pagesPerRow = 1;
+    // Each pixel must be stored before the next is shaded (needsPixelOrder): no blocks of kLanes pixels.
+    bool pixelOrder = true;
 
     // Same block as GSMem::BlockOf for a page-aligned buffer.
     bool owns(int x, int y) const
@@ -1193,6 +1220,7 @@ struct GSCpuBackend::QueuedPrimitive
     TextureSampler texture; // its state pointer is rebound to batch.state by each worker
     bool textureFlush = false; // TEXFLUSH marker instead of a primitive
     bool barrier = false;      // samples what earlier queued primitives draw: wait for them
+    bool pixelOrder = false;   // needsPixelOrder
     int64_t area = 0;          // bounding box pixels
     bool upload = false;       // host-to-local image data instead of a primitive
     bool clutLoad = false;     // CLUT load instead of a primitive
@@ -1930,7 +1958,9 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
                 !overlapsAny(blocks.texture, m_writesSinceTextureFlush))
                 texture.decoded = FindDecodedTexture(m_decodedCaches[0], texture);
         }
-        DrawWith(batch, RasterContext{&pixel, &texture, &m_texturePageCaches[0], 0u, 1u});
+        RasterContext raster{&pixel, &texture, &m_texturePageCaches[0], 0u, 1u};
+        raster.pixelOrder = feedback || needsPixelOrder(batch, blocks, true);
+        DrawWith(batch, raster);
         NoteDirectWrite(blocks.frame);
         if (blocks.writesZ)
             NoteDirectWrite(blocks.z);
@@ -1984,6 +2014,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     item.upload = false;
     item.clutLoad = false;
     item.barrier = barrier;
+    item.pixelOrder = needsPixelOrder(batch, blocks, false); // feedback was ruled out above
     item.area = primitiveArea(batch);
     NotePendingRange(m_pendingWrites, blocks.frame);
     NoteClutSourceWrite(blocks.frame);
@@ -2071,6 +2102,7 @@ void GSCpuBackend::DrawQueued(const QueuedPrimitive &item, uint32_t index)
     raster.layout = &blockLayout(frame.psm);
     raster.frameBase = GSInternal::framePageBaseToBlock(frame.fbp);
     raster.pagesPerRow = (std::max<uint32_t>(frame.fbw, 1u) * 64u) >> raster.layout->pageWidthShift; // as GSMem's PageId
+    raster.pixelOrder = item.pixelOrder;
     DrawWith(batch, raster);
 }
 
@@ -2292,7 +2324,8 @@ void GSCpuBackend::WorkerMain(uint32_t index)
     }
 }
 
-void GSCpuBackend::WritePixel(const PixelPipeline &p, int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+void GSCpuBackend::WritePixel(const PixelPipeline &p, int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog,
+                              bool depthTested)
 {
     if (x < p.scissorX0 || x > p.scissorX1 || y < p.scissorY0 || y > p.scissorY1)
         return;
@@ -2348,7 +2381,7 @@ void GSCpuBackend::WritePixel(const PixelPipeline &p, int x, int y, uint32_t z, 
         return;
     }
 
-    switch (p.ztst)
+    switch (depthTested ? 1u : p.ztst)
     {
     case 0:
         return;
@@ -2419,6 +2452,193 @@ void GSCpuBackend::WritePixel(const PixelPipeline &p, int x, int y, uint32_t z, 
     if (writeMask.writeDepth && !p.zmask)
     {
         p.writeZ(m_vram, p.zbp, p.fbw, x, y, z);
+    }
+}
+
+// WritePixel's stages as loops over the lanes; only the framebuffer reads and the stores stay per lane.
+void GSCpuBackend::WritePixelBlock(const PixelPipeline &p, int x0, int y, uint32_t live, const uint32_t *z, int32_t *r,
+                                   int32_t *g, int32_t *b, int32_t *a, const int32_t *fog)
+{
+    constexpr int N = kLanes;
+    if (y < p.scissorY0 || y > p.scissorY1)
+        return;
+    for (int i = 0; i < N; ++i)
+        if (x0 + i < p.scissorX0 || x0 + i > p.scissorX1)
+            live &= ~(1u << i);
+    if (live == 0u)
+        return;
+
+    if (p.fge)
+    {
+        const int fogR = p.fogR, fogG = p.fogG, fogB = p.fogB;
+        for (int i = 0; i < N; ++i)
+        {
+            const int inverseFog = 255 - fog[i];
+            r[i] = (((fog[i] * r[i]) >> 8) + ((inverseFog * fogR) >> 8)) & 0xFF;
+            g[i] = (((fog[i] * g[i]) >> 8) + ((inverseFog * fogG) >> 8)) & 0xFF;
+            b[i] = (((fog[i] * b[i]) >> 8) + ((inverseFog * fogB) >> 8)) & 0xFF;
+        }
+    }
+
+    // classifyAlphaTest: which of RGB, alpha and depth each lane writes (all ones: written).
+    int32_t writeRgb[N], writeAlpha[N], writeDepth[N], preserveAlpha[N], readsFrame[N];
+    for (int i = 0; i < N; ++i)
+    {
+        writeRgb[i] = -1;
+        writeAlpha[i] = -1;
+        writeDepth[i] = -1;
+        preserveAlpha[i] = 0;
+        readsFrame[i] = p.passReadsFramebuffer ? -1 : 0;
+    }
+    if (p.alphaTest)
+    {
+        const int atst = static_cast<int>((p.test >> 1) & 0x7u);
+        const int aref = static_cast<int>((p.test >> 4) & 0xFFu);
+        int32_t pass[N];
+        switch (atst)
+        {
+        case 0:
+            for (int i = 0; i < N; ++i)
+                pass[i] = 0;
+            break;
+        case 1:
+            for (int i = 0; i < N; ++i)
+                pass[i] = -1;
+            break;
+        case 2:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] < aref ? -1 : 0;
+            break;
+        case 3:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] <= aref ? -1 : 0;
+            break;
+        case 4:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] == aref ? -1 : 0;
+            break;
+        case 5:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] >= aref ? -1 : 0;
+            break;
+        case 6:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] > aref ? -1 : 0;
+            break;
+        default:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] != aref ? -1 : 0;
+            break;
+        }
+        // What a failing lane still writes (TEST.AFAIL).
+        int32_t failRgb = 0, failAlpha = 0, failDepth = 0;
+        switch (static_cast<uint8_t>((p.test >> 12) & 0x3u))
+        {
+        case 1: // FB_ONLY
+            failRgb = failAlpha = -1;
+            break;
+        case 2: // ZB_ONLY
+            failDepth = -1;
+            break;
+        case 3: // RGB_ONLY, FB_ONLY except on RGBA32
+            failRgb = -1;
+            failAlpha = p.fpsm == GS_PSM_CT32 ? 0 : -1;
+            break;
+        default: // KEEP
+            break;
+        }
+        const int32_t ct32 = p.fpsm == GS_PSM_CT32 ? -1 : 0;
+        const int32_t frameExtras = (p.fbmsk != 0u || p.abe) ? -1 : 0;
+        const int32_t dateReads = p.dateNeedsRead ? -1 : 0;
+        for (int i = 0; i < N; ++i)
+        {
+            writeRgb[i] = pass[i] | failRgb;
+            writeAlpha[i] = pass[i] | failAlpha;
+            writeDepth[i] = pass[i] | failDepth;
+            preserveAlpha[i] = writeRgb[i] & ~writeAlpha[i] & ct32;
+            readsFrame[i] = dateReads | ((writeRgb[i] | writeAlpha[i]) & (frameExtras | preserveAlpha[i]));
+        }
+        for (int i = 0; i < N; ++i)
+            if ((writeRgb[i] | writeAlpha[i] | writeDepth[i]) == 0)
+                live &= ~(1u << i);
+        if (live == 0u)
+            return;
+    }
+
+    uint32_t raw[N], dest[N];
+    for (int i = 0; i < N; ++i)
+    {
+        raw[i] = 0u;
+        if (((live >> i) & 1u) && readsFrame[i])
+            raw[i] = p.readFrame(m_vram, p.fbp, p.fbw, static_cast<uint32_t>(x0 + i), static_cast<uint32_t>(y));
+    }
+    if (p.frame16)
+        for (int i = 0; i < N; ++i)
+            dest[i] = Rgba5551ToRgba8888(static_cast<u16>(raw[i]));
+    else if (p.frame24)
+        for (int i = 0; i < N; ++i)
+            dest[i] = readsFrame[i] ? raw[i] | 0x80000000u : 0u;
+    else
+        for (int i = 0; i < N; ++i)
+            dest[i] = raw[i];
+
+    if (((p.test >> 14) & 0x1u) != 0u)
+        for (int i = 0; i < N; ++i)
+            if (!passesDestinationAlphaTest(p.test, p.fpsm, raw[i]))
+                live &= ~(1u << i);
+    if (live == 0u)
+        return;
+
+    if (p.abe)
+    {
+        // ((A - B) * C >> 7) + D, each of A, B, D the source colour, the destination or zero.
+        const int32_t as = p.asel == 0 ? -1 : 0, ad = p.asel == 1 ? -1 : 0;
+        const int32_t bs = p.bsel == 0 ? -1 : 0, bd = p.bsel == 1 ? -1 : 0;
+        const int32_t ds = p.dsel == 0 ? -1 : 0, dd = p.dsel == 1 ? -1 : 0;
+        const int32_t cs = p.csel == 0 ? -1 : 0, cd = p.csel == 1 ? -1 : 0;
+        const int32_t cf = p.csel >= 2 ? p.fix : 0;
+        const int32_t everyPixel = p.pabe ? 0 : -1; // PABE: only pixels whose alpha has its top bit set
+        for (int i = 0; i < N; ++i)
+        {
+            const int32_t dr = static_cast<int32_t>(dest[i] & 0xFFu);
+            const int32_t dg = static_cast<int32_t>((dest[i] >> 8) & 0xFFu);
+            const int32_t db = static_cast<int32_t>((dest[i] >> 16) & 0xFFu);
+            const int32_t da = static_cast<int32_t>((dest[i] >> 24) & 0xFFu);
+            const int32_t c = (a[i] & cs) | (da & cd) | cf;
+            const int32_t br = (((((r[i] & as) | (dr & ad)) - ((r[i] & bs) | (dr & bd))) * c) >> 7) + ((r[i] & ds) | (dr & dd));
+            const int32_t bg = (((((g[i] & as) | (dg & ad)) - ((g[i] & bs) | (dg & bd))) * c) >> 7) + ((g[i] & ds) | (dg & dd));
+            const int32_t bb = (((((b[i] & as) | (db & ad)) - ((b[i] & bs) | (db & bd))) * c) >> 7) + ((b[i] & ds) | (db & dd));
+            const int32_t blend = ((a[i] & 0x80) != 0 ? -1 : 0) | everyPixel;
+            r[i] = (std::min(std::max(br, 0), 255) & blend) | (r[i] & ~blend);
+            g[i] = (std::min(std::max(bg, 0), 255) & blend) | (g[i] & ~blend);
+            b[i] = (std::min(std::max(bb, 0), 255) & blend) | (b[i] & ~blend);
+        }
+    }
+
+    uint32_t out[N];
+    const int32_t alphaOr = p.fba ? 0x80 : 0;
+    const uint32_t fbmsk = p.fbmsk;
+    for (int i = 0; i < N; ++i)
+    {
+        const uint32_t alpha = static_cast<uint32_t>((a[i] | (alphaOr & writeAlpha[i])) & 0xFF);
+        uint32_t pixel = static_cast<uint32_t>(r[i]) | (static_cast<uint32_t>(g[i]) << 8) | (static_cast<uint32_t>(b[i]) << 16) |
+                         (alpha << 24);
+        pixel = (pixel & ~fbmsk) | (dest[i] & fbmsk);
+        const uint32_t keep = static_cast<uint32_t>(preserveAlpha[i]) & 0xFF000000u;
+        out[i] = (pixel & ~keep) | (dest[i] & keep);
+    }
+    if (p.frame16)
+        for (int i = 0; i < N; ++i)
+            out[i] = Rgba8888ToRgba5551(out[i]);
+
+    for (int i = 0; i < N; ++i)
+    {
+        if (!((live >> i) & 1u))
+            continue;
+        if (writeRgb[i] | writeAlpha[i])
+            p.writeFrame(m_vram, p.fbp, p.fbw, static_cast<uint32_t>(x0 + i), static_cast<uint32_t>(y), out[i]);
+        if (writeDepth[i] && !p.zmask)
+            p.writeZ(m_vram, p.zbp, p.fbw, static_cast<uint32_t>(x0 + i), static_cast<uint32_t>(y), z[i]);
     }
 }
 
@@ -2755,6 +2975,130 @@ uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::Textu
            (static_cast<uint32_t>(a) << 24);
 }
 
+// The same texels as SampleTexture, lane by lane. With a decoded texture and REPEAT or CLAMP wrapping (where every
+// wrapped tap lies in the decoded rectangle), the coordinate and filtering arithmetic runs as loops over the lanes, and
+// only the tile checks and texel reads stay per lane; each lane decodes the tiles SampleTexture would.
+void GSCpuBackend::SampleTextureBlock(const TextureSampler &sampler, GSMem::TexturePageCache &cache, const float *s,
+                                      const float *t, const float *q, const uint16_t *u, const uint16_t *v, uint32_t live,
+                                      uint32_t *out)
+{
+    constexpr int N = kLanes;
+    DecodedTexture *const decoded = sampler.decoded;
+    if (!decoded || sampler.wrapU > 1u || sampler.wrapV > 1u)
+    {
+        for (int i = 0; i < N; ++i)
+            if ((live >> i) & 1u)
+                out[i] = SampleTexture(sampler, cache, s[i], t[i], q[i], u[i], v[i]);
+        return;
+    }
+
+    const int texW = sampler.texW;
+    const int texH = sampler.texH;
+    float texUf[N], texVf[N];
+    if (sampler.fst)
+    {
+        for (int i = 0; i < N; ++i)
+        {
+            texUf[i] = static_cast<float>(u[i]) / 16.0f;
+            texVf[i] = static_cast<float>(v[i]) / 16.0f;
+        }
+    }
+    else
+    {
+        for (int i = 0; i < N; ++i)
+        {
+            const float invQ = 1.0f / fabsQ(q[i]);
+            texUf[i] = s[i] * invQ * static_cast<float>(texW);
+            texVf[i] = t[i] * invQ * static_cast<float>(texH);
+        }
+    }
+
+    // wrapTextureCoordinate for REPEAT (0) and CLAMP (1).
+    const bool repeatU = sampler.wrapU == 0u;
+    const bool repeatV = sampler.wrapV == 0u;
+    const uint32_t maskU = static_cast<uint32_t>(texW - 1);
+    const uint32_t maskV = static_cast<uint32_t>(texH - 1);
+    auto wrap = [](int c, bool repeat, uint32_t mask, int size)
+    {
+        return repeat ? static_cast<int>(static_cast<uint32_t>(c) & mask) : clampInt(c, 0, size - 1);
+    };
+
+    const uint32_t *const texels = decoded->texels.get();
+    const size_t width = static_cast<size_t>(decoded->width);
+    auto texel = [&](int tu, int tv) -> uint32_t
+    {
+        const uint32_t tile = static_cast<uint32_t>(tv >> kDecodedTileShift) * decoded->tilesPerRow +
+                              static_cast<uint32_t>(tu >> kDecodedTileShift);
+        if (!decoded->tileReady[tile])
+            DecodeTile(*decoded, sampler, cache, tile);
+        return texels[static_cast<size_t>(tv) * width + static_cast<size_t>(tu)];
+    };
+
+    if (!sampler.linear)
+    {
+        int pu[N], pv[N];
+        for (int i = 0; i < N; ++i)
+        {
+            pu[i] = wrap(static_cast<int>(texUf[i]), repeatU, maskU, texW);
+            pv[i] = wrap(static_cast<int>(texVf[i]), repeatV, maskV, texH);
+        }
+        for (int i = 0; i < N; ++i)
+            if ((live >> i) & 1u)
+                out[i] = texel(pu[i], pv[i]);
+        return;
+    }
+
+    int u0[N], v0[N], u1[N], v1[N], fx[N], fy[N];
+    for (int i = 0; i < N; ++i)
+    {
+        const float sampleU = texUf[i] - 0.5f;
+        const float sampleV = texVf[i] - 0.5f;
+        const int iu = floorToInt(sampleU);
+        const int iv = floorToInt(sampleV);
+        fx[i] = static_cast<int>((sampleU - static_cast<float>(iu)) * 256.0f + 0.5f);
+        fy[i] = static_cast<int>((sampleV - static_cast<float>(iv)) * 256.0f + 0.5f);
+        u0[i] = wrap(iu, repeatU, maskU, texW);
+        v0[i] = wrap(iv, repeatV, maskV, texH);
+        u1[i] = wrap(iu + 1, repeatU, maskU, texW);
+        v1[i] = wrap(iv + 1, repeatV, maskV, texH);
+    }
+    uint32_t c00[N], c10[N], c01[N], c11[N];
+    for (int i = 0; i < N; ++i)
+    {
+        if (!((live >> i) & 1u))
+        {
+            c00[i] = c10[i] = c01[i] = c11[i] = 0u;
+            continue;
+        }
+        c00[i] = texel(u0[i], v0[i]);
+        if ((fx[i] | fy[i]) == 0)
+        {
+            // Texel aligned: SampleTexture reads (and decodes) only this tap, and the blend gives it back.
+            c10[i] = c01[i] = c11[i] = c00[i];
+            continue;
+        }
+        c10[i] = texel(u1[i], v0[i]);
+        c01[i] = texel(u0[i], v1[i]);
+        c11[i] = texel(u1[i], v1[i]);
+    }
+    // lerpChannel on each channel.
+    for (int i = 0; i < N; ++i)
+    {
+        uint32_t result = 0u;
+        for (int shift = 0; shift < 32; shift += 8)
+        {
+            const int p00 = static_cast<int>((c00[i] >> shift) & 0xFFu);
+            const int p10 = static_cast<int>((c10[i] >> shift) & 0xFFu);
+            const int p01 = static_cast<int>((c01[i] >> shift) & 0xFFu);
+            const int p11 = static_cast<int>((c11[i] >> shift) & 0xFFu);
+            const int top = (p00 << 8) + (p10 - p00) * fx[i];
+            const int bottom = (p01 << 8) + (p11 - p01) * fx[i];
+            result |= static_cast<uint32_t>(clampU8(((top << 8) + (bottom - top) * fy[i] + 0x8000) >> 16)) << shift;
+        }
+        out[i] = result;
+    }
+}
+
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext &raster)
 {
     const GSDrawState &state = batch.state;
@@ -2958,6 +3302,168 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
         const int spanX1 = std::min(maxX, floorToInt(hi + fx2 - 0.5f) + 2);
 
         for (int runStart = spanX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, spanX1); runStart = runEnd + 1)
+        {
+        if (!raster.pixelOrder)
+        {
+            // kLanes pixels at a time: each stage below is the per-pixel code further down, as a loop over the
+            // lanes, so every lane comes out as that pixel would. Depth tests and texture samples of a block run
+            // before its stores, which needsPixelOrder made sure cannot matter.
+            constexpr int N = kLanes;
+            for (int xb = runStart; xb <= runEnd; xb += N)
+            {
+                const int count = std::min(N, runEnd - xb + 1);
+                float w0[N], w1[N], w2[N];
+                int32_t covered[N];
+                for (int i = 0; i < N; ++i)
+                {
+                    float px = static_cast<float>(xb + i) + 0.5f;
+                    w0[i] = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+                    w1[i] = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+                    w2[i] = 1.0f - w0[i] - w1[i];
+                    covered[i] = (i < count && !(w0[i] < -kEdgeEpsilon || w1[i] < -kEdgeEpsilon || w2[i] < -kEdgeEpsilon)) ? 1 : 0;
+                }
+                uint32_t live = 0u;
+                for (int i = 0; i < N; ++i)
+                    live |= static_cast<uint32_t>(covered[i]) << i;
+                if (live == 0u)
+                    continue;
+
+                // static_cast<u32>(double) as compiled for x86-64 (through a 64-bit conversion), written out so the
+                // lanes keep it.
+                u32 zs[N];
+                for (int i = 0; i < N; ++i)
+                {
+                    const double z = v0.z * w0[i] + v1.z * w1[i] + v2.z * w2[i];
+                    zs[i] = static_cast<u32>(static_cast<int64_t>(z + 0.5));
+                }
+                if (earlyZ)
+                {
+                    for (int i = 0; i < N; ++i)
+                    {
+                        if (!((live >> i) & 1u))
+                            continue;
+                        const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, xb + i, y);
+                        if (pixel.ztst == 2u ? zs[i] < storedZ : zs[i] <= storedZ)
+                            live &= ~(1u << i);
+                    }
+                    if (live == 0u)
+                        continue;
+                }
+
+                int32_t r[N], g[N], b[N], a[N];
+                if (state.prim.iip)
+                {
+                    for (int i = 0; i < N; ++i)
+                    {
+                        r[i] = clampU8(static_cast<int>(v0.r * w0[i] + v1.r * w1[i] + v2.r * w2[i]));
+                        g[i] = clampU8(static_cast<int>(v0.g * w0[i] + v1.g * w1[i] + v2.g * w2[i]));
+                        b[i] = clampU8(static_cast<int>(v0.b * w0[i] + v1.b * w1[i] + v2.b * w2[i]));
+                        a[i] = clampU8(static_cast<int>(v0.a * w0[i] + v1.a * w1[i] + v2.a * w2[i]));
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < N; ++i)
+                    {
+                        r[i] = v2.r;
+                        g[i] = v2.g;
+                        b[i] = v2.b;
+                        a[i] = v2.a;
+                    }
+                }
+
+                if (state.prim.tme)
+                {
+                    float is[N], it[N], iq[N];
+                    uint16_t iu[N], iv[N];
+                    if (state.prim.fst)
+                    {
+                        for (int i = 0; i < N; ++i)
+                        {
+                            iu[i] = static_cast<uint16_t>(v0.u * w0[i] + v1.u * w1[i] + v2.u * w2[i]);
+                            iv[i] = static_cast<uint16_t>(v0.v * w0[i] + v1.v * w1[i] + v2.v * w2[i]);
+                            is[i] = 0.0f;
+                            it[i] = 0.0f;
+                            iq[i] = 1.0f;
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < N; ++i)
+                        {
+                            is[i] = v0.s * w0[i] + v1.s * w1[i] + v2.s * w2[i];
+                            it[i] = v0.t * w0[i] + v1.t * w1[i] + v2.t * w2[i];
+                            iq[i] = v0.q * w0[i] + v1.q * w1[i] + v2.q * w2[i];
+                            iu[i] = 0;
+                            iv[i] = 0;
+                        }
+                    }
+                    uint32_t texel[N];
+                    SampleTextureBlock(*raster.texture, *raster.cache, is, it, iq, iu, iv, live, texel);
+
+                    // combineTexture.
+                    const auto &tex = ctx.tex0;
+                    const bool tcc = tex.tcc != 0u;
+                    int32_t tr[N], tg[N], tb[N], ta[N];
+                    for (int i = 0; i < N; ++i)
+                    {
+                        tr[i] = static_cast<int32_t>(texel[i] & 0xFFu);
+                        tg[i] = static_cast<int32_t>((texel[i] >> 8) & 0xFFu);
+                        tb[i] = static_cast<int32_t>((texel[i] >> 16) & 0xFFu);
+                        ta[i] = static_cast<int32_t>((texel[i] >> 24) & 0xFFu);
+                    }
+                    switch (tex.tfx)
+                    {
+                    case 0: // MODULATE
+                        for (int i = 0; i < N; ++i)
+                        {
+                            r[i] = std::min((tr[i] * r[i]) >> 7, 255);
+                            g[i] = std::min((tg[i] * g[i]) >> 7, 255);
+                            b[i] = std::min((tb[i] * b[i]) >> 7, 255);
+                        }
+                        if (tcc)
+                            for (int i = 0; i < N; ++i)
+                                a[i] = std::min((ta[i] * a[i]) >> 7, 255);
+                        break;
+                    case 2: // HIGHLIGHT
+                    case 3: // HIGHLIGHT2
+                        for (int i = 0; i < N; ++i)
+                        {
+                            r[i] = std::min(((tr[i] * r[i]) >> 7) + a[i], 255);
+                            g[i] = std::min(((tg[i] * g[i]) >> 7) + a[i], 255);
+                            b[i] = std::min(((tb[i] * b[i]) >> 7) + a[i], 255);
+                        }
+                        if (tcc)
+                        {
+                            if (tex.tfx == 2u)
+                                for (int i = 0; i < N; ++i)
+                                    a[i] = std::min(ta[i] + a[i], 255);
+                            else
+                                for (int i = 0; i < N; ++i)
+                                    a[i] = ta[i];
+                        }
+                        break;
+                    default: // DECAL
+                        for (int i = 0; i < N; ++i)
+                        {
+                            r[i] = tr[i];
+                            g[i] = tg[i];
+                            b[i] = tb[i];
+                        }
+                        if (tcc)
+                            for (int i = 0; i < N; ++i)
+                                a[i] = ta[i];
+                        break;
+                    }
+                }
+
+                int32_t fog[N];
+                for (int i = 0; i < N; ++i)
+                    fog[i] = clampU8(static_cast<int>(v0.fog * w0[i] + v1.fog * w1[i] + v2.fog * w2[i]));
+                WritePixelBlock(pixel, xb, y, live, zs, r, g, b, a, fog);
+            }
+            continue;
+        }
         for (int x = runStart; x <= runEnd; ++x)
         {
             float px = static_cast<float>(x) + 0.5f;
@@ -3039,7 +3545,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(pixel, x, y, pixelZ, r, g, b, a, fog);
+            WritePixel(pixel, x, y, pixelZ, r, g, b, a, fog, true);
+        }
         }
     }
 }
