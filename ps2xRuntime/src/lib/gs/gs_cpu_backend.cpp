@@ -334,6 +334,16 @@ namespace
                                      ((a >= 0x40u) ? 0x8000u : 0u));
     }
 
+    // Where a circuit's picture starts on screen: DISPLAY DX (in VCK units, MAGH+1 per pixel) and DY.
+    void decodeDisplayPosition(uint64_t display64, uint32_t &outX, uint32_t &outY)
+    {
+        const uint32_t dx = static_cast<uint32_t>(display64 & 0x0FFFu);
+        const uint32_t dy = static_cast<uint32_t>((display64 >> 12) & 0x07FFu);
+        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
+        outX = dx / (magh + 1u);
+        outY = dy;
+    }
+
     void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
     {
         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
@@ -3646,8 +3656,23 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
             copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
         {
-            result.width = std::max(width1, width2);
-            result.height = std::max(height1, height2);
+            // Each circuit's picture sits at its own DISPLAY position (TMB's menus: the UI layer at DY 50, the
+            // picture behind it at DY 146): the output starts at the upper left one.
+            uint32_t x1 = 0u, y1 = 0u, x2 = 0u, y2 = 0u;
+            decodeDisplayPosition(request.display1, x1, y1);
+            decodeDisplayPosition(request.display2, x2, y2);
+            if (frameModeInterlace)
+            {
+                y1 /= 2u;
+                y2 /= 2u;
+            }
+            const uint32_t left = std::min(x1, x2), top = std::min(y1, y2);
+            const uint32_t ox1 = std::min(x1 - left, kHostFrameWidth), oy1 = std::min(y1 - top, kHostFrameHeight);
+            const uint32_t ox2 = std::min(x2 - left, kHostFrameWidth), oy2 = std::min(y2 - top, kHostFrameHeight);
+            const uint32_t w1 = std::min(width1, kHostFrameWidth - ox1), h1 = std::min(height1, kHostFrameHeight - oy1);
+            const uint32_t w2 = std::min(width2, kHostFrameWidth - ox2), h2 = std::min(height2, kHostFrameHeight - oy2);
+            result.width = std::max(ox1 + w1, ox2 + w2);
+            result.height = std::max(oy1 + h1, oy2 + h2);
             result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
             const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
             const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
@@ -3662,13 +3687,14 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                     dst[3] = pmode.alp;
                 }
             if (!pmode.slbg)
-                for (uint32_t y = 0; y < height2; ++y)
-                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
-            for (uint32_t y = 0; y < height1; ++y)
-                for (uint32_t x = 0; x < width1; ++x)
+                for (uint32_t y = 0; y < h2; ++y)
+                    std::memcpy(result.pixels.data() + ((y + oy2) * kHostFrameWidth + ox2) * 4u,
+                                crt2.data() + y * kHostFrameWidth * 4u, w2 * 4u);
+            for (uint32_t y = 0; y < h1; ++y)
+                for (uint32_t x = 0; x < w1; ++x)
                 {
                     const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
+                    uint8_t *dst = result.pixels.data() + ((y + oy1) * kHostFrameWidth + x + ox1) * 4u;
                     const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
                     dst[0] = blendPresentationChannel(src[0], dst[0], factor);
                     dst[1] = blendPresentationChannel(src[1], dst[1], factor);
