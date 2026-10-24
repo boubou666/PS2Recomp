@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 bool latchPresentationOnVBlank()
@@ -439,17 +440,26 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     // Guest code that runs slower than real time (busy-wait loops) would otherwise stretch
     // VBlank and timer events; once the host deadline has passed, fast-forward to the event.
-    static const bool hostCatchUp = []
+    static const std::optional<WallClockCatchUp> envCatchUp = []() -> std::optional<WallClockCatchUp>
     {
         const char *value = std::getenv("PS2X_EE_CATCHUP");
-        return !value || std::strcmp(value, "0") != 0;
+        if (!value || !*value)
+            return std::nullopt;
+        if (std::strcmp(value, "0") == 0)
+            return WallClockCatchUp::Off;
+        if (std::strcmp(value, "field") == 0)
+            return WallClockCatchUp::OncePerField;
+        return WallClockCatchUp::Full;
     }();
-    if (m_wallClockCatchUp && hostCatchUp && nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u)
+    const WallClockCatchUp catchUp = envCatchUp.value_or(m_wallClockCatchUp);
+    if (catchUp != WallClockCatchUp::Off && nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u &&
+        !(catchUp == WallClockCatchUp::OncePerField && m_lastCatchUpTick == m_vsyncTick))
     {
         const auto hostDeadline = std::chrono::steady_clock::time_point(
             std::chrono::steady_clock::duration(m_nextDeadlineHostTicks.load(std::memory_order_acquire)));
         if (std::chrono::steady_clock::now() >= hostDeadline)
         {
+            m_lastCatchUpTick = m_vsyncTick;
             accountCycles(static_cast<uint32_t>(std::min<uint64_t>(nextEventCycle - m_eeCycle,
                                                                    std::numeric_limits<uint32_t>::max())));
             m_checkpointPending.store(true, std::memory_order_release);

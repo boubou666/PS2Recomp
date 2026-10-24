@@ -372,7 +372,16 @@ public:
     // deadline has passed, so busy-wait loops do not stretch VBlank and timer events. A game whose
     // EE is stalled by host work (a saturated GS) loses EE time that way while the IOP keeps its
     // pace: its EE-produced audio can underrun. Disabling it lets emulated time slow down instead.
-    void setWallClockCatchUp(bool enabled) noexcept { m_wallClockCatchUp = enabled; }
+    // OncePerField skips to at most one event per field: a game never sees more than one field go by
+    // at once, which its late-frame paths may not expect. PS2X_EE_CATCHUP=0|field|1 overrides the mode.
+    enum class WallClockCatchUp : uint8_t
+    {
+        Off,
+        OncePerField,
+        Full,
+    };
+    void setWallClockCatchUp(bool enabled) noexcept { m_wallClockCatchUp = enabled ? WallClockCatchUp::Full : WallClockCatchUp::Off; }
+    void setWallClockCatchUp(WallClockCatchUp mode) noexcept { m_wallClockCatchUp = mode; }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -512,7 +521,8 @@ private:
     // Host deadline of the event at m_nextDeadlineCycle; lets slow guest code catch up to wall-clock time.
     std::atomic<std::chrono::steady_clock::rep> m_nextDeadlineHostTicks{0};
     uint32_t m_hostCatchUpPoll = 0;
-    bool m_wallClockCatchUp = true;
+    WallClockCatchUp m_wallClockCatchUp = WallClockCatchUp::Full;
+    uint64_t m_lastCatchUpTick = ~0ull;
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
