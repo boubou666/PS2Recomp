@@ -124,7 +124,7 @@ namespace ps2_vu1_detail
     }
 
 
-    inline int32_t vuFloatToInt(float value, float scale)
+    PS2X_VU_INLINE int32_t vuFloatToInt(float value, float scale)
     {
         const double scaled = static_cast<double>(value) * static_cast<double>(scale);
         if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
@@ -139,7 +139,7 @@ namespace ps2_vu1_detail
     // interpreter's FE_TOWARDZERO mode does. A plain IEEE sum differs by one ulp when the small
     // operand has the opposite sign: Valkyrie Profile 2 derives its file decryption key on VU0
     // and depends on the exact PS2 result (PCSX2 hardcodes these additions as a "TriAce hack").
-    inline float vuAdd(float a, float b)
+    PS2X_VU_INLINE float vuAdd(float a, float b)
     {
 
         uint32_t ua = 0u;
@@ -159,14 +159,14 @@ namespace ps2_vu1_detail
         return a + b;
     }
 
-    inline float vuSub(float a, float b)
+    PS2X_VU_INLINE float vuSub(float a, float b)
     {
         return vuAdd(a, -b);
     }
 
     // vuAdd on four lanes: with AVX2 the same operand alignment, then one SSE add under the
     // interpreter's round-toward-zero mode; without it, lane by lane.
-    inline __m128 vuAdd4(__m128 a, __m128 b)
+    PS2X_VU_INLINE __m128 vuAdd4(__m128 a, __m128 b)
     {
 #if !defined(__AVX2__)
         alignas(16) float la[4];
@@ -202,14 +202,14 @@ namespace ps2_vu1_detail
 #endif
     }
 
-    inline __m128 negate4(__m128 value)
+    PS2X_VU_INLINE __m128 negate4(__m128 value)
     {
         return _mm_xor_ps(value, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))));
     }
 
     // MAX/MINI compare raw sign-magnitude bit patterns and pass the chosen operand through unchanged, so
     // denormals (often integer data, e.g. colors unpacked by VIF) and exponent-255 values survive.
-    inline int64_t vuMinMaxKey(float value)
+    PS2X_VU_INLINE int64_t vuMinMaxKey(float value)
     {
         uint32_t bits = 0u;
         std::memcpy(&bits, &value, sizeof(bits));
@@ -217,11 +217,11 @@ namespace ps2_vu1_detail
         return (bits & 0x80000000u) != 0u ? -magnitude : magnitude;
     }
 
-    inline float vuMax(float a, float b) { return vuMinMaxKey(a) > vuMinMaxKey(b) ? a : b; }
-    inline float vuMini(float a, float b) { return vuMinMaxKey(a) < vuMinMaxKey(b) ? a : b; }
+    PS2X_VU_INLINE float vuMax(float a, float b) { return vuMinMaxKey(a) > vuMinMaxKey(b) ? a : b; }
+    PS2X_VU_INLINE float vuMini(float a, float b) { return vuMinMaxKey(a) < vuMinMaxKey(b) ? a : b; }
 
     // normalizeOperand() on four lanes: denormals become signed zero, exponent 255 becomes +-FLT_MAX.
-    inline void normalizeVector(const float *source, float *target)
+    PS2X_VU_INLINE void normalizeVector(const float *source, float *target)
     {
         const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source));
         const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
@@ -917,8 +917,10 @@ PS2X_VU_INLINE void VU1Interpreter::applyDestAcc(const float *result, uint8_t de
 // flags. The other lanes (zero results above all) take the exact result as a double, which classifies them like
 // fmacFlagsSlow, or for sums at FLT_MAX its long double; an out-of-range product of a product-sum goes to
 // fmacFlagsSlow.
-template <uint8_t kUpperHints>
-PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status,
+template <typename Left, typename Right, typename Acc>
+PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsWith(float *result, uint8_t dest, FmacOperation operation,
+                                                  const Left &leftOperand, const Right &rightOperand,
+                                                  const Acc &accOperand, uint32_t &mac, uint32_t &status,
                                                   uint32_t &sticky) const
 {
     // dest bit 3 is x (lane 0); movemask bit c is lane c.
@@ -934,8 +936,6 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
                                           _mm_cmpgt_epi32(_mm_set1_epi32(254), exponent));
     const uint32_t outOfRange = active & ~static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(inRange)));
 
-    const uint32_t upper = m_currentUpperInstruction;
-    const FmacOperation operation = decodeFmacOperation(upper);
     const FmacKind kind = operation.kind;
     const bool productSum = kind == FmacKind::Madd || kind == FmacKind::Msub || kind == FmacKind::CrossMsub;
     const bool cross = kind == FmacKind::CrossMsub || kind == FmacKind::CrossMul;
@@ -947,29 +947,8 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
         return false;
     if (productSum || outOfRange != 0u)
     {
-        alignas(16) float left[4];
-        alignas(16) float right[4];
-        loadOperands<(kUpperHints & kKnownNormalFs) != 0u>(m_state.vf[FS(upper)], left);
-        switch (operation.right)
-        {
-        case FmacOperation::Right::Broadcast:
-            if constexpr ((kUpperHints & kKnownNormalFt) != 0u)
-                _mm_store_ps(right, _mm_set1_ps(m_state.vf[FT(upper)][operation.broadcast]));
-            else
-                _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.vf[FT(upper)][operation.broadcast])));
-            break;
-        case FmacOperation::Right::Q:
-            _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.q)));
-            break;
-        case FmacOperation::Right::I:
-            _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.i)));
-            break;
-        default:
-            loadOperands<(kUpperHints & kKnownNormalFt) != 0u>(m_state.vf[FT(upper)], right);
-            break;
-        }
-        __m128 leftVector = _mm_load_ps(left);
-        __m128 rightVector = _mm_load_ps(right);
+        __m128 leftVector = leftOperand();
+        __m128 rightVector = rightOperand();
         if (cross)
         {
             leftVector = _mm_shuffle_ps(leftVector, leftVector, _MM_SHUFFLE(3, 0, 2, 1));     // y z x w
@@ -1034,9 +1013,7 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
                 break;
             default:
             {
-                alignas(16) float accumulator[4];
-                loadOperands<(kUpperHints & kKnownNormalAcc) != 0u>(m_state.acc, accumulator);
-                const __m256d accWide = _mm256_cvtps_pd(_mm_load_ps(accumulator));
+                const __m256d accWide = _mm256_cvtps_pd(accOperand());
                 const __m256d product = _mm256_mul_pd(leftWide, rightWide);
                 exact = kind == FmacKind::Madd ? _mm256_add_pd(accWide, product) : _mm256_sub_pd(accWide, product);
                 break;
@@ -1083,10 +1060,15 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
             {
                 alignas(32) double sums[4];
                 _mm256_store_pd(sums, exact);
+                alignas(16) float lefts[4], rights[4], accs[4]{};
+                _mm_store_ps(lefts, leftVector);
+                _mm_store_ps(rights, rightVector);
+                if (productSum)
+                    _mm_store_ps(accs, accOperand());
                 for (uint32_t lanes = atFloatMax; lanes != 0u; lanes &= lanes - 1u)
                 {
                     const uint32_t lane = static_cast<uint32_t>(_tzcnt_u32(lanes));
-                    const uint32_t flags = fmacSumAtFloatMaxFlags(result[lane], lane, sums[lane]);
+                    const uint32_t flags = fmacSumAtFloatMaxFlags(result[lane], lane, sums[lane], kind, lefts, rights, accs);
                     zeroLanes |= (flags & 1u) << lane;
                     signLanes |= ((flags >> 1) & 1u) << lane;
                     underflowLanes |= ((flags >> 2) & 1u) << lane;
@@ -1105,6 +1087,49 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
     status = (zeroLanes != 0u ? 0x1u : 0u) | (signLanes != 0u ? 0x2u : 0u) | (underflowLanes != 0u ? 0x4u : 0u) |
              (overflowLanes != 0u ? 0x8u : 0u);
     return true;
+}
+
+// The operands of the instruction being executed (m_currentUpperInstruction), normalized, for fmacFlagsWith.
+template <uint8_t kUpperHints>
+PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status,
+                                                  uint32_t &sticky) const
+{
+    const uint32_t upper = m_currentUpperInstruction;
+    const FmacOperation operation = decodeFmacOperation(upper);
+    const auto left = [&]() PS2X_VU_LAMBDA_INLINE
+    {
+        alignas(16) float value[4];
+        loadOperands<(kUpperHints & kKnownNormalFs) != 0u>(m_state.vf[FS(upper)], value);
+        return _mm_load_ps(value);
+    };
+    const auto right = [&]() PS2X_VU_LAMBDA_INLINE
+    {
+        switch (operation.right)
+        {
+        case FmacOperation::Right::Broadcast:
+            if constexpr ((kUpperHints & kKnownNormalFt) != 0u)
+                return _mm_set1_ps(m_state.vf[FT(upper)][operation.broadcast]);
+            else
+                return _mm_set1_ps(normalizeOperand(m_state.vf[FT(upper)][operation.broadcast]));
+        case FmacOperation::Right::Q:
+            return _mm_set1_ps(normalizeOperand(m_state.q));
+        case FmacOperation::Right::I:
+            return _mm_set1_ps(normalizeOperand(m_state.i));
+        default:
+        {
+            alignas(16) float value[4];
+            loadOperands<(kUpperHints & kKnownNormalFt) != 0u>(m_state.vf[FT(upper)], value);
+            return _mm_load_ps(value);
+        }
+        }
+    };
+    const auto acc = [&]() PS2X_VU_LAMBDA_INLINE
+    {
+        alignas(16) float value[4];
+        loadOperands<(kUpperHints & kKnownNormalAcc) != 0u>(m_state.acc, value);
+        return _mm_load_ps(value);
+    };
+    return fmacFlagsWith(result, dest, operation, left, right, acc, mac, status, sticky);
 }
 
 template <uint8_t kUpperHints>
@@ -3202,14 +3227,14 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBodyEntry(cons
     return stepPairBody<false, kDeadFlags, kUpperHints, kPosition>(decoded, context);
 }
 
-template <const VU1Interpreter::BlockPlan &kPlan, const auto &kBodies, const auto &kPairs>
-PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::runBlock(const RunContext &context, CompiledEntry first)
+template <const VU1Interpreter::BlockPlan &kPlan>
+PS2X_VU_INLINE bool VU1Interpreter::blockReady(const RunContext &context, uint64_t &base) const
 {
     static_assert(kPlan.valid, "ps2_vu_aot emitted a block planBlock() rejects");
     // The first pair may wait for values from before the block (a loop's first pair reading what the previous
     // iteration wrote): the whole schedule then starts that much later, exactly as stallUntilReady() would delay
     // it. Any other live-in must be ready by its planned cycle.
-    uint64_t base = m_cycle;
+    base = m_cycle;
     [&]<size_t... kLiveIn>(std::index_sequence<kLiveIn...>) PS2X_VU_LAMBDA_INLINE
     {
         ((kPlan.liveIns[kLiveIn].issue == 0u ? (base = std::max(base, blockLiveInReadyCycle<kPlan.liveIns[kLiveIn]>()))
@@ -3228,6 +3253,14 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::runBlock(const RunCont
              ...);
         }(std::make_index_sequence<kPlan.liveInCount>{});
     }
+    return ready;
+}
+
+template <const VU1Interpreter::BlockPlan &kPlan, const auto &kBodies, const auto &kPairs>
+PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::runBlock(const RunContext &context, CompiledEntry first)
+{
+    uint64_t base = 0u;
+    const bool ready = blockReady<kPlan>(context, base);
     if (!ready)
         return first(*this, context);
 

@@ -314,12 +314,22 @@ namespace
 }
 
 // Lane flags of a sum at FLT_MAX or above (sum: as a double), from the long double result as fmacFlagsSlow does.
-uint8_t VU1Interpreter::fmacSumAtFloatMaxFlags(float &value, uint32_t lane, double sum) const
+// calculateFmacExactResult's expressions, from the normalized operands (cross products: shuffled).
+uint8_t VU1Interpreter::fmacSumAtFloatMaxFlags(float &value, uint32_t lane, double sum, FmacKind kind,
+                                               const float left[4], const float right[4], const float acc[4]) const
 {
+    const long double l = left[lane], r = right[lane], a = acc[lane];
     long double exactResult = 0.0L;
-    if (calculateFmacExactResult(lane, exactResult))
-        return normalizeFmacExactResult(value, exactResult);
-    return classifyExactResult(value, sum);
+    switch (kind)
+    {
+    case FmacKind::Add: exactResult = l + r; break;
+    case FmacKind::Sub: exactResult = l - r; break;
+    case FmacKind::Madd: exactResult = a + l * r; break;
+    case FmacKind::Msub: exactResult = a - l * r; break;
+    case FmacKind::CrossMsub: exactResult = lane == 3u ? 0.0L : a - l * r; break;
+    default: return classifyExactResult(value, sum); // products are exact in double and never get here
+    }
+    return normalizeFmacExactResult(value, exactResult);
 }
 
 void VU1Interpreter::fmacFlagsSlow(float *result, uint8_t dest)
@@ -438,6 +448,12 @@ void VU1Interpreter::stallUntilReady(const DecodedInstructionPair &decoded, uint
         advanceTo(readyCycle);
         readyCycle = calculatePairReadyCycle(decoded);
     }
+}
+
+VU1Interpreter::StepResult VU1Interpreter::stepPairInterpreted(const DecodedInstructionPair &decoded,
+                                                               const RunContext &context)
+{
+    return stepPair(decoded, context);
 }
 
 VU1Interpreter::StepResult VU1Interpreter::stepPairLogged(const DecodedInstructionPair &decoded, const RunContext &context)

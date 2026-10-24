@@ -10,12 +10,14 @@
 // At run time a fragment replaces the interpreter only while VU1 code memory holds its exact bytes at its
 // address (VU1Interpreter::refreshCompiledFragments), so stray matches in the scan are harmless.
 #include "runtime/ps2_vu1_inline.h"
+#include "runtime/ps2_vu1_jit.h"
 
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -183,6 +185,411 @@ namespace
         return unobserved;
     }
 
+
+    // ---- Recompiled blocks (ps2_vu1_jit.h) ----
+    struct JitPairInfo
+    {
+        Vu1Jit::UpperInfo upper;
+        Vu1Jit::Lower lower = Vu1Jit::Lower::Nop;
+        bool fallback = false;  // through the interpreter's pair body
+        bool liveFlags = false; // an FMAC whose flags a reader can see (Vu1Jit::fmacLive)
+    };
+
+    std::string vfName(uint32_t reg) { return "vf" + std::to_string(reg); }
+    std::string viName(uint32_t reg) { return reg == 0u ? std::string("vi0") : "vi" + std::to_string(reg); }
+
+    // One block as one function: VU registers in locals, each instruction a Vu1Jit call. Returns false when the
+    // block keeps the per-pair path (a branch or E bit anywhere but at its end, a delay slot it cannot recompile).
+    bool writeJitBlock(std::ostream &out, const std::vector<VU1Interpreter::DecodedInstructionPair> &decoded,
+                       uint32_t first, uint32_t end, uint32_t firstPair, const std::vector<bool> &unobserved,
+                       const VU1Interpreter::BlockPlan &plan)
+    {
+        using Vu = VU1Interpreter;
+        using J = Vu1Jit;
+        const uint32_t count = end - first;
+        const auto upperOf = [&](uint32_t k) { return decoded[first + k].upper; };
+        const auto lowerOf = [&](uint32_t k) { return decoded[first + k].lower; };
+        const auto isBranch = [&](uint32_t k)
+        { return !decoded[first + k].iBit && J::lowerKind(lowerOf(k)) == J::Lower::Branch; };
+        const bool branchEnd = count >= 2u && isBranch(count - 2u);
+        const bool eBitEnd = count >= 2u && decoded[first + count - 2u].eBit;
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            const bool tail = k + 2u == count && (branchEnd || eBitEnd);
+            if ((isBranch(k) || decoded[first + k].eBit) && !tail)
+                return false;
+        }
+
+        std::vector<JitPairInfo> info(count);
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            const Vu::DecodedInstructionPair &pair = decoded[first + k];
+            JitPairInfo &pi = info[k];
+            pi.upper = J::upperInfo(pair.upper);
+            if ((pi.upper.kind == J::Upper::Fmac || pi.upper.kind == J::Upper::FmacAcc) && ((pair.upper >> 21) & 0xFu) == 0u)
+                pi.upper = {J::Upper::Nop, 0}; // no lane written, no flag either
+            pi.lower = pair.iBit ? J::Lower::Nop : J::lowerKind(pair.lower);
+            const bool fmac = pi.upper.kind == J::Upper::Fmac || pi.upper.kind == J::Upper::FmacAcc;
+            pi.liveFlags = fmac && ((pair.upper >> 21) & 0xFu) != 0u && !unobserved[first + k];
+            pi.fallback = pi.upper.kind == J::Upper::Unsupported || pi.lower == J::Lower::Unsupported;
+        }
+        // The last two pairs end the block: the interpreter cannot run them in the middle of it.
+        for (uint32_t k = count >= 2u ? count - 2u : 0u; k < count; ++k)
+            if (info[k].fallback && (branchEnd || eBitEnd))
+                return false;
+
+        // Registers the block touches (loaded on entry) and writes (stored on exit).
+        std::vector<bool> vfUsed(32, false), vfWritten(32, false), viUsed(16, false), viWritten(16, false);
+        bool accUsed = false, accWritten = false;
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            const Vu::DecodedInstructionPair &pair = decoded[first + k];
+            const uint32_t upper = pair.upper, lower = pair.lower;
+            vfUsed[ps2_vu1_detail::FS(upper)] = vfUsed[ps2_vu1_detail::FT(upper)] = true;
+            vfUsed[ps2_vu1_detail::FD(upper)] = true;
+            if (pair.upperUsage.accRead || pair.upperUsage.accWrite)
+                accUsed = true;
+            if (pair.upperUsage.accWrite)
+                accWritten = true;
+            if (pair.upperUsage.vfWrite.reg)
+                vfWritten[pair.upperUsage.vfWrite.reg] = true;
+            if (info[k].upper.kind != J::Upper::Nop && info[k].upper.kind != J::Upper::Clip &&
+                info[k].upper.kind != J::Upper::FmacAcc)
+                vfWritten[info[k].upper.target] = true;
+            if (!pair.iBit)
+            {
+                vfUsed[ps2_vu1_detail::FS(lower)] = vfUsed[ps2_vu1_detail::FT(lower)] = true;
+                viUsed[ps2_vu1_detail::VIS(lower)] = viUsed[ps2_vu1_detail::VIT(lower)] = true;
+                viUsed[ps2_vu1_detail::VID(lower)] = true;
+                if (pair.lowerUsage.vfWrite.reg)
+                    vfWritten[pair.lowerUsage.vfWrite.reg] = true;
+                for (uint32_t reg = 1; reg < 16u; ++reg)
+                    if (pair.lowerUsage.viWrite & (1u << reg))
+                        viWritten[reg] = true;
+                // Recompiled lower instructions write their decoded targets; mark them in case the usage omits one.
+                switch (info[k].lower)
+                {
+                case J::Lower::Lq: case J::Lower::Move: case J::Lower::Mr32: case J::Lower::Lqi: case J::Lower::Lqd:
+                case J::Lower::Mfir: case J::Lower::Mfp: case J::Lower::Rnext: case J::Lower::Rget:
+                    vfWritten[ps2_vu1_detail::FT(lower)] = true;
+                    break;
+                case J::Lower::FlagRead:
+                {
+                    const uint32_t op = lower >> 25;
+                    if (op == 0x10u || op == 0x12u || op == 0x13u) // FCEQ, FCAND, FCOR write vi1
+                        viUsed[1] = viWritten[1] = true;
+                    else if (ps2_vu1_detail::VIT(lower) != 0u)
+                        viWritten[ps2_vu1_detail::VIT(lower)] = true;
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+        }
+        vfWritten[0] = false;
+        viWritten[0] = false;
+
+        const uint32_t id = firstPair + first;
+        const auto cycle = [&](uint32_t k) { return "base + " + std::to_string(plan.issue[k]) + "u"; };
+        const auto hex32 = [](uint32_t value) { return "0x" + hex(value, 8) + "u"; };
+        std::ostringstream body;
+        const auto storeAll = [&](const char *indent)
+        {
+            for (uint32_t reg = 1; reg < 32u; ++reg)
+                if (vfWritten[reg])
+                    body << indent << "J::store(s.vf[" << reg << "], " << vfName(reg) << ");\n";
+            if (accWritten)
+                body << indent << "J::store(s.acc, acc);\n";
+            for (uint32_t reg = 1; reg < 16u; ++reg)
+                if (viWritten[reg])
+                    body << indent << "s.vi[" << reg << "] = " << viName(reg) << ";\n";
+        };
+        const auto loadAll = [&](const char *indent)
+        {
+            for (uint32_t reg = 1; reg < 32u; ++reg)
+                if (vfUsed[reg])
+                    body << indent << vfName(reg) << " = J::load(s.vf[" << reg << "]);\n";
+            if (accUsed)
+                body << indent << "acc = J::load(s.acc);\n";
+            for (uint32_t reg = 1; reg < 16u; ++reg)
+                if (viUsed[reg])
+                    body << indent << viName(reg) << " = s.vi[" << reg << "];\n";
+        };
+
+        // A conditional branch reads the old value of a VI the pair before it wrote (readBranchVi).
+        std::string branchOldVi;
+        int branchOldReg = -1;
+        if (branchEnd)
+        {
+            const uint32_t b = count - 2u;
+            const uint32_t opcode = lowerOf(b) >> 25;
+            if (opcode >= 0x28u && b > 0u)
+            {
+                const Vu::DecodedInstructionPair &before = decoded[first + b - 1u];
+                if (!before.iBit && before.lowerUsage.delaysNextBranchRead)
+                    for (uint32_t reg = 1; reg < 16u; ++reg)
+                        if (before.lowerUsage.viWrite & (1u << reg))
+                            branchOldReg = static_cast<int>(reg);
+            }
+        }
+        // The VI a branch right after the block would read as it was (recordViWriteForBranch).
+        int lastViReg = -1;
+        {
+            const Vu::DecodedInstructionPair &last = decoded[first + count - 1u];
+            if (!last.iBit && last.lowerUsage.delaysNextBranchRead)
+                for (uint32_t reg = 1; reg < 16u; ++reg)
+                    if (last.lowerUsage.viWrite & (1u << reg))
+                        lastViReg = static_cast<int>(reg);
+        }
+
+        bool needsBodies = false;
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            const Vu::DecodedInstructionPair &pair = decoded[first + k];
+            const JitPairInfo &pi = info[k];
+            const uint32_t pc = (firstPair + first + k) * 8u;
+            const uint32_t upper = pair.upper, lower = pair.lower;
+            const uint8_t hints = static_cast<uint8_t>(plan.knownNormal[k] | (unobserved[first + k] ? Vu::kHintFlagsUnobserved : 0u));
+            body << "        // pair " << (firstPair + first + k) << " (pc 0x" << hex(pc, 4) << ")\n";
+            if (branchEnd && branchOldReg >= 0 && k + 3u == count)
+                body << "        const int32_t viBranchOld = " << viName(static_cast<uint32_t>(branchOldReg)) << ";\n";
+            if (lastViReg >= 0 && k + 1u == count)
+                body << "        const int32_t viLastOld = " << viName(static_cast<uint32_t>(lastViReg)) << ";\n";
+            if (pi.fallback)
+            {
+                needsBodies = true;
+                body << "        {\n";
+                storeAll("            ");
+                body << "            J::advance(vu, " << cycle(k) << ");\n"
+                     << "            jitBody" << (firstPair + first + k) << "(vu, context);\n";
+                loadAll("            ");
+                body << "        }\n";
+                continue;
+            }
+            const auto fs = vfName(ps2_vu1_detail::FS(upper)), ft = vfName(ps2_vu1_detail::FT(upper));
+            const bool needsClock = pi.upper.kind == J::Upper::Clip ||
+                                    ((pi.upper.kind == J::Upper::Fmac || pi.upper.kind == J::Upper::FmacAcc) &&
+                                     (ps2_vu1_detail::decodeFmacOperation(upper).right == ps2_vu1_detail::FmacOperation::Right::Q ||
+                                      pi.liveFlags)) ||
+                                    pi.lower == J::Lower::Div || pi.lower == J::Lower::Sqrt || pi.lower == J::Lower::Rsqrt ||
+                                    pi.lower == J::Lower::Mfp || pi.lower == J::Lower::Fcset || pi.lower == J::Lower::Fsset ||
+                                    pi.lower == J::Lower::Efu;
+            if (needsClock)
+                body << "        J::advance(vu, " << cycle(k) << ");\n";
+
+            std::ostringstream up;
+            switch (pi.upper.kind)
+            {
+            case J::Upper::Fmac:
+            case J::Upper::FmacAcc:
+                if (pi.liveFlags)
+                    up << "J::fmacLive<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u, "
+                       << (plan.deadFlags[k] ? "true" : "false") << ">(vu, ";
+                else
+                    up << "J::fmac<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u>(vu, ";
+                up
+                   << (pi.upper.kind == J::Upper::FmacAcc ? std::string("acc") : vfName(pi.upper.target)) << ", " << fs
+                   << ", " << ft << ", acc);";
+                break;
+            case J::Upper::Max:
+            case J::Upper::Mini:
+                up << "J::maxMini<" << hex32(upper) << ", " << (pi.upper.kind == J::Upper::Max ? "true" : "false")
+                   << ">(vu, " << vfName(pi.upper.target) << ", " << fs << ", " << ft << ");";
+                break;
+            case J::Upper::Itof:
+                up << "J::itof<" << hex32(upper) << ">(" << vfName(pi.upper.target) << ", " << fs << ");";
+                break;
+            case J::Upper::Ftoi:
+                up << "J::ftoi<" << hex32(upper) << ", 0u>(" << vfName(pi.upper.target) << ", " << fs << ");";
+                break;
+            case J::Upper::Abs:
+                up << "J::abs<" << hex32(upper) << ">(" << vfName(pi.upper.target) << ", " << fs << ");";
+                break;
+            case J::Upper::Clip:
+                up << "J::clip(vu, " << fs << ", " << ft << ");";
+                break;
+            default:
+                break;
+            }
+
+            std::ostringstream lo;
+            if (!pair.iBit)
+            {
+                const uint8_t lft = ps2_vu1_detail::FT(lower), lfs = ps2_vu1_detail::FS(lower);
+                const uint8_t vit = ps2_vu1_detail::VIT(lower), vis = ps2_vu1_detail::VIS(lower), vid = ps2_vu1_detail::VID(lower);
+                const std::string L = hex32(lower);
+                const std::string viT = vit ? viName(vit) : std::string("viDiscard");
+                const std::string viD = vid ? viName(vid) : std::string("viDiscard");
+                switch (pi.lower)
+                {
+                case J::Lower::Lq: lo << "J::lq<" << L << ">(context, " << vfName(lft) << ", " << viName(vis) << ");"; break;
+                case J::Lower::Sq: lo << "J::sq<" << L << ">(vu, context, " << cycle(k) << ", " << vfName(lfs) << ", " << viName(vit) << ");"; break;
+                case J::Lower::Ilw: lo << "J::ilw<" << L << ">(context, " << viT << ", " << viName(vis) << ");"; break;
+                case J::Lower::Isw: lo << "J::isw<" << L << ">(vu, context, " << cycle(k) << ", " << viName(vit) << ", " << viName(vis) << ");"; break;
+                case J::Lower::Iaddiu: lo << viT << " = static_cast<int16_t>(" << viName(vis) << " + (" << J::imm15(lower) << "));"; break;
+                case J::Lower::Isubiu: lo << viT << " = static_cast<int16_t>(" << viName(vis) << " - (" << J::imm15(lower) << "));"; break;
+                case J::Lower::Iadd: lo << viD << " = static_cast<int16_t>(" << viName(vis) << " + " << viName(vit) << ");"; break;
+                case J::Lower::Isub: lo << viD << " = static_cast<int16_t>(" << viName(vis) << " - " << viName(vit) << ");"; break;
+                case J::Lower::Iaddi:
+                    lo << viT << " = static_cast<int16_t>(" << viName(vis) << " + ("
+                       << static_cast<int>(static_cast<int16_t>(static_cast<int32_t>(((lower >> 6) & 0x1Fu) << 27) >> 27)) << "));";
+                    break;
+                case J::Lower::Iand: lo << viD << " = " << viName(vis) << " & " << viName(vit) << ";"; break;
+                case J::Lower::Ior: lo << viD << " = " << viName(vis) << " | " << viName(vit) << ";"; break;
+                case J::Lower::Move: lo << "J::move<" << L << ">(" << vfName(lft) << ", " << vfName(lfs) << ");"; break;
+                case J::Lower::Mr32: lo << "J::mr32<" << L << ">(" << vfName(lft) << ", " << vfName(lfs) << ");"; break;
+                case J::Lower::Lqi: lo << "J::lqi<" << L << ">(context, " << vfName(lft) << ", " << viName(vis) << ", " << (vis == 0 ? "true" : "false") << ");"; break;
+                case J::Lower::Sqi: lo << "J::sqi<" << L << ">(vu, context, " << cycle(k) << ", " << vfName(lfs) << ", " << viName(vit) << ", " << (vit == 0 ? "true" : "false") << ");"; break;
+                case J::Lower::Lqd: lo << "J::lqd<" << L << ">(context, " << vfName(lft) << ", " << viName(vis) << ", " << (vis == 0 ? "true" : "false") << ");"; break;
+                case J::Lower::Sqd: lo << "J::sqd<" << L << ">(vu, context, " << cycle(k) << ", " << vfName(lfs) << ", " << viName(vit) << ", " << (vit == 0 ? "true" : "false") << ");"; break;
+                case J::Lower::Div: lo << "J::div<" << L << ">(vu, " << vfName(lfs) << ", " << vfName(lft) << ");"; break;
+                case J::Lower::Sqrt: lo << "J::sqrt<" << L << ">(vu, " << vfName(lft) << ");"; break;
+                case J::Lower::Rsqrt: lo << "J::rsqrt<" << L << ">(vu, " << vfName(lfs) << ", " << vfName(lft) << ");"; break;
+                case J::Lower::Mtir: lo << "J::mtir<" << L << ">(" << viT << ", " << vfName(lfs) << ");"; break;
+                case J::Lower::Mfir: lo << "J::mfir<" << L << ">(" << vfName(lft) << ", " << viName(vis) << ");"; break;
+                case J::Lower::Ilwr: lo << "J::ilwr<" << L << ">(context, " << viT << ", " << viName(vis) << ");"; break;
+                case J::Lower::Iswr: lo << "J::iswr<" << L << ">(vu, context, " << cycle(k) << ", " << viName(vit) << ", " << viName(vis) << ");"; break;
+                case J::Lower::Mfp: lo << "J::mfp<" << L << ">(vu, " << vfName(lft) << ");"; break;
+                case J::Lower::Xtop: lo << viT << " = static_cast<int32_t>(s.top & 0x3FFu);"; break;
+                case J::Lower::Xitop: lo << viT << " = static_cast<int32_t>(s.itop & 0x3FFu);"; break;
+                case J::Lower::FlagRead:
+                {
+                    const uint32_t op = lower >> 25;
+                    const std::string flagTarget = (op == 0x10u || op == 0x12u || op == 0x13u) ? viName(1) : viT;
+                    lo << "J::flagRead<" << L << ">(vu, " << cycle(k) << ", " << flagTarget << ", " << viName(vis) << ");";
+                    break;
+                }
+                case J::Lower::Fcset: lo << "J::fcset<" << L << ">(vu);"; break;
+                case J::Lower::Fsset: lo << "J::fsset<" << L << ">(vu);"; break;
+                case J::Lower::Rnext: lo << "J::rnext<" << L << ">(vu, " << vfName(lft) << ");"; break;
+                case J::Lower::Rget: lo << "J::rget<" << L << ">(vu, " << vfName(lft) << ");"; break;
+                case J::Lower::Rinit: lo << "J::rinit<" << L << ">(vu, " << vfName(lfs) << ");"; break;
+                case J::Lower::Rxor: lo << "J::rxor<" << L << ">(vu, " << vfName(lfs) << ");"; break;
+                case J::Lower::Efu: lo << "J::efu<" << L << ">(vu, " << vfName(lfs) << ");"; break;
+                case J::Lower::Branch:
+                {
+                    // Evaluated where the branch issues; the delay slot follows, then the pc moves.
+                    const uint32_t opcode = lower >> 25;
+                    const int32_t imm = J::imm11(lower);
+                    const std::string targetStatic = "((" + std::to_string(pc + 8u) + "u + " + std::to_string(imm * 8) + "u) & 0x3FFFu)";
+                    const auto readCond = [&](uint8_t reg) -> std::string
+                    {
+                        if (reg == 0u)
+                            return "0";
+                        if (k == 0u)
+                            return "J::readBranchVi(vu, " + std::to_string(reg) + ")";
+                        if (static_cast<int>(reg) == branchOldReg)
+                            return "viBranchOld";
+                        return viName(reg);
+                    };
+                    const auto i16 = [](const std::string &v) { return "static_cast<int16_t>(" + v + ")"; };
+                    switch (opcode)
+                    {
+                    case 0x20u: lo << "taken = true; target = " << targetStatic << ";"; break;
+                    case 0x21u:
+                        lo << "taken = true; target = " << targetStatic << ";";
+                        if (vit)
+                            lo << " " << viName(vit) << " = " << ((pc + 16u) / 8u) << ";";
+                        break;
+                    case 0x24u: lo << "taken = true; target = (static_cast<uint32_t>(static_cast<uint16_t>(" << viName(vis) << ")) * 8u) & 0x3FFFu;"; break;
+                    case 0x25u:
+                        lo << "taken = true; target = (static_cast<uint32_t>(static_cast<uint16_t>(" << viName(vis) << ")) * 8u) & 0x3FFFu;";
+                        if (vit)
+                            lo << " " << viName(vit) << " = " << ((pc + 16u) / 8u) << ";";
+                        break;
+                    case 0x28u: lo << "taken = " << i16(readCond(vis)) << " == " << i16(readCond(vit)) << "; target = " << targetStatic << ";"; break;
+                    case 0x29u: lo << "taken = " << i16(readCond(vis)) << " != " << i16(readCond(vit)) << "; target = " << targetStatic << ";"; break;
+                    case 0x2Cu: lo << "taken = " << i16(readCond(vis)) << " < 0; target = " << targetStatic << ";"; break;
+                    case 0x2Du: lo << "taken = " << i16(readCond(vis)) << " > 0; target = " << targetStatic << ";"; break;
+                    case 0x2Eu: lo << "taken = " << i16(readCond(vis)) << " <= 0; target = " << targetStatic << ";"; break;
+                    case 0x2Fu: lo << "taken = " << i16(readCond(vis)) << " >= 0; target = " << targetStatic << ";"; break;
+                    default: return false;
+                    }
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+
+            const uint8_t shadow = pair.upperVfShadowReg;
+            if (pair.iBit)
+            {
+                body << "        " << up.str() << "\n";
+                body << "        J::setI(vu, " << hex32(lower) << ");\n";
+            }
+            else if (shadow != 0u)
+            {
+                body << "        {\n            const __m128 shadowOld = " << vfName(shadow) << ";\n"
+                     << "            " << up.str() << "\n"
+                     << "            const __m128 shadowUpper = " << vfName(shadow) << ";\n"
+                     << "            " << vfName(shadow) << " = shadowOld;\n"
+                     << "            " << lo.str() << "\n"
+                     << "            " << vfName(shadow) << " = shadowUpper;\n        }\n";
+            }
+            else
+            {
+                if (!up.str().empty())
+                    body << "        " << up.str() << "\n";
+                if (!lo.str().empty())
+                    body << "        " << lo.str() << "\n";
+            }
+            const bool writesVf0 = (pi.upper.kind != J::Upper::Nop && pi.upper.kind != J::Upper::Clip &&
+                                    pi.upper.kind != J::Upper::FmacAcc && pi.upper.target == 0u) ||
+                                   (!pair.iBit && ps2_vu1_detail::FT(lower) == 0u &&
+                                    (pi.lower == J::Lower::Lq || pi.lower == J::Lower::Move || pi.lower == J::Lower::Mr32 ||
+                                     pi.lower == J::Lower::Lqi || pi.lower == J::Lower::Lqd || pi.lower == J::Lower::Mfir ||
+                                     pi.lower == J::Lower::Mfp || pi.lower == J::Lower::Rnext || pi.lower == J::Lower::Rget));
+            if (writesVf0)
+                body << "        vf0 = J::vf0();\n";
+        }
+
+        // Pair bodies for the pairs the interpreter runs.
+        if (needsBodies)
+            for (uint32_t k = 0; k < count; ++k)
+                if (info[k].fallback)
+                {
+                    const uint8_t hints = static_cast<uint8_t>(plan.knownNormal[k] | (unobserved[first + k] ? Vu::kHintFlagsUnobserved : 0u));
+                    out << "    Vu::StepResult jitBody" << (firstPair + first + k) << "(Vu &vu, const Vu::RunContext &context)\n"
+                        << "    {\n        return vu.stepPairBodyEntry<" << (plan.deadFlags[k] ? "true" : "false") << ", "
+                        << static_cast<unsigned>(hints) << "u, Vu::BlockInterior>(kPair" << (firstPair + first + k)
+                        << ", context);\n    }\n";
+                }
+
+        out << "    Vu::StepResult jit" << id << "(Vu &vu, const Vu::RunContext &context)\n    {\n"
+            << "        using J = Vu1Jit;\n"
+            << "        uint64_t base = 0u;\n"
+            << "        if (!vu.blockReady<kBlockPlan" << id << ">(context, base))\n"
+            << "            return pair" << id << "(vu, context);\n"
+            << "        VU1State &s = J::state(vu);\n"
+            << "        [[maybe_unused]] __m128 vf0 = J::vf0();\n"
+            << "        [[maybe_unused]] int32_t vi0 = 0, viDiscard = 0;\n"
+            << "        [[maybe_unused]] bool taken = false;\n"
+            << "        [[maybe_unused]] uint32_t target = 0u;\n";
+        for (uint32_t reg = 1; reg < 32u; ++reg)
+            if (vfUsed[reg])
+                out << "        __m128 " << vfName(reg) << " = J::load(s.vf[" << reg << "]);\n";
+        out << "        [[maybe_unused]] __m128 acc = " << (accUsed ? "J::load(s.acc)" : "_mm_setzero_ps()") << ";\n";
+        for (uint32_t reg = 1; reg < 16u; ++reg)
+            if (viUsed[reg])
+                out << "        int32_t " << viName(reg) << " = s.vi[" << reg << "];\n";
+        out << body.str();
+        body.str("");
+        storeAll("        ");
+        out << body.str();
+        const uint32_t lastPc = (firstPair + end - 1u) * 8u;
+        if (branchEnd)
+            out << "        s.pc = taken ? target : J::wrapPc(context, " << (lastPc + 8u) << "u);\n";
+        else
+            out << "        s.pc = J::wrapPc(context, " << (lastPc + 8u) << "u);\n";
+        out << "        J::leave<kBlockPlan" << id << ", kBlockPairs" << id << ">(vu, base);\n";
+        if (lastViReg >= 0)
+            out << "        J::recordViForBranch(vu, " << lastViReg << ", viLastOld);\n";
+        out << "        return Vu::StepResult::" << (eBitEnd ? "Ended" : "Continue") << ";\n    }\n";
+        return true;
+    }
+
     // Straight-line runs [first, end) of the fragment: a block ends after a branch's delay slot and after the delay
     // slot of an E bit, starts at every static branch target, and leaves out XGKICK and reserved pairs (they run on
     // their own, as does any pair a jump lands on in the middle of a block).
@@ -272,23 +679,45 @@ namespace
         out << "// Generated by ps2_vu_aot from " << elfName << " (file offset 0x" << hex(fragment.fileOffset, 0)
             << "): VU1 microcode pairs " << fragment.firstPair << ".." << (fragment.firstPair + fragment.pairCount - 1)
             << ", " << blocks.size() << " blocks.\n"
-            << "#include \"runtime/ps2_vu1_inline.h\"\n\n"
+            << "#include \"runtime/ps2_vu1_jit.h\"\n\n"
+            << "#if PS2X_VU1_JIT\n#define JIT_ENTRY(n) &jit##n\n#else\n#define JIT_ENTRY(n) &block##n\n#endif\n\n"
             << "namespace " << prefix << tag << "\n{\n"
             << "    using Vu = VU1Interpreter;\n";
         const auto decodeCall = [&](uint32_t pair)
         { return "Vu::decodePair(Vu::Unit::VU1, 0x" + hex(words[pair].first, 8) + "u, 0x" + hex(words[pair].second, 8) + "u)"; };
-        std::vector<bool> blockStart(fragment.pairCount, false);
+        std::vector<bool> blockStart(fragment.pairCount, false), jitStart(fragment.pairCount, false);
         for (const auto &[first, end] : blocks)
             blockStart[first] = true;
+        const bool jitEnabled = std::getenv("PS2X_VU_AOT_NO_JIT") == nullptr;
+        // Recompiled blocks first: their pairs only run alone when a block cannot start (or a jump lands inside
+        // one), through the interpreter; compiling them pair by pair takes most of the build.
+        std::vector<std::string> jitText(fragment.pairCount);
+        std::vector<bool> jitCovered(fragment.pairCount, false);
+        if (jitEnabled)
+            for (const auto &[first, end] : blocks)
+            {
+                std::ostringstream jit;
+                const Vu::BlockPlan plan = Vu::planBlock(decoded.data() + first, end - first);
+                if (!writeJitBlock(jit, decoded, first, end, fragment.firstPair, unobserved, plan))
+                    continue;
+                jitText[first] = jit.str();
+                jitStart[first] = true;
+                for (uint32_t pair = first; pair < end; ++pair)
+                    jitCovered[pair] = true;
+            }
         for (uint32_t pair = 0; pair < fragment.pairCount; ++pair)
         {
             const uint32_t id = fragment.firstPair + pair;
             out << "\n    constexpr Vu::DecodedInstructionPair kPair" << id << " = " << decodeCall(pair) << ";\n"
                 << "    Vu::StepResult pair" << id << "(Vu &vu, const Vu::RunContext &context)\n"
-                << "    {\n"
-                << "        return vu.stepPair" << (unobserved[pair] ? "<Vu::kHintFlagsUnobserved>" : "") << "(kPair" << id
-                << ", context);\n"
-                << "    }\n";
+                << "    {\n";
+            if (jitCovered[pair])
+                out << "#if PS2X_VU1_JIT\n        return vu.stepPairInterpreted(kPair" << id << ", context);\n#else\n";
+            out << "        return vu.stepPair" << (unobserved[pair] ? "<Vu::kHintFlagsUnobserved>" : "") << "(kPair" << id
+                << ", context);\n";
+            if (jitCovered[pair])
+                out << "#endif\n";
+            out << "    }\n";
         }
         for (const auto &[first, end] : blocks)
         {
@@ -300,6 +729,10 @@ namespace
             out << "};\n"
                 << "    constexpr Vu::BlockPlan kBlockPlan" << id << " = Vu::planBlock(kBlockPairs" << id << ", " << (end - first)
                 << "u);\n";
+            if (jitStart[first])
+                out << "#if PS2X_VU1_JIT\n" << jitText[first] << "#endif\n";
+            if (jitStart[first])
+                out << "#if !PS2X_VU1_JIT\n";
             for (uint32_t pair = first; pair < end; ++pair)
                 out << "    Vu::StepResult body" << (fragment.firstPair + pair) << "(Vu &vu, const Vu::RunContext &context)\n"
                     << "    {\n"
@@ -318,11 +751,14 @@ namespace
                 << "        return vu.runBlock<kBlockPlan" << id << ", kBlockBodies" << id << ", kBlockPairs" << id
                 << ">(context, &pair" << id << ");\n"
                 << "    }\n";
+            if (jitStart[first])
+                out << "#endif\n";
         }
         out << "\n    constexpr Vu::CompiledEntry kPairs[] = {";
         for (uint32_t pair = 0; pair < fragment.pairCount; ++pair)
-            out << (pair % 8u == 0u ? "\n        " : " ") << (blockStart[pair] ? "&block" : "&pair") << (fragment.firstPair + pair)
-                << ",";
+            out << (pair % 8u == 0u ? "\n        " : " ")
+                << (jitStart[pair] ? "JIT_ENTRY(" : blockStart[pair] ? "&block" : "&pair") << (fragment.firstPair + pair)
+                << (jitStart[pair] ? ")" : "") << ",";
         out << "\n    };\n\n"
             << "    const bool registered = (Vu::registerCompiledFragment({" << fragment.firstPair << "u, "
             << fragment.pairCount << "u, 0x" << hex(fragment.hash, 16) << "ull, kPairs}), true);\n"

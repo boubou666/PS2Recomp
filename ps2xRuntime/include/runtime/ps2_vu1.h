@@ -37,8 +37,16 @@ struct VU1State
     uint32_t branchDelay;
 };
 
+namespace ps2_vu1_detail
+{
+    enum class FmacKind : uint8_t;
+    struct FmacOperation;
+}
+struct Vu1Jit;
+
 class VU1Interpreter
 {
+    friend struct Vu1Jit; // the recompiled blocks (ps2_vu1_jit.h) work on the interpreter's state directly
 public:
     enum class Unit : uint8_t
     {
@@ -145,6 +153,8 @@ public:
     // kUpperHints: kKnownNormal* and kHintFlagsUnobserved.
     template <uint8_t kUpperHints = 0>
     StepResult stepPair(const DecodedInstructionPair &decoded, const RunContext &context);
+    // stepPair(), out of line: for compiled pairs that rarely run alone (inside recompiled blocks).
+    StepResult stepPairInterpreted(const DecodedInstructionPair &decoded, const RunContext &context);
     // run()'s loop condition, checked before every pair.
     bool canIssue(const RunContext &context) const
     {
@@ -216,6 +226,9 @@ public:
     // as it leaves; its pairs before the last two leave the pc and the branch and halt handling to it too.
     template <const BlockPlan &kPlan, const auto &kBodies, const auto &kPairs>
     StepResult runBlock(const RunContext &context, CompiledEntry first);
+    // runBlock()'s entry check: whether the planned schedule holds, from base (the first pair's issue cycle).
+    template <const BlockPlan &kPlan>
+    bool blockReady(const RunContext &context, uint64_t &base) const;
     enum BlockPosition : uint8_t
     {
         NotInBlock,
@@ -431,10 +444,16 @@ private:
     void applyFmacDestAcc(float *result, uint8_t dest);
     template <uint8_t kUpperHints = 0>
     bool fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status, uint32_t &sticky) const;
+    // fmacFlagsFast with the operands given: each callable returns one, normalized (right: broadcast, Q or I
+    // already spread; cross products unshuffled).
+    template <typename Left, typename Right, typename Acc>
+    bool fmacFlagsWith(float *result, uint8_t dest, ps2_vu1_detail::FmacOperation operation, const Left &left,
+                       const Right &right, const Acc &acc, uint32_t &mac, uint32_t &status, uint32_t &sticky) const;
     template <uint8_t kUpperHints = 0>
     void fmacFlags(float *result, uint8_t dest);
     void fmacFlagsSlow(float *result, uint8_t dest);
-    uint8_t fmacSumAtFloatMaxFlags(float &value, uint32_t lane, double sum) const;
+    uint8_t fmacSumAtFloatMaxFlags(float &value, uint32_t lane, double sum, ps2_vu1_detail::FmacKind kind,
+                                   const float left[4], const float right[4], const float acc[4]) const;
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
     bool calculateFmacExactResult(uint32_t component, long double &result) const;
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
