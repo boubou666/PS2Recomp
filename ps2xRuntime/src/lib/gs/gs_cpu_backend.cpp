@@ -895,8 +895,16 @@ namespace
             last = std::min(std::max(high, regionMin), regionMax);
             return;
         }
-        // REGION_REPEAT remaps texels into the region; REPEAT wraps out-of-range ones.
-        if (wrap == 3u || (wrap == 0u && (low < 0 || high >= size)))
+        if (wrap == 3u)
+        {
+            // REGION_REPEAT addresses (coordinate & MIN) | MAX, which can lie past the texture's size.
+            const int regionMask = static_cast<int>((clamp >> (columns ? 4 : 24)) & 0x3FFu);
+            const int regionFix = static_cast<int>((clamp >> (columns ? 14 : 34)) & 0x3FFu);
+            last = std::max(last, regionMask | regionFix);
+            return;
+        }
+        // REPEAT wraps out-of-range texels.
+        if (wrap == 0u && (low < 0 || high >= size))
             return;
         first = std::max(low, 0);
         last = std::min(high, size - 1);
@@ -986,7 +994,7 @@ namespace
         if (blocks.samples)
         {
             textureRows(batch, firstRow, lastRow);
-            blocks.texture = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, lastRow);
+            blocks.texture = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, std::min(lastRow, 2047));
         }
         return blocks;
     }
