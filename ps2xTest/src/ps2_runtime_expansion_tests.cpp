@@ -177,6 +177,12 @@ namespace
 
     std::atomic<uint32_t> gGuestJumpTargetCount{0u};
 
+    void testGuestBranchSelfTailJumpHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 29, 0x00001F00u);
+        runtime->dispatchGuestBranch(rdram, ctx, 0x3600u, 0x3610u, 0u, PS2Runtime::GuestBranchKind::DirectJump, "test-j");
+    }
+
     void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
     {
         gGuestJumpTargetCount.fetch_add(1u, std::memory_order_relaxed);
@@ -459,6 +465,32 @@ void register_ps2_runtime_expansion_tests()
                       "a callee unwinding to the dispatcher must not be taken for a returned stub");
             t.Equals(ctx.pc, 0x3000u, "the pending inner call should stay the resume point");
             t.Equals(::getRegU32(&ctx, 31), 0x3010u, "the inner call's return address should be kept");
+        });
+
+        tc.Run("dispatchGuestBranch call does not treat a tail jump to the callee entry as a return", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3600u, &testGuestBranchSelfTailJumpHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            setRegU32(ctx, 29, 0x00002000u);
+
+            const bool continuedInCaller = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3600u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                "test-jal");
+
+            t.IsFalse(continuedInCaller,
+                      "a pending tail jump back to the callee entry must unwind to the dispatcher");
+            t.Equals(ctx.pc, 0x3600u,
+                     "the dispatcher should resume at the tail-jump target");
+            t.Equals(::getRegU32(&ctx, 29), 0x00001F00u,
+                     "the callee's stack pointer belongs to the pending tail call");
         });
 
         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
