@@ -191,14 +191,37 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
         status |= laneFlags[component];
     }
 
+    if (m_flagWritesDead)
+    {
+        m_deadSticky |= status | extraSticky;
+        return;
+    }
     FlagPipelineEntry *entry = pushFlagEntry(true, 0xFFFFFFFFu);
     if (!entry)
         return;
     entry->mac = mac;
     entry->status = status;
-    entry->extraSticky = extraSticky;
+    entry->extraSticky = extraSticky | m_deadSticky;
+    m_deadSticky = 0u;
     entry->writesMac = true;
     entry->writesStatus = true;
+}
+
+void VU1Interpreter::foldDeadSticky()
+{
+    // The newest pending status write takes them, else the status register.
+    for (uint32_t index = m_flagCount; index-- > 0u;)
+    {
+        FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + index) % kMaxFlagEntries];
+        if (entry.writesStatus)
+        {
+            entry.extraSticky |= m_deadSticky;
+            m_deadSticky = 0u;
+            return;
+        }
+    }
+    m_state.status |= (m_deadSticky & 0xFu) << 6;
+    m_deadSticky = 0u;
 }
 
 void VU1Interpreter::commitFlags()

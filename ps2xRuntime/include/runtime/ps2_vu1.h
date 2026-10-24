@@ -160,6 +160,51 @@ public:
         const CompiledEntry *pairs = nullptr;
     };
     static void registerCompiledFragment(const CompiledFragment &fragment);
+
+    // ---- Blocks: straight-line runs of pairs that ps2_vu_aot compiles as one function ----
+    // planBlock() schedules a block at compile time, assuming every value written before the block is ready by the
+    // time the block first reads it: each pair's issue cycle after entry. runBlock() checks that assumption on entry
+    // (the live-ins: what the block reads before writing it, with the cycle it first reads it) and then issues each
+    // pair at its planned cycle instead of working out its operands' readiness; otherwise it runs the first pair as
+    // stepPair() does and leaves the rest to the per-pair functions. Results, flags and cycle counts are the
+    // interpreter's: the clock goes through the same cycles, and pairs still record when their results land.
+    static constexpr uint32_t kMaxBlockPairs = 64u;
+    struct BlockLiveIn
+    {
+        enum Kind : uint8_t
+        {
+            Vf,
+            Vi,
+            Acc,
+            Fdiv,        // a pending DIV/SQRT/RSQRT the block waits for
+            EfuResource, // the EFU still busy with an earlier instruction
+            EfuEntries   // WAITP before the block's own EFU instructions
+        };
+        Kind kind = Vf;
+        uint8_t reg = 0;
+        uint8_t lanes = 0;
+        uint16_t issue = 0;
+    };
+    struct BlockPlan
+    {
+        uint32_t pairCount = 0;
+        std::array<uint16_t, kMaxBlockPairs> issue{};
+        std::array<BlockLiveIn, 64> liveIns{};
+        uint32_t liveInCount = 0;
+        // Pairs whose MAC/status writes no instruction can see: a later write in the block lands before any reader
+        // runs. They only add their sticky bits, to the next write that does land (m_deadSticky).
+        std::array<bool, kMaxBlockPairs> deadFlags{};
+        bool usesDtBits = false;
+        bool valid = false; // false: not a block runBlock() handles (reserved instruction, XGKICK, too long...)
+    };
+    static constexpr BlockPlan planBlock(const DecodedInstructionPair *pairs, uint32_t count);
+    // kBodies[i] runs pair i as stepPairBody() (a function of its own per pair: inlining a whole block into one
+    // function costs GCC gigabytes); first runs the block's first pair as stepPair() does.
+    template <const BlockPlan &kPlan, const auto &kBodies>
+    StepResult runBlock(const RunContext &context, CompiledEntry first);
+    template <bool kDeadFlags>
+    StepResult stepPairBodyEntry(const DecodedInstructionPair &decoded, const RunContext &context);
+
     static constexpr uint64_t codeHash(const uint8_t *code, uint32_t size)
     {
         uint64_t hash = 0xCBF29CE484222325ull; // FNV-1a
@@ -330,6 +375,19 @@ private:
     __attribute__((always_inline)) inline
 #endif
     StepResult stepPairImpl(const DecodedInstructionPair &decoded, const RunContext &context);
+    // Everything stepPairImpl does once the pair can issue. kDeadFlags: see BlockPlan::deadFlags.
+    template <bool kLogInFlight, bool kDeadFlags = false>
+#if defined(_MSC_VER) && !defined(__clang__)
+    __forceinline
+#else
+    __attribute__((always_inline)) inline
+#endif
+    StepResult stepPairBody(const DecodedInstructionPair &decoded, const RunContext &context);
+    template <BlockLiveIn kLiveIn>
+    uint64_t blockLiveInReadyCycle() const;
+    void foldDeadSticky();
+    bool m_flagWritesDead = false; // the pair being executed has dead MAC/status writes (BlockPlan::deadFlags)
+    uint32_t m_deadSticky = 0;     // their sticky bits (Z/S/U/O), for the next flag write that lands
     StepResult stepPairLogged(const DecodedInstructionPair &decoded, const RunContext &context);
     void stallUntilReady(const DecodedInstructionPair &decoded, uint64_t readyCycle, uint64_t budgetEnd);
 

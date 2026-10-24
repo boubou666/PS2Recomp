@@ -14,6 +14,7 @@
 #include <emmintrin.h>
 #include <immintrin.h>
 #include <limits>
+#include <utility>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #define PS2X_VU_INLINE __forceinline
@@ -868,14 +869,19 @@ PS2X_VU_INLINE void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t 
 
 PS2X_VU_INLINE void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
 {
-    if (dest & 0x8u)
-        dst[0] = result[0];
-    if (dest & 0x4u)
-        dst[1] = result[1];
-    if (dest & 0x2u)
-        dst[2] = result[2];
-    if (dest & 0x1u)
-        dst[3] = result[3];
+    // One vector blend rather than per-lane stores (the result was just written as a vector: scalar reloads of it
+    // stall on store forwarding). Bits are copied as they are.
+    const __m128 value = _mm_loadu_ps(result);
+    if ((dest & 0xFu) == 0xFu)
+    {
+        _mm_storeu_ps(dst, value);
+        return;
+    }
+    if ((dest & 0xFu) == 0u)
+        return;
+    const __m128 keep = _mm_castsi128_ps(_mm_set_epi32((dest & 0x1u) ? -1 : 0, (dest & 0x2u) ? -1 : 0,
+                                                       (dest & 0x4u) ? -1 : 0, (dest & 0x8u) ? -1 : 0));
+    _mm_storeu_ps(dst, _mm_blendv_ps(_mm_loadu_ps(dst), value, keep));
 }
 
 PS2X_VU_INLINE void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
@@ -960,11 +966,25 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
                                                  _mm_cmpgt_epi32(_mm_set1_epi32(253), productExponent));
             const uint32_t zeroProducts = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(zero))) & active;
             const uint32_t normalProducts = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(normal))) & active;
-            if ((zeroProducts | normalProducts) != active)
-                return false;
             const uint32_t productNegative =
                 static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(_mm_xor_si128(leftBits, rightBits)))) & active;
             sticky = (zeroProducts != 0u ? 0x1u : 0u) | (productNegative != 0u ? 0x2u : 0u);
+            if (const uint32_t otherProducts = active & ~(zeroProducts | normalProducts); otherProducts != 0u)
+            {
+#if defined(__AVX2__)
+                // A product of two floats is exact as a double: classify it like classifyExactResult.
+                const __m256d product =
+                    _mm256_andnot_pd(_mm256_set1_pd(-0.0),
+                                     _mm256_mul_pd(_mm256_cvtps_pd(leftVector), _mm256_cvtps_pd(rightVector)));
+                const uint32_t tiny = static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(
+                    product, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::min())), _CMP_LT_OQ)));
+                const uint32_t huge = static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(
+                    product, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::max())), _CMP_GT_OQ)));
+                sticky |= ((tiny & otherProducts) != 0u ? 0x5u : 0u) | ((huge & otherProducts) != 0u ? 0x8u : 0u);
+#else
+                return false;
+#endif
+            }
         }
 
         if (outOfRange != 0u)
@@ -1002,9 +1022,15 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
             const __m256d floatMin = _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::min()));
             const bool exactProduct = kind == FmacKind::Mul || kind == FmacKind::CrossMul;
             // Sums at FLT_MAX or above take the long double result (fmacSumAtFloatMaxFlags), the others the double.
+            // A double sum more than 2^-40 above FLT_MAX is above it exactly, as the long double is: only sums near
+            // FLT_MAX need the long double.
+            const __m256d floatMaxMargin =
+                _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::max()) * (1.0 + 0x1p-40));
             const uint32_t atFloatMax =
                 exactProduct ? 0u
-                             : static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, floatMax, _CMP_GE_OQ))) & outOfRange;
+                             : static_cast<uint32_t>(_mm256_movemask_pd(_mm256_and_pd(
+                                   _mm256_cmp_pd(magnitude, floatMax, _CMP_GE_OQ),
+                                   _mm256_cmp_pd(magnitude, floatMaxMargin, _CMP_LE_OQ)))) & outOfRange;
             const uint32_t classified = outOfRange & ~atFloatMax;
             const uint32_t isZero =
                 static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, _mm256_setzero_pd(), _CMP_EQ_OQ))) & classified;
@@ -1065,12 +1091,18 @@ PS2X_VU_INLINE void VU1Interpreter::fmacFlags(float *result, uint8_t dest)
         fmacFlagsSlow(result, dest);
         return;
     }
+    if (m_flagWritesDead)
+    {
+        m_deadSticky |= status | sticky;
+        return;
+    }
     FlagPipelineEntry *entry = pushFlagEntry(true, 0xFFFFFFFFu);
     if (!entry)
         return;
     entry->mac = mac;
     entry->status = status;
-    entry->extraSticky = sticky;
+    entry->extraSticky = sticky | m_deadSticky;
+    m_deadSticky = 0u;
     entry->writesMac = true;
     entry->writesStatus = true;
 }
@@ -2598,7 +2630,15 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairImpl(const Dec
         if (m_cycle >= budgetEnd)
             return StepResult::Stop;
     }
+    return stepPairBody<kLogInFlight>(decoded, context);
+}
 
+template <bool kLogInFlight, bool kDeadFlags>
+PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const DecodedInstructionPair &decoded,
+                                                                      const RunContext &context)
+{
+    if constexpr (kDeadFlags)
+        m_flagWritesDead = true;
     uint8_t writtenVi = 0u;
     int32_t oldVi = 0;
     if (decoded.lowerUsage.viWrite != 0u)
@@ -2667,6 +2707,8 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairImpl(const Dec
         execLower(decoded.lower, context.vuData, context.dataSize, *context.gs, context.memory, decoded.upper);
     }
 
+    if constexpr (kDeadFlags)
+        m_flagWritesDead = false;
     m_viBranchBackupValid = false;
 
     markPairWrites(decoded);
@@ -2755,5 +2797,307 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairImpl(const Dec
     return programEnded ? StepResult::Ended : StepResult::Continue;
 }
 
+
+
+// ============================================================================
+// Blocks compiled ahead of time (ps2_vu_aot)
+// ============================================================================
+// The issue cycles calculatePairReadyCycle() and stallUntilReady() give each pair of a straight-line run, from the
+// latencies markPairWrites(), queueQ() and queueP() record, with every value written before the run counted as
+// ready. A read of such a value becomes a live-in, checked on entry by runBlock().
+constexpr VU1Interpreter::BlockPlan VU1Interpreter::planBlock(const DecodedInstructionPair *pairs, uint32_t count)
+{
+    BlockPlan plan{};
+    if (count < 2u || count > kMaxBlockPairs)
+        return plan;
+    constexpr int32_t kExternal = -1;
+    std::array<std::array<int32_t, 4>, 32> vfReady{};
+    std::array<int32_t, 16> viReady{};
+    std::array<int32_t, 4> accReady{};
+    for (auto &lanes : vfReady)
+        lanes.fill(kExternal);
+    viReady.fill(kExternal);
+    accReady.fill(kExternal);
+    int32_t fdivReady = kExternal;   // the block's own pending DIV, if any
+    int32_t efuResource = kExternal; // after the block's own EFU instruction
+    int32_t efuEntries = kExternal;  // latest result of the block's own EFU instructions
+    std::array<uint8_t, 32> vfSeen{};
+    uint16_t viSeen = 0;
+    uint8_t accSeen = 0;
+    bool fdivSeen = false, efuResourceSeen = false, efuEntriesSeen = false;
+    bool overflow = false;
+    const auto addLiveIn = [&](BlockLiveIn::Kind kind, uint8_t reg, uint8_t lanes, int32_t issue)
+    {
+        if (plan.liveInCount == plan.liveIns.size())
+        {
+            overflow = true;
+            return;
+        }
+        plan.liveIns[plan.liveInCount++] = {kind, reg, lanes, static_cast<uint16_t>(issue)};
+    };
+
+    int32_t cycle = 0;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        const DecodedInstructionPair &pair = pairs[index];
+        if (pair.upperUsage.reserved || pair.lowerUsage.reserved || pair.lowerUsage.pipeline == PipelineXgkick)
+            return BlockPlan{};
+        plan.usesDtBits = plan.usesDtBits || pair.dBit || pair.tBit;
+
+        // Issue cycle: the latest in-block result this pair reads (calculatePairReadyCycle).
+        int32_t ready = cycle;
+        uint8_t externalVf[32]{};
+        uint16_t externalVi = 0;
+        uint8_t externalAcc = 0;
+        for (const InstructionUsage *usage : {&pair.upperUsage, &pair.lowerUsage})
+        {
+            for (uint32_t read = 0; read < usage->vfReadCount; ++read)
+            {
+                const VfAccess access = usage->vfRead[read];
+                for (uint32_t lane = 0; lane < 4u; ++lane)
+                {
+                    if ((access.lanes & (0x8u >> lane)) == 0u)
+                        continue;
+                    if (vfReady[access.reg][lane] != kExternal)
+                        ready = std::max(ready, vfReady[access.reg][lane]);
+                    else
+                        externalVf[access.reg] = static_cast<uint8_t>(externalVf[access.reg] | (0x8u >> lane));
+                }
+            }
+            for (uint32_t reg = 1; reg < 16u; ++reg)
+            {
+                if ((usage->viRead & (1u << reg)) == 0u)
+                    continue;
+                if (viReady[reg] != kExternal)
+                    ready = std::max(ready, viReady[reg]);
+                else
+                    externalVi = static_cast<uint16_t>(externalVi | (1u << reg));
+            }
+            for (uint32_t lane = 0; lane < 4u; ++lane)
+            {
+                if ((usage->accRead & (0x8u >> lane)) == 0u)
+                    continue;
+                if (accReady[lane] != kExternal)
+                    ready = std::max(ready, accReady[lane]);
+                else
+                    externalAcc = static_cast<uint8_t>(externalAcc | (0x8u >> lane));
+            }
+        }
+        const InstructionUsage &lower = pair.lowerUsage;
+        bool externalFdiv = false, externalEfuResource = false, externalEfuEntries = false;
+        if (lower.pipeline == PipelineFdiv || lower.waitQ)
+        {
+            if (fdivReady != kExternal)
+                ready = std::max(ready, fdivReady);
+            else
+                externalFdiv = true;
+        }
+        if (lower.pipeline == PipelineEfu)
+        {
+            if (efuResource != kExternal)
+                ready = std::max(ready, efuResource);
+            else
+                externalEfuResource = true;
+        }
+        if (lower.waitP)
+        {
+            // Every pending result: the block's own and any from before it.
+            if (efuEntries != kExternal)
+                ready = std::max(ready, efuEntries);
+            externalEfuEntries = true;
+        }
+        plan.issue[index] = static_cast<uint16_t>(ready);
+
+        // Live-ins: the first read of each value from before the block binds the earliest.
+        for (uint32_t reg = 1; reg < 32u; ++reg)
+        {
+            const uint8_t lanes = static_cast<uint8_t>(externalVf[reg] & ~vfSeen[reg]);
+            if (lanes != 0u)
+            {
+                addLiveIn(BlockLiveIn::Vf, static_cast<uint8_t>(reg), lanes, ready);
+                vfSeen[reg] = static_cast<uint8_t>(vfSeen[reg] | lanes);
+            }
+        }
+        for (uint32_t reg = 1; reg < 16u; ++reg)
+        {
+            if ((externalVi & ~viSeen & (1u << reg)) != 0u)
+            {
+                addLiveIn(BlockLiveIn::Vi, static_cast<uint8_t>(reg), 0u, ready);
+                viSeen = static_cast<uint16_t>(viSeen | (1u << reg));
+            }
+        }
+        if (const uint8_t lanes = static_cast<uint8_t>(externalAcc & ~accSeen); lanes != 0u)
+        {
+            addLiveIn(BlockLiveIn::Acc, 0u, lanes, ready);
+            accSeen = static_cast<uint8_t>(accSeen | lanes);
+        }
+        if (externalFdiv && !fdivSeen)
+        {
+            addLiveIn(BlockLiveIn::Fdiv, 0u, 0u, ready);
+            fdivSeen = true;
+        }
+        if (externalEfuResource && !efuResourceSeen)
+        {
+            addLiveIn(BlockLiveIn::EfuResource, 0u, 0u, ready);
+            efuResourceSeen = true;
+        }
+        if (externalEfuEntries && !efuEntriesSeen)
+        {
+            addLiveIn(BlockLiveIn::EfuEntries, 0u, 0u, ready);
+            efuEntriesSeen = true;
+        }
+
+        // Results (markPairWrites, queueQ, queueP).
+        const auto setLanes = [&](std::array<int32_t, 4> &laneReady, uint8_t lanes, int32_t at)
+        {
+            for (uint32_t lane = 0; lane < 4u; ++lane)
+                if ((lanes & (0x8u >> lane)) != 0u)
+                    laneReady[lane] = at;
+        };
+        const VfAccess lowerWrite = lower.vfWrite;
+        if (lowerWrite.reg != 0u && pair.suppressedLowerVf != lowerWrite.reg)
+            setLanes(vfReady[lowerWrite.reg], lowerWrite.lanes,
+                     ready + static_cast<int32_t>(lower.vfLatency != 0u ? lower.vfLatency : lower.latency));
+        const VfAccess upperWrite = pair.upperUsage.vfWrite;
+        if (upperWrite.reg != 0u)
+            setLanes(vfReady[upperWrite.reg], upperWrite.lanes,
+                     ready + static_cast<int32_t>(pair.upperUsage.vfLatency != 0u ? pair.upperUsage.vfLatency
+                                                                               : pair.upperUsage.latency));
+        if (const uint32_t viWrites = lower.viWrite & 0xFFFEu; viWrites != 0u)
+            for (uint32_t reg = 1; reg < 16u; ++reg)
+                if ((viWrites & (1u << reg)) != 0u)
+                    viReady[reg] = ready + static_cast<int32_t>(lower.viLatency != 0u ? lower.viLatency : lower.latency);
+        if (pair.upperUsage.accWrite != 0u)
+            setLanes(accReady, pair.upperUsage.accWrite, ready + static_cast<int32_t>(kAccForwardLatency));
+        if (lower.pipeline == PipelineFdiv && lower.latency != 0u)
+            fdivReady = ready + static_cast<int32_t>(lower.latency);
+        if (lower.pipeline == PipelineEfu && lower.latency != 0u)
+        {
+            efuEntries = std::max(efuEntries, ready + static_cast<int32_t>(lower.latency));
+            efuResource = ready + static_cast<int32_t>(lower.latency) - 1;
+        }
+        cycle = ready + 1;
+        if (cycle > 0xFFFF)
+            return BlockPlan{};
+    }
+    if (overflow)
+        return BlockPlan{};
+
+    // Dead MAC/status writes. Readers: FSEQ, FSSET, FSAND, FSOR, FMEQ, FMAND, FMOR (FSSET also drops the status
+    // writes of its own pair, so neither end of a dead pair may hold one).
+    const auto lowerOp = [&](uint32_t index) { return pairs[index].iBit ? 0xFFu : (pairs[index].lower >> 25); };
+    const auto readsFlags = [&](uint32_t index)
+    {
+        const uint32_t op = lowerOp(index);
+        return op >= 0x14u && op <= 0x1Bu && op != 0x19u;
+    };
+    const auto writesFlags = [&](uint32_t index)
+    { return decodeFmacOperation(pairs[index].upper).kind != FmacKind::None && ((pairs[index].upper >> 21) & 0xFu) != 0u; };
+    const int32_t blockEnd = cycle;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (!writesFlags(index) || lowerOp(index) == 0x15u)
+            continue;
+        uint32_t next = index + 1u;
+        while (next < count && !writesFlags(next))
+            ++next;
+        if (next >= count || lowerOp(next) == 0x15u)
+            continue;
+        const int32_t lands = plan.issue[index] + static_cast<int32_t>(kFmacLatency);
+        const int32_t nextLands = plan.issue[next] + static_cast<int32_t>(kFmacLatency);
+        if (nextLands > blockEnd)
+            continue;
+        bool seen = false;
+        for (uint32_t reader = 0; reader < count && !seen; ++reader)
+            seen = readsFlags(reader) && plan.issue[reader] >= lands && plan.issue[reader] < nextLands;
+        plan.deadFlags[index] = !seen;
+    }
+    plan.pairCount = count;
+    plan.valid = true;
+    return plan;
+}
+
+// The cycle by which a live-in is ready (what calculatePairReadyCycle() would wait for).
+template <VU1Interpreter::BlockLiveIn kLiveIn>
+PS2X_VU_INLINE uint64_t VU1Interpreter::blockLiveInReadyCycle() const
+{
+    constexpr BlockLiveIn liveIn = kLiveIn;
+    const auto lanesReady = [](const std::array<uint64_t, 4> &laneReady) PS2X_VU_LAMBDA_INLINE
+    {
+        uint64_t ready = 0u;
+        for (uint32_t lane = 0; lane < 4u; ++lane)
+            if ((liveIn.lanes & (0x8u >> lane)) != 0u)
+                ready = std::max(ready, laneReady[lane]);
+        return ready;
+    };
+    if constexpr (liveIn.kind == BlockLiveIn::Vf)
+        return lanesReady(m_vfReady[liveIn.reg]);
+    else if constexpr (liveIn.kind == BlockLiveIn::Vi)
+        return m_viReady[liveIn.reg];
+    else if constexpr (liveIn.kind == BlockLiveIn::Acc)
+        return lanesReady(m_accReady);
+    else if constexpr (liveIn.kind == BlockLiveIn::Fdiv)
+        return m_fdiv.valid ? m_fdiv.readyCycle : 0u;
+    else if constexpr (liveIn.kind == BlockLiveIn::EfuResource)
+        return m_efuResourceReady;
+    else
+    {
+        uint64_t ready = 0u;
+        for (const ScalarPipelineEntry &entry : m_efu)
+            if (entry.valid)
+                ready = std::max(ready, entry.readyCycle);
+        return ready;
+    }
+}
+
+template <bool kDeadFlags>
+PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBodyEntry(const DecodedInstructionPair &decoded,
+                                                                           const RunContext &context)
+{
+    return stepPairBody<false, kDeadFlags>(decoded, context);
+}
+
+template <const VU1Interpreter::BlockPlan &kPlan, const auto &kBodies>
+PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::runBlock(const RunContext &context, CompiledEntry first)
+{
+    static_assert(kPlan.valid, "ps2_vu_aot emitted a block planBlock() rejects");
+    // The first pair may wait for values from before the block (a loop's first pair reading what the previous
+    // iteration wrote): the whole schedule then starts that much later, exactly as stallUntilReady() would delay
+    // it. Any other live-in must be ready by its planned cycle.
+    uint64_t base = m_cycle;
+    [&]<size_t... kLiveIn>(std::index_sequence<kLiveIn...>) PS2X_VU_LAMBDA_INLINE
+    {
+        ((kPlan.liveIns[kLiveIn].issue == 0u ? (base = std::max(base, blockLiveInReadyCycle<kPlan.liveIns[kLiveIn]>()))
+                                             : base),
+         ...);
+    }(std::make_index_sequence<kPlan.liveInCount>{});
+    bool ready = !m_logInFlight && !m_state.branchPending && !m_state.haltAfterDelaySlot && !m_state.ebit &&
+                 base + kPlan.issue[kPlan.pairCount - 1u] < context.budgetEnd &&
+                 !(kPlan.usesDtBits && (m_state.dBitEnabled || m_state.tBitEnabled));
+    if (ready)
+    {
+        [&]<size_t... kLiveIn>(std::index_sequence<kLiveIn...>) PS2X_VU_LAMBDA_INLINE
+        {
+            ((ready = ready && (kPlan.liveIns[kLiveIn].issue == 0u ||
+                                blockLiveInReadyCycle<kPlan.liveIns[kLiveIn]>() <= base + kPlan.liveIns[kLiveIn].issue)),
+             ...);
+        }(std::make_index_sequence<kPlan.liveInCount>{});
+    }
+    if (!ready)
+        return first(*this, context);
+
+    StepResult result = StepResult::Continue;
+    [&]<size_t... kIndex>(std::index_sequence<kIndex...>) PS2X_VU_LAMBDA_INLINE
+    {
+        // A stop request (reserved instruction) ends the run before the next pair, as canIssue() would.
+        ((result == StepResult::Continue && !m_stopRequested
+              ? (advanceTo(base + kPlan.issue[kIndex]), result = kBodies[kIndex](*this, context))
+              : result),
+         ...);
+    }(std::make_index_sequence<kPlan.pairCount>{});
+    if (m_deadSticky != 0u) // only when the run stopped before the write that takes them
+        foldDeadSticky();
+    return result;
+}
 
 #endif
