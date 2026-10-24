@@ -8,8 +8,10 @@
 #include "runtime/ps2_vu1.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <emmintrin.h>
 #include <immintrin.h>
@@ -231,6 +233,17 @@ namespace ps2_vu1_detail
         result = _mm_or_si128(_mm_andnot_si128(maxExponent, result),
                               _mm_and_si128(maxExponent, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
         _mm_storeu_si128(reinterpret_cast<__m128i *>(target), result);
+    }
+
+    // PS2X_VU1_EXACT_FLAGS=1: compute the flags kHintFlagsUnobserved would skip.
+    inline bool exactFlagsRequested()
+    {
+        static const bool exact = []
+        {
+            const char *value = std::getenv("PS2X_VU1_EXACT_FLAGS");
+            return value && value[0] == '1';
+        }();
+        return exact;
     }
 
     // normalizeVector(), or a plain copy of a register known to hold normalized values (BlockPlan::knownNormal).
@@ -904,7 +917,7 @@ PS2X_VU_INLINE void VU1Interpreter::applyDestAcc(const float *result, uint8_t de
 // flags. The other lanes (zero results above all) take the exact result as a double, which classifies them like
 // fmacFlagsSlow, or for sums at FLT_MAX its long double; an out-of-range product of a product-sum goes to
 // fmacFlagsSlow.
-template <uint8_t kKnownNormal>
+template <uint8_t kUpperHints>
 PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status,
                                                   uint32_t &sticky) const
 {
@@ -936,11 +949,11 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
     {
         alignas(16) float left[4];
         alignas(16) float right[4];
-        loadOperands<(kKnownNormal & kKnownNormalFs) != 0u>(m_state.vf[FS(upper)], left);
+        loadOperands<(kUpperHints & kKnownNormalFs) != 0u>(m_state.vf[FS(upper)], left);
         switch (operation.right)
         {
         case FmacOperation::Right::Broadcast:
-            if constexpr ((kKnownNormal & kKnownNormalFt) != 0u)
+            if constexpr ((kUpperHints & kKnownNormalFt) != 0u)
                 _mm_store_ps(right, _mm_set1_ps(m_state.vf[FT(upper)][operation.broadcast]));
             else
                 _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.vf[FT(upper)][operation.broadcast])));
@@ -952,7 +965,7 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
             _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.i)));
             break;
         default:
-            loadOperands<(kKnownNormal & kKnownNormalFt) != 0u>(m_state.vf[FT(upper)], right);
+            loadOperands<(kUpperHints & kKnownNormalFt) != 0u>(m_state.vf[FT(upper)], right);
             break;
         }
         __m128 leftVector = _mm_load_ps(left);
@@ -1022,7 +1035,7 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
             default:
             {
                 alignas(16) float accumulator[4];
-                loadOperands<(kKnownNormal & kKnownNormalAcc) != 0u>(m_state.acc, accumulator);
+                loadOperands<(kUpperHints & kKnownNormalAcc) != 0u>(m_state.acc, accumulator);
                 const __m256d accWide = _mm256_cvtps_pd(_mm_load_ps(accumulator));
                 const __m256d product = _mm256_mul_pd(leftWide, rightWide);
                 exact = kind == FmacKind::Madd ? _mm256_add_pd(accWide, product) : _mm256_sub_pd(accWide, product);
@@ -1094,14 +1107,81 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
     return true;
 }
 
-template <uint8_t kKnownNormal>
+template <uint8_t kUpperHints>
 PS2X_VU_INLINE void VU1Interpreter::fmacFlags(float *result, uint8_t dest)
 {
     // dest 0 writes no flags (updateFmacFlags).
     if (dest == 0u)
         return;
+    if constexpr ((kUpperHints & kHintFlagsUnobserved) != 0u)
+    {
+        if (!exactFlagsRequested())
+        {
+            // Only the result matters. fmacFlagsFast leaves lanes with exponent 2..253 as they are, and zeros
+            // whose exact result is a zero of the same sign: a sum is zero only when its operands cancel exactly
+            // (same exponent, so nothing truncated) or are zeros, a product only when an operand is zero; a
+            // product-sum only then too if its product is exactly zero. The other lanes (denormals, near
+            // FLT_MAX, inexact product-sums) go through fmacFlagsFast, their flags dropped.
+            static constexpr uint8_t kDestLanes[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                                                       0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+            const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
+            const __m128i exponent = _mm_and_si128(_mm_srli_epi32(bits, 23), _mm_set1_epi32(0xFF));
+            const __m128i inRange = _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
+                                                  _mm_cmpgt_epi32(_mm_set1_epi32(254), exponent));
+            uint32_t pending = kDestLanes[dest & 0xFu] & ~static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(inRange)));
+            if (pending != 0u)
+            {
+                const uint32_t upper = m_currentUpperInstruction;
+                const FmacOperation operation = decodeFmacOperation(upper);
+                const uint32_t zeros = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
+                    _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128()))));
+                if (operation.kind == FmacKind::Add || operation.kind == FmacKind::Sub || operation.kind == FmacKind::Mul)
+                {
+                    pending &= ~zeros;
+                }
+                else if (operation.kind == FmacKind::Madd || operation.kind == FmacKind::Msub)
+                {
+                    // Operands that normalize to zero: exponent 0.
+                    const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
+                    const auto zeroLanes = [&](__m128i value)
+                    { return _mm_cmpeq_epi32(_mm_and_si128(value, exponentMask), _mm_setzero_si128()); };
+                    __m128i right;
+                    switch (operation.right)
+                    {
+                    case FmacOperation::Right::Broadcast:
+                        right = _mm_set1_epi32(std::bit_cast<int32_t>(m_state.vf[FT(upper)][operation.broadcast]));
+                        break;
+                    case FmacOperation::Right::Q:
+                        right = _mm_set1_epi32(std::bit_cast<int32_t>(m_state.q));
+                        break;
+                    case FmacOperation::Right::I:
+                        right = _mm_set1_epi32(std::bit_cast<int32_t>(m_state.i));
+                        break;
+                    default:
+                        right = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[FT(upper)]));
+                        break;
+                    }
+                    const __m128i left = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[FS(upper)]));
+                    const uint32_t zeroProducts = static_cast<uint32_t>(
+                        _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(zeroLanes(left), zeroLanes(right)))));
+                    pending &= ~(zeros & zeroProducts);
+                }
+            }
+            if (pending == 0u)
+                return;
+            const bool wasDead = m_flagWritesDead;
+            const uint32_t deadSticky = m_deadSticky;
+            m_flagWritesDead = true;
+            uint32_t mac = 0u, status = 0u, sticky = 0u;
+            if (!fmacFlagsFast<kUpperHints>(result, dest, mac, status, sticky))
+                fmacFlagsSlow(result, dest);
+            m_flagWritesDead = wasDead;
+            m_deadSticky = deadSticky;
+            return;
+        }
+    }
     uint32_t mac = 0u, status = 0u, sticky = 0u;
-    if (!fmacFlagsFast<kKnownNormal>(result, dest, mac, status, sticky))
+    if (!fmacFlagsFast<kUpperHints>(result, dest, mac, status, sticky))
     {
         fmacFlagsSlow(result, dest);
         return;
@@ -1122,17 +1202,17 @@ PS2X_VU_INLINE void VU1Interpreter::fmacFlags(float *result, uint8_t dest)
     entry->writesStatus = true;
 }
 
-template <uint8_t kKnownNormal>
+template <uint8_t kUpperHints>
 PS2X_VU_INLINE void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
 {
-    fmacFlags<kKnownNormal>(result, dest);
+    fmacFlags<kUpperHints>(result, dest);
     applyDest(dst, result, dest);
 }
 
-template <uint8_t kKnownNormal>
+template <uint8_t kUpperHints>
 PS2X_VU_INLINE void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 {
-    fmacFlags<kKnownNormal>(result, dest);
+    fmacFlags<kUpperHints>(result, dest);
     applyDestAcc(result, dest);
 }
 
@@ -1342,6 +1422,11 @@ PS2X_VU_INLINE uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedIns
 
 PS2X_VU_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
 {
+    markPairWritesAt(decoded, m_cycle);
+}
+
+PS2X_VU_INLINE void VU1Interpreter::markPairWritesAt(const DecodedInstructionPair &decoded, uint64_t issueCycle)
+{
     // Writeback completion of everything issued so far; the end-of-program flush waits for it.
     const auto noteWriteback = [this](uint64_t readyCycle)
     {
@@ -1367,9 +1452,9 @@ PS2X_VU_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair 
         const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
                                      ? decoded.lowerUsage.vfLatency
                                      : decoded.lowerUsage.latency;
-        setLanes(m_vfReady[lowerWrite.reg], lowerWrite.lanes, m_cycle + latency);
-        m_vfReadyMax[lowerWrite.reg] = std::max(m_vfReadyMax[lowerWrite.reg], m_cycle + latency);
-        noteWriteback(m_cycle + latency);
+        setLanes(m_vfReady[lowerWrite.reg], lowerWrite.lanes, issueCycle + latency);
+        m_vfReadyMax[lowerWrite.reg] = std::max(m_vfReadyMax[lowerWrite.reg], issueCycle + latency);
+        noteWriteback(issueCycle + latency);
     }
 
     const VfAccess upperWrite = decoded.upperUsage.vfWrite;
@@ -1378,14 +1463,14 @@ PS2X_VU_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair 
         const uint32_t latency = decoded.upperUsage.vfLatency != 0u
                                      ? decoded.upperUsage.vfLatency
                                      : decoded.upperUsage.latency;
-        setLanes(m_vfReady[upperWrite.reg], upperWrite.lanes, m_cycle + latency);
-        m_vfReadyMax[upperWrite.reg] = std::max(m_vfReadyMax[upperWrite.reg], m_cycle + latency);
-        noteWriteback(m_cycle + latency);
+        setLanes(m_vfReady[upperWrite.reg], upperWrite.lanes, issueCycle + latency);
+        m_vfReadyMax[upperWrite.reg] = std::max(m_vfReadyMax[upperWrite.reg], issueCycle + latency);
+        noteWriteback(issueCycle + latency);
     }
 
     if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
     {
-        const uint64_t readyCycle = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency
+        const uint64_t readyCycle = issueCycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency
                                                                                    : decoded.lowerUsage.latency);
         for (uint32_t mask = viWrites; mask != 0u; mask &= mask - 1u)
             m_viReady[static_cast<uint32_t>(_tzcnt_u32(mask))] = readyCycle;
@@ -1393,9 +1478,9 @@ PS2X_VU_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair 
     }
     if (decoded.upperUsage.accWrite != 0u)
     {
-        setLanes(m_accReady, decoded.upperUsage.accWrite, m_cycle + kAccForwardLatency);
-        m_accReadyMax = std::max(m_accReadyMax, m_cycle + kAccForwardLatency);
-        noteWriteback(m_cycle + kAccForwardLatency);
+        setLanes(m_accReady, decoded.upperUsage.accWrite, issueCycle + kAccForwardLatency);
+        m_accReadyMax = std::max(m_accReadyMax, issueCycle + kAccForwardLatency);
+        noteWriteback(issueCycle + kAccForwardLatency);
     }
 }
 
@@ -1425,7 +1510,7 @@ PS2X_VU_INLINE void VU1Interpreter::progressXgkick(uint64_t cycles)
 // ============================================================================
 // Upper instructions (FMAC pipeline)
 // ============================================================================
-template <uint8_t kKnownNormal>
+template <uint8_t kUpperHints>
 PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
@@ -1444,9 +1529,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     alignas(16) float normalizedVs[4];
     alignas(16) float normalizedVt[4];
     alignas(16) float normalizedAcc[4];
-    loadOperands<(kKnownNormal & kKnownNormalFs) != 0u>(m_state.vf[fs], normalizedVs);
-    loadOperands<(kKnownNormal & kKnownNormalFt) != 0u>(m_state.vf[ft], normalizedVt);
-    loadOperands<(kKnownNormal & kKnownNormalAcc) != 0u>(m_state.acc, normalizedAcc);
+    loadOperands<(kUpperHints & kKnownNormalFs) != 0u>(m_state.vf[fs], normalizedVs);
+    loadOperands<(kUpperHints & kKnownNormalFt) != 0u>(m_state.vf[ft], normalizedVt);
+    loadOperands<(kUpperHints & kKnownNormalAcc) != 0u>(m_state.acc, normalizedAcc);
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
@@ -1464,7 +1549,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     {
         float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(bc)));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     }
     case 0x04:
@@ -1474,7 +1559,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     {
         float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(bc))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     }
     case 0x08:
@@ -1484,7 +1569,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     {
         float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     }
     case 0x0C:
@@ -1494,7 +1579,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     {
         float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc)))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     }
     case 0x10:
@@ -1527,13 +1612,13 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         float bc = vt[op & 3];
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * bc;
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     }
     case 0x1C: // MULq
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * q;
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x1D: // MAXi
         for (int c = 0; c < 4; c++)
@@ -1543,7 +1628,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x1E: // MULi
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * i;
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x1F: // MINIi
         for (int c = 0; c < 4; c++)
@@ -1552,48 +1637,48 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x20: // ADDq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(q)));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x21: // MADDq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x22: // ADDi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(i)));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x23: // MADDi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x24: // SUBq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(q))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x25: // MSUBq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q)))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x26: // SUBi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(i))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x27: // MSUBi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i)))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x28: // ADD
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_load_ps(vt)));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x29: // MADD
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x2A: // MUL
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * vt[c];
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x2B: // MAX
         for (int c = 0; c < 4; c++)
@@ -1602,18 +1687,18 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x2C: // SUB
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_load_ps(vt))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x2D: // MSUB
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt)))));
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x2E: // OPMSUB
         result[0] = vuSub(acc[0], vs[1] * vt[2]);
         result[1] = vuSub(acc[1], vs[2] * vt[0]);
         result[2] = vuSub(acc[2], vs[0] * vt[1]);
         result[3] = 0.0f;
-        applyFmacDest<kKnownNormal>(vd, result, dest);
+        applyFmacDest<kUpperHints>(vd, result, dest);
         return;
     case 0x2F: // MINI
         for (int c = 0; c < 4; c++)
@@ -1642,7 +1727,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         {
             float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(bc)));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         }
         case 0x04:
@@ -1652,7 +1737,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         {
             float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(bc))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         }
         case 0x08:
@@ -1662,7 +1747,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         {
             float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         }
         case 0x0C:
@@ -1672,7 +1757,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         {
             float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc)))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         }
         case 0x10: // ITOF0
@@ -1751,13 +1836,13 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
             float bc = vt[specialOp & 3];
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * bc;
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         }
         case 0x1C: // MULAq
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * q;
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x1D: // ABS (clears the sign bit; the magnitude bits pass through)
             for (int c = 0; c < 4; c++)
@@ -1772,7 +1857,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         case 0x1E: // MULAi
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * i;
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x1F: // CLIP
         {
@@ -1808,63 +1893,63 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         }
         case 0x20: // ADDAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(q)));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x21: // MADDAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x22: // ADDAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(i)));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x23: // MADDAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x24: // SUBAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(q))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x25: // MSUBAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q)))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x26: // SUBAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(i))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x27: // MSUBAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i)))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x28: // ADDA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_load_ps(vt)));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x29: // MADDA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x2A: // MULA
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * vt[c];
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x2C: // SUBA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_load_ps(vt))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x2D: // MSUBA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt)))));
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x2E: // OPMULA
             result[0] = vs[1] * vt[2];
             result[1] = vs[2] * vt[0];
             result[2] = vs[0] * vt[1];
             result[3] = 0.0f;
-            applyFmacDestAcc<kKnownNormal>(result, dest);
+            applyFmacDestAcc<kUpperHints>(result, dest);
             return;
         case 0x2F:
         case 0x30: // NOP
@@ -2620,16 +2705,17 @@ PS2X_VU_INLINE void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, u
     }
 }
 
+template <uint8_t kUpperHints>
 PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPair(const DecodedInstructionPair &decoded,
                                                                   const RunContext &context)
 {
     // Time-sliced runs keep the previous value of every register they write (logInFlightWrite): out of line.
     if (m_logInFlight)
         return stepPairLogged(decoded, context);
-    return stepPairImpl<false>(decoded, context);
+    return stepPairImpl<false, kUpperHints>(decoded, context);
 }
 
-template <bool kLogInFlight>
+template <bool kLogInFlight, uint8_t kUpperHints>
 PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairImpl(const DecodedInstructionPair &decoded,
                                                                       const RunContext &context)
 {
@@ -2648,10 +2734,10 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairImpl(const Dec
         if (m_cycle >= budgetEnd)
             return StepResult::Stop;
     }
-    return stepPairBody<kLogInFlight>(decoded, context);
+    return stepPairBody<kLogInFlight, false, kUpperHints>(decoded, context);
 }
 
-template <bool kLogInFlight, bool kDeadFlags, uint8_t kKnownNormal>
+template <bool kLogInFlight, bool kDeadFlags, uint8_t kUpperHints, VU1Interpreter::BlockPosition kPosition>
 PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const DecodedInstructionPair &decoded,
                                                                       const RunContext &context)
 {
@@ -2695,7 +2781,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
 
     if (decoded.iBit)
     {
-        execUpper<kKnownNormal>(decoded.upper);
+        execUpper<kUpperHints>(decoded.upper);
         float immediate = 0.0f;
         std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
         m_state.i = normalizeOperand(immediate);
@@ -2707,7 +2793,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
         std::memcpy(oldVf,
                     m_state.vf[decoded.upperVfShadowReg],
                     sizeof(oldVf));
-        execUpper<kKnownNormal>(decoded.upper);
+        execUpper<kUpperHints>(decoded.upper);
         std::memcpy(upperVf,
                     m_state.vf[decoded.upperVfShadowReg],
                     sizeof(upperVf));
@@ -2721,7 +2807,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
     }
     else
     {
-        execUpper<kKnownNormal>(decoded.upper);
+        execUpper<kUpperHints>(decoded.upper);
         execLower(decoded.lower, context.vuData, context.dataSize, *context.gs, context.memory, decoded.upper);
     }
 
@@ -2729,7 +2815,8 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
         m_flagWritesDead = false;
     m_viBranchBackupValid = false;
 
-    markPairWrites(decoded);
+    if constexpr (kPosition == NotInBlock)
+        markPairWrites(decoded);
     if (kLogInFlight && upperWrite.reg != 0u)
     {
         const uint32_t latency =
@@ -2763,6 +2850,12 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
     m_state.vi[0] = 0;
+
+    if constexpr (kPosition == BlockInterior)
+    {
+        advanceOneCycle();
+        return StepResult::Continue;
+    }
 
     uint32_t nextPc = m_state.pc + 8u;
     if (nextPc >= context.codeSize)
@@ -3102,14 +3195,14 @@ PS2X_VU_INLINE uint64_t VU1Interpreter::blockLiveInReadyCycle() const
     }
 }
 
-template <bool kDeadFlags, uint8_t kKnownNormal>
+template <bool kDeadFlags, uint8_t kUpperHints, VU1Interpreter::BlockPosition kPosition>
 PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBodyEntry(const DecodedInstructionPair &decoded,
                                                                            const RunContext &context)
 {
-    return stepPairBody<false, kDeadFlags, kKnownNormal>(decoded, context);
+    return stepPairBody<false, kDeadFlags, kUpperHints, kPosition>(decoded, context);
 }
 
-template <const VU1Interpreter::BlockPlan &kPlan, const auto &kBodies>
+template <const VU1Interpreter::BlockPlan &kPlan, const auto &kBodies, const auto &kPairs>
 PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::runBlock(const RunContext &context, CompiledEntry first)
 {
     static_assert(kPlan.valid, "ps2_vu_aot emitted a block planBlock() rejects");
@@ -3138,15 +3231,49 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::runBlock(const RunCont
     if (!ready)
         return first(*this, context);
 
+    // The interior pairs leave the pc to the block: it is set before the last two pairs, or where the run stops.
+    constexpr uint32_t kInterior = kPlan.pairCount - 2u;
+    const uint32_t entryPc = m_state.pc;
+    const auto pcAfter = [&](uint32_t pairs) PS2X_VU_LAMBDA_INLINE
+    {
+        uint32_t pc = entryPc + 8u * pairs;
+        if (pc >= context.codeSize)
+            pc -= context.codeSize;
+        return pc;
+    };
     StepResult result = StepResult::Continue;
+    uint32_t executed = 0u;
     [&]<size_t... kIndex>(std::index_sequence<kIndex...>) PS2X_VU_LAMBDA_INLINE
     {
         // A stop request (reserved instruction) ends the run before the next pair, as canIssue() would.
-        ((result == StepResult::Continue && !m_stopRequested
-              ? (advanceTo(base + kPlan.issue[kIndex]), result = kBodies[kIndex](*this, context))
-              : result),
-         ...);
+        const auto runPair = [&]<size_t kPair>() PS2X_VU_LAMBDA_INLINE
+        {
+            if (result != StepResult::Continue || m_stopRequested)
+                return;
+            if constexpr (kPair == kInterior)
+                m_state.pc = pcAfter(kInterior);
+            advanceTo(base + kPlan.issue[kPair]);
+            result = kBodies[kPair](*this, context);
+            ++executed;
+        };
+        (runPair.template operator()<kIndex>(), ...);
     }(std::make_index_sequence<kPlan.pairCount>{});
+
+    // When each pair's results land, as markPairWrites() would have recorded them pair by pair.
+    if (executed == kPlan.pairCount)
+    {
+        [&]<size_t... kIndex>(std::index_sequence<kIndex...>) PS2X_VU_LAMBDA_INLINE
+        {
+            (markPairWritesAt(kPairs[kIndex], base + kPlan.issue[kIndex]), ...);
+        }(std::make_index_sequence<kPlan.pairCount>{});
+    }
+    else
+    {
+        for (uint32_t pair = 0; pair < executed; ++pair)
+            markPairWritesAt(kPairs[pair], base + kPlan.issue[pair]);
+        if (executed <= kInterior)
+            m_state.pc = pcAfter(executed);
+    }
     if (m_deadSticky != 0u) // only when the run stopped before the write that takes them
         foldDeadSticky();
     return result;

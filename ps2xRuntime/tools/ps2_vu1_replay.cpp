@@ -1,6 +1,8 @@
 // Replays VU1 microprogram runs recorded with PS2X_VU1_RECORD and compares the interpreter's results
 // (registers, VU1 data memory, PATH1 packets, cycle count) with the recording.
-//   ps2_vu1_replay <trace> [repeat]   repeat > 1 also reports the interpreter's speed.
+//   ps2_vu1_replay <trace> [repeat] [--ignore-flags]   repeat > 1 also reports the interpreter's speed.
+// --ignore-flags leaves out the MAC and status flags, which compiled microcode skips where no instruction can read
+// them (VU1Interpreter::kHintFlagsUnobserved).
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_vu1_trace.h"
 
@@ -21,6 +23,8 @@ void (*g_ps2RecompiledFunctionTable[1])(uint8_t *, R5900Context *, PS2Runtime *)
 
 namespace
 {
+    bool g_ignoreFlags = false;
+
     std::string describeStateDifference(const VU1State &expected, const VU1State &actual)
     {
         std::string diff;
@@ -58,9 +62,11 @@ namespace
         scalar("i", &expected.i, &actual.i, 4);
         scalar("r", &expected.r, &actual.r, 4);
         scalar("pc", &expected.pc, &actual.pc, 4);
-        scalar("mac", &expected.mac, &actual.mac, 4);
+        if (!g_ignoreFlags)
+            scalar("mac", &expected.mac, &actual.mac, 4);
         scalar("clip", &expected.clip, &actual.clip, 4);
-        scalar("status", &expected.status, &actual.status, 4);
+        if (!g_ignoreFlags)
+            scalar("status", &expected.status, &actual.status, 4);
         scalar("stoppedByD", &expected.stoppedByD, &actual.stoppedByD, 1);
         scalar("stoppedByT", &expected.stoppedByT, &actual.stoppedByT, 1);
         return diff;
@@ -69,22 +75,30 @@ namespace
 
 int main(int argc, char **argv)
 {
-    if (argc < 2)
+    std::vector<const char *> args;
+    for (int index = 1; index < argc; ++index)
     {
-        std::fprintf(stderr, "usage: %s <trace> [repeat]\n", argv[0]);
+        if (std::strcmp(argv[index], "--ignore-flags") == 0)
+            g_ignoreFlags = true;
+        else
+            args.push_back(argv[index]);
+    }
+    if (args.empty())
+    {
+        std::fprintf(stderr, "usage: %s <trace> [repeat] [--ignore-flags]\n", argv[0]);
         return 2;
     }
-    FILE *in = std::fopen(argv[1], "rb");
+    FILE *in = std::fopen(args[0], "rb");
     if (!in)
     {
-        std::fprintf(stderr, "cannot open %s\n", argv[1]);
+        std::fprintf(stderr, "cannot open %s\n", args[0]);
         return 2;
     }
     std::vector<Vu1TraceRecord> records;
     for (Vu1TraceRecord record; readVu1TraceRecord(in, record);)
         records.push_back(record);
     std::fclose(in);
-    const int repeat = argc > 2 ? std::atoi(argv[2]) : 1;
+    const int repeat = args.size() > 1 ? std::atoi(args[1]) : 1;
 
     GS gs; // never initialized: packets are only observed
     VU1Interpreter vu1;
