@@ -894,6 +894,8 @@ bool PS2Runtime::syncCoreSubsystems()
     m_vu1.reset();
     if (const char *threaded = std::getenv("PS2X_VIF1_THREAD"); threaded && threaded[0] == '1')
         m_memory.setVif1Threaded(true);
+    if (const char *lag = std::getenv("PS2X_GS_LAG"); lag && lag[0] == '1')
+        m_memory.setGsLag(true);
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;

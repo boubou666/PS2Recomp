@@ -366,6 +366,19 @@ public:
     void setVif1Threaded(bool enabled);
     bool vif1Threaded() const { return m_vif1Threaded; }
     void waitForVif1() const;
+    // GS lag (with the worker): the GS and VU1 may finish a frame while the EE runs the next one, as on the
+    // hardware. PATH3 packets and GS privileged register writes then join the worker's queue in order instead of
+    // waiting for it (CSR, live state, is read and written at once), the presented frame is latched by the worker
+    // once it has drawn it (queueVif1Callback), and sceGsSyncPath only waits for the frame before
+    // (waitForVif1PreviousFrame). PS2X_GS_LAG=1 enables it. A game whose threads depend on the EE being held back
+    // by the GS may behave differently with it.
+    void setGsLag(bool enabled) { m_gsLag = enabled; }
+    bool gsLag() const { return m_gsLag && m_vif1Threaded; }
+    void queueVif1Callback(std::function<void()> callback);
+    // Marks the end of a frame in the queue (the presentation latch).
+    void markVif1Frame();
+    // Waits for the transfers queued before the last frame mark.
+    void waitForVif1PreviousFrame();
     bool onVif1Worker() const;
     // VU0 FBRST of the EE when the transfer being processed was queued (D and T bit enables of VU1).
     using Vu0FbrstProvider = std::function<uint32_t()>;
@@ -453,10 +466,26 @@ public:
 
     struct Vif1Job
     {
+        enum class Kind : uint8_t
+        {
+            Vif1,        // VIF1 DMA data
+            Path3,       // a GIF packet on PATH3
+            PrivWrite32, // GS privileged register writes
+            PrivWrite64,
+            Callback,
+        };
+        Kind kind = Kind::Vif1;
         std::vector<uint8_t> data;
         uint32_t vu0Fbrst = 0;
+        uint32_t address = 0;
+        uint64_t value = 0;
+        std::function<void()> callback;
     };
     void queueVif1Job(std::vector<uint8_t> data);
+    void queueVif1Job(Vif1Job job);
+    void waitForVif1Until(uint64_t queued) const;
+    bool m_gsLag = false;
+    uint64_t m_vif1FrameMark = 0;
     void vif1WorkerMain();
     void stopVif1Worker();
     bool m_vif1Threaded = false;

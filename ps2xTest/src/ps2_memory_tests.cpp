@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 namespace
@@ -1551,6 +1553,34 @@ void register_ps2_memory_tests()
             for (uint32_t i = 0; i < 64u && unpacked; ++i)
                 unpacked = mem.read8(PS2_VU1_DATA_BASE + i * 16u + 7u) == static_cast<uint8_t>(i + 1u);
             t.IsTrue(unpacked, "reading VU1 memory should see every queued unpack, each with its own source data");
+            mem.setVif1Threaded(false);
+        });
+
+        tc.Run("GS lag: display register writes apply after the queued work, CSR stays live", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setVif1Threaded(true);
+            mem.setGsLag(true);
+
+            // Hold the worker on a queued job, as if it were still drawing the frame before.
+            std::atomic<bool> release{false};
+            mem.queueVif1Callback([&release]()
+                                  {
+                                      while (!release.load())
+                                          std::this_thread::yield();
+                                  });
+            constexpr uint32_t kDispfb1 = 0x12000070u;
+            constexpr uint32_t kCsr = 0x12001000u;
+            mem.write64(kDispfb1, 0x1234u);
+            t.IsTrue(mem.gs().dispfb1 != 0x1234u, "DISPFB1 should wait in the queue behind the work before it");
+            mem.gs().csr.fetch_or(0x2000u);
+            t.IsTrue((mem.read64(kCsr) & 0x2000u) != 0u, "a CSR read should not wait for the queue");
+
+            release.store(true);
+            t.Equals(mem.read64(kDispfb1), static_cast<uint64_t>(0x1234u),
+                     "reading DISPFB1 should wait for the queue and see the write");
+            mem.setGsLag(false);
             mem.setVif1Threaded(false);
         });
 

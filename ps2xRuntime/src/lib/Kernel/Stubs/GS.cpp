@@ -1293,6 +1293,15 @@ namespace ps2_stubs
         int32_t mode = static_cast<int32_t>(getRegU32(ctx, 4));
         auto &mem = runtime->memory();
 
+        // With the GS lag the paths count as idle once the frame before is drawn: the transfers queued since then
+        // have their data copied already (PS2Memory::setGsLag).
+        if (mode == 0 && mem.gsLag())
+        {
+            mem.processPendingTransfers();
+            mem.waitForVif1PreviousFrame();
+            setReturnS32(ctx, 0);
+            return;
+        }
         if (mode == 0)
         {
             mem.processPendingTransfers();

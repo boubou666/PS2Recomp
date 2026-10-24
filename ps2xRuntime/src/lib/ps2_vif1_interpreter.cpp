@@ -745,6 +745,23 @@ void PS2Memory::waitForVif1() const
     if (!m_vif1Threaded || t_onVif1Worker)
         return;
     const uint64_t queued = m_vif1Queued.load(std::memory_order_acquire);
+    waitForVif1Until(queued);
+}
+
+void PS2Memory::markVif1Frame()
+{
+    m_vif1FrameMark = m_vif1Queued.load(std::memory_order_acquire);
+}
+
+void PS2Memory::waitForVif1PreviousFrame()
+{
+    if (!m_vif1Threaded || t_onVif1Worker)
+        return;
+    waitForVif1Until(m_vif1FrameMark);
+}
+
+void PS2Memory::waitForVif1Until(uint64_t queued) const
+{
     if (m_vif1Done.load(std::memory_order_acquire) >= queued)
         return;
 
@@ -767,6 +784,19 @@ void PS2Memory::queueVif1Job(std::vector<uint8_t> data)
         return;
     Vif1Job job;
     job.data = std::move(data);
+    queueVif1Job(std::move(job));
+}
+
+void PS2Memory::queueVif1Callback(std::function<void()> callback)
+{
+    Vif1Job job;
+    job.kind = Vif1Job::Kind::Callback;
+    job.callback = std::move(callback);
+    queueVif1Job(std::move(job));
+}
+
+void PS2Memory::queueVif1Job(Vif1Job job)
+{
     job.vu0Fbrst = m_vu0FbrstProvider ? m_vu0FbrstProvider() : 0u;
     {
         std::lock_guard<std::mutex> lock(m_vif1Mutex);
@@ -791,7 +821,24 @@ void PS2Memory::vif1WorkerMain()
             m_vif1Jobs.pop_front();
         }
         m_vif1JobVu0Fbrst = job.vu0Fbrst;
-        processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
+        switch (job.kind)
+        {
+        case Vif1Job::Kind::Vif1:
+            processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
+            break;
+        case Vif1Job::Kind::Path3:
+            submitGifPacket(GifPathId::Path3, job.data.data(), static_cast<uint32_t>(job.data.size()), false);
+            break;
+        case Vif1Job::Kind::PrivWrite32:
+            write32(job.address, static_cast<uint32_t>(job.value));
+            break;
+        case Vif1Job::Kind::PrivWrite64:
+            write64(job.address, job.value);
+            break;
+        case Vif1Job::Kind::Callback:
+            job.callback();
+            break;
+        }
         if (m_gifArbiter)
             m_gifArbiter->drain();
         {

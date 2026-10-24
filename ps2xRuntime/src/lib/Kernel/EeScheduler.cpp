@@ -1974,7 +1974,18 @@ void EeScheduler::processEvent(const EeEvent &event)
             }
             if (frameComplete || ++s_vblanksWithoutLatch >= kMaxVBlanksWithoutLatch)
             {
-                m_runtime.gsForPresentation().latchHostPresentationFrame();
+                PS2Memory &memory = m_runtime.memory();
+                if (memory.gsLag())
+                {
+                    // The worker may still be drawing the frame: it latches once it has.
+                    PS2Runtime *runtime = &m_runtime;
+                    memory.queueVif1Callback([runtime]() { runtime->gsForPresentation().latchHostPresentationFrame(); });
+                    memory.markVif1Frame();
+                }
+                else
+                {
+                    m_runtime.gsForPresentation().latchHostPresentationFrame();
+                }
                 s_vblanksWithoutLatch = 0u;
             }
         }

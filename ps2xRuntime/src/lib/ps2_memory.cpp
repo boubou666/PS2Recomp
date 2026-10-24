@@ -98,6 +98,7 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+    constexpr uint32_t kGsCsrReset = 1u << 9;
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -752,9 +753,10 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
-        waitForVif1();
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (!(regOff == kGsCsrRegOffset && gsLag())) // CSR is live state: with the GS lag it does not wait
+            waitForVif1();
         if (regOff == kGsCsrRegOffset)
         {
             uint64_t val = gs_regs.csr.load();
@@ -801,8 +803,9 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
-        waitForVif1();
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (!(regOff == kGsCsrRegOffset && gsLag()))
+            waitForVif1();
         if (regOff == kGsCsrRegOffset)
         {
             return gs_regs.csr.load();
@@ -963,9 +966,28 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
-        waitForVif1();
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (gsLag() && !onVif1Worker())
+        {
+            // CSR (interrupt acknowledgements, the FIELD bit the EE just read) applies now, the display registers
+            // after the queued drawing; a GS reset waits for it.
+            if (regOff != kGsCsrRegOffset)
+            {
+                Vif1Job job;
+                job.kind = Vif1Job::Kind::PrivWrite32;
+                job.address = address;
+                job.value = value;
+                queueVif1Job(std::move(job));
+                return;
+            }
+            if (off == 0u && (value & kGsCsrReset) != 0u)
+                waitForVif1();
+        }
+        else
+        {
+            waitForVif1();
+        }
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1024,8 +1046,25 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
-        waitForVif1();
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (gsLag() && !onVif1Worker())
+        {
+            if (regOff != kGsCsrRegOffset) // as in write32
+            {
+                Vif1Job job;
+                job.kind = Vif1Job::Kind::PrivWrite64;
+                job.address = address;
+                job.value = value;
+                queueVif1Job(std::move(job));
+                return;
+            }
+            if ((value & kGsCsrReset) != 0u)
+                waitForVif1();
+        }
+        else
+        {
+            waitForVif1();
+        }
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -1814,7 +1853,9 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
 
 void PS2Memory::processPendingTransfers()
 {
-    const bool hadGif = !m_pendingGifTransfers.empty();
+    // With the GS lag, PATH3 packets join the worker's queue after the PATH1/PATH2 packets before them.
+    const bool queueGif = gsLag();
+    const bool hadGif = !m_pendingGifTransfers.empty() && !queueGif;
     if (hadGif)
         waitForVif1(); // PATH3 after the queued PATH1/PATH2 packets
     uint32_t observedGifQwc = 0u;
@@ -1833,6 +1874,19 @@ void PS2Memory::processPendingTransfers()
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
     }
 
+    // PATH3 packets: to the worker's queue (a copy: the EE may reuse the buffer) with the GS lag, else now.
+    const auto submitPath3 = [&](const uint8_t *data, uint32_t size)
+    {
+        if (queueGif)
+        {
+            Vif1Job job;
+            job.kind = Vif1Job::Kind::Path3;
+            job.data.assign(data, data + size);
+            queueVif1Job(std::move(job));
+            return;
+        }
+        submitGifPacket(GifPathId::Path3, data, size, false);
+    };
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
@@ -1840,6 +1894,14 @@ void PS2Memory::processPendingTransfers()
         {
             m_seenGifCopy = true;
             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+            if (queueGif)
+            {
+                Vif1Job job;
+                job.kind = Vif1Job::Kind::Path3;
+                job.data = std::move(p.chainData);
+                queueVif1Job(std::move(job));
+                continue;
+            }
             submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
         }
         else if (p.qwc > 0)
@@ -1869,7 +1931,7 @@ void PS2Memory::processPendingTransfers()
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
+                    submitPath3(m_scratchpad + srcPhys, chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1888,7 +1950,7 @@ void PS2Memory::processPendingTransfers()
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
+                    submitPath3(m_rdram + srcPhys, chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
