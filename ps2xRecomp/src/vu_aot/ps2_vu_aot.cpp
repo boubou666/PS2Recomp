@@ -195,6 +195,13 @@ namespace
         bool liveFlags = false; // an FMAC whose flags a reader can see (Vu1Jit::fmacLive)
     };
 
+    // PS2X_VU_AOT_RELAXED=1: FMAC instructions of recompiled blocks as plain SSE (Vu1Jit::fmacRelaxed).
+    bool relaxedFloat()
+    {
+        static const bool relaxed = std::getenv("PS2X_VU_AOT_RELAXED") != nullptr;
+        return relaxed;
+    }
+
     std::string vfName(uint32_t reg) { return "vf" + std::to_string(reg); }
     std::string viName(uint32_t reg) { return reg == 0u ? std::string("vi0") : "vi" + std::to_string(reg); }
 
@@ -383,7 +390,9 @@ namespace
             {
             case J::Upper::Fmac:
             case J::Upper::FmacAcc:
-                if (pi.liveFlags)
+                if (relaxedFloat())
+                    up << "J::fmacRelaxed<" << hex32(upper) << ", " << (pi.liveFlags ? "true" : "false") << ">(vu, ";
+                else if (pi.liveFlags)
                     up << "J::fmacLive<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u, "
                        << (plan.deadFlags[k] ? "true" : "false") << ">(vu, ";
                 else
@@ -683,6 +692,8 @@ namespace
             << "#if PS2X_VU1_JIT\n#define JIT_ENTRY(n) &jit##n\n#else\n#define JIT_ENTRY(n) &block##n\n#endif\n\n"
             << "namespace " << prefix << tag << "\n{\n"
             << "    using Vu = VU1Interpreter;\n";
+        if (relaxedFloat())
+            out << "#if PS2X_VU1_JIT\n    [[maybe_unused]] const bool kRelaxedFloat = Vu1Jit::enableRelaxedFloat();\n#endif\n";
         const auto decodeCall = [&](uint32_t pair)
         { return "Vu::decodePair(Vu::Unit::VU1, 0x" + hex(words[pair].first, 8) + "u, 0x" + hex(words[pair].second, 8) + "u)"; };
         std::vector<bool> blockStart(fragment.pairCount, false), jitStart(fragment.pairCount, false);

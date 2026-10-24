@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 
+#include <atomic>
 #include <cfenv>
 #include <limits>
 #include <cmath>
@@ -448,6 +449,25 @@ void VU1Interpreter::stallUntilReady(const DecodedInstructionPair &decoded, uint
         advanceTo(readyCycle);
         readyCycle = calculatePairReadyCycle(decoded);
     }
+}
+
+namespace
+{
+    std::atomic<bool> &relaxedFloatFlag()
+    {
+        static std::atomic<bool> flag{false};
+        return flag;
+    }
+}
+
+void VU1Interpreter::setRelaxedFloat(bool enabled)
+{
+    relaxedFloatFlag().store(enabled, std::memory_order_relaxed);
+}
+
+bool VU1Interpreter::relaxedFloat()
+{
+    return relaxedFloatFlag().load(std::memory_order_relaxed);
 }
 
 VU1Interpreter::StepResult VU1Interpreter::stepPairInterpreted(const DecodedInstructionPair &decoded,
@@ -959,6 +979,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    const bool relaxed = m_unit == Unit::VU1 && relaxedFloat();
+    const unsigned int previousCsr = relaxed ? _mm_getcsr() : 0u;
+    if (relaxed)
+        _mm_setcsr(previousCsr | 0x8040u); // flush to zero, denormals are zero
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     commitReadyPipelines(); // afterwards every clock advance commits what became ready
@@ -1028,6 +1052,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     }
     commitFlags();
     m_state.cycles = m_cycle;
+    if (relaxed)
+        _mm_setcsr((_mm_getcsr() & ~0x8040u) | (previousCsr & 0x8040u));
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }

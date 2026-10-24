@@ -711,12 +711,12 @@ constexpr VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(Unit
     case 0x74:
     case 0x75:
     case 0x76:
-    case 0x77:
     case 0x78:
     case 0x79:
     case 0x7A:
     case 0x7C:
     case 0x7D:
+    case 0x7E:
         if (unit == Unit::VU0)
         {
             usage.reserved = true;
@@ -728,9 +728,11 @@ constexpr VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(Unit
         case 0x70:
             usage.latency = 11u;
             break;
+        // The special codes go by four, like DIV/SQRT/RSQRT/WAITQ at 0x38..0x3B: 0x78 ESQRT, 0x79 ERSQRT,
+        // 0x7A ERCPR, 0x7B WAITP, 0x7C ESIN, 0x7D EATAN, 0x7E EEXP (0x77 and 0x7F are not instructions).
         case 0x71:
         case 0x72:
-        case 0x77:
+        case 0x79:
             usage.latency = 18u;
             break;
         case 0x73:
@@ -738,7 +740,7 @@ constexpr VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(Unit
             break;
         case 0x74:
         case 0x75:
-        case 0x7C:
+        case 0x7D:
             usage.latency = 54u;
             break;
         case 0x76:
@@ -746,10 +748,10 @@ constexpr VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(Unit
         case 0x7A:
             usage.latency = 12u;
             break;
-        case 0x79:
+        case 0x7C:
             usage.latency = 29u;
             break;
-        case 0x7D:
+        case 0x7E:
             usage.latency = 44u;
             break;
         default:
@@ -2665,7 +2667,7 @@ PS2X_VU_INLINE void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, u
                 queueP(sum, 12u);
                 return;
             }
-            case 0x77: // ERSQRT
+            case 0x79: // ERSQRT
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -2686,7 +2688,7 @@ PS2X_VU_INLINE void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, u
                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
                 return;
             }
-            case 0x79: // ESIN
+            case 0x7C: // ESIN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -2702,13 +2704,13 @@ PS2X_VU_INLINE void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, u
             }
             case 0x7B: // WAITP
                 return;
-            case 0x7C: // EATAN
+            case 0x7D: // EATAN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
                 return;
             }
-            case 0x7D: // EEXP
+            case 0x7E: // EEXP
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);

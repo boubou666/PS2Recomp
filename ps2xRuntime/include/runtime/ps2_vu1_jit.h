@@ -177,8 +177,8 @@ struct Vu1Jit
         case 0x41u: return Lower::Rget;
         case 0x42u: return Lower::Rinit;
         case 0x43u: return Lower::Rxor;
-        case 0x70u: case 0x71u: case 0x72u: case 0x73u: case 0x74u: case 0x75u: case 0x76u: case 0x77u: case 0x78u:
-        case 0x79u: case 0x7Au: case 0x7Cu: case 0x7Du:
+        case 0x70u: case 0x71u: case 0x72u: case 0x73u: case 0x74u: case 0x75u: case 0x76u: case 0x78u: case 0x79u:
+        case 0x7Au: case 0x7Cu: case 0x7Du: case 0x7Eu:
             return Lower::Efu;
         case 0x64u: return Lower::Mfp;
         case 0x68u: return Lower::Xtop;
@@ -354,6 +354,81 @@ struct Vu1Jit
             entry->writesStatus = true;
         }
         target = blend<kDest>(target, _mm_load_ps(result));
+    }
+
+    // ---- Relaxed float mode (VU1Interpreter::setRelaxedFloat) ----
+    static bool enableRelaxedFloat()
+    {
+        Vu::setRelaxedFloat(true);
+        return true;
+    }
+    template <uint32_t kIndex>
+    static PS2X_VU_INLINE __m128 spread(__m128 value)
+    {
+        return _mm_shuffle_ps(value, value, _MM_SHUFFLE(kIndex, kIndex, kIndex, kIndex));
+    }
+    // An FMAC instruction as plain SSE: operands as they are (denormals are zero under DAZ), the sum of IEEE
+    // arithmetic instead of the PS2's (no operand truncation), the result clamped to +-FLT_MAX. kLiveFlags: the MAC
+    // and status flags a reader can see, from the result (zero, sign, overflow before the clamp), queued at the issue
+    // cycle (the caller advanced the clock to it).
+    template <uint32_t kUpper, bool kLiveFlags>
+    static PS2X_VU_INLINE void fmacRelaxed(Vu &vu, __m128 &target, __m128 vs, __m128 vt, __m128 acc)
+    {
+        constexpr FmacOperation kOperation = ps2_vu1_detail::decodeFmacOperation(kUpper);
+        constexpr uint8_t kDest = (kUpper >> 21) & 0xFu;
+        if constexpr (kDest == 0u)
+            return;
+        __m128 right;
+        if constexpr (kOperation.right == FmacOperation::Right::Broadcast)
+            right = spread<kOperation.broadcast>(vt);
+        else if constexpr (kOperation.right == FmacOperation::Right::Q)
+            right = _mm_set1_ps(vu.m_state.q);
+        else if constexpr (kOperation.right == FmacOperation::Right::I)
+            right = _mm_set1_ps(vu.m_state.i);
+        else
+            right = vt;
+        __m128 left = vs;
+        if constexpr (kOperation.kind == FmacKind::CrossMul || kOperation.kind == FmacKind::CrossMsub)
+        {
+            left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));     // y z x w
+            right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(3, 1, 0, 2)); // z x y w
+        }
+        __m128 result;
+        if constexpr (kOperation.kind == FmacKind::Add)
+            result = _mm_add_ps(left, right);
+        else if constexpr (kOperation.kind == FmacKind::Sub)
+            result = _mm_sub_ps(left, right);
+        else if constexpr (kOperation.kind == FmacKind::Mul || kOperation.kind == FmacKind::CrossMul)
+            result = _mm_mul_ps(left, right);
+        else if constexpr (kOperation.kind == FmacKind::Madd)
+            result = _mm_add_ps(acc, _mm_mul_ps(left, right));
+        else
+            result = _mm_sub_ps(acc, _mm_mul_ps(left, right));
+        if constexpr (kOperation.kind == FmacKind::CrossMul || kOperation.kind == FmacKind::CrossMsub)
+            result = _mm_blend_ps(result, _mm_setzero_ps(), 0x8);
+        const __m128 maximum = _mm_set1_ps(std::numeric_limits<float>::max());
+        const __m128 clamped = _mm_max_ps(_mm_min_ps(result, maximum), _mm_xor_ps(maximum, _mm_set1_ps(-0.0f)));
+        if constexpr (kLiveFlags)
+        {
+            static constexpr uint8_t kReverse4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                                                      0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+            constexpr uint32_t kActive = ((kDest >> 3) & 1u) | (((kDest >> 2) & 1u) << 1) | (((kDest >> 1) & 1u) << 2) |
+                                         ((kDest & 1u) << 3);
+            const uint32_t zero = static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpeq_ps(clamped, _mm_setzero_ps()))) & kActive;
+            const uint32_t sign = static_cast<uint32_t>(_mm_movemask_ps(clamped)) & kActive;
+            const uint32_t overflow =
+                static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpneq_ps(clamped, result))) & kActive;
+            if (Vu::FlagPipelineEntry *entry = vu.pushFlagEntry(true, 0xFFFFFFFFu))
+            {
+                entry->mac = static_cast<uint32_t>(kReverse4[zero]) | (static_cast<uint32_t>(kReverse4[sign]) << 4) |
+                             (static_cast<uint32_t>(kReverse4[overflow]) << 12);
+                entry->status = (zero ? 0x1u : 0u) | (sign ? 0x2u : 0u) | (overflow ? 0x8u : 0u);
+                entry->extraSticky = 0u;
+                entry->writesMac = true;
+                entry->writesStatus = true;
+            }
+        }
+        target = blend<kDest>(target, clamped);
     }
 
     template <FmacOperation kOperation>
@@ -782,7 +857,7 @@ struct Vu1Jit
                 sum += n(component);
             vu.queueP(sum, 12u);
         }
-        else if constexpr (kFunct == 0x77u) // ERSQRT
+        else if constexpr (kFunct == 0x79u) // ERSQRT
         {
             float result = n(kComponent);
             if (result >= 0.0f)
@@ -798,14 +873,14 @@ struct Vu1Jit
             const float value = n(kComponent);
             vu.queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
         }
-        else if constexpr (kFunct == 0x79u) // ESIN
+        else if constexpr (kFunct == 0x7Cu) // ESIN
             vu.queueP(ps2_vu1_detail::vuEsin(n(kComponent)), 29u);
         else if constexpr (kFunct == 0x7Au) // ERCPR
         {
             const float value = n(kComponent);
             vu.queueP(value != 0.0f ? 1.0f / value : value, 12u);
         }
-        else if constexpr (kFunct == 0x7Cu) // EATAN
+        else if constexpr (kFunct == 0x7Du) // EATAN
             vu.queueP(ps2_vu1_detail::vuEatan(n(kComponent)), 54u);
         else // EEXP
             vu.queueP(ps2_vu1_detail::vuEexp(n(kComponent)), 44u);

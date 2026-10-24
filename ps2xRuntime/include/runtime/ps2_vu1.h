@@ -172,6 +172,11 @@ public:
         const CompiledEntry *pairs = nullptr;
     };
     static void registerCompiledFragment(const CompiledFragment &fragment);
+    // Relaxed float mode of the recompiled VU1 microcode (ps2_vu_aot PS2X_VU_AOT_RELAXED=1, ps2_vu1_jit.h): VU1 runs
+    // with the SSE denormals-are-zero and flush-to-zero modes, which give the PS2's zero for denormal operands and
+    // results, and FMAC instructions are plain SSE operations clamped to +-FLT_MAX.
+    static void setRelaxedFloat(bool enabled);
+    static bool relaxedFloat();
 
     // ---- Blocks: straight-line runs of pairs that ps2_vu_aot compiles as one function ----
     // planBlock() schedules a block at compile time, assuming every value written before the block is ready by the

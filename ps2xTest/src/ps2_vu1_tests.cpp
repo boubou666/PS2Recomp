@@ -755,6 +755,27 @@ void register_ps2_vu1_tests()
                      "a nonzero numerator divided by zero should set current and sticky D");
         });
 
+        tc.Run("EFU special codes go by four: 0x79 ERSQRT, 0x7C ESIN, 0x7D EATAN, 0x7E EEXP", [](TestCase &t)
+        {
+            // TMB's lighting microcode computes 1/distance with ERSQRT (0x79); run as ESIN it lit whole half-spaces.
+            const auto efu = [&](uint32_t special, float x) -> float
+            {
+                Vu1Fixture fx;
+                t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+                writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(special, 1u, 0u, 0u, 0x8u), kVuUpperNop);
+                writeVuInstructionPair(fx.code, 8u, makeVuLowerSpecial(0x7Bu, 0u), kVuUpperNop); // WAITP
+                VU1Interpreter vu1;
+                vu1.state().vf[1][0] = x;
+                vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+                return vu1.state().p;
+            };
+            t.Equals(efu(0x79u, 4.0f), 0.5f, "0x79 is ERSQRT");
+            t.IsTrue(std::fabs(efu(0x7Cu, 0.5f) - std::sin(0.5f)) < 1e-3f, "0x7C is ESIN");
+            // EATAN takes the game's (x - 1) / (x + 1): 0 gives atan(1).
+            t.IsTrue(std::fabs(efu(0x7Du, 0.0f) - 0.785398f) < 1e-3f, "0x7D is EATAN");
+            t.IsTrue(std::fabs(efu(0x7Eu, 1.0f) - std::exp(-1.0f)) < 1e-3f, "0x7E is EEXP");
+        });
+
         tc.Run("EFU WAITP and RNG execute with architectural latency and state", [](TestCase &t)
         {
             Vu1Fixture fx;
@@ -842,10 +863,10 @@ void register_ps2_vu1_tests()
                 uint32_t latency;
             };
             constexpr EfuCase cases[] = {
-                {0x70u, 11u}, {0x71u, 18u}, {0x72u, 18u}, {0x73u, 24u},
-                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x77u, 18u},
-                {0x78u, 12u}, {0x79u, 29u}, {0x7Au, 12u}, {0x7Cu, 54u},
-                {0x7Du, 44u}};
+                {0x70u, 11u}, {0x71u, 18u}, {0x72u, 18u}, {0x73u, 24u}, // ESADD ERSADD ELENG ERLENG
+                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u},               // EATANxy EATANxz ESUM
+                {0x78u, 12u}, {0x79u, 18u}, {0x7Au, 12u},               // ESQRT ERSQRT ERCPR
+                {0x7Cu, 29u}, {0x7Du, 54u}, {0x7Eu, 44u}};              // ESIN EATAN EEXP
 
             for (const EfuCase &efu : cases)
             {

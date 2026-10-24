@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -24,6 +25,38 @@ void (*g_ps2RecompiledFunctionTable[1])(uint8_t *, R5900Context *, PS2Runtime *)
 namespace
 {
     bool g_ignoreFlags = false;
+    bool g_tolerance = false;
+
+    // --tolerance: how far a run's results are from the recording, word by word (as signed 32-bit integers:
+    // float words then differ by their distance in ulps, FTOI results by their integer difference).
+    struct ToleranceStats
+    {
+        size_t runs = 0, exact = 0, cycleDiffer = 0, packetShapeDiffer = 0;
+        size_t words = 0, differing = 0;
+        size_t buckets[5]{}; // |diff| 1, 2-4, 5-16, 17-256, more
+        int64_t maxDiff = 0;
+        void word(uint32_t expected, uint32_t actual)
+        {
+            ++words;
+            if (expected == actual)
+                return;
+            ++differing;
+            const int64_t diff = std::llabs(static_cast<int64_t>(static_cast<int32_t>(expected)) -
+                                            static_cast<int64_t>(static_cast<int32_t>(actual)));
+            maxDiff = std::max(maxDiff, diff);
+            buckets[diff <= 1 ? 0 : diff <= 4 ? 1 : diff <= 16 ? 2 : diff <= 256 ? 3 : 4]++;
+        }
+        void bytes(const uint8_t *expected, const uint8_t *actual, size_t size)
+        {
+            for (size_t offset = 0; offset + 4u <= size; offset += 4u)
+            {
+                uint32_t e = 0, a = 0;
+                std::memcpy(&e, expected + offset, 4);
+                std::memcpy(&a, actual + offset, 4);
+                word(e, a);
+            }
+        }
+    };
 
     std::string describeStateDifference(const VU1State &expected, const VU1State &actual)
     {
@@ -80,6 +113,8 @@ int main(int argc, char **argv)
     {
         if (std::strcmp(argv[index], "--ignore-flags") == 0)
             g_ignoreFlags = true;
+        else if (std::strcmp(argv[index], "--tolerance") == 0)
+            g_ignoreFlags = g_tolerance = true;
         else
             args.push_back(argv[index]);
     }
@@ -108,6 +143,8 @@ int main(int argc, char **argv)
                           { packets.emplace_back(packet, packet + size); });
 
     size_t mismatches = 0, resumeMismatches = 0, timingMismatches = 0;
+    ToleranceStats packetStats, dataStats, registerStats;
+    size_t toleranceRuns = 0, toleranceExact = 0, cycleDiffer = 0, packetShapeDiffer = 0;
     uint64_t totalCycles = 0;
     double seconds = 0.0;
     for (int pass = 0; pass < repeat; ++pass)
@@ -141,6 +178,31 @@ int main(int argc, char **argv)
             std::string diff = describeStateDifference(record.stateAfter, actual);
             const bool dataDiffers = data != record.dataAfter;
             const bool packetsDiffer = packets != record.packets;
+            if (g_tolerance)
+            {
+                ++toleranceRuns;
+                if (diff.empty() && !dataDiffers && !packetsDiffer && expectedCycles == actualCycles)
+                {
+                    ++toleranceExact;
+                    continue;
+                }
+                if (expectedCycles != actualCycles)
+                    ++cycleDiffer;
+                bool sameShape = packets.size() == record.packets.size();
+                for (size_t p = 0; sameShape && p < packets.size(); ++p)
+                    sameShape = packets[p].size() == record.packets[p].size();
+                if (!sameShape)
+                    ++packetShapeDiffer;
+                else
+                    for (size_t p = 0; p < packets.size(); ++p)
+                        packetStats.bytes(record.packets[p].data(), packets[p].data(), packets[p].size());
+                dataStats.bytes(record.dataAfter.data(), data.data(), data.size());
+                registerStats.bytes(reinterpret_cast<const uint8_t *>(record.stateAfter.vf),
+                                    reinterpret_cast<const uint8_t *>(actual.vf), sizeof(actual.vf));
+                registerStats.bytes(reinterpret_cast<const uint8_t *>(record.stateAfter.acc),
+                                    reinterpret_cast<const uint8_t *>(actual.acc), sizeof(actual.acc));
+                continue;
+            }
             if (diff.empty() && !dataDiffers && !packetsDiffer)
             {
                 if (expectedCycles != actualCycles && timingMismatches++ < 10)
@@ -172,6 +234,20 @@ int main(int argc, char **argv)
             seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     }
 
+    if (g_tolerance)
+    {
+        std::printf("tolerance: runs=%zu exact=%zu cycles-differ=%zu packet-shape-differs=%zu\n", toleranceRuns,
+                    toleranceExact, cycleDiffer, packetShapeDiffer);
+        const auto report = [](const char *name, const ToleranceStats &stats)
+        {
+            std::printf("  %-9s words=%zu differing=%zu (|d|<=1 %zu, <=4 %zu, <=16 %zu, <=256 %zu, more %zu) max=%lld\n", name,
+                        stats.words, stats.differing, stats.buckets[0], stats.buckets[1], stats.buckets[2],
+                        stats.buckets[3], stats.buckets[4], static_cast<long long>(stats.maxDiff));
+        };
+        report("packets", packetStats);
+        report("data", dataStats);
+        report("registers", registerStats);
+    }
     std::printf("records=%zu mismatches=%zu resume-mismatches=%zu timing-only=%zu vu-cycles=%llu\n", records.size(),
                 mismatches, resumeMismatches, timingMismatches, static_cast<unsigned long long>(totalCycles));
     const int timedPasses = repeat > 1 ? repeat - 1 : 1;
