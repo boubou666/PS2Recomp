@@ -459,8 +459,19 @@ public:
     inline PS2Memory &memory() { return m_memory; }
     inline const PS2Memory &memory() const { return m_memory; }
 
-    inline GS &gs() { return m_gs; }
-    inline const GS &gs() const { return m_gs; }
+    // The GS as the guest sees it: after the queued VIF1 transfers (PS2Memory::waitForVif1).
+    inline GS &gs()
+    {
+        m_memory.waitForVif1();
+        return m_gs;
+    }
+    inline const GS &gs() const
+    {
+        m_memory.waitForVif1();
+        return m_gs;
+    }
+    // Without waiting: presentation, which shows whatever is drawn by then.
+    inline GS &gsForPresentation() { return m_gs; }
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
     inline VU1Interpreter &vu0() { return m_vu0; }

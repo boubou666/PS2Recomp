@@ -9,7 +9,10 @@
 #include <unordered_map>
 #include <atomic>
 #include <iostream>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -356,6 +359,19 @@ public:
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
+    // VIF1 DMA (unpacks, VU1 microprograms, PATH1/PATH2 packets) on a worker thread, as the VIF and VU1 run beside
+    // the EE on the hardware. Each transfer still completes at once for the EE: its data is copied when it starts,
+    // and anything that observes VIF1, VU1 or the GS (their registers, VU1 memory, other GIF paths, GS kernel calls)
+    // first waits for the queued transfers (waitForVif1). PS2X_VIF1_THREAD=1 enables it.
+    void setVif1Threaded(bool enabled);
+    bool vif1Threaded() const { return m_vif1Threaded; }
+    void waitForVif1() const;
+    bool onVif1Worker() const;
+    // VU0 FBRST of the EE when the transfer being processed was queued (D and T bit enables of VU1).
+    using Vu0FbrstProvider = std::function<uint32_t()>;
+    void setVu0FbrstProvider(Vu0FbrstProvider provider) { m_vu0FbrstProvider = std::move(provider); }
+    uint32_t vif1JobVu0Fbrst() const { return m_vif1JobVu0Fbrst; }
+
     int pollDmaRegisters();
 
     // Track code modifications for self-modifying code
@@ -434,6 +450,26 @@ public:
     std::vector<PendingTransfer> m_pendingVif1Transfers;
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
+
+    struct Vif1Job
+    {
+        std::vector<uint8_t> data;
+        uint32_t vu0Fbrst = 0;
+    };
+    void queueVif1Job(std::vector<uint8_t> data);
+    void vif1WorkerMain();
+    void stopVif1Worker();
+    bool m_vif1Threaded = false;
+    std::thread m_vif1Thread;
+    mutable std::mutex m_vif1Mutex;
+    std::condition_variable m_vif1WorkCv;
+    mutable std::condition_variable m_vif1IdleCv;
+    std::deque<Vif1Job> m_vif1Jobs;
+    std::atomic<uint64_t> m_vif1Queued{0};
+    std::atomic<uint64_t> m_vif1Done{0};
+    bool m_vif1Stop = false;
+    uint32_t m_vif1JobVu0Fbrst = 0;
+    Vu0FbrstProvider m_vu0FbrstProvider;
 
     struct CodeRegion
     {

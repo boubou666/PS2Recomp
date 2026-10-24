@@ -715,3 +715,103 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
     }
 }
+
+namespace
+{
+    thread_local bool t_onVif1Worker = false;
+}
+
+void PS2Memory::setVif1Threaded(bool enabled)
+{
+    if (enabled == m_vif1Threaded)
+        return;
+    if (!enabled)
+    {
+        stopVif1Worker();
+        return;
+    }
+    m_vif1Stop = false;
+    m_vif1Threaded = true;
+    m_vif1Thread = std::thread([this]() { vif1WorkerMain(); });
+}
+
+bool PS2Memory::onVif1Worker() const
+{
+    return t_onVif1Worker;
+}
+
+void PS2Memory::waitForVif1() const
+{
+    if (!m_vif1Threaded || t_onVif1Worker)
+        return;
+    const uint64_t queued = m_vif1Queued.load(std::memory_order_acquire);
+    if (m_vif1Done.load(std::memory_order_acquire) >= queued)
+        return;
+
+    // Most waits are short (the frame's last transfers): spin a little before sleeping.
+    for (uint32_t spin = 0; spin < 4096u; ++spin)
+    {
+        if (m_vif1Done.load(std::memory_order_acquire) >= queued)
+            return;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        _mm_pause();
+#endif
+    }
+    std::unique_lock<std::mutex> lock(m_vif1Mutex);
+    m_vif1IdleCv.wait(lock, [&]() { return m_vif1Done.load(std::memory_order_acquire) >= queued; });
+}
+
+void PS2Memory::queueVif1Job(std::vector<uint8_t> data)
+{
+    if (data.empty())
+        return;
+    Vif1Job job;
+    job.data = std::move(data);
+    job.vu0Fbrst = m_vu0FbrstProvider ? m_vu0FbrstProvider() : 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_vif1Mutex);
+        m_vif1Jobs.push_back(std::move(job));
+        m_vif1Queued.fetch_add(1u, std::memory_order_release);
+    }
+    m_vif1WorkCv.notify_one();
+}
+
+void PS2Memory::vif1WorkerMain()
+{
+    t_onVif1Worker = true;
+    for (;;)
+    {
+        Vif1Job job;
+        {
+            std::unique_lock<std::mutex> lock(m_vif1Mutex);
+            m_vif1WorkCv.wait(lock, [&]() { return m_vif1Stop || !m_vif1Jobs.empty(); });
+            if (m_vif1Jobs.empty())
+                return;
+            job = std::move(m_vif1Jobs.front());
+            m_vif1Jobs.pop_front();
+        }
+        m_vif1JobVu0Fbrst = job.vu0Fbrst;
+        processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
+        if (m_gifArbiter)
+            m_gifArbiter->drain();
+        {
+            std::lock_guard<std::mutex> lock(m_vif1Mutex);
+            m_vif1Done.fetch_add(1u, std::memory_order_release);
+        }
+        m_vif1IdleCv.notify_all();
+    }
+}
+
+void PS2Memory::stopVif1Worker()
+{
+    if (!m_vif1Threaded)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_vif1Mutex);
+        m_vif1Stop = true;
+    }
+    m_vif1WorkCv.notify_all();
+    if (m_vif1Thread.joinable())
+        m_vif1Thread.join();
+    m_vif1Threaded = false;
+}

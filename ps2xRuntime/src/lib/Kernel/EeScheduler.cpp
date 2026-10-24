@@ -1974,7 +1974,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             }
             if (frameComplete || ++s_vblanksWithoutLatch >= kMaxVBlanksWithoutLatch)
             {
-                m_runtime.gs().latchHostPresentationFrame();
+                m_runtime.gsForPresentation().latchHostPresentationFrame();
                 s_vblanksWithoutLatch = 0u;
             }
         }

@@ -1521,6 +1521,39 @@ void register_ps2_memory_tests()
                      "compact VIF1 chain should clear the STR bit after drain");
         });
 
+        tc.Run("VIF1 worker thread: transfers complete at once, VU1 memory readers wait for them", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setVif1Threaded(true);
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kSrc = 0x00024000u;
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+
+            // Each transfer: UNPACK V4_32 of one vector to VU1 qword i, from the same (reused) source buffer.
+            bool completedAtOnce = true;
+            for (uint32_t i = 0; i < 64u; ++i)
+            {
+                std::memset(rdram + kSrc, 0, 32u);
+                const uint32_t cmd = makeVifCmd(0x6Cu, 1u, static_cast<uint16_t>(i));
+                std::memcpy(rdram + kSrc, &cmd, sizeof(cmd));
+                std::memset(rdram + kSrc + 4u, static_cast<int>(i + 1u), 16u);
+                mem.writeIORegister(kVif1Ch + 0x10u, kSrc);
+                mem.writeIORegister(kVif1Ch + 0x20u, 2u);
+                mem.writeIORegister(kVif1Ch + 0x00u, 0x100u);
+                completedAtOnce = completedAtOnce && (mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u;
+            }
+            t.IsTrue(completedAtOnce, "each VIF1 transfer should complete for the EE at once");
+
+            bool unpacked = true;
+            for (uint32_t i = 0; i < 64u && unpacked; ++i)
+                unpacked = mem.read8(PS2_VU1_DATA_BASE + i * 16u + 7u) == static_cast<uint8_t>(i + 1u);
+            t.IsTrue(unpacked, "reading VU1 memory should see every queued unpack, each with its own source data");
+            mem.setVif1Threaded(false);
+        });
+
         tc.Run("VIF1 DMA chain preserves compact tag high bytes when qwc is zero", [](TestCase &t)
         {
             PS2Memory mem;
