@@ -209,7 +209,7 @@ namespace
     // block keeps the per-pair path (a branch or E bit anywhere but at its end, a delay slot it cannot recompile).
     bool writeJitBlock(std::ostream &out, const std::vector<VU1Interpreter::DecodedInstructionPair> &decoded,
                        uint32_t first, uint32_t end, uint32_t firstPair, const std::vector<bool> &unobserved,
-                       const VU1Interpreter::BlockPlan &plan)
+                       const VU1Interpreter::BlockPlan &plan, uint32_t pcMask)
     {
         using Vu = VU1Interpreter;
         using J = Vu1Jit;
@@ -481,7 +481,8 @@ namespace
                     // Evaluated where the branch issues; the delay slot follows, then the pc moves.
                     const uint32_t opcode = lower >> 25;
                     const int32_t imm = J::imm11(lower);
-                    const std::string targetStatic = "((" + std::to_string(pc + 8u) + "u + " + std::to_string(imm * 8) + "u) & 0x3FFFu)";
+                    const std::string mask = "0x" + hex(pcMask, 4) + "u";
+                    const std::string targetStatic = "((" + std::to_string(pc + 8u) + "u + " + std::to_string(imm * 8) + "u) & " + mask + ")";
                     const auto readCond = [&](uint8_t reg) -> std::string
                     {
                         if (reg == 0u)
@@ -501,9 +502,9 @@ namespace
                         if (vit)
                             lo << " " << viName(vit) << " = " << ((pc + 16u) / 8u) << ";";
                         break;
-                    case 0x24u: lo << "taken = true; target = (static_cast<uint32_t>(static_cast<uint16_t>(" << viName(vis) << ")) * 8u) & 0x3FFFu;"; break;
+                    case 0x24u: lo << "taken = true; target = (static_cast<uint32_t>(static_cast<uint16_t>(" << viName(vis) << ")) * 8u) & " << mask << ";"; break;
                     case 0x25u:
-                        lo << "taken = true; target = (static_cast<uint32_t>(static_cast<uint16_t>(" << viName(vis) << ")) * 8u) & 0x3FFFu;";
+                        lo << "taken = true; target = (static_cast<uint32_t>(static_cast<uint16_t>(" << viName(vis) << ")) * 8u) & " << mask << ";";
                         if (vit)
                             lo << " " << viName(vit) << " = " << ((pc + 16u) / 8u) << ";";
                         break;
@@ -651,8 +652,12 @@ namespace
     }
 
     void writeFragment(const std::filesystem::path &path, const std::string &prefix, const std::string &elfName,
-                       const Fragment &fragment, const uint8_t *code, bool stickyUnobserved)
+                       const Fragment &fragment, const uint8_t *code, bool stickyUnobserved,
+                       VU1Interpreter::Unit unit = VU1Interpreter::Unit::VU1)
     {
+        const bool vu0 = unit == VU1Interpreter::Unit::VU0;
+        const std::string unitName = vu0 ? "Vu::Unit::VU0" : "Vu::Unit::VU1";
+        const uint32_t pcMask = vu0 ? 0x0FFFu : 0x3FFFu;
         // One small function per pair (inlining stepPair() into one function per fragment takes GCC minutes), and
         // one per straight-line run (VU1Interpreter::runBlock), which replaces the first pair's entry.
         // A namespace per fragment keeps the names apart when a build merges sources (unity builds).
@@ -666,7 +671,7 @@ namespace
             std::memcpy(&lower, code + pair * 8u, 4);
             std::memcpy(&upper, code + pair * 8u + 4u, 4);
             words.push_back({lower, upper});
-            decoded.push_back(Vu::decodePair(Vu::Unit::VU1, lower, upper));
+            decoded.push_back(Vu::decodePair(unit, lower, upper));
         }
         const auto blocks = findBlocks(decoded, fragment.firstPair);
         // Flags no reader sees are skipped only if nothing in the program can read the sticky bits they add to.
@@ -695,7 +700,7 @@ namespace
         if (relaxedFloat())
             out << "#if PS2X_VU1_JIT\n    [[maybe_unused]] const bool kRelaxedFloat = Vu1Jit::enableRelaxedFloat();\n#endif\n";
         const auto decodeCall = [&](uint32_t pair)
-        { return "Vu::decodePair(Vu::Unit::VU1, 0x" + hex(words[pair].first, 8) + "u, 0x" + hex(words[pair].second, 8) + "u)"; };
+        { return "Vu::decodePair(" + unitName + ", 0x" + hex(words[pair].first, 8) + "u, 0x" + hex(words[pair].second, 8) + "u)"; };
         std::vector<bool> blockStart(fragment.pairCount, false), jitStart(fragment.pairCount, false);
         for (const auto &[first, end] : blocks)
             blockStart[first] = true;
@@ -709,7 +714,7 @@ namespace
             {
                 std::ostringstream jit;
                 const Vu::BlockPlan plan = Vu::planBlock(decoded.data() + first, end - first);
-                if (!writeJitBlock(jit, decoded, first, end, fragment.firstPair, unobserved, plan))
+                if (!writeJitBlock(jit, decoded, first, end, fragment.firstPair, unobserved, plan, pcMask))
                     continue;
                 jitText[first] = jit.str();
                 jitStart[first] = true;
@@ -772,7 +777,7 @@ namespace
                 << (jitStart[pair] ? ")" : "") << ",";
         out << "\n    };\n\n"
             << "    const bool registered = (Vu::registerCompiledFragment({" << fragment.firstPair << "u, "
-            << fragment.pairCount << "u, 0x" << hex(fragment.hash, 16) << "ull, kPairs}), true);\n"
+            << fragment.pairCount << "u, 0x" << hex(fragment.hash, 16) << "ull, kPairs, " << unitName << "}), true);\n"
             << "}\n";
     }
 }
@@ -828,11 +833,14 @@ int main(int argc, char **argv)
         }
     }
 
+    // VU0 microprograms come by MPG too (through VIF0): fragments that fit VU0 code memory and decode as VU0
+    // microcode (no EFU, XGKICK or XTOP) also get a VU0 build.
+    const std::string vu0Prefix = "vu0_aot_";
     std::filesystem::create_directories(outDir);
     for (const auto &entry : std::filesystem::directory_iterator(outDir))
     {
         const std::string name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) == 0 && entry.path().extension() == ".cpp")
+        if ((name.rfind(prefix, 0) == 0 || name.rfind(vu0Prefix, 0) == 0) && entry.path().extension() == ".cpp")
             std::filesystem::remove(entry.path());
     }
     // Sticky status bits gather every FMAC write: if any microcode can read them, every write stays computed.
@@ -855,7 +863,31 @@ int main(int argc, char **argv)
                       stickyUnobserved);
         totalPairs += fragment.pairCount;
     }
-    std::printf("ps2_vu_aot: %zu microcode fragments, %u instruction pairs -> %s\n", fragments.size(), totalPairs,
-                outDir.string().c_str());
+    constexpr uint32_t kVu0CodePairs = 0x1000u / 8u;
+    size_t vu0Fragments = 0;
+    for (const Fragment &fragment : fragments)
+    {
+        if (fragment.firstPair + fragment.pairCount > kVu0CodePairs)
+            continue;
+        bool vu0Code = true;
+        for (uint32_t pair = 0; pair < fragment.pairCount && vu0Code; ++pair)
+        {
+            uint32_t lower = 0, upper = 0;
+            std::memcpy(&lower, file.data() + fragment.fileOffset + pair * 8u, 4);
+            std::memcpy(&upper, file.data() + fragment.fileOffset + pair * 8u + 4u, 4);
+            const auto decoded = VU1Interpreter::decodePair(VU1Interpreter::Unit::VU0, lower, upper);
+            vu0Code = !decoded.upperUsage.reserved && !decoded.lowerUsage.reserved;
+        }
+        if (!vu0Code)
+            continue;
+        // The EE reads VU0's flags (CFC2), sticky bits included: every VU0 flag write is computed.
+        const std::filesystem::path path =
+            outDir / (vu0Prefix + hex(fragment.firstPair, 3) + "_" + hex(fragment.hash, 16) + ".cpp");
+        writeFragment(path, vu0Prefix, elfPath.filename().string(), fragment, file.data() + fragment.fileOffset, false,
+                      VU1Interpreter::Unit::VU0);
+        ++vu0Fragments;
+    }
+    std::printf("ps2_vu_aot: %zu microcode fragments, %u instruction pairs (%zu also as VU0 microcode) -> %s\n",
+                fragments.size(), totalPairs, vu0Fragments, outDir.string().c_str());
     return 0;
 }

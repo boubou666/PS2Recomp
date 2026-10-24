@@ -465,23 +465,29 @@ struct Vu1Jit
             status, sticky);
     }
 
-    // MAX/MINI: raw sign-magnitude comparison (vuMax/vuMini), bits passed through. kRight: vector, broadcast, I.
+    // MAX/MINI: raw sign-magnitude comparison (vuMax/vuMini: the larger or smaller key, else the second operand),
+    // bits passed through. The key is the magnitude, negated when the sign is set.
     template <uint32_t kUpper, bool kMax>
     static PS2X_VU_INLINE void maxMini(Vu &vu, __m128 &target, __m128 vs, __m128 vt)
     {
         constexpr uint32_t kOp = kUpper & 0x3Fu;
         constexpr uint8_t kDest = (kUpper >> 21) & 0xFu;
-        alignas(16) float s[4], t[4], result[4];
-        _mm_store_ps(s, vs);
+        __m128 t;
         if constexpr (kOp == 0x1Du || kOp == 0x1Fu) // MAXi, MINIi
-            _mm_store_ps(t, _mm_set1_ps(vu.m_state.i));
+            t = _mm_set1_ps(vu.m_state.i);
         else if constexpr (kOp < 0x18u) // bc
-            _mm_store_ps(t, _mm_set1_ps(lane(vt, kOp & 3u)));
+            t = spread<kOp & 3u>(vt);
         else
-            _mm_store_ps(t, vt);
-        for (int c = 0; c < 4; ++c)
-            result[c] = kMax ? ps2_vu1_detail::vuMax(s[c], t[c]) : ps2_vu1_detail::vuMini(s[c], t[c]);
-        target = blend<kDest>(target, _mm_load_ps(result));
+            t = vt;
+        const auto key = [](__m128 value)
+        {
+            const __m128i bits = _mm_castps_si128(value);
+            const __m128i sign = _mm_srai_epi32(bits, 31);
+            return _mm_sub_epi32(_mm_xor_si128(_mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)), sign), sign);
+        };
+        const __m128i ks = key(vs), kt = key(t);
+        const __m128 pickS = _mm_castsi128_ps(kMax ? _mm_cmpgt_epi32(ks, kt) : _mm_cmpgt_epi32(kt, ks));
+        target = blend<kDest>(target, _mm_blendv_ps(t, vs, pickS));
     }
 
     template <uint32_t kUpper>

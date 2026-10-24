@@ -170,6 +170,7 @@ public:
         uint32_t pairCount = 0;
         uint64_t codeHash = 0;
         const CompiledEntry *pairs = nullptr;
+        Unit unit = Unit::VU1; // the VU whose code memory it runs from
     };
     static void registerCompiledFragment(const CompiledFragment &fragment);
     // Relaxed float mode of the recompiled VU1 microcode (ps2_vu_aot PS2X_VU_AOT_RELAXED=1, ps2_vu1_jit.h): VU1 runs
@@ -177,6 +178,8 @@ public:
     // results, and FMAC instructions are plain SSE operations clamped to +-FLT_MAX.
     static void setRelaxedFloat(bool enabled);
     static bool relaxedFloat();
+    // Runs this instance through the interpreter only (checks of the compiled code against it).
+    void setCompiledCodeDisabled(bool disabled) { m_compiledCodeDisabled = disabled; }
 
     // ---- Blocks: straight-line runs of pairs that ps2_vu_aot compiles as one function ----
     // planBlock() schedules a block at compile time, assuming every value written before the block is ready by the
@@ -400,6 +403,7 @@ private:
     const uint8_t *m_compiledCode = nullptr;
     uint64_t m_compiledStamp = 0;
     bool m_compiledChecked = false;
+    bool m_compiledCodeDisabled = false;
     void refreshCompiledFragments(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp);
 
     void run(uint8_t *vuCode, uint32_t codeSize,

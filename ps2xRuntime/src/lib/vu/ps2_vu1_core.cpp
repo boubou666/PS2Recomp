@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cfenv>
 #include <limits>
@@ -702,6 +703,32 @@ void VU1Interpreter::progressXgkickActive(uint64_t cycles)
     m_xgkick.cycleCredit += static_cast<uint32_t>(std::min<uint64_t>(cycles, 0x40000000u));
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
+        // Inside a GIFtag's data, a qword every two cycles in one copy, up to the tag's end or the end of VU memory
+        // (the tag's size was checked against the buffer when it was read).
+        if (m_xgkick.currentTagEnd != 0u && m_xgkick.copiedBytes < m_xgkick.currentTagEnd)
+        {
+            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+            const uint32_t qwords = std::min({m_xgkick.cycleCredit / 2u,
+                                              (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u,
+                                              (m_activeVuDataSize - source) / 16u});
+            if (qwords > 1u)
+            {
+                std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + source, qwords * 16u);
+                m_xgkick.copiedBytes += qwords * 16u;
+                m_xgkick.cycleCredit -= qwords * 2u;
+                if (m_xgkick.copiedBytes >= m_xgkick.currentTagEnd)
+                {
+                    if (m_xgkick.currentTagEop)
+                        finishXgkick();
+                    else
+                    {
+                        m_xgkick.currentTagEnd = 0u;
+                        m_xgkick.currentTagEop = false;
+                    }
+                }
+                continue;
+            }
+        }
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
@@ -959,6 +986,8 @@ void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t co
     const uint32_t pairCount = codeSize / 8u;
     for (const CompiledFragment &fragment : compiledFragmentRegistry())
     {
+        if (fragment.unit != m_unit)
+            continue;
         if (fragment.firstPair + fragment.pairCount > pairCount ||
             codeHash(vuCode + fragment.firstPair * 8u, fragment.pairCount * 8u) != fragment.codeHash)
             continue;
@@ -1004,10 +1033,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     // Microcode compiled ahead of time replaces the interpreter on the pairs whose bytes it was compiled from.
     const CompiledEntry *compiled = nullptr;
-    const bool trackedVuCode = memory == nullptr || vuCode == memory->getVU1Code();
-    if (m_unit == Unit::VU1 && trackedVuCode && compiledFragmentsEnabled() && !compiledFragmentRegistry().empty())
+    const bool vu1 = m_unit == Unit::VU1;
+    const bool trackedVuCode = memory == nullptr || vuCode == (vu1 ? memory->getVU1Code() : memory->getVU0Code());
+    if (trackedVuCode && !m_compiledCodeDisabled && compiledFragmentsEnabled() && !compiledFragmentRegistry().empty())
     {
-        const uint64_t stamp = memory == nullptr ? m_externalCodeGeneration + 1u : memory->getVU1CodeGeneration() + 1u;
+        const uint64_t stamp = memory == nullptr ? m_externalCodeGeneration + 1u
+                                                 : (vu1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration()) + 1u;
         if (!m_compiledChecked || stamp != m_compiledStamp || vuCode != m_compiledCode)
             refreshCompiledFragments(vuCode, codeSize, stamp);
         if (!m_compiledByPair.empty())

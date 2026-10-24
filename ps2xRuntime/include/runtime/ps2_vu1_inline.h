@@ -3237,10 +3237,26 @@ PS2X_VU_INLINE bool VU1Interpreter::blockReady(const RunContext &context, uint64
     // iteration wrote): the whole schedule then starts that much later, exactly as stallUntilReady() would delay
     // it. Any other live-in must be ready by its planned cycle.
     base = m_cycle;
+    // Every register write has landed by m_lastWritebackCycle, and every lane of a VF register by m_vfReadyMax:
+    // checking those first gives the same answer without the per-lane reads.
+    const auto readyBy = [&]<BlockLiveIn kLiveIn>(uint64_t limit) PS2X_VU_LAMBDA_INLINE
+    {
+        if constexpr (kLiveIn.kind == BlockLiveIn::Vf || kLiveIn.kind == BlockLiveIn::Vi || kLiveIn.kind == BlockLiveIn::Acc)
+            if (m_lastWritebackCycle <= limit)
+                return true;
+        if constexpr (kLiveIn.kind == BlockLiveIn::Vf)
+            if (m_vfReadyMax[kLiveIn.reg] <= limit)
+                return true;
+        if constexpr (kLiveIn.kind == BlockLiveIn::Acc)
+            if (m_accReadyMax <= limit)
+                return true;
+        return blockLiveInReadyCycle<kLiveIn>() <= limit;
+    };
     [&]<size_t... kLiveIn>(std::index_sequence<kLiveIn...>) PS2X_VU_LAMBDA_INLINE
     {
-        ((kPlan.liveIns[kLiveIn].issue == 0u ? (base = std::max(base, blockLiveInReadyCycle<kPlan.liveIns[kLiveIn]>()))
-                                             : base),
+        ((kPlan.liveIns[kLiveIn].issue == 0u && !readyBy.template operator()<kPlan.liveIns[kLiveIn]>(base)
+              ? (base = std::max(base, blockLiveInReadyCycle<kPlan.liveIns[kLiveIn]>()))
+              : base),
          ...);
     }(std::make_index_sequence<kPlan.liveInCount>{});
     bool ready = !m_logInFlight && !m_state.branchPending && !m_state.haltAfterDelaySlot && !m_state.ebit &&
@@ -3251,7 +3267,7 @@ PS2X_VU_INLINE bool VU1Interpreter::blockReady(const RunContext &context, uint64
         [&]<size_t... kLiveIn>(std::index_sequence<kLiveIn...>) PS2X_VU_LAMBDA_INLINE
         {
             ((ready = ready && (kPlan.liveIns[kLiveIn].issue == 0u ||
-                                blockLiveInReadyCycle<kPlan.liveIns[kLiveIn]>() <= base + kPlan.liveIns[kLiveIn].issue)),
+                                readyBy.template operator()<kPlan.liveIns[kLiveIn]>(base + kPlan.liveIns[kLiveIn].issue))),
              ...);
         }(std::make_index_sequence<kPlan.liveInCount>{});
     }

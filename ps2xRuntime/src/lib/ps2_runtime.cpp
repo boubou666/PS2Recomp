@@ -1661,12 +1661,56 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         return;
     }
 
+    // PS2X_VU0_CHECK=1: every microprogram also runs through the interpreter from the same state; a difference
+    // with the compiled run is reported and the interpreter's result kept.
+    static const bool s_check = []
+    {
+        const char *value = std::getenv("PS2X_VU0_CHECK");
+        return value && value[0] == '1';
+    }();
+    VU1State before{};
+    std::vector<uint8_t> dataBefore;
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    if (s_check)
+    {
+        before = m_vu0.state();
+        dataBefore.assign(vu0Data, vu0Data + PS2_VU0_DATA_SIZE);
+    }
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
                   startPC, 0u, ctx->vu0_itop, 4096, true);
+    if (s_check)
+    {
+        const VU1State compiled = m_vu0.state();
+        const std::vector<uint8_t> dataCompiled(vu0Data, vu0Data + PS2_VU0_DATA_SIZE);
+        std::memcpy(vu0Data, dataBefore.data(), PS2_VU0_DATA_SIZE);
+        m_vu0.reset();
+        m_vu0.state() = before;
+        m_vu0.setCompiledCodeDisabled(true);
+        m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory, startPC, 0u,
+                      ctx->vu0_itop, 4096, true);
+        m_vu0.setCompiledCodeDisabled(false);
+        const VU1State &reference = m_vu0.state();
+        static uint64_t s_runs = 0, s_mismatches = 0;
+        ++s_runs;
+        const bool sameRegs = std::memcmp(compiled.vf, reference.vf, sizeof(compiled.vf)) == 0 &&
+                              std::memcmp(compiled.vi, reference.vi, sizeof(compiled.vi)) == 0 &&
+                              std::memcmp(compiled.acc, reference.acc, sizeof(compiled.acc)) == 0 &&
+                              compiled.q == reference.q && compiled.p == reference.p && compiled.i == reference.i &&
+                              compiled.mac == reference.mac && compiled.status == reference.status &&
+                              compiled.clip == reference.clip && compiled.pc == reference.pc &&
+                              compiled.cycles - before.cycles == reference.cycles - before.cycles;
+        const bool sameData = std::memcmp(dataCompiled.data(), vu0Data, PS2_VU0_DATA_SIZE) == 0;
+        if (!(sameRegs && sameData) && s_mismatches++ < 20u)
+            std::fprintf(stderr, "[vu0:check] mismatch #%llu start pc=0x%x regs=%d data=%d mac %x/%x status %x/%x clip %x/%x\n",
+                         static_cast<unsigned long long>(s_mismatches), startPC, sameRegs ? 1 : 0, sameData ? 1 : 0,
+                         compiled.mac, reference.mac, compiled.status, reference.status, compiled.clip, reference.clip);
+        if ((s_runs % 20000u) == 0u)
+            std::fprintf(stderr, "[vu0:check] %llu runs, %llu mismatches\n", static_cast<unsigned long long>(s_runs),
+                         static_cast<unsigned long long>(s_mismatches));
+    }
     copyVu0StateToContext(m_vu0.state(), ctx);
 }
 
