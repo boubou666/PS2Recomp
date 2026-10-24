@@ -1599,7 +1599,7 @@ void register_code_generator_tests()
             std::string out = gen.translateInstruction(inst);
 
             t.IsTrue(out.find("ctx->vu0_vf[11]") != std::string::npos, "S2 VSQI source VF should come from rd");
-            t.IsTrue(out.find("ctx->vi[10] = static_cast<uint16_t>(ctx->vi[10] + 1)") != std::string::npos,
+            t.IsTrue(out.find("ctx->vi[10] = static_cast<uint16_t>(ctx->vi[10] + 1u)") != std::string::npos,
                      "S2 VSQI should post-increment the VI base from rt");
             t.IsTrue(out.find("ctx->vi[11]") == std::string::npos, "S2 VSQI must not use rd as VI base");
             t.IsTrue(out.find("getVU0Data()") != std::string::npos, "S2 VSQI should address VU0 data memory");
