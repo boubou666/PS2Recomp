@@ -142,6 +142,9 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // latchHostPresentationFrame() once the GS has drawn what is queued before it, with the display registers
+    // as they are now (the caller's position in the GS's stream); on the GS thread if it has one.
+    void queueHostPresentationLatch();
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -174,10 +177,12 @@ private:
         {
             GifPacket,
             NativePackedGifPacket,
-            NativeImageUpload
+            NativeImageUpload,
+            PresentationLatch, // displayRegisters (queueHostPresentationLatch)
         };
         Kind kind = Kind::GifPacket;
         uint64_t registers[4]{};
+        GSPresentationRequest displayRegisters{};
         std::vector<uint8_t> bytes;
     };
     bool shouldQueue() const;
@@ -215,6 +220,7 @@ private:
     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     GSPresentationRequest buildPresentationRequestUnlocked() const;
+    void latchHostPresentationFrame(const GSPresentationRequest *displayRegisters);
 
 
     GSContext &activeContext();

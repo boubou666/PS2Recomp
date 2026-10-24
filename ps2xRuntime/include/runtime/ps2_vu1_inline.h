@@ -233,6 +233,16 @@ namespace ps2_vu1_detail
         _mm_storeu_si128(reinterpret_cast<__m128i *>(target), result);
     }
 
+    // normalizeVector(), or a plain copy of a register known to hold normalized values (BlockPlan::knownNormal).
+    template <bool kKnown>
+    inline void loadOperands(const float *source, float *target)
+    {
+        if constexpr (kKnown)
+            std::memcpy(target, source, 4u * sizeof(float));
+        else
+            normalizeVector(source, target);
+    }
+
     inline float vuEatan(float value)
     {
         constexpr float coefficients[] = {
@@ -894,6 +904,7 @@ PS2X_VU_INLINE void VU1Interpreter::applyDestAcc(const float *result, uint8_t de
 // flags. The other lanes (zero results above all) take the exact result as a double, which classifies them like
 // fmacFlagsSlow, or for sums at FLT_MAX its long double; an out-of-range product of a product-sum goes to
 // fmacFlagsSlow.
+template <uint8_t kKnownNormal>
 PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status,
                                                   uint32_t &sticky) const
 {
@@ -925,11 +936,14 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
     {
         alignas(16) float left[4];
         alignas(16) float right[4];
-        normalizeVector(m_state.vf[FS(upper)], left);
+        loadOperands<(kKnownNormal & kKnownNormalFs) != 0u>(m_state.vf[FS(upper)], left);
         switch (operation.right)
         {
         case FmacOperation::Right::Broadcast:
-            _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.vf[FT(upper)][operation.broadcast])));
+            if constexpr ((kKnownNormal & kKnownNormalFt) != 0u)
+                _mm_store_ps(right, _mm_set1_ps(m_state.vf[FT(upper)][operation.broadcast]));
+            else
+                _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.vf[FT(upper)][operation.broadcast])));
             break;
         case FmacOperation::Right::Q:
             _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.q)));
@@ -938,7 +952,7 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
             _mm_store_ps(right, _mm_set1_ps(normalizeOperand(m_state.i)));
             break;
         default:
-            normalizeVector(m_state.vf[FT(upper)], right);
+            loadOperands<(kKnownNormal & kKnownNormalFt) != 0u>(m_state.vf[FT(upper)], right);
             break;
         }
         __m128 leftVector = _mm_load_ps(left);
@@ -1008,7 +1022,7 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
             default:
             {
                 alignas(16) float accumulator[4];
-                normalizeVector(m_state.acc, accumulator);
+                loadOperands<(kKnownNormal & kKnownNormalAcc) != 0u>(m_state.acc, accumulator);
                 const __m256d accWide = _mm256_cvtps_pd(_mm_load_ps(accumulator));
                 const __m256d product = _mm256_mul_pd(leftWide, rightWide);
                 exact = kind == FmacKind::Madd ? _mm256_add_pd(accWide, product) : _mm256_sub_pd(accWide, product);
@@ -1080,13 +1094,14 @@ PS2X_VU_INLINE bool VU1Interpreter::fmacFlagsFast(float *result, uint8_t dest, u
     return true;
 }
 
+template <uint8_t kKnownNormal>
 PS2X_VU_INLINE void VU1Interpreter::fmacFlags(float *result, uint8_t dest)
 {
     // dest 0 writes no flags (updateFmacFlags).
     if (dest == 0u)
         return;
     uint32_t mac = 0u, status = 0u, sticky = 0u;
-    if (!fmacFlagsFast(result, dest, mac, status, sticky))
+    if (!fmacFlagsFast<kKnownNormal>(result, dest, mac, status, sticky))
     {
         fmacFlagsSlow(result, dest);
         return;
@@ -1107,15 +1122,17 @@ PS2X_VU_INLINE void VU1Interpreter::fmacFlags(float *result, uint8_t dest)
     entry->writesStatus = true;
 }
 
+template <uint8_t kKnownNormal>
 PS2X_VU_INLINE void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
 {
-    fmacFlags(result, dest);
+    fmacFlags<kKnownNormal>(result, dest);
     applyDest(dst, result, dest);
 }
 
+template <uint8_t kKnownNormal>
 PS2X_VU_INLINE void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 {
-    fmacFlags(result, dest);
+    fmacFlags<kKnownNormal>(result, dest);
     applyDestAcc(result, dest);
 }
 
@@ -1408,6 +1425,7 @@ PS2X_VU_INLINE void VU1Interpreter::progressXgkick(uint64_t cycles)
 // ============================================================================
 // Upper instructions (FMAC pipeline)
 // ============================================================================
+template <uint8_t kKnownNormal>
 PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
@@ -1426,9 +1444,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     alignas(16) float normalizedVs[4];
     alignas(16) float normalizedVt[4];
     alignas(16) float normalizedAcc[4];
-    normalizeVector(m_state.vf[fs], normalizedVs);
-    normalizeVector(m_state.vf[ft], normalizedVt);
-    normalizeVector(m_state.acc, normalizedAcc);
+    loadOperands<(kKnownNormal & kKnownNormalFs) != 0u>(m_state.vf[fs], normalizedVs);
+    loadOperands<(kKnownNormal & kKnownNormalFt) != 0u>(m_state.vf[ft], normalizedVt);
+    loadOperands<(kKnownNormal & kKnownNormalAcc) != 0u>(m_state.acc, normalizedAcc);
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
@@ -1444,9 +1462,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x02:
     case 0x03: // ADDbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(bc)));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     }
     case 0x04:
@@ -1454,9 +1472,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x06:
     case 0x07: // SUBbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(bc))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     }
     case 0x08:
@@ -1464,9 +1482,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0A:
     case 0x0B: // MADDbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     }
     case 0x0C:
@@ -1474,9 +1492,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0E:
     case 0x0F: // MSUBbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3];
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc)))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     }
     case 0x10:
@@ -1506,16 +1524,16 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x1A:
     case 0x1B: // MULbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3];
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * bc;
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     }
     case 0x1C: // MULq
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * q;
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x1D: // MAXi
         for (int c = 0; c < 4; c++)
@@ -1525,7 +1543,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x1E: // MULi
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * i;
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x1F: // MINIi
         for (int c = 0; c < 4; c++)
@@ -1534,48 +1552,48 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x20: // ADDq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(q)));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x21: // MADDq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x22: // ADDi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(i)));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x23: // MADDi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x24: // SUBq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(q))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x25: // MSUBq
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q)))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x26: // SUBi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(i))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x27: // MSUBi
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i)))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x28: // ADD
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_load_ps(vt)));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x29: // MADD
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x2A: // MUL
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * vt[c];
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x2B: // MAX
         for (int c = 0; c < 4; c++)
@@ -1584,18 +1602,18 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x2C: // SUB
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_load_ps(vt))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x2D: // MSUB
         _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt)))));
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x2E: // OPMSUB
         result[0] = vuSub(acc[0], vs[1] * vt[2]);
         result[1] = vuSub(acc[1], vs[2] * vt[0]);
         result[2] = vuSub(acc[2], vs[0] * vt[1]);
         result[3] = 0.0f;
-        applyFmacDest(vd, result, dest);
+        applyFmacDest<kKnownNormal>(vd, result, dest);
         return;
     case 0x2F: // MINI
         for (int c = 0; c < 4; c++)
@@ -1622,9 +1640,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         case 0x02:
         case 0x03: // ADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(bc)));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         }
         case 0x04:
@@ -1632,9 +1650,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         case 0x06:
         case 0x07: // SUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(bc))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         }
         case 0x08:
@@ -1642,9 +1660,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0A:
         case 0x0B: // MADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         }
         case 0x0C:
@@ -1652,9 +1670,9 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0E:
         case 0x0F: // MSUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3];
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(bc)))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         }
         case 0x10: // ITOF0
@@ -1730,16 +1748,16 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         case 0x1A:
         case 0x1B: // MULAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3];
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * bc;
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         }
         case 0x1C: // MULAq
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * q;
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x1D: // ABS (clears the sign bit; the magnitude bits pass through)
             for (int c = 0; c < 4; c++)
@@ -1754,7 +1772,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         case 0x1E: // MULAi
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * i;
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x1F: // CLIP
         {
@@ -1790,63 +1808,63 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
         }
         case 0x20: // ADDAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(q)));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x21: // MADDAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x22: // ADDAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_set1_ps(i)));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x23: // MADDAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x24: // SUBAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(q))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x25: // MSUBAq
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(q)))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x26: // SUBAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_set1_ps(i))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x27: // MSUBAi
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_set1_ps(i)))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x28: // ADDA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), _mm_load_ps(vt)));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x29: // MADDA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), _mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x2A: // MULA
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * vt[c];
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x2C: // SUBA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(vs), negate4(_mm_load_ps(vt))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x2D: // MSUBA
             _mm_storeu_ps(result, vuAdd4(_mm_load_ps(acc), negate4(_mm_mul_ps(_mm_load_ps(vs), _mm_load_ps(vt)))));
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x2E: // OPMULA
             result[0] = vs[1] * vt[2];
             result[1] = vs[2] * vt[0];
             result[2] = vs[0] * vt[1];
             result[3] = 0.0f;
-            applyFmacDestAcc(result, dest);
+            applyFmacDestAcc<kKnownNormal>(result, dest);
             return;
         case 0x2F:
         case 0x30: // NOP
@@ -2633,7 +2651,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairImpl(const Dec
     return stepPairBody<kLogInFlight>(decoded, context);
 }
 
-template <bool kLogInFlight, bool kDeadFlags>
+template <bool kLogInFlight, bool kDeadFlags, uint8_t kKnownNormal>
 PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const DecodedInstructionPair &decoded,
                                                                       const RunContext &context)
 {
@@ -2677,7 +2695,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
 
     if (decoded.iBit)
     {
-        execUpper(decoded.upper);
+        execUpper<kKnownNormal>(decoded.upper);
         float immediate = 0.0f;
         std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
         m_state.i = normalizeOperand(immediate);
@@ -2689,7 +2707,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
         std::memcpy(oldVf,
                     m_state.vf[decoded.upperVfShadowReg],
                     sizeof(oldVf));
-        execUpper(decoded.upper);
+        execUpper<kKnownNormal>(decoded.upper);
         std::memcpy(upperVf,
                     m_state.vf[decoded.upperVfShadowReg],
                     sizeof(upperVf));
@@ -2703,7 +2721,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
     }
     else
     {
-        execUpper(decoded.upper);
+        execUpper<kKnownNormal>(decoded.upper);
         execLower(decoded.lower, context.vuData, context.dataSize, *context.gs, context.memory, decoded.upper);
     }
 
@@ -2826,6 +2844,10 @@ constexpr VU1Interpreter::BlockPlan VU1Interpreter::planBlock(const DecodedInstr
     uint8_t accSeen = 0;
     bool fdivSeen = false, efuResourceSeen = false, efuEntriesSeen = false;
     bool overflow = false;
+    // Lanes an FMAC instruction of the block wrote last (normalized results); vf0 is constant.
+    std::array<uint8_t, 32> normalVf{};
+    normalVf[0] = 0xFu;
+    uint8_t normalAcc = 0u;
     const auto addLiveIn = [&](BlockLiveIn::Kind kind, uint8_t reg, uint8_t lanes, int32_t issue)
     {
         if (plan.liveInCount == plan.liveIns.size())
@@ -2947,6 +2969,36 @@ constexpr VU1Interpreter::BlockPlan VU1Interpreter::planBlock(const DecodedInstr
             efuEntriesSeen = true;
         }
 
+        // Operands of the upper instruction known normalized, then what this pair's writes do to that.
+        const bool fmac = decodeFmacOperation(pair.upper).kind != FmacKind::None;
+        if (fmac)
+        {
+            const auto knownLanes = [&](uint8_t reg)
+            {
+                if (reg == 0u)
+                    return true;
+                uint8_t lanes = 0u;
+                for (uint32_t read = 0; read < pair.upperUsage.vfReadCount; ++read)
+                    if (pair.upperUsage.vfRead[read].reg == reg)
+                        lanes = static_cast<uint8_t>(lanes | pair.upperUsage.vfRead[read].lanes);
+                return lanes != 0u && (lanes & ~normalVf[reg]) == 0u;
+            };
+            uint8_t known = 0u;
+            if (knownLanes(FS(pair.upper)))
+                known = static_cast<uint8_t>(known | kKnownNormalFs);
+            if (knownLanes(FT(pair.upper)))
+                known = static_cast<uint8_t>(known | kKnownNormalFt);
+            if (pair.upperUsage.accRead != 0u && (pair.upperUsage.accRead & ~normalAcc) == 0u)
+                known = static_cast<uint8_t>(known | kKnownNormalAcc);
+            plan.knownNormal[index] = known;
+        }
+        if (const VfAccess write = pair.upperUsage.vfWrite; write.reg != 0u)
+            normalVf[write.reg] = static_cast<uint8_t>(fmac ? (normalVf[write.reg] | write.lanes) : (normalVf[write.reg] & ~write.lanes));
+        if (const uint8_t lanes = pair.upperUsage.accWrite; lanes != 0u)
+            normalAcc = static_cast<uint8_t>(fmac ? (normalAcc | lanes) : (normalAcc & ~lanes));
+        if (const VfAccess write = pair.lowerUsage.vfWrite; write.reg != 0u && pair.suppressedLowerVf != write.reg)
+            normalVf[write.reg] = static_cast<uint8_t>(normalVf[write.reg] & ~write.lanes);
+
         // Results (markPairWrites, queueQ, queueP).
         const auto setLanes = [&](std::array<int32_t, 4> &laneReady, uint8_t lanes, int32_t at)
         {
@@ -3050,11 +3102,11 @@ PS2X_VU_INLINE uint64_t VU1Interpreter::blockLiveInReadyCycle() const
     }
 }
 
-template <bool kDeadFlags>
+template <bool kDeadFlags, uint8_t kKnownNormal>
 PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBodyEntry(const DecodedInstructionPair &decoded,
                                                                            const RunContext &context)
 {
-    return stepPairBody<false, kDeadFlags>(decoded, context);
+    return stepPairBody<false, kDeadFlags, kKnownNormal>(decoded, context);
 }
 
 template <const VU1Interpreter::BlockPlan &kPlan, const auto &kBodies>

@@ -177,8 +177,8 @@ namespace
             for (uint32_t pair = first; pair < end; ++pair)
                 out << "    Vu::StepResult body" << (fragment.firstPair + pair) << "(Vu &vu, const Vu::RunContext &context)\n"
                     << "    {\n"
-                    << "        return vu.stepPairBodyEntry<kBlockPlan" << id << ".deadFlags[" << (pair - first) << "]>(kPair"
-                    << (fragment.firstPair + pair) << ", context);\n"
+                    << "        return vu.stepPairBodyEntry<kBlockPlan" << id << ".deadFlags[" << (pair - first) << "], kBlockPlan"
+                    << id << ".knownNormal[" << (pair - first) << "]>(kPair" << (fragment.firstPair + pair) << ", context);\n"
                     << "    }\n";
             out << "    constexpr Vu::CompiledEntry kBlockBodies" << id << "[] = {";
             for (uint32_t pair = first; pair < end; ++pair)

@@ -169,6 +169,9 @@ public:
     // stepPair() does and leaves the rest to the per-pair functions. Results, flags and cycle counts are the
     // interpreter's: the clock goes through the same cycles, and pairs still record when their results land.
     static constexpr uint32_t kMaxBlockPairs = 64u;
+    static constexpr uint8_t kKnownNormalFs = 0x1u;
+    static constexpr uint8_t kKnownNormalFt = 0x2u;
+    static constexpr uint8_t kKnownNormalAcc = 0x4u;
     struct BlockLiveIn
     {
         enum Kind : uint8_t
@@ -194,6 +197,9 @@ public:
         // Pairs whose MAC/status writes no instruction can see: a later write in the block lands before any reader
         // runs. They only add their sticky bits, to the next write that does land (m_deadSticky).
         std::array<bool, kMaxBlockPairs> deadFlags{};
+        // Per pair, the upper instruction's operands that an FMAC instruction of the block wrote (kKnownNormal*):
+        // FMAC results are normalized already, so they are read without normalizeOperand().
+        std::array<uint8_t, kMaxBlockPairs> knownNormal{};
         bool usesDtBits = false;
         bool valid = false; // false: not a block runBlock() handles (reserved instruction, XGKICK, too long...)
     };
@@ -202,7 +208,7 @@ public:
     // function costs GCC gigabytes); first runs the block's first pair as stepPair() does.
     template <const BlockPlan &kPlan, const auto &kBodies>
     StepResult runBlock(const RunContext &context, CompiledEntry first);
-    template <bool kDeadFlags>
+    template <bool kDeadFlags, uint8_t kKnownNormal = 0>
     StepResult stepPairBodyEntry(const DecodedInstructionPair &decoded, const RunContext &context);
 
     static constexpr uint64_t codeHash(const uint8_t *code, uint32_t size)
@@ -376,7 +382,7 @@ private:
 #endif
     StepResult stepPairImpl(const DecodedInstructionPair &decoded, const RunContext &context);
     // Everything stepPairImpl does once the pair can issue. kDeadFlags: see BlockPlan::deadFlags.
-    template <bool kLogInFlight, bool kDeadFlags = false>
+    template <bool kLogInFlight, bool kDeadFlags = false, uint8_t kKnownNormal = 0>
 #if defined(_MSC_VER) && !defined(__clang__)
     __forceinline
 #else
@@ -398,14 +404,20 @@ private:
     const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory,
                                                                  uint32_t pc);
 
+    // kKnownNormal: BlockPlan::knownNormal.
+    template <uint8_t kKnownNormal = 0>
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
 
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);
+    template <uint8_t kKnownNormal = 0>
     void applyFmacDest(float *dst, float *result, uint8_t dest);
+    template <uint8_t kKnownNormal = 0>
     void applyFmacDestAcc(float *result, uint8_t dest);
+    template <uint8_t kKnownNormal = 0>
     bool fmacFlagsFast(float *result, uint8_t dest, uint32_t &mac, uint32_t &status, uint32_t &sticky) const;
+    template <uint8_t kKnownNormal = 0>
     void fmacFlags(float *result, uint8_t dest);
     void fmacFlagsSlow(float *result, uint8_t dest);
     uint8_t fmacSumAtFloatMaxFlags(float &value, uint32_t lane, double sum) const;

@@ -268,7 +268,7 @@ void GS::workerLoop()
                     std::fprintf(stderr, "[gs-record] started\n");
                 }
             }
-            if (recorder.started)
+            if (recorder.started && command.kind != QueuedCommand::Kind::PresentationLatch)
             {
                 if (std::chrono::duration<double>(std::chrono::steady_clock::now() - recorder.began).count() > recorder.seconds)
                 {
@@ -295,6 +295,10 @@ void GS::workerLoop()
             case QueuedCommand::Kind::NativeImageUpload:
                 target->uploadImageNativeNow(command.registers[0], command.registers[1], command.registers[2],
                                              command.registers[3], data, size);
+                break;
+            case QueuedCommand::Kind::PresentationLatch:
+                if (target == this)
+                    latchHostPresentationFrame(&command.displayRegisters);
                 break;
             }
         }
@@ -811,6 +815,29 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    latchHostPresentationFrame(nullptr);
+}
+
+void GS::queueHostPresentationLatch()
+{
+    if (!shouldQueue())
+    {
+        latchHostPresentationFrame();
+        return;
+    }
+    QueuedCommand command;
+    command.kind = QueuedCommand::Kind::PresentationLatch;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        if (!m_privRegs)
+            return;
+        command.displayRegisters = buildPresentationRequestUnlocked();
+    }
+    enqueue(std::move(command));
+}
+
+void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegisters)
+{
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -823,6 +850,18 @@ void GS::latchHostPresentationFrame()
             return;
         }
         request = buildPresentationRequestUnlocked();
+    }
+    if (displayRegisters)
+    {
+        // The drawing contexts are this thread's; the display registers were taken when the latch was queued.
+        request.pmode = displayRegisters->pmode;
+        request.smode2 = displayRegisters->smode2;
+        request.dispfb1 = displayRegisters->dispfb1;
+        request.display1 = displayRegisters->display1;
+        request.dispfb2 = displayRegisters->dispfb2;
+        request.display2 = displayRegisters->display2;
+        request.bgcolor = displayRegisters->bgcolor;
+        request.vsyncTick = displayRegisters->vsyncTick;
     }
 
     PresentationFrame frame{};

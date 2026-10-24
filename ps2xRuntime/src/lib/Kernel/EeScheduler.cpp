@@ -1977,9 +1977,10 @@ void EeScheduler::processEvent(const EeEvent &event)
                 PS2Memory &memory = m_runtime.memory();
                 if (memory.gsLag())
                 {
-                    // The worker may still be drawing the frame: it latches once it has.
+                    // The worker may still be drawing the frame: the latch follows it through the worker's queue,
+                    // then the GS thread's.
                     PS2Runtime *runtime = &m_runtime;
-                    memory.queueVif1Callback([runtime]() { runtime->gsForPresentation().latchHostPresentationFrame(); });
+                    memory.queueVif1Callback([runtime]() { runtime->gsForPresentation().queueHostPresentationLatch(); });
                     memory.markVif1Frame();
                 }
                 else
