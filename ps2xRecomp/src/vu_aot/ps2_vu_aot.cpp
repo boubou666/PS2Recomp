@@ -220,9 +220,15 @@ namespace
         { return !decoded[first + k].iBit && J::lowerKind(lowerOf(k)) == J::Lower::Branch; };
         const bool branchEnd = count >= 2u && isBranch(count - 2u);
         const bool eBitEnd = count >= 2u && decoded[first + count - 2u].eBit;
+        // A branch or E bit on the last pair (its delay slot past the block, e.g. the fragment's end): the block
+        // leaves it pending, as the interpreter does after that pair.
+        const bool branchLast = !branchEnd && !eBitEnd && isBranch(count - 1u);
+        const bool eBitLast = !branchEnd && !eBitEnd && decoded[first + count - 1u].eBit;
+        if (branchLast && eBitLast)
+            return false;
         for (uint32_t k = 0; k < count; ++k)
         {
-            const bool tail = k + 2u == count && (branchEnd || eBitEnd);
+            const bool tail = (k + 2u == count && (branchEnd || eBitEnd)) || (k + 1u == count && (branchLast || eBitLast));
             if ((isBranch(k) || decoded[first + k].eBit) && !tail)
                 return false;
         }
@@ -242,7 +248,7 @@ namespace
         }
         // The last two pairs end the block: the interpreter cannot run them in the middle of it.
         for (uint32_t k = count >= 2u ? count - 2u : 0u; k < count; ++k)
-            if (info[k].fallback && (branchEnd || eBitEnd))
+            if (info[k].fallback && (branchEnd || eBitEnd || branchLast || eBitLast))
                 return false;
 
         // Registers the block touches (loaded on entry) and writes (stored on exit).
@@ -327,9 +333,9 @@ namespace
         // A conditional branch reads the old value of a VI the pair before it wrote (readBranchVi).
         std::string branchOldVi;
         int branchOldReg = -1;
-        if (branchEnd)
+        if (branchEnd || branchLast)
         {
-            const uint32_t b = count - 2u;
+            const uint32_t b = branchEnd ? count - 2u : count - 1u;
             const uint32_t opcode = lowerOf(b) >> 25;
             if (opcode >= 0x28u && b > 0u)
             {
@@ -359,7 +365,7 @@ namespace
             const uint32_t upper = pair.upper, lower = pair.lower;
             const uint8_t hints = static_cast<uint8_t>(plan.knownNormal[k] | (unobserved[first + k] ? Vu::kHintFlagsUnobserved : 0u));
             body << "        // pair " << (firstPair + first + k) << " (pc 0x" << hex(pc, 4) << ")\n";
-            if (branchEnd && branchOldReg >= 0 && k + 3u == count)
+            if (branchOldReg >= 0 && k + (branchEnd ? 3u : 2u) == count)
                 body << "        const int32_t viBranchOld = " << viName(static_cast<uint32_t>(branchOldReg)) << ";\n";
             if (lastViReg >= 0 && k + 1u == count)
                 body << "        const int32_t viLastOld = " << viName(static_cast<uint32_t>(lastViReg)) << ";\n";
@@ -593,6 +599,11 @@ namespace
             out << "        s.pc = taken ? target : J::wrapPc(context, " << (lastPc + 8u) << "u);\n";
         else
             out << "        s.pc = J::wrapPc(context, " << (lastPc + 8u) << "u);\n";
+        if (branchLast) // stepPairBody after a branch pair: pending, its delay already counted down
+            out << "        if (taken)\n        {\n            s.branchPending = true;\n            s.branchTarget = target;\n"
+                << "            s.branchDelay = 0;\n        }\n";
+        if (eBitLast)
+            out << "        s.ebit = true;\n";
         out << "        J::leave<kBlockPlan" << id << ", kBlockPairs" << id << ">(vu, base);\n";
         if (lastViReg >= 0)
             out << "        J::recordViForBranch(vu, " << lastViReg << ", viLastOld);\n";
@@ -604,12 +615,15 @@ namespace
     // slot of an E bit, starts at every static branch target, and leaves out XGKICK and reserved pairs (they run on
     // their own, as does any pair a jump lands on in the middle of a block).
     std::vector<std::pair<uint32_t, uint32_t>> findBlocks(const std::vector<VU1Interpreter::DecodedInstructionPair> &pairs,
-                                                         uint32_t firstPair)
+                                                         uint32_t firstPair, const std::set<uint32_t> &entryPairs = {})
     {
         using Vu = VU1Interpreter;
         const uint32_t count = static_cast<uint32_t>(pairs.size());
         std::vector<bool> starts(count + 2u, false), alone(count, false);
         starts[0] = true;
+        for (uint32_t entry : entryPairs) // where microprograms start (VCALLMS targets)
+            if (entry >= firstPair && entry < firstPair + count)
+                starts[entry - firstPair] = true;
         for (uint32_t index = 0; index < count; ++index)
         {
             const Vu::DecodedInstructionPair &pair = pairs[index];
@@ -653,7 +667,7 @@ namespace
 
     void writeFragment(const std::filesystem::path &path, const std::string &prefix, const std::string &elfName,
                        const Fragment &fragment, const uint8_t *code, bool stickyUnobserved,
-                       VU1Interpreter::Unit unit = VU1Interpreter::Unit::VU1)
+                       VU1Interpreter::Unit unit = VU1Interpreter::Unit::VU1, const std::set<uint32_t> &entryPairs = {})
     {
         const bool vu0 = unit == VU1Interpreter::Unit::VU0;
         const std::string unitName = vu0 ? "Vu::Unit::VU0" : "Vu::Unit::VU1";
@@ -673,7 +687,7 @@ namespace
             words.push_back({lower, upper});
             decoded.push_back(Vu::decodePair(unit, lower, upper));
         }
-        const auto blocks = findBlocks(decoded, fragment.firstPair);
+        const auto blocks = findBlocks(decoded, fragment.firstPair, entryPairs);
         // Flags no reader sees are skipped only if nothing in the program can read the sticky bits they add to.
         std::vector<bool> unobserved(fragment.pairCount, false);
         if (stickyUnobserved)
@@ -865,6 +879,15 @@ int main(int argc, char **argv)
     }
     constexpr uint32_t kVu0CodePairs = 0x1000u / 8u;
     size_t vu0Fragments = 0;
+    // VU0 microprograms start where the EE's VCALLMS points (COP2, funct 0x38, immediate in bits 6..20): blocks
+    // start there too, so a call does not begin with interpreted pairs.
+    std::set<uint32_t> vu0Entries;
+    for (size_t offset = 0; offset + 4u <= file.size(); offset += 4u)
+    {
+        const uint32_t word = readU32(file, offset);
+        if ((word >> 26) == 0x12u && ((word >> 25) & 1u) != 0u && (word & 0x3Fu) == 0x38u && ((word >> 21) & 0xFu) == 0u)
+            vu0Entries.insert((word >> 6) & 0x7FFFu);
+    }
     for (const Fragment &fragment : fragments)
     {
         if (fragment.firstPair + fragment.pairCount > kVu0CodePairs)
@@ -884,7 +907,7 @@ int main(int argc, char **argv)
         const std::filesystem::path path =
             outDir / (vu0Prefix + hex(fragment.firstPair, 3) + "_" + hex(fragment.hash, 16) + ".cpp");
         writeFragment(path, vu0Prefix, elfPath.filename().string(), fragment, file.data() + fragment.fileOffset, false,
-                      VU1Interpreter::Unit::VU0);
+                      VU1Interpreter::Unit::VU0, vu0Entries);
         ++vu0Fragments;
     }
     std::printf("ps2_vu_aot: %zu microcode fragments, %u instruction pairs (%zu also as VU0 microcode) -> %s\n",

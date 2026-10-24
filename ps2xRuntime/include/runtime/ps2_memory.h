@@ -322,6 +322,8 @@ public:
     uint64_t takeTimerSpinCycles() noexcept { return m_timerSpinCycles.exchange(0u, std::memory_order_acq_rel); }
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
+    // Applies the cycles advanceEeTimers() has been holding back (timer registers read the result).
+    uint32_t flushEeTimers() noexcept;
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
@@ -526,6 +528,11 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    uint64_t m_pendingTimerCycles = 0;
+    uint64_t m_timerEventCycles = 0;
+    bool m_gifFqcSet = false;
+    uint32_t applyEeTimerCycles(uint64_t eeCycles) noexcept;
+    [[nodiscard]] uint64_t eeTimerEventCycles() const noexcept;
     std::atomic<uint64_t> m_timerSpinCycles{0u};
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);

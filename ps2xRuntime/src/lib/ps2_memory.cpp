@@ -404,24 +404,48 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_pendingTimerCycles = 0u;
+    m_timerEventCycles = 0u;
     // The EE kernel keeps Timer 3 counting H-BLANKs for its alarms; games poll it unconfigured.
     m_eeTimers[3].mode = kEeTimerModeCue | 0x3u;
     m_timerSpinCycles.store(0u, std::memory_order_release);
 }
 
+// The timers advance lazily: cycles add up until the next one that can raise a flag (m_timerEventCycles, from
+// the state as of the last update) or until a timer register is accessed (flushEeTimers). Advancing by a sum of
+// cycles gives the same counts and remainders as advancing by its parts, and no flag can be reached before.
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 {
     if (eeCycles == 0u)
     {
         return 0u;
     }
+    if (m_gifFqcSet)
+    {
+        // The FIFO count processPendingTransfers() shows drains once the EE runs on.
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            gifStatIt->second &= ~kGifFqcMask;
+        m_gifFqcSet = false;
+    }
+    m_pendingTimerCycles += eeCycles;
+    if (m_pendingTimerCycles < m_timerEventCycles)
+        return 0u;
+    return flushEeTimers();
+}
 
-    constexpr uint32_t kGifStat = 0x10003020u;
-    constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+uint32_t PS2Memory::flushEeTimers() noexcept
+{
+    const uint32_t interruptMask = m_pendingTimerCycles != 0u ? applyEeTimerCycles(m_pendingTimerCycles) : 0u;
+    m_pendingTimerCycles = 0u;
+    m_timerEventCycles = eeTimerEventCycles();
+    return interruptMask;
+}
 
+uint32_t PS2Memory::applyEeTimerCycles(uint64_t eeCycles) noexcept
+{
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
@@ -486,6 +510,15 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 }
 
 uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    const uint64_t event = eeTimerEventCycles();
+    if (event == std::numeric_limits<uint64_t>::max())
+        return event;
+    return event > m_pendingTimerCycles ? event - m_pendingTimerCycles : 1u;
+}
+
+// EE cycles from the timers' current state to the next flag one of them can raise.
+uint64_t PS2Memory::eeTimerEventCycles() const noexcept
 {
     uint64_t nearest = std::numeric_limits<uint64_t>::max();
     for (const EeTimer &timer : m_eeTimers)
@@ -1182,6 +1215,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimers();
+        m_timerEventCycles = 0u; // recomputed from the new state at the next advance
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1872,6 +1907,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        m_gifFqcSet = true;
     }
 
     // PATH3 packets: to the worker's queue (a copy: the EE may reuse the buffer) with the GS lag, else now.
@@ -2538,6 +2574,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimers();
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
