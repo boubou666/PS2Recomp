@@ -298,7 +298,10 @@ void GS::workerLoop()
                 break;
             case QueuedCommand::Kind::PresentationLatch:
                 if (target == this)
+                {
                     latchHostPresentationFrame(&command.displayRegisters);
+                    m_queuedLatchesDone.fetch_add(1u, std::memory_order_release);
+                }
                 break;
             }
         }
@@ -823,6 +826,7 @@ void GS::queueHostPresentationLatch()
     if (!shouldQueue())
     {
         latchHostPresentationFrame();
+        m_queuedLatchesDone.fetch_add(1u, std::memory_order_release);
         return;
     }
     QueuedCommand command;

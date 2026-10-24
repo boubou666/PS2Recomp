@@ -379,8 +379,11 @@ public:
     void queueVif1Callback(std::function<void()> callback);
     // Marks the end of a frame in the queue (the presentation latch).
     void markVif1Frame();
-    // Waits for the transfers queued before the last frame mark.
+    // Waits for the transfers queued before the last frame mark, and for the frames before that one to be presented
+    // (setPresentedFramesProvider): the GS is at most one frame behind, which bounds the added input latency.
     void waitForVif1PreviousFrame();
+    using PresentedFramesProvider = std::function<uint64_t()>;
+    void setPresentedFramesProvider(PresentedFramesProvider provider) { m_presentedFramesProvider = std::move(provider); }
     bool onVif1Worker() const;
     // VU0 FBRST of the EE when the transfer being processed was queued (D and T bit enables of VU1).
     using Vu0FbrstProvider = std::function<uint32_t()>;
@@ -488,6 +491,8 @@ public:
     void waitForVif1Until(uint64_t queued) const;
     bool m_gsLag = false;
     uint64_t m_vif1FrameMark = 0;
+    uint64_t m_vif1FramesMarked = 0;
+    PresentedFramesProvider m_presentedFramesProvider;
     void vif1WorkerMain();
     void stopVif1Worker();
     bool m_vif1Threaded = false;

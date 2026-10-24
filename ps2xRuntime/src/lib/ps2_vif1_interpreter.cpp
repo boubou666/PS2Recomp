@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <chrono>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -751,6 +752,7 @@ void PS2Memory::waitForVif1() const
 void PS2Memory::markVif1Frame()
 {
     m_vif1FrameMark = m_vif1Queued.load(std::memory_order_acquire);
+    ++m_vif1FramesMarked;
 }
 
 void PS2Memory::waitForVif1PreviousFrame()
@@ -758,6 +760,20 @@ void PS2Memory::waitForVif1PreviousFrame()
     if (!m_vif1Threaded || t_onVif1Worker)
         return;
     waitForVif1Until(m_vif1FrameMark);
+    if (!m_presentedFramesProvider || m_vif1FramesMarked < 2u)
+        return;
+    // The GS thread presents the frames in order; give up after a second rather than hang if it stopped.
+    const uint64_t target = m_vif1FramesMarked - 1u;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (uint32_t spin = 0; m_presentedFramesProvider() < target; ++spin)
+    {
+        if (spin < 64u)
+            std::this_thread::yield();
+        else if (std::chrono::steady_clock::now() > deadline)
+            break;
+        else
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 void PS2Memory::waitForVif1Until(uint64_t queued) const

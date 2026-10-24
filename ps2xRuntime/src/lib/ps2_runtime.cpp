@@ -885,6 +885,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                              (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                              (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                              (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    m_memory.setPresentedFramesProvider([this]() { return gsForPresentation().queuedLatchesDone(); });
     m_memory.setVu0FbrstProvider([this]()
                                  {
                                      const R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;

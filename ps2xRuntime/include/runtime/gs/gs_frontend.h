@@ -145,6 +145,8 @@ public:
     // latchHostPresentationFrame() once the GS has drawn what is queued before it, with the display registers
     // as they are now (the caller's position in the GS's stream); on the GS thread if it has one.
     void queueHostPresentationLatch();
+    // Latches queueHostPresentationLatch() asked for that are done (the frame is presented).
+    uint64_t queuedLatchesDone() const { return m_queuedLatchesDone.load(std::memory_order_acquire); }
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -221,6 +223,7 @@ private:
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     GSPresentationRequest buildPresentationRequestUnlocked() const;
     void latchHostPresentationFrame(const GSPresentationRequest *displayRegisters);
+    std::atomic<uint64_t> m_queuedLatchesDone{0};
 
 
     GSContext &activeContext();
