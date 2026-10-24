@@ -1496,6 +1496,43 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[14]") != std::string::npos, "S2 VLQI base VI should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[6]") != std::string::npos, "S2 VLQI destination VF should come from rt");
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
+            t.IsTrue(out.find("getVU0Data()") != std::string::npos, "S2 VLQI should address VU0 data memory");
+            t.IsTrue(out.find("READ128") == std::string::npos, "S2 VLQI must not read EE memory");
+        });
+
+        tc.Run("VU0 S2 VSQI stores fs (rd) at the VI base in rt", [](TestCase &t) {
+            Instruction inst{};
+            inst.opcode = OPCODE_COP2;
+            inst.rs = COP2_CO | 0x4;
+            inst.rt = 10; // it
+            inst.rd = 11; // fs
+            inst.function = 0x3D;
+            inst.vectorInfo.vectorField = 0xF;
+            inst.raw = (((VU0_S2_VSQI >> 2) & 0x1F) << 6) | (VU0_S2_VSQI & 0x3);
+
+            CodeGenerator gen({}, {});
+            std::string out = gen.translateInstruction(inst);
+
+            t.IsTrue(out.find("ctx->vu0_vf[11]") != std::string::npos, "S2 VSQI source VF should come from rd");
+            t.IsTrue(out.find("ctx->vi[10] = static_cast<uint16_t>(ctx->vi[10] + 1)") != std::string::npos,
+                     "S2 VSQI should post-increment the VI base from rt");
+            t.IsTrue(out.find("ctx->vi[11]") == std::string::npos, "S2 VSQI must not use rd as VI base");
+            t.IsTrue(out.find("getVU0Data()") != std::string::npos, "S2 VSQI should address VU0 data memory");
+        });
+
+        tc.Run("VU0 S2 VDIV uses the PS2 divide (zero divisor gives +-max)", [](TestCase &t) {
+            Instruction inst{};
+            inst.opcode = OPCODE_COP2;
+            inst.rs = COP2_CO;
+            inst.rt = 2;
+            inst.rd = 1;
+            inst.function = 0x3C;
+            inst.raw = (((VU0_S2_VDIV >> 2) & 0x1F) << 6) | (VU0_S2_VDIV & 0x3);
+
+            CodeGenerator gen({}, {});
+            std::string out = gen.translateInstruction(inst);
+
+            t.IsTrue(out.find("ps2_fdiv(fs, ft)") != std::string::npos, "S2 VDIV should use ps2_fdiv");
         });
 
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
