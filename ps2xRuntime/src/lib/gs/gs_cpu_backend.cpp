@@ -2841,7 +2841,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
             for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
             for (int x = runStart; x <= runEnd; ++x)
             {
-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+                float tx =(static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
                 if (state.prim.fst)
@@ -2922,6 +2922,14 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
     const float slope0 = ((fy1 - fy2) * winding) * invAbsDenom;
     const float slope1 = ((fy2 - fy0) * winding) * invAbsDenom;
 
+    // Early depth test: WritePixel's Z comparison done before shading, so occluded pixels skip
+    // the texture sample. A pixel failing it writes nothing whatever its colour, and sampling
+    // has no visible side effect, so the result is the same.
+    const PixelPipeline &pixel = *raster.pixel;
+    if (pixel.ztst == 0u)
+        return;
+    const bool earlyZ = pixel.ztst >= 2u;
+
     for (int y = minY; y <= maxY; ++y)
     {
         float py = static_cast<float>(y) + 0.5f;
@@ -2962,6 +2970,13 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                 continue;
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const u32 pixelZ = static_cast<u32>(z + 0.5);
+            if (earlyZ)
+            {
+                const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, x, y);
+                if (pixel.ztst == 2u ? pixelZ < storedZ : pixelZ <= storedZ)
+                    continue;
+            }
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
@@ -3024,7 +3039,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(*raster.pixel, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            WritePixel(pixel, x, y, pixelZ, r, g, b, a, fog);
         }
     }
 }
