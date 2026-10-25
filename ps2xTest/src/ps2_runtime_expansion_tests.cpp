@@ -1239,6 +1239,24 @@ void register_ps2_runtime_expansion_tests()
                      "each argument, pointers and ints included, takes a whole sd-spilled slot");
         });
 
+        tc.Run("vsprintf with a null format writes the empty string at address 0", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kDestAddr = 0x00002000u;
+            std::memcpy(rdram.data() + kDestAddr, "stale", 6);
+            setRegU32(ctx, 4, kDestAddr);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 0x00002200u);
+
+            ps2_stubs::vsprintf(rdram.data(), &ctx, &runtime);
+
+            t.Equals(rdram[kDestAddr], uint8_t{0}, "the destination is terminated, not left with its old text");
+            t.Equals(::getRegU32(&ctx, 2), 0u, "nothing was written before the terminator");
+        });
+
         tc.Run("multiply-add matrix writes rd only when R5900 requires it", [](TestCase &t)
         {
             R5900Decoder decoder;
