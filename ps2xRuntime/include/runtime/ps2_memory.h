@@ -565,6 +565,7 @@ public:
     uint32_t applyEeTimerCycles(uint64_t eeCycles) noexcept;
     [[nodiscard]] uint64_t eeTimerEventCycles() const noexcept;
     std::atomic<uint64_t> m_timerSpinCycles{0u};
+    std::vector<uint8_t> readDmaSourceChain(uint32_t channelBase, uint32_t chcr);
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

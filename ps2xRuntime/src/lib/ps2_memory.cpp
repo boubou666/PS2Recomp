@@ -1576,197 +1576,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
                 else if (mode == 1)
                 {
-                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
-                    uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
-                    uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
-                    uint32_t asp = (chcr >> 4) & 0x3u;
-                    const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    // Bounds for a chain that never ends (tags leading back to themselves); a busy frame's display
-                    // list is thousands of tags and megabytes.
-                    const int kMaxChainTags = 1 << 20;
-                    const size_t kMaxChainBytes = size_t{256} << 20;
-                    std::vector<uint8_t> chainBuf;
-
-                    auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
-                    {
-                        const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
-                        uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-                        const bool scratch = isScratchpad(srcAddr);
-                        uint32_t src = 0;
-                        src = translateAddress(srcAddr);
-                        const uint8_t *base2;
-                        uint32_t maxSz2;
-                        if (scratch)
-                        {
-                            base2 = m_scratchpad;
-                            maxSz2 = PS2_SCRATCHPAD_SIZE;
-                        }
-                        else
-                        {
-                            base2 = m_rdram;
-                            maxSz2 = PS2_RAM_SIZE;
-                        }
-
-                        while (bytes > 0)
-                        {
-                            if (src >= maxSz2)
-                                src = 0;
-                            uint32_t chunk = bytes;
-                            if (src + chunk > maxSz2)
-                                chunk = maxSz2 - src;
-                            if (chunk == 0)
-                                break;
-                            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
-                            bytes -= chunk;
-                            src += chunk;
-                        }
-                    };
-
-                    auto appendVifTagData = [&](uint32_t localTagAddr)
-                    {
-                        uint32_t tagPhys = 0u;
-                        const bool tagScratch = isScratchpad(localTagAddr);
-                        tagPhys = translateAddress(localTagAddr);
-
-                        const uint8_t *localBase = tagScratch ? m_scratchpad : m_rdram;
-                        const uint32_t localMax = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
-                        if (tagPhys + 16u > localMax)
-                            return;
-
-                        // CHCR.TTE sends the DMAtag's upper 64 bits to the channel before
-                        // the tag payload. VIF chains use those bytes for two VIFcodes.
-                        chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
-                    };
-
-                    const bool isVifChannel =
-                        channelBase == 0x10009000u || channelBase == 0x10008000u;
-                    const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
-
-                    int tagsProcessed = 0;
-                    uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
-
-                    while (tagsProcessed < kMaxChainTags && chainBuf.size() < kMaxChainBytes)
-                    {
-                        const uint32_t currentTagAddr = tagAddr;
-                        const bool tagInSPR = isScratchpad(tagAddr);
-                        uint32_t physTag = 0;
-                        try
-                        {
-                            physTag = translateAddress(tagAddr);
-                        }
-                        catch (...)
-                        {
-                            break;
-                        }
-                        const uint8_t *tagBase;
-                        uint32_t tagMax;
-                        if (tagInSPR)
-                        {
-                            tagBase = m_scratchpad;
-                            tagMax = PS2_SCRATCHPAD_SIZE;
-                        }
-                        else
-                        {
-                            tagBase = m_rdram;
-                            tagMax = PS2_RAM_SIZE;
-                        }
-                        if (physTag + 16 > tagMax)
-                            break;
-
-                        const uint8_t *tp = tagBase + physTag;
-                        uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
-                        uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
-                        uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
-                        const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
-                        lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
-                        ++tagsProcessed;
-
-                        uint32_t dataAddr = 0;
-                        bool hasPayload = (tagQwc > 0);
-                        bool endChain = false;
-
-                        switch (id)
-                        {
-                        case 0:
-                            dataAddr = addr;
-                            tagAddr = tagAddr + 16;
-                            endChain = true;
-                            break;
-                        case 1:
-                            dataAddr = tagAddr + 16;
-                            tagAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
-                            break;
-                        case 2:
-                            dataAddr = tagAddr + 16;
-                            tagAddr = addr;
-                            break;
-                        case 3:
-                        case 4:
-                            dataAddr = addr;
-                            tagAddr = tagAddr + 16;
-                            break;
-                        case 5:
-                            dataAddr = tagAddr + 16;
-                            {
-                                const uint32_t retAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
-                                if (asp == 0u)
-                                {
-                                    asr0 = retAddr;
-                                    asp = 1u;
-                                }
-                                else if (asp == 1u)
-                                {
-                                    asr1 = retAddr;
-                                    asp = 2u;
-                                }
-                            }
-                            tagAddr = addr;
-                            break;
-                        case 6:
-                            dataAddr = tagAddr + 16;
-                            if (asp == 2u)
-                            {
-                                tagAddr = asr1;
-                                asp = 1u;
-                            }
-                            else if (asp == 1u)
-                            {
-                                tagAddr = asr0;
-                                asp = 0u;
-                            }
-                            else
-                            {
-                                endChain = true;
-                            }
-                            break;
-                        case 7:
-                            dataAddr = tagAddr + 16;
-                            endChain = true;
-                            break;
-                        default:
-                            hasPayload = false;
-                            endChain = true;
-                            break;
-                        }
-
-                        if (transferTagData)
-                            appendVifTagData(currentTagAddr);
-
-                        if (hasPayload)
-                            appendData(dataAddr, tagQwc);
-                        if (irq && tieEnabled)
-                            endChain = true;
-                        if (endChain)
-                            break;
-                    }
-
-                    m_ioRegisters[channelBase + 0x30] = tagAddr;
-                    m_ioRegisters[channelBase + 0x40] = asr0;
-                    m_ioRegisters[channelBase + 0x50] = asr1;
-                    chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
-                    chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
-                    m_ioRegisters[channelBase + 0x00] = chcr;
+                    std::vector<uint8_t> chainBuf = readDmaSourceChain(channelBase, chcr);
 
                     if (!chainBuf.empty())
                     {
@@ -1822,6 +1632,202 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     }
 
     return false;
+}
+
+std::vector<uint8_t> PS2Memory::readDmaSourceChain(uint32_t channelBase, uint32_t chcr)
+{
+    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+    uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
+    uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+    uint32_t asp = (chcr >> 4) & 0x3u;
+    const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+    // Bounds for a chain that never ends (tags leading back to themselves); a busy frame's display
+    // list is thousands of tags and megabytes.
+    const int kMaxChainTags = 1 << 20;
+    const size_t kMaxChainBytes = size_t{256} << 20;
+    std::vector<uint8_t> chainBuf;
+
+    auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+    {
+        const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
+        uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+        const bool scratch = isScratchpad(srcAddr);
+        uint32_t src = 0;
+        src = translateAddress(srcAddr);
+        const uint8_t *base2;
+        uint32_t maxSz2;
+        if (scratch)
+        {
+            base2 = m_scratchpad;
+            maxSz2 = PS2_SCRATCHPAD_SIZE;
+        }
+        else
+        {
+            base2 = m_rdram;
+            maxSz2 = PS2_RAM_SIZE;
+        }
+
+        while (bytes > 0)
+        {
+            if (src >= maxSz2)
+                src = 0;
+            uint32_t chunk = bytes;
+            if (src + chunk > maxSz2)
+                chunk = maxSz2 - src;
+            if (chunk == 0)
+                break;
+            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
+            bytes -= chunk;
+            src += chunk;
+        }
+    };
+
+    auto appendVifTagData = [&](uint32_t localTagAddr)
+    {
+        uint32_t tagPhys = 0u;
+        const bool tagScratch = isScratchpad(localTagAddr);
+        tagPhys = translateAddress(localTagAddr);
+
+        const uint8_t *localBase = tagScratch ? m_scratchpad : m_rdram;
+        const uint32_t localMax = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        if (tagPhys + 16u > localMax)
+            return;
+
+        // CHCR.TTE sends the DMAtag's upper 64 bits to the channel before
+        // the tag payload. VIF chains use those bytes for two VIFcodes.
+        chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
+    };
+
+    const bool isVifChannel =
+        channelBase == 0x10009000u || channelBase == 0x10008000u;
+    const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
+
+    int tagsProcessed = 0;
+    uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+
+    while (tagsProcessed < kMaxChainTags && chainBuf.size() < kMaxChainBytes)
+    {
+        const uint32_t currentTagAddr = tagAddr;
+        const bool tagInSPR = isScratchpad(tagAddr);
+        uint32_t physTag = 0;
+        try
+        {
+            physTag = translateAddress(tagAddr);
+        }
+        catch (...)
+        {
+            break;
+        }
+        const uint8_t *tagBase;
+        uint32_t tagMax;
+        if (tagInSPR)
+        {
+            tagBase = m_scratchpad;
+            tagMax = PS2_SCRATCHPAD_SIZE;
+        }
+        else
+        {
+            tagBase = m_rdram;
+            tagMax = PS2_RAM_SIZE;
+        }
+        if (physTag + 16 > tagMax)
+            break;
+
+        const uint8_t *tp = tagBase + physTag;
+        uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
+        uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
+        uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
+        const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
+        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+        lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+        ++tagsProcessed;
+
+        uint32_t dataAddr = 0;
+        bool hasPayload = (tagQwc > 0);
+        bool endChain = false;
+
+        switch (id)
+        {
+        case 0:
+            dataAddr = addr;
+            tagAddr = tagAddr + 16;
+            endChain = true;
+            break;
+        case 1:
+            dataAddr = tagAddr + 16;
+            tagAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
+            break;
+        case 2:
+            dataAddr = tagAddr + 16;
+            tagAddr = addr;
+            break;
+        case 3:
+        case 4:
+            dataAddr = addr;
+            tagAddr = tagAddr + 16;
+            break;
+        case 5:
+            dataAddr = tagAddr + 16;
+            {
+                const uint32_t retAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
+                if (asp == 0u)
+                {
+                    asr0 = retAddr;
+                    asp = 1u;
+                }
+                else if (asp == 1u)
+                {
+                    asr1 = retAddr;
+                    asp = 2u;
+                }
+            }
+            tagAddr = addr;
+            break;
+        case 6:
+            dataAddr = tagAddr + 16;
+            if (asp == 2u)
+            {
+                tagAddr = asr1;
+                asp = 1u;
+            }
+            else if (asp == 1u)
+            {
+                tagAddr = asr0;
+                asp = 0u;
+            }
+            else
+            {
+                endChain = true;
+            }
+            break;
+        case 7:
+            dataAddr = tagAddr + 16;
+            endChain = true;
+            break;
+        default:
+            hasPayload = false;
+            endChain = true;
+            break;
+        }
+
+        if (transferTagData)
+            appendVifTagData(currentTagAddr);
+
+        if (hasPayload)
+            appendData(dataAddr, tagQwc);
+        if (irq && tieEnabled)
+            endChain = true;
+        if (endChain)
+            break;
+    }
+
+    m_ioRegisters[channelBase + 0x30] = tagAddr;
+    m_ioRegisters[channelBase + 0x40] = asr0;
+    m_ioRegisters[channelBase + 0x50] = asr1;
+    chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
+    chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
+    m_ioRegisters[channelBase + 0x00] = chcr;
+    return chainBuf;
 }
 
 bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
