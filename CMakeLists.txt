@@ -27,6 +27,15 @@ if(ANDROID)
     set(PS2X_BUILD_STUDIO OFF)
 endif()
 
+# CMake takes the Windows CPU from PROCESSOR_ARCHITECTURE, which some shells (MSYS2 login shells started from
+# other programs) do not pass on. Without it the x86 flags below are skipped; ask the compiler for its target.
+if(NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -dumpmachine
+        OUTPUT_VARIABLE PS2X_COMPILER_TRIPLE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    string(REGEX REPLACE "-.*$" "" CMAKE_SYSTEM_PROCESSOR "${PS2X_COMPILER_TRIPLE}")
+    message(STATUS "Target processor from the compiler: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
 set(PS2X_IS_ARM_TARGET OFF)
 set(PS2X_IS_AARCH64_TARGET OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")

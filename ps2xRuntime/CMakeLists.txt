@@ -256,7 +256,8 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
 if(NOT PS2X_ENABLE_FFMPEG)
     message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
     add_library(ffmpeg INTERFACE)
-elseif(WIN32)
+elseif(MSVC)
+    # MinGW (MSYS2) finds its FFmpeg packages with pkg-config, like Linux, below.
     include(ExternalProject)
 
     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
@@ -599,7 +600,9 @@ if(WIN32 AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
     set(PS2X_SAMPLING_PROFILER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
     target_sources(ps2EntryRunner PRIVATE "${PS2X_SAMPLING_PROFILER_SOURCE}")
     set_source_files_properties("${PS2X_SAMPLING_PROFILER_SOURCE}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
-    target_link_libraries(ps2EntryRunner PRIVATE winmm)
+    # raylib first: winmm exports a PlaySound too, and ahead of raylib on a MinGW link line it takes raylib's
+    # PlaySound calls, then clashes with raudio's definition.
+    target_link_libraries(ps2EntryRunner PRIVATE raylib winmm)
 endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
