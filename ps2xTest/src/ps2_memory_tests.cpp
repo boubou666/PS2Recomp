@@ -363,6 +363,110 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
         });
 
+        tc.Run("EE timer overflows missed while the flag is set are delivered one per acknowledge", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer0Count = 0x10000000u;
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            constexpr uint32_t kCue = 1u << 7u;
+            constexpr uint32_t kOvfe = 1u << 9u;
+            constexpr uint32_t kOvff = 1u << 11u;
+            constexpr uint64_t kCyclesPerOverflow = 0x10000ull * 2u;
+
+            mem.writeIORegister(kTimer0Count, 0u);
+            mem.writeIORegister(kTimer0Mode, kCue | kOvfe | kOvff);
+
+            t.Equals(mem.advanceEeTimers(3u * kCyclesPerOverflow), 1u, "three overflows at once should raise TIM0");
+            t.Equals(mem.readIORegister(kTimer0Count), 0u, "COUNT should wrap back to zero after exact overflows");
+
+            uint32_t delivered = 1u;
+            for (int acknowledge = 0; acknowledge < 4; ++acknowledge)
+            {
+                mem.writeIORegister(kTimer0Mode, kCue | kOvfe | kOvff);
+                if (mem.advanceEeTimers(1u) == 1u)
+                {
+                    ++delivered;
+                }
+            }
+            t.Equals(delivered, 3u, "every overflow should reach the handler, one per OVFF acknowledge");
+            t.IsTrue((mem.readIORegister(kTimer0Mode) & kOvff) == 0u, "OVFF should stay clear once the backlog is drained");
+        });
+
+        tc.Run("EE timer zero-return compares missed in one batch are delivered one per acknowledge", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer1Count = 0x10000800u;
+            constexpr uint32_t kTimer1Mode = 0x10000810u;
+            constexpr uint32_t kTimer1Compare = 0x10000820u;
+            constexpr uint32_t kZret = 1u << 6u;
+            constexpr uint32_t kCue = 1u << 7u;
+            constexpr uint32_t kCmpe = 1u << 8u;
+            constexpr uint32_t kEquf = 1u << 10u;
+            constexpr uint32_t kMode = kZret | kCue | kCmpe;
+
+            mem.writeIORegister(kTimer1Count, 0u);
+            mem.writeIORegister(kTimer1Compare, 100u);
+            mem.writeIORegister(kTimer1Mode, kMode | kEquf);
+
+            t.Equals(mem.advanceEeTimers(2u * 450u), 2u, "four and a half compare periods should raise TIM1");
+            t.Equals(mem.readIORegister(kTimer1Count), 50u, "COUNT should hold the ticks past the last compare");
+
+            uint32_t delivered = 1u;
+            for (int acknowledge = 0; acknowledge < 6; ++acknowledge)
+            {
+                mem.writeIORegister(kTimer1Mode, kMode | kEquf);
+                if (mem.advanceEeTimers(1u) == 2u)
+                {
+                    ++delivered;
+                }
+            }
+            t.Equals(delivered, 4u, "each of the four compares should reach the handler");
+        });
+
+        tc.Run("EE timer backlog is dropped when the interrupt is disabled", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            constexpr uint32_t kCue = 1u << 7u;
+            constexpr uint32_t kOvfe = 1u << 9u;
+            constexpr uint32_t kOvff = 1u << 11u;
+
+            mem.writeIORegister(kTimer0Mode, kCue | kOvfe | kOvff);
+            t.Equals(mem.advanceEeTimers(4u * 0x20000ull), 1u, "four overflows at once should raise TIM0");
+
+            mem.writeIORegister(kTimer0Mode, kCue | kOvff);
+            mem.writeIORegister(kTimer0Mode, kCue | kOvfe | kOvff);
+            t.Equals(mem.advanceEeTimers(1u), 0u, "clearing OVFE should drop the overflows still owed");
+            t.IsTrue((mem.readIORegister(kTimer0Mode) & kOvff) == 0u, "OVFF should stay clear without a backlog");
+        });
+
+        tc.Run("EE timer interrupt owed after an acknowledge survives register reads", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer2Count = 0x10001000u;
+            constexpr uint32_t kTimer2Mode = 0x10001010u;
+            constexpr uint32_t kCue = 1u << 7u;
+            constexpr uint32_t kOvfe = 1u << 9u;
+            constexpr uint32_t kOvff = 1u << 11u;
+
+            mem.writeIORegister(kTimer2Count, 0u);
+            mem.writeIORegister(kTimer2Mode, kCue | kOvfe | kOvff);
+            t.Equals(mem.advanceEeTimers(2u * 0x20000ull), 4u, "two overflows at once should raise TIM2");
+
+            mem.writeIORegister(kTimer2Mode, kCue | kOvfe | kOvff);
+            (void)mem.readIORegister(kTimer2Count);
+            (void)mem.readIORegister(kTimer2Mode);
+            t.Equals(mem.advanceEeTimers(1u), 4u, "the owed overflow should still raise TIM2 after the reads");
+        });
+
         tc.Run("INTC_STAT latches raised causes and clears the bits written as ones", [](TestCase &t)
         {
             PS2Memory mem;
