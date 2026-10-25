@@ -498,18 +498,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     // Guest code that runs slower than real time (busy-wait loops) would otherwise stretch
     // VBlank and timer events; once the host deadline has passed, fast-forward to the event.
-    static const std::optional<WallClockCatchUp> envCatchUp = []() -> std::optional<WallClockCatchUp>
-    {
-        const char *value = std::getenv("PS2X_EE_CATCHUP");
-        if (!value || !*value)
-            return std::nullopt;
-        if (std::strcmp(value, "0") == 0)
-            return WallClockCatchUp::Off;
-        if (std::strcmp(value, "field") == 0)
-            return WallClockCatchUp::OncePerField;
-        return WallClockCatchUp::Full;
-    }();
-    const WallClockCatchUp catchUp = envCatchUp.value_or(m_wallClockCatchUp);
+    const WallClockCatchUp catchUp = wallClockCatchUp();
     if (catchUp != WallClockCatchUp::Off && nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u &&
         !(catchUp == WallClockCatchUp::OncePerField && m_lastCatchUpTick == m_vsyncTick))
     {
@@ -557,6 +546,22 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     renewTimeSlice();
     return false;
+}
+
+EeScheduler::WallClockCatchUp EeScheduler::wallClockCatchUp() const noexcept
+{
+    static const std::optional<WallClockCatchUp> envCatchUp = []() -> std::optional<WallClockCatchUp>
+    {
+        const char *value = std::getenv("PS2X_EE_CATCHUP");
+        if (!value || !*value)
+            return std::nullopt;
+        if (std::strcmp(value, "0") == 0)
+            return WallClockCatchUp::Off;
+        if (std::strcmp(value, "field") == 0)
+            return WallClockCatchUp::OncePerField;
+        return WallClockCatchUp::Full;
+    }();
+    return envCatchUp.value_or(m_wallClockCatchUp);
 }
 
 void EeScheduler::scheduleGsInterruptCheck(uint64_t delayCycles)

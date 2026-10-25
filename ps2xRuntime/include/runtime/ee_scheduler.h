@@ -406,6 +406,7 @@ public:
     };
     void setWallClockCatchUp(bool enabled) noexcept { m_wallClockCatchUp = enabled ? WallClockCatchUp::Full : WallClockCatchUp::Off; }
     void setWallClockCatchUp(WallClockCatchUp mode) noexcept { m_wallClockCatchUp = mode; }
+    [[nodiscard]] WallClockCatchUp wallClockCatchUp() const noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
