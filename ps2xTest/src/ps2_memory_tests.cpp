@@ -2754,6 +2754,49 @@ void register_ps2_memory_tests()
                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
         });
 
+        tc.Run("DMAC SPR_TO and SPR_FROM interleave mode move TQWC and skip SQWC quadwords", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kToChannel = 0x1000D400u;
+            constexpr uint32_t kFromChannel = 0x1000D000u;
+            constexpr uint32_t kDSqwc = 0x1000E030u;
+            constexpr uint32_t kMadr = 0x00029000u;
+            constexpr uint32_t kOut = 0x0002A000u;
+            constexpr uint32_t kSadr = 0x00000400u;
+            uint8_t *rdram = mem.getRDRAM();
+            uint8_t *spr = mem.getScratchpad();
+            for (uint32_t qw = 0; qw < 6u; ++qw)
+                std::memset(rdram + kMadr + qw * 16u, static_cast<int>(0x10u + qw), 16u);
+
+            mem.writeIORegister(kDSqwc, (2u << 16u) | 1u);
+            mem.writeIORegister(kToChannel + 0x10u, kMadr);
+            mem.writeIORegister(kToChannel + 0x20u, 4u);
+            mem.writeIORegister(kToChannel + 0x80u, kSadr);
+            mem.writeIORegister(kToChannel + 0x00u, 0x108u);
+
+            t.Equals(spr[kSadr], static_cast<uint8_t>(0x10u), "the first block starts at MADR");
+            t.Equals(spr[kSadr + 16u], static_cast<uint8_t>(0x11u), "the first block holds TQWC quadwords");
+            t.Equals(spr[kSadr + 32u], static_cast<uint8_t>(0x13u), "the next block starts after SQWC skipped quadwords");
+            t.Equals(spr[kSadr + 48u], static_cast<uint8_t>(0x14u), "the scratchpad side stays contiguous");
+            t.Equals(mem.readIORegister(kToChannel + 0x10u), kMadr + 6u * 16u, "MADR ends after the last skip");
+            t.Equals(mem.readIORegister(kToChannel + 0x20u), 0u, "QWC is spent");
+            t.Equals(mem.readIORegister(kToChannel + 0x80u), kSadr + 64u, "SADR moves past the copied data");
+            t.Equals(mem.readIORegister(kToChannel + 0x00u) & 0x100u, 0u, "the transfer completes the channel");
+
+            std::memset(rdram + kOut, 0, 96u);
+            mem.writeIORegister(kFromChannel + 0x10u, kOut);
+            mem.writeIORegister(kFromChannel + 0x20u, 4u);
+            mem.writeIORegister(kFromChannel + 0x80u, kSadr);
+            mem.writeIORegister(kFromChannel + 0x00u, 0x108u);
+
+            t.Equals(rdram[kOut + 16u], static_cast<uint8_t>(0x11u), "SPR_FROM writes TQWC quadwords");
+            t.Equals(rdram[kOut + 32u], static_cast<uint8_t>(0u), "SPR_FROM leaves the skipped quadword alone");
+            t.Equals(rdram[kOut + 48u], static_cast<uint8_t>(0x13u), "SPR_FROM resumes after the skip");
+            t.Equals(mem.readIORegister(kFromChannel + 0x00u) & 0x100u, 0u, "SPR_FROM completes the channel");
+        });
+
         tc.Run("DMAC SPR_TO source chain follows ref, cnt and end tags", [](TestCase &t)
         {
             PS2Memory mem;
