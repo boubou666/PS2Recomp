@@ -3041,9 +3041,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             // Reading an unchanged count means the guest polls faster than the timer ticks
             // (a busy-wait, e.g. VP2's movie player pacing on the HBLANK counter): owe it the
-            // EE cycles of one tick so the wait ends in game time.
+            // EE cycles of one tick so the wait ends in game time. Polls before the scheduler applies
+            // that charge must not add more ticks: SC3 measures Timer0 over 256 HBLANKs this way.
             const uint32_t count = timer.count & 0xFFFFu;
-            if ((timer.mode & kEeTimerModeCue) != 0u && count == timer.lastReadCount)
+            if ((timer.mode & kEeTimerModeCue) != 0u && count == timer.lastReadCount &&
+                m_timerSpinCycles.load(std::memory_order_acquire) == 0u)
             {
                 const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
                 m_timerSpinCycles.fetch_add(std::max<uint64_t>(kEeClockHz / clockHz, 1u), std::memory_order_acq_rel);
