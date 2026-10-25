@@ -439,6 +439,28 @@ void register_ps2_gs_tests()
             t.Equals(mem.read32(kGsImr + 4u), 0x01234567u, "IMR high dword should match");
         });
 
+        tc.Run("a game's paraLLEl-GS request yields to PS2X_GS_RENDERER and to a running GS thread", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            setenv("PS2X_GS_RENDERER", "cpu", 1);
+            {
+                GS gs;
+                gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+                t.IsFalse(gs.requestParallelRenderer(), "PS2X_GS_RENDERER=cpu keeps the CPU renderer");
+            }
+            unsetenv("PS2X_GS_RENDERER");
+
+            GS gs;
+            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            gs.enableAsync();
+            const uint64_t eopTag[2] = {1ull << 15, 0u};
+            gs.submitGIFPacket(reinterpret_cast<const uint8_t *>(eopTag), sizeof(eopTag));
+            gs.waitForIdle();
+            t.IsFalse(gs.requestParallelRenderer(), "the GS thread already draws on the CPU");
+        });
+
         tc.Run("unknown GS privileged offsets are no-op and read as zero", [](TestCase &t)
         {
             PS2Memory mem;
