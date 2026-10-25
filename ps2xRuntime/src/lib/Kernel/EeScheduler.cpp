@@ -124,6 +124,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
+    m_deadlinesHeldUntil = {};
     m_eeCycle = 0u;
     m_iopEeCycles = 0u;
     m_iopVblankEnd = 0u;
@@ -432,6 +433,13 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+    {
+        m_checkpointPending.store(true, std::memory_order_release);
+        m_transferToDispatcher = true;
+        return true;
+    }
+    if (nextEventCycle == 0u && m_deadlinesHeldUntil != std::chrono::steady_clock::time_point{} &&
+        (++m_hostCatchUpPoll & 0xFFu) == 0u && std::chrono::steady_clock::now() >= m_deadlinesHeldUntil)
     {
         m_checkpointPending.store(true, std::memory_order_release);
         m_transferToDispatcher = true;
@@ -1929,6 +1937,7 @@ void EeScheduler::processPendingEvents()
 
 void EeScheduler::processDueDeadlines()
 {
+    m_deadlinesHeldUntil = {};
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -1949,6 +1958,13 @@ void EeScheduler::processDueDeadlines()
             if (pacingDeadline == std::chrono::steady_clock::time_point{})
             {
                 updateNextDeadline();
+                return;
+            }
+
+            if (now < pacingDeadline && interruptInvocationPending())
+            {
+                m_deadlinesHeldUntil = pacingDeadline;
+                m_nextDeadlineCycle.store(0u, std::memory_order_release);
                 return;
             }
 
@@ -2013,6 +2029,18 @@ void EeScheduler::processDueDeadlines()
             processEvent(scheduled.event);
         }
     }
+}
+
+bool EeScheduler::interruptInvocationPending() const
+{
+    const auto isInterrupt = [](const GuestInvocation &invocation)
+    { return invocation.kind == GuestInvocationKind::Interrupt; };
+    if (std::any_of(m_pendingInvocations.begin(), m_pendingInvocations.end(), isInterrupt))
+    {
+        return true;
+    }
+    const GuestThread *running = m_currentThreadId != 0 ? currentThread() : nullptr;
+    return running != nullptr && std::any_of(running->invocations.begin(), running->invocations.end(), isInterrupt);
 }
 
 void EeScheduler::processEvent(const EeEvent &event)
