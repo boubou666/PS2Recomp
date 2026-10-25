@@ -616,6 +616,30 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
         });
 
+        tc.Run("sceGsSetDefDispEnv counts DH in frame lines: twice the buffer height in interlaced FRAME mode", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x5000u;
+            constexpr uint32_t kDisplayOffset = 24u; // pmode, smode2, dispfb, display
+            auto displayHeight = [&](uint64_t smode2)
+            {
+                runtime.memory().gs().smode2 = smode2;
+                R5900Context ctx{};
+                setRegU32(ctx, 4, kEnvAddr);
+                setRegU32(ctx, 5, 0u);
+                setRegU32(ctx, 6, 640u);
+                setRegU32(ctx, 7, 256u);
+                ps2_stubs::sceGsSetDefDispEnv(rdram.data(), &ctx, &runtime);
+                uint64_t display = 0;
+                std::memcpy(&display, rdram.data() + kEnvAddr + kDisplayOffset, sizeof(display));
+                return static_cast<uint32_t>((display >> 44) & 0x7FFu) + 1u;
+            };
+            t.Equals(displayHeight(0x3u), 512u, "interlaced FRAME mode shows a 256-line buffer on 512 lines");
+            t.Equals(displayHeight(0x1u), 256u, "interlaced FIELD mode keeps DH at the buffer height");
+        });
+
         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)
         {
             PS2Runtime runtime;

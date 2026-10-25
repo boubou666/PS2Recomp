@@ -1080,13 +1080,15 @@ namespace ps2_stubs
         const int32_t sdy = static_cast<int16_t>(dy & 0xFFFFu);
         const uint32_t displayX = static_cast<uint32_t>(652 + sdx * static_cast<int32_t>(magh + 1u));
         const uint32_t displayY = static_cast<uint32_t>(50 + sdy);
-        uint64_t display = makeDisplay(displayX, displayY, magh, 0, w * (magh + 1u) - 1u, h - 1);
-
         // PMODE: read circuit 2 on, CRTMD=1, alpha from ALP, output alpha from
         // circuit 1 (SCE_GS_SET_PMODE(0, 1, 1, 1, 0, 0)). SMODE2 keeps the
         // interlace/field mode programmed by sceGsResetGraph.
         constexpr uint64_t kDefaultPmode = 0x66u;
         const uint64_t smode2 = runtime ? (runtime->memory().gs().smode2 & 0x3u) : 0x1u;
+        // DH counts frame lines. In interlaced FRAME mode (INT=1, FFMD=1) both fields show every line of an
+        // h-line buffer, so the display is 2h lines high (Twisted Metal: Black's matches: 640x256 buffers, DH 511).
+        const uint32_t displayLines = smode2 == 0x3u ? h * 2u : h;
+        uint64_t display = makeDisplay(displayX, displayY, magh, 0, w * (magh + 1u) - 1u, displayLines - 1u);
         writeGsDispEnv(rdram, envAddr, display, dispfb, kDefaultPmode, smode2);
         setReturnS32(ctx, 0);
     }
