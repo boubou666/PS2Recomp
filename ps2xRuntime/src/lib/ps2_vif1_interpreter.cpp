@@ -521,15 +521,36 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
-void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
-        return;
+        return 0u;
 
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
     {
+        if (m_vif1Direct.qwLeft != 0u)
+        {
+            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+            if (availableQw == 0u)
+                break;
+            const uint32_t bytes = std::min<uint32_t>(m_vif1Direct.qwLeft, availableQw) * 16u;
+            const uint32_t stop = m_vif1Segments
+                                      ? findSignalStall(m_vif1Direct.scan, data + pos, bytes, 0x10009000u, *m_vif1Segments, pos)
+                                      : bytes;
+            if (stop != 0u)
+                submitGifPacket(GifPathId::Path2, data + pos, stop, true, m_vif1Direct.directHl, true);
+            m_vif1Direct.qwLeft -= stop / 16u;
+            pos += stop;
+            if (stop < bytes)
+            {
+                m_vif1StoppedAtSignal = true;
+                return pos;
+            }
+            continue;
+        }
+
         if (m_vif1PendingPath2ImageQwc != 0u)
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
@@ -725,6 +746,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
+                if (m_vif1Segments)
+                {
+                    GifSignalScan scan;
+                    const uint32_t stop = findSignalStall(scan, data + pos, qwCount * 16u, 0x10009000u, *m_vif1Segments, pos);
+                    if (stop < qwCount * 16u)
+                    {
+                        if (stop != 0u)
+                            submitGifPacket(GifPathId::Path2, data + pos, stop, true, directHl, true);
+                        m_vif1Direct.qwLeft = qwCount - stop / 16u;
+                        m_vif1Direct.directHl = directHl;
+                        m_vif1Direct.scan = scan;
+                        m_vif1StoppedAtSignal = true;
+                        return pos + stop;
+                    }
+                }
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
 
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
@@ -755,6 +791,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
     }
+    return std::min(pos, sizeBytes);
 }
 
 namespace

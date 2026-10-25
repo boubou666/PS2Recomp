@@ -1313,6 +1313,11 @@ namespace ps2_stubs
         if (mode == 0)
         {
             mem.processPendingTransfers();
+            if (mem.dmaChannelSignalStalled(0x10009000u) || mem.dmaChannelSignalStalled(0x1000A000u))
+            {
+                setReturnS32(ctx, -1);
+                return;
+            }
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;

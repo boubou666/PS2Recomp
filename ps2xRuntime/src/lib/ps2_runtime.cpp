@@ -2183,6 +2183,7 @@ void PS2Runtime::pollGsInterrupt(uint8_t *rdram)
     // raises it, as does a new edge even when the line stayed high in between (ack, then re-raise).
     if (const uint32_t due = ps2GsApplyDueEvents(m_memory.gs(), m_eeScheduler->currentCycle()); due != 0u)
         g_gsCsrRaisedEdges.fetch_or(due, std::memory_order_acq_rel);
+    m_memory.resumeSignalStalls();
     const uint32_t rising = g_gsCsrRaisedEdges.exchange(0u, std::memory_order_acq_rel);
     const uint32_t enabled = ~static_cast<uint32_t>(m_memory.gs().imr >> 8) & 0x3u;
     const bool line = (static_cast<uint32_t>(m_memory.gs().csr.load(std::memory_order_acquire)) & enabled) != 0u;
@@ -2866,6 +2867,8 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     try
     {
         m_memory.write64(vaddr, value);
+        if (Ps2AddressInRange(vaddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
+            drainCompletedDmacHandlers(rdram);
     }
     catch (const std::exception &)
     {

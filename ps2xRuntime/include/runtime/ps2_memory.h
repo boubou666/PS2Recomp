@@ -14,6 +14,7 @@
 #include <mutex>
 #include <thread>
 
+#include "gs/gif_signal_scan.h"
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -376,8 +377,14 @@ public:
     void processVIF0Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
-    void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+    uint32_t processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
+    // A SIGNAL that reaches the GS while CSR.SIGNAL is set stops the GS until the CPU clears the bit. The GIF and
+    // VIF1 DMA channels stop at such a SIGNAL (CHCR.STR stays set, MADR/QWC/TADR point at it) and continue from
+    // memory once CSR.SIGNAL is acknowledged. PS2X_GS_SIGNAL_STALL=0 disables it.
+    void setSignalStallEnabled(bool enabled) { m_signalStallEnabled = enabled; }
+    bool dmaChannelSignalStalled(uint32_t channelBase) const;
+    void resumeSignalStalls();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
     // VIF1 DMA (unpacks, VU1 microprograms, PATH1/PATH2 packets) on a worker thread, as the VIF and VU1 run beside
@@ -478,13 +485,51 @@ public:
     bool m_vif1PendingPath2DirectHl = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
+    struct DmaSegment
+    {
+        uint32_t offset = 0;
+        uint32_t bytes = 0;
+        uint32_t madr = 0;
+        uint32_t tadr = 0;
+        uint32_t asr0 = 0;
+        uint32_t asr1 = 0;
+        uint32_t chcr = 0;
+        bool last = false;
+    };
     struct PendingTransfer
     {
         bool fromScratchpad = false;
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        std::vector<DmaSegment> segments;
     };
+    struct DmaSignalStall
+    {
+        uint32_t channelBase = 0;
+        bool last = false;
+        uint64_t generation = 0;
+    };
+    struct Vif1DirectContinuation
+    {
+        uint32_t qwLeft = 0;
+        bool directHl = false;
+        GifSignalScan scan;
+    };
+    bool m_signalStallEnabled = true;
+    bool m_signalPassed = false;
+    uint64_t m_signalStallGeneration = 0;
+    std::vector<DmaSignalStall> m_signalStalls;
+    GifSignalScan m_path3Scan;
+    Vif1DirectContinuation m_vif1Direct;
+    const std::vector<DmaSegment> *m_vif1Segments = nullptr;
+    bool m_vif1StoppedAtSignal = false;
+    bool signalStallApplies(uint32_t channelBase) const;
+    bool signalStallBlocked(uint32_t channelBase) const;
+    uint32_t findSignalStall(GifSignalScan &scan, const uint8_t *data, uint32_t size, uint32_t channelBase,
+                             const std::vector<DmaSegment> &segments, uint32_t segmentOffset);
+    void stallDmaChannel(uint32_t channelBase, const std::vector<DmaSegment> &segments, uint32_t offset);
+    void resumeDmaChannel(const DmaSignalStall &stall);
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
@@ -565,7 +610,8 @@ public:
     uint32_t applyEeTimerCycles(uint64_t eeCycles) noexcept;
     [[nodiscard]] uint64_t eeTimerEventCycles() const noexcept;
     std::atomic<uint64_t> m_timerSpinCycles{0u};
-    std::vector<uint8_t> readDmaSourceChain(uint32_t channelBase, uint32_t chcr);
+    std::vector<uint8_t> readDmaSourceChain(uint32_t channelBase, uint32_t chcr, std::vector<DmaSegment> *segments = nullptr,
+                                            uint32_t pendingQwc = 0, bool pendingEnds = false);
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

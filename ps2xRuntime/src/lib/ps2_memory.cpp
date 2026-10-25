@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -106,6 +107,8 @@ namespace
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
     constexpr uint32_t kGsCsrReset = 1u << 9;
+    constexpr uint32_t kVif1Channel = 0x10009000u;
+    constexpr uint32_t kGifChannel = 0x1000A000u;
     constexpr uint32_t kGsImrRegOffset = 0x1010u;
 
     struct PendingGsEvent
@@ -155,6 +158,16 @@ namespace
         return raised;
     }
 
+    bool gsSignalOutstanding(const GSRegisters &regs)
+    {
+        if ((regs.csr.load() & 0x1ull) != 0u)
+            return true;
+        std::lock_guard<std::mutex> lock(g_gsEventMutex);
+        return std::any_of(g_gsPendingEvents.begin(), g_gsPendingEvents.end(),
+                           [](const PendingGsEvent &pending)
+                           { return pending.event == GsCpuEvent::Signal; });
+    }
+
     void acknowledgeGsSignal(GSRegisters &regs, uint64_t written)
     {
         if ((written & 0x200ull) != 0u)
@@ -173,10 +186,10 @@ namespace
     // estimated drawing time has elapsed in EE cycles, no SIGNAL/FINISH/LABEL waits for its drawing or
     // for its handler's acknowledge, and the GS thread is idle. Before that it is neither empty nor
     // almost full. Games poll it to wait for the GS to go idle.
-    inline uint64_t readCsr(const GSRegisters &regs)
+    inline uint64_t readCsr(const GSRegisters &regs, bool stalled)
     {
         const uint64_t csr = regs.csr.load();
-        bool drawing = ps2GsDrawing() || (csr & ~(regs.imr >> 8) & 0x3ull) != 0u;
+        bool drawing = stalled || ps2GsDrawing() || (csr & ~(regs.imr >> 8) & 0x3ull) != 0u;
         {
             std::lock_guard<std::mutex> lock(g_gsEventMutex);
             drawing = drawing || !g_gsPendingEvents.empty();
@@ -309,6 +322,8 @@ PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
     ps2SetScratchpadHostPtr(nullptr);
+    if (const char *stall = std::getenv("PS2X_GS_SIGNAL_STALL"); stall && stall[0] == '0')
+        m_signalStallEnabled = false;
 }
 
 PS2Memory::~PS2Memory()
@@ -399,6 +414,9 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    m_signalStalls.clear();
+    m_path3Scan = {};
+    m_vif1Direct = {};
     resetEeTimers();
 
     try
@@ -903,7 +921,7 @@ uint32_t PS2Memory::read32(uint32_t address)
             waitForVif1();
         if (regOff == kGsCsrRegOffset)
         {
-            uint64_t val = readCsr(gs_regs);
+            uint64_t val = readCsr(gs_regs, !m_signalStalls.empty());
             return (uint32_t)(val >> (off * 8));
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -952,7 +970,7 @@ uint64_t PS2Memory::read64(uint32_t address)
             waitForVif1();
         if (regOff == kGsCsrRegOffset)
         {
-            return readCsr(gs_regs);
+            return readCsr(gs_regs, !m_signalStalls.empty());
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
         return reg ? *reg : 0;
@@ -1138,7 +1156,11 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             // Done as a single atomic RMW -- see writeCsrHalf's comment.
             writeCsrHalf(gs_regs.csr, off, value);
             if (off == 0u)
+            {
                 acknowledgeGsSignal(gs_regs, value);
+                if ((value & (kGsCsrReset | 0x1u)) != 0u)
+                    resumeSignalStalls();
+            }
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -1219,6 +1241,8 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
             // atomic RMW -- see writeCsrFull's comment.
             writeCsrFull(gs_regs.csr, value);
             acknowledgeGsSignal(gs_regs, value);
+            if ((value & (kGsCsrReset | 0x1u)) != 0u)
+                resumeSignalStalls();
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -1403,7 +1427,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         {
             writeCsrHalf(gs_regs.csr, off, value);
             if (off == 0u)
+            {
                 acknowledgeGsSignal(gs_regs, value);
+                if ((value & (kGsCsrReset | 0x1u)) != 0u)
+                    resumeSignalStalls();
+            }
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -1453,6 +1481,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
+    if (address >= 0x10008000u && address < 0x1000F000u && (address & 0xFFu) == 0u && dmaChannelSignalStalled(address))
+    {
+        if ((value & 0x100u) != 0u)
+            return true;
+        m_signalStalls.erase(std::remove_if(m_signalStalls.begin(), m_signalStalls.end(),
+                                            [address](const DmaSignalStall &stall)
+                                            { return stall.channelBase == address; }),
+                             m_signalStalls.end());
+    }
+
     m_ioRegisters[address] = value;
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
@@ -1468,6 +1506,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_vif1Direct = {};
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1569,14 +1608,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
+                const bool stallable = signalStallApplies(channelBase);
 
-                if (mode == 0 && qwc > 0)
+                if (mode == 0 && qwc > 0 && !stallable)
                 {
                     enqueueTransfer(madr, qwc);
                 }
-                else if (mode == 1)
+                else if (mode == 1 || (mode == 0 && qwc > 0))
                 {
-                    std::vector<uint8_t> chainBuf = readDmaSourceChain(channelBase, chcr);
+                    std::vector<DmaSegment> segments;
+                    std::vector<uint8_t> chainBuf = readDmaSourceChain(channelBase, chcr, stallable ? &segments : nullptr,
+                                                                       mode == 0 ? qwc : 0u, mode == 0);
 
                     if (!chainBuf.empty())
                     {
@@ -1585,6 +1627,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         pt.srcAddr = 0;
                         pt.qwc = 0;
                         pt.chainData = std::move(chainBuf);
+                        pt.segments = std::move(segments);
                         if (channelBase == 0x1000A000)
                         {
                             m_pendingGifTransfers.push_back(std::move(pt));
@@ -1634,7 +1677,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
-std::vector<uint8_t> PS2Memory::readDmaSourceChain(uint32_t channelBase, uint32_t chcr)
+std::vector<uint8_t> PS2Memory::readDmaSourceChain(uint32_t channelBase, uint32_t chcr, std::vector<DmaSegment> *segments,
+                                                   uint32_t pendingQwc, bool pendingEnds)
 {
     uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
@@ -1705,7 +1749,28 @@ std::vector<uint8_t> PS2Memory::readDmaSourceChain(uint32_t channelBase, uint32_
     int tagsProcessed = 0;
     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
-    while (tagsProcessed < kMaxChainTags && chainBuf.size() < kMaxChainBytes)
+    auto appendSegment = [&](uint32_t dataAddr, uint32_t qwCount, bool last)
+    {
+        const size_t offset = chainBuf.size();
+        appendData(dataAddr, qwCount);
+        if (!segments)
+            return;
+        DmaSegment segment;
+        segment.offset = static_cast<uint32_t>(offset);
+        segment.bytes = static_cast<uint32_t>(chainBuf.size() - offset);
+        segment.madr = dataAddr;
+        segment.tadr = tagAddr;
+        segment.asr0 = asr0;
+        segment.asr1 = asr1;
+        segment.chcr = (((chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4)) & 0x0000FFFFu) | (lastTagUpper << 16);
+        segment.last = last;
+        segments->push_back(segment);
+    };
+
+    if (pendingQwc != 0u)
+        appendSegment(m_ioRegisters[channelBase + 0x10] & 0x7FFFFFF0u, pendingQwc, pendingEnds);
+
+    while (!pendingEnds && tagsProcessed < kMaxChainTags && chainBuf.size() < kMaxChainBytes)
     {
         const uint32_t currentTagAddr = tagAddr;
         const bool tagInSPR = isScratchpad(tagAddr);
@@ -1810,13 +1875,14 @@ std::vector<uint8_t> PS2Memory::readDmaSourceChain(uint32_t channelBase, uint32_
             break;
         }
 
+        if (irq && tieEnabled)
+            endChain = true;
+
         if (transferTagData)
             appendVifTagData(currentTagAddr);
 
         if (hasPayload)
-            appendData(dataAddr, tagQwc);
-        if (irq && tieEnabled)
-            endChain = true;
+            appendSegment(dataAddr, tagQwc, endChain);
         if (endChain)
             break;
     }
@@ -2042,8 +2108,112 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+bool PS2Memory::signalStallApplies(uint32_t channelBase) const
+{
+    if (!m_signalStallEnabled || !m_gifArbiter)
+        return false;
+    if (channelBase == kGifChannel)
+        return !gsLag();
+    return channelBase == kVif1Channel && !m_vif1Threaded;
+}
+
+bool PS2Memory::dmaChannelSignalStalled(uint32_t channelBase) const
+{
+    return std::any_of(m_signalStalls.begin(), m_signalStalls.end(),
+                       [channelBase](const DmaSignalStall &stall)
+                       { return stall.channelBase == channelBase; });
+}
+
+bool PS2Memory::signalStallBlocked(uint32_t channelBase) const
+{
+    return m_signalPassed || (!m_signalStalls.empty() && m_signalStalls.front().channelBase != channelBase) ||
+           gsSignalOutstanding(gs_regs);
+}
+
+uint32_t PS2Memory::findSignalStall(GifSignalScan &scan, const uint8_t *data, uint32_t size, uint32_t channelBase,
+                                    const std::vector<DmaSegment> &segments, uint32_t segmentOffset)
+{
+    uint32_t offset = 0u;
+    while ((offset = scan.nextSignal(data, size, offset)) < size)
+    {
+        const uint32_t at = segmentOffset + offset;
+        const bool resumable = std::any_of(segments.begin(), segments.end(),
+                                           [at](const DmaSegment &segment)
+                                           { return at >= segment.offset && at - segment.offset < segment.bytes &&
+                                                    ((at - segment.offset) & 0xFu) == 0u; });
+        if (resumable && signalStallBlocked(channelBase))
+            return offset;
+        m_signalPassed = true;
+        scan.passQuadword();
+        offset += 16u;
+    }
+    return size;
+}
+
+void PS2Memory::stallDmaChannel(uint32_t channelBase, const std::vector<DmaSegment> &segments, uint32_t offset)
+{
+    const auto segment = std::find_if(segments.begin(), segments.end(),
+                                      [offset](const DmaSegment &candidate)
+                                      { return offset >= candidate.offset && offset - candidate.offset < candidate.bytes; });
+    if (segment == segments.end())
+        return;
+    const uint32_t into = offset - segment->offset;
+    m_ioRegisters[channelBase + 0x00u] = segment->chcr | 0x100u;
+    m_ioRegisters[channelBase + 0x10u] = segment->madr + into;
+    m_ioRegisters[channelBase + 0x20u] = (segment->bytes - into) / 16u;
+    m_ioRegisters[channelBase + 0x30u] = segment->tadr;
+    m_ioRegisters[channelBase + 0x40u] = segment->asr0;
+    m_ioRegisters[channelBase + 0x50u] = segment->asr1;
+
+    DmaSignalStall stall;
+    stall.channelBase = channelBase;
+    stall.last = segment->last;
+    stall.generation = ++m_signalStallGeneration;
+    const auto existing = std::find_if(m_signalStalls.begin(), m_signalStalls.end(),
+                                       [channelBase](const DmaSignalStall &candidate)
+                                       { return candidate.channelBase == channelBase; });
+    if (existing != m_signalStalls.end())
+        *existing = stall;
+    else
+        m_signalStalls.push_back(stall);
+}
+
+void PS2Memory::resumeDmaChannel(const DmaSignalStall &stall)
+{
+    const uint32_t channelBase = stall.channelBase;
+    const uint32_t chcr = m_ioRegisters[channelBase + 0x00u];
+    const bool chain = ((chcr >> 2u) & 0x3u) == 1u;
+    PendingTransfer pt;
+    pt.chainData = readDmaSourceChain(channelBase, chcr, &pt.segments, m_ioRegisters[channelBase + 0x20u] & 0xFFFFu,
+                                      stall.last || !chain);
+    if (channelBase == kGifChannel)
+        m_pendingGifTransfers.push_back(std::move(pt));
+    else
+        m_pendingVif1Transfers.push_back(std::move(pt));
+    processPendingTransfers();
+}
+
+void PS2Memory::resumeSignalStalls()
+{
+    while (!m_signalStalls.empty() && !gsSignalOutstanding(gs_regs))
+    {
+        const DmaSignalStall stall = m_signalStalls.front();
+        resumeDmaChannel(stall);
+        if (!m_signalStalls.empty() && m_signalStalls.front().channelBase == stall.channelBase &&
+            m_signalStalls.front().generation != stall.generation)
+            break;
+        m_signalStalls.erase(std::remove_if(m_signalStalls.begin(), m_signalStalls.end(),
+                                            [&stall](const DmaSignalStall &candidate)
+                                            { return candidate.generation == stall.generation; }),
+                             m_signalStalls.end());
+    }
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    m_signalPassed = false;
+    bool gifStalled = false;
+    bool vif1Stalled = false;
     // With the GS lag, PATH3 packets join the worker's queue after the PATH1/PATH2 packets before them.
     const bool queueGif = gsLag();
     const bool hadGif = !m_pendingGifTransfers.empty() && !queueGif;
@@ -2082,7 +2252,22 @@ void PS2Memory::processPendingTransfers()
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
-        if (!p.chainData.empty())
+        if (!p.chainData.empty() && !p.segments.empty() && !queueGif)
+        {
+            m_seenGifCopy = true;
+            m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t size = static_cast<uint32_t>(p.chainData.size());
+            const uint32_t stop = findSignalStall(m_path3Scan, p.chainData.data(), size, kGifChannel, p.segments, 0u);
+            if (stop != 0u)
+                submitGifPacket(GifPathId::Path3, p.chainData.data(), stop, false, false, true);
+            if (stop < size)
+            {
+                stallDmaChannel(kGifChannel, p.segments, stop);
+                gifStalled = true;
+                break;
+            }
+        }
+        else if (!p.chainData.empty())
         {
             m_seenGifCopy = true;
             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
@@ -2246,7 +2431,16 @@ void PS2Memory::processPendingTransfers()
         }
         if (!p.chainData.empty())
         {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            m_vif1Segments = p.segments.empty() ? nullptr : &p.segments;
+            m_vif1StoppedAtSignal = false;
+            const uint32_t stop = processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            m_vif1Segments = nullptr;
+            if (m_vif1StoppedAtSignal)
+            {
+                stallDmaChannel(kVif1Channel, p.segments, stop);
+                vif1Stalled = true;
+                break;
+            }
         }
         else if (p.qwc > 0)
         {
@@ -2323,7 +2517,7 @@ void PS2Memory::processPendingTransfers()
         m_ioRegisters[D_STAT] = dstat;
     };
 
-    if (hadGif)
+    if (hadGif && !gifStalled)
     {
         raiseDStatChannel(2u); // GIF channel
         queueCompletedDmacCause(2u);
@@ -2337,7 +2531,7 @@ void PS2Memory::processPendingTransfers()
         m_ioRegisters[VIF0_CHANNEL + 0x00] &= ~0x100u;
         m_ioRegisters[VIF0_CHANNEL + 0x20] = 0;
     }
-    if (hadVif1)
+    if (hadVif1 && !vif1Stalled)
     {
         raiseDStatChannel(1u); // VIF1 channel
         queueCompletedDmacCause(1u);
@@ -2454,6 +2648,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     if (!m_rdram || !m_gsVRAM || m_path3Masked)
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
+        return false;
+    if (!m_signalStalls.empty() || m_path3Scan.inTag())
         return false;
     if ((chcr & 0x100u) == 0u || ((chcr >> 2u) & 0x3u) != 1u)
         return false;
@@ -2648,6 +2844,8 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
         return false;
+    if (!m_signalStalls.empty() || m_path3Scan.inTag())
+        return false;
     if ((chcr & 0x100u) == 0u || ((chcr >> 2u) & 0x3u) != 1u)
         return false;
     if ((chcr & (1u << 7u)) != 0u || ((chcr >> 4u) & 0x3u) != 0u)
@@ -2771,7 +2969,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return static_cast<uint32_t>((readCsr(gs_regs) >> (off * 8u)) & 0xFFFFFFFFull);
+            return static_cast<uint32_t>((readCsr(gs_regs, !m_signalStalls.empty()) >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -2822,7 +3020,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     {
         if (address >= 0x10008000 && address < 0x1000F000)
         {
-            if ((address & 0xFF) == 0x00)
+            if ((address & 0xFF) == 0x00 && !dmaChannelSignalStalled(address))
             {
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
