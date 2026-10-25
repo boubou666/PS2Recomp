@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <bit>
 #include <bitset>
+#include <climits>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -889,9 +890,15 @@ namespace
                 maxCoord = i == 0 ? coord : std::max(maxCoord, coord);
             }
             if (!state.prim.fst && (negativeQ || !positiveQ))
-                return;
-            low = static_cast<int>(minCoord) - 2; // bilinear taps and rounding
-            high = static_cast<int>(maxCoord) + 2;
+            {
+                low = INT_MIN / 2;
+                high = INT_MAX / 2;
+            }
+            else
+            {
+                low = static_cast<int>(minCoord) - 2; // bilinear taps and rounding
+                high = static_cast<int>(maxCoord) + 2;
+            }
         }
         const uint64_t clamp = state.context.clamp;
         const uint8_t wrap = static_cast<uint8_t>((clamp >> (columns ? 0 : 2)) & 0x3u);
@@ -919,9 +926,20 @@ namespace
         last = std::min(high, size - 1);
     }
 
+    // The rows a primitive samples of its texture's buffer, including the page rows that columns past the buffer
+    // width reach (GS addressing carries them into the next page rows).
     void textureRows(const GSPrimitiveBatch &batch, int &firstRow, int &lastRow)
     {
         textureSpan(batch, false, firstRow, lastRow);
+        int firstColumn = 0;
+        int lastColumn = 0;
+        textureSpan(batch, true, firstColumn, lastColumn);
+        const auto &tex0 = batch.state.context.tex0;
+        uint32_t pageWidth = 0u;
+        uint32_t pageHeight = 0u;
+        pageGeometry(tex0.psm, pageWidth, pageHeight);
+        const uint32_t pagesPerRow = std::max(1u, (std::max<uint32_t>(tex0.tbw, 1u) * 64u + pageWidth - 1u) / pageWidth);
+        lastRow += static_cast<int>(static_cast<uint32_t>(std::max(lastColumn, 0)) / pageWidth / pagesPerRow * pageHeight);
     }
 
     constexpr uint32_t kVramPages = kVramBlocks / 32u;
