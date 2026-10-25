@@ -290,6 +290,38 @@ void register_ps2_memory_tests()
             t.Equals(mem.takeTimerSpinCycles(), uint64_t{0}, "a changed count owes nothing");
         });
 
+        tc.Run("busy-wait polls before the scheduler applies a charge owe no further ticks", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer0Count = 0x10000000u;
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            constexpr uint32_t kTimer3Count = 0x10001800u;
+            constexpr uint32_t kTimer3Mode = 0x10001810u;
+            t.IsTrue(mem.writeIORegister(kTimer3Mode, 0x83u), "HBLANK counting should start");
+            t.IsTrue(mem.writeIORegister(kTimer0Mode, 0x82u), "BUSCLK/256 counting should start");
+            t.IsTrue(mem.writeIORegister(kTimer0Count, 0u), "timer 0 reset should succeed");
+
+            const auto pollUntilChange = [&]()
+            {
+                const uint32_t before = mem.readIORegister(kTimer3Count);
+                for (uint32_t poll = 0; poll < 100000u; ++poll)
+                {
+                    if (mem.readIORegister(kTimer3Count) != before)
+                        return;
+                    if ((poll & 3u) == 3u)
+                        mem.advanceEeTimers(40u + mem.takeTimerSpinCycles());
+                }
+            };
+            for (uint32_t hblank = 0; hblank < 256u; ++hblank)
+                pollUntilChange();
+
+            const uint32_t timer0 = mem.readIORegister(kTimer0Count);
+            t.IsTrue(timer0 > 9200u && timer0 < 9500u,
+                     "256 HBLANKs span ~9372 BUSCLK/256 counts, got " + std::to_string(timer0));
+        });
+
         tc.Run("EE timers 0 through 3 expose independent COUNT MODE and COMP registers", [](TestCase &t)
         {
             PS2Memory mem;
