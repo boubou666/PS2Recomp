@@ -1072,6 +1072,26 @@ void register_ps2_memory_tests()
             t.Equals(mem.vif1_regs.col[3], 0xAAAA0004u, "STCOL should set col[3]");
         });
 
+        tc.Run("VIF UNPACK wraps its destination at the end of VU1 data memory", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x6Cu, 2u, 0x03FFu));
+            for (uint32_t value = 1u; value <= 8u; ++value)
+                appendU32(packet, value);
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            uint32_t last[4]{};
+            uint32_t first[4]{};
+            std::memcpy(last, mem.getVU1Data() + 0x3FFu * 16u, 16u);
+            std::memcpy(first, mem.getVU1Data(), 16u);
+            t.IsTrue(last[0] == 1u && last[3] == 4u, "the first vector should land in the last VU1 qword");
+            t.IsTrue(first[0] == 5u && first[3] == 8u, "the second vector should wrap to VU1 qword 0");
+        });
+
         tc.Run("VIF UNPACK V4-16 sign and zero extension follow immediate bit14", [](TestCase &t)
         {
             PS2Memory mem;
