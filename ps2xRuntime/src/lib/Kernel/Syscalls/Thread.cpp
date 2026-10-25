@@ -127,14 +127,19 @@ namespace ps2_syscalls
             ee.transferIfRequested(interruptSafe);
         }
 
+        int threadIdOnSuccess(int result, int id)
+        {
+            return result == KE_OK ? id : result;
+        }
+
         void wakeupThreadImpl(uint8_t *rdram,
                               R5900Context *ctx,
                               PS2Runtime *runtime,
                               bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
-            const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
-            setReturnS32(ctx, result);
+            const int id = static_cast<int>(getRegU32(ctx, 4));
+            setReturnS32(ctx, threadIdOnSuccess(ee.wakeupThread(id, interruptSafe), id));
             ee.transferIfRequested(interruptSafe);
         }
 
@@ -326,8 +331,9 @@ namespace ps2_syscalls
     {
         logPriorityCall("SuspendThread", ctx);
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
-        setReturnS32(ctx, result);
+        const int requested = static_cast<int>(getRegU32(ctx, 4));
+        const int id = requested == 0 ? ee.currentThreadId() : requested;
+        setReturnS32(ctx, threadIdOnSuccess(ee.suspendThread(requested, false), id));
         ee.transferIfRequested(false);
     }
 
@@ -335,8 +341,8 @@ namespace ps2_syscalls
     {
         logPriorityCall("ResumeThread", ctx);
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
-        setReturnS32(ctx, result);
+        const int id = static_cast<int>(getRegU32(ctx, 4));
+        setReturnS32(ctx, threadIdOnSuccess(ee.resumeThread(id, false), id));
         ee.transferIfRequested(false);
     }
 
