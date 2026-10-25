@@ -281,6 +281,20 @@ namespace
         {
             const uint8_t *srcBase = payload;
             const uint8_t *payloadEnd = payload + available;
+            const uint32_t addMode = regs.mode & 3u;
+            if (!maskEnable && addMode != 1u && addMode != 2u && cl >= wl && !(vl == 3u && vn != 3u))
+            {
+                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                {
+                    const uint32_t destOff = ((vuAddr + (writeIndex / wl) * cl + writeIndex % wl) & addrMask) * 16u;
+                    if (destOff + 16u > vuDataSize)
+                        continue;
+                    uint32_t lanes[4];
+                    decodeUnpackVector(vl, vn, components, zeroExtend, srcBase + writeIndex * bytesPerVector, payloadEnd, lanes);
+                    std::memcpy(vuData + destOff, lanes, sizeof(lanes));
+                }
+                return totalBytes;
+            }
             uint32_t srcIndex = 0u;
             for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
             {
