@@ -242,6 +242,7 @@ namespace ps2x::iop::detail
             servicingDmaInterrupts = false;
             servicingGuestCallbacks = false;
             callDepth = 0u;
+            maskedThreadId = 0;
             secrMcCommandHandler = {};
             secrMcDevIdHandler = {};
             checkKelfPathCallback = {};
@@ -669,6 +670,8 @@ namespace ps2x::iop::detail
                     break;
                 if (totalCycles >= spu2.nextEventCycle())
                     spu2.advanceTo(totalCycles);
+                if (memory.interruptControl() == 0u)
+                    continue;
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                     servicePendingDmaInterrupts();
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
@@ -803,14 +806,18 @@ namespace ps2x::iop::detail
         // the other threads get while an inline call keeps running.
         void runOthersSlice(uint64_t deadline)
         {
-            spu2.advanceTo(totalCycles);
-            servicePendingDmaInterrupts();
-            servicePendingSifCommands();
-            servicePendingGuestCallbacks();
-            timrman.serviceDue(totalCycles, *this);
-            vblank.serviceDue(totalCycles, *this);
+            IopThread *next = resumeMaskedThread();
             uint64_t nextDelayWake = UINT64_MAX;
-            IopThread *next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+            if (!next)
+            {
+                spu2.advanceTo(totalCycles);
+                servicePendingDmaInterrupts();
+                servicePendingSifCommands();
+                servicePendingGuestCallbacks();
+                timrman.serviceDue(totalCycles, *this);
+                vblank.serviceDue(totalCycles, *this);
+                next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+            }
             if (!next)
             {
                 uint64_t nextWake = std::min(deadline, nextDelayWake);
@@ -827,7 +834,7 @@ namespace ps2x::iop::detail
             }
             const uint64_t before = totalCycles;
             runCpu(next->cpu, kDefaultSlice);
-            kernel.endTimeslice(*next, kThreadReturnSentinel);
+            endTimeslice(*next);
             if (totalCycles == before)
                 ++totalCycles;
         }
@@ -838,16 +845,20 @@ namespace ps2x::iop::detail
             {
                 if (totalCycles >= deadline)
                     return false;
-                spu2.advanceTo(totalCycles);
-                servicePendingDmaInterrupts();
-                servicePendingSifCommands();
-                servicePendingGuestCallbacks();
-                timrman.serviceDue(totalCycles, *this);
-                vblank.serviceDue(totalCycles, *this);
-                if (threadRunnable(owner))
-                    break;
+                IopThread *next = resumeMaskedThread();
                 uint64_t nextDelayWake = UINT64_MAX;
-                IopThread *next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+                if (!next)
+                {
+                    spu2.advanceTo(totalCycles);
+                    servicePendingDmaInterrupts();
+                    servicePendingSifCommands();
+                    servicePendingGuestCallbacks();
+                    timrman.serviceDue(totalCycles, *this);
+                    vblank.serviceDue(totalCycles, *this);
+                    if (threadRunnable(owner))
+                        break;
+                    next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+                }
                 if (!next)
                 {
                     uint64_t nextWake = std::min(deadline, nextDelayWake);
@@ -863,7 +874,7 @@ namespace ps2x::iop::detail
                 }
                 const uint64_t before = totalCycles;
                 runCpu(next->cpu, kDefaultSlice);
-                kernel.endTimeslice(*next, kThreadReturnSentinel);
+                endTimeslice(*next);
                 if (totalCycles == before)
                     ++totalCycles;
             }
@@ -876,6 +887,28 @@ namespace ps2x::iop::detail
             const char *value = std::getenv("PS2X_IOP_CALL_BUDGET");
             return value && *value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : kMaxCallInstructions;
         }();
+        // A thread that ends its slice with interrupts disabled keeps the CPU: no interrupt can be taken
+        // to wake another thread before it re-enables them.
+        IopThread *resumeMaskedThread()
+        {
+            const int id = maskedThreadId;
+            maskedThreadId = 0;
+            if (id == 0 || memory.interruptControl() != 0u)
+                return nullptr;
+            IopThread *thread = kernel.thread(id);
+            if (thread == nullptr || thread->state != IopThreadState::Ready)
+                return nullptr;
+            kernel.beginThread(*thread);
+            return thread;
+        }
+
+        void endTimeslice(IopThread &thread)
+        {
+            const int id = thread.id;
+            kernel.endTimeslice(thread, kThreadReturnSentinel);
+            const IopThread *after = kernel.thread(id);
+            maskedThreadId = memory.interruptControl() == 0u && after != nullptr && after->state == IopThreadState::Ready ? id : 0;
+        }
 
         uint32_t executeGuestFunctionAsThread(uint32_t address,
                                               uint32_t a0,
@@ -1165,14 +1198,18 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
-                    spu2.advanceTo(totalCycles);
-                    servicePendingDmaInterrupts();
-                    servicePendingSifCommands();
-                    servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
-                    vblank.serviceDue(totalCycles, *this);
+                    IopThread *next = resumeMaskedThread();
                     uint64_t nextDelayWake = UINT64_MAX;
-                    IopThread *next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+                    if (!next)
+                    {
+                        spu2.advanceTo(totalCycles);
+                        servicePendingDmaInterrupts();
+                        servicePendingSifCommands();
+                        servicePendingGuestCallbacks();
+                        timrman.serviceDue(totalCycles, *this);
+                        vblank.serviceDue(totalCycles, *this);
+                        next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+                    }
                     if (!next)
                     {
                         uint64_t nextWake = std::min(target, nextDelayWake);
@@ -1188,7 +1225,7 @@ namespace ps2x::iop::detail
                     }
                     const uint64_t before = totalCycles;
                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
-                    kernel.endTimeslice(*next, kThreadReturnSentinel);
+                    endTimeslice(*next);
                     if (totalCycles == before)
                         ++totalCycles;
                 }
@@ -1366,6 +1403,7 @@ namespace ps2x::iop::detail
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
+        int maskedThreadId = 0;
         GuestCallback secrMcCommandHandler;
         GuestCallback secrMcDevIdHandler;
         GuestCallback checkKelfPathCallback;
