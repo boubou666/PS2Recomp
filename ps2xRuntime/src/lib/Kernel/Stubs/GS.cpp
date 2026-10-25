@@ -842,6 +842,17 @@ namespace ps2_stubs
 
             if (runtime)
             {
+                // The sync mode registers as SetGsCrt leaves them (the packet below cannot set them: GIF addresses
+                // 0x41/0x42 are SCISSOR_2/ALPHA_1). Scan-out reads them (paraLLEl-GS): SMODE2 interlace/field mode,
+                // SMODE1 CMOD 2 NTSC / 3 PAL with LC 32 (analog).
+                auto &gs = runtime->memory().gs();
+                gs.smode2 = smode2;
+                if (omode == 2u || omode == 3u)
+                    gs.smode1 = (32ull << 3) | (static_cast<uint64_t>(omode) << 13);
+            }
+
+            if (runtime)
+            {
                 uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
                 if (pktAddr != 0u)
                 {

@@ -277,6 +277,7 @@ struct GSTransferSnapshot
 struct GSPresentationRequest
 {
     uint64_t pmode = 0;
+    uint64_t smode1 = 0;
     uint64_t smode2 = 0;
     uint64_t dispfb1 = 0;
     uint64_t display1 = 0;

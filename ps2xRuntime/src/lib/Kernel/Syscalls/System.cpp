@@ -17,6 +17,11 @@ namespace ps2_syscalls
                 ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
 
             gs.smode2 = smode2;
+            // SMODE1 as the BIOS sets it for the mode, as far as scan-out needs (paraLLEl-GS): CMOD 2 NTSC / 3 PAL,
+            // LC 32 for analog video. The BIOS takes 2 / 3 (sceGsResetGraph's omode); 0 / 1 as above too.
+            const int cmod = videoMode == 0 ? 2 : videoMode == 1 ? 3 : videoMode;
+            if (cmod == 2 || cmod == 3)
+                gs.smode1 = (32ull << 3) | (static_cast<uint64_t>(cmod) << 13);
 
             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
             if ((gs.pmode & 0x3ull) == 0ull)

@@ -412,6 +412,65 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86|i[3-6]86" AND NOT MSVC AND N
     target_compile_options(ps2_runtime PUBLIC "-march=${PS2X_X86_MARCH}")
 endif()
 
+# paraLLEl-GS (https://github.com/Arntzen-Software/parallel-gs, LGPL-3.0+): emulates the GS with Vulkan compute
+# shaders. PS2X_GS_RENDERER=parallel draws on the GPU instead of the CPU rasterizer (gs_parallel.cpp).
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    set(PS2X_ENABLE_PARALLEL_GS_DEFAULT ON)
+else()
+    set(PS2X_ENABLE_PARALLEL_GS_DEFAULT OFF)
+endif()
+option(PS2X_ENABLE_PARALLEL_GS "Build the paraLLEl-GS Vulkan renderer (PS2X_GS_RENDERER=parallel)"
+    ${PS2X_ENABLE_PARALLEL_GS_DEFAULT})
+
+if(PS2X_ENABLE_PARALLEL_GS)
+    # Only the library sources are used (its own CMakeLists wants every Granite submodule); Granite with the two
+    # submodules a standalone build needs. The shaders come precompiled (gs/shaders/slangmosh.hpp).
+    FetchContent_Declare(parallel_gs
+        GIT_REPOSITORY https://github.com/Arntzen-Software/parallel-gs.git
+        GIT_TAG cc6184af7e0c03da603045ca371ffa5dae9b0655
+        GIT_SUBMODULES ""
+        SOURCE_SUBDIR no-cmake
+        PATCH_COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=<SOURCE_DIR> -DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/cmake
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_parallel_gs.cmake
+    )
+    FetchContent_Declare(granite
+        GIT_REPOSITORY https://github.com/Themaister/Granite.git
+        GIT_TAG 16e7395f6a4858c1783dbf6f521f90b9d5f82ac5
+        GIT_SUBMODULES third_party/volk third_party/khronos/vulkan-headers
+        EXCLUDE_FROM_ALL
+    )
+    set(GRANITE_FAST_MATH OFF CACHE BOOL "" FORCE)
+    set(GRANITE_VULKAN_FOSSILIZE OFF CACHE BOOL "" FORCE)
+    set(GRANITE_RENDERER OFF CACHE BOOL "" FORCE)
+    set(GRANITE_VULKAN_SPIRV_CROSS OFF CACHE BOOL "" FORCE)
+    set(GRANITE_VULKAN_SHADER_MANAGER_RUNTIME_COMPILER OFF CACHE BOOL "" FORCE)
+    set(GRANITE_VULKAN_SYSTEM_HANDLES OFF CACHE BOOL "" FORCE)
+    set(GRANITE_SHADER_COMPILER_OPTIMIZE OFF CACHE BOOL "" FORCE)
+    set(GRANITE_SHIPPING ON CACHE BOOL "" FORCE)
+    set(GRANITE_TOOLS OFF CACHE BOOL "" FORCE)
+    set(GRANITE_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
+    set(GRANITE_RENDERDOC_CAPTURE OFF CACHE BOOL "" FORCE)
+    set(GRANITE_PLATFORM "null" CACHE STRING "" FORCE)
+    FetchContent_MakeAvailable(parallel_gs granite)
+
+    set(PS2X_PARALLEL_GS_DIR "${parallel_gs_SOURCE_DIR}/gs")
+    add_library(parallel-gs STATIC
+        "${PS2X_PARALLEL_GS_DIR}/gs_interface.cpp"
+        "${PS2X_PARALLEL_GS_DIR}/gs_util.cpp"
+        "${PS2X_PARALLEL_GS_DIR}/page_tracker.cpp"
+        "${PS2X_PARALLEL_GS_DIR}/gs_renderer.cpp"
+    )
+    target_include_directories(parallel-gs PUBLIC "${PS2X_PARALLEL_GS_DIR}")
+    target_link_libraries(parallel-gs PUBLIC granite-vulkan granite-math)
+    set_target_properties(parallel-gs PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+
+    # Its own translation unit: Granite's headers stay out of the rest of the runtime.
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_parallel.cpp)
+    set_source_files_properties(src/lib/gs/gs_parallel.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    target_link_libraries(ps2_runtime PRIVATE parallel-gs)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_PARALLEL_GS=1)
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1

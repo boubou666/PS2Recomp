@@ -8,11 +8,14 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+
+class GSParallelRenderer;
 
 struct GSDebugSnapshot
 {
@@ -181,13 +184,28 @@ private:
             NativePackedGifPacket,
             NativeImageUpload,
             PresentationLatch, // displayRegisters (queueHostPresentationLatch)
+            Register,          // registers[0] address, registers[1] value (writeRegister with paraLLEl-GS)
+            Call,              // call() on the GS thread (runOnWorker)
         };
         Kind kind = Kind::GifPacket;
         uint64_t registers[4]{};
         GSPresentationRequest displayRegisters{};
         std::vector<uint8_t> bytes;
+        std::function<void()> call;
     };
     bool shouldQueue() const;
+    // Runs work on the GS thread, in queue order, and waits for it (directly without a GS thread).
+    void runOnWorker(std::function<void()> work);
+    // PS2X_GS_RENDERER=parallel: the GS thread hands packets to paraLLEl-GS (created there when it starts) instead
+    // of decoding them for the CPU backend. Falls back to the CPU backend when it cannot be created.
+    bool m_parallelRequested = false;
+    std::unique_ptr<GSParallelRenderer> m_parallel;
+    void processWithParallel(const QueuedCommand &command);
+    void storePresentationFrame(PresentationFrame &&frame);
+    // SIGNAL / FINISH / LABEL as the GS raises them (CSR, SIGLBLID).
+    void raiseSignal(uint64_t value);
+    void raiseFinish();
+    void setLabel(uint64_t value);
     void enqueue(QueuedCommand &&command);
     void workerLoop();
     bool processNativePackedGIFPacketNow(const uint8_t *data, uint32_t sizeBytes);

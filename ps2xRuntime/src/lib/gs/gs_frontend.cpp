@@ -1,6 +1,7 @@
 #include "ThreadNaming.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_parallel.h"
 #include "runtime/gs/gs_trace.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
@@ -236,6 +237,24 @@ void GS::workerLoop()
 {
     ThreadNaming::SetCurrentThreadName("gs");
     t_onGsWorker = true;
+#if defined(PS2X_HAVE_PARALLEL_GS)
+    if (m_parallelRequested && !m_parallel)
+    {
+        GSParallelRenderer::Callbacks callbacks;
+        callbacks.signal = [this](uint64_t value) { raiseSignal(value); };
+        callbacks.finish = [this]() { raiseFinish(); };
+        callbacks.label = [this](uint64_t value) { setLabel(value); };
+        m_parallel = GSParallelRenderer::create(m_localMemorySize, callbacks);
+        if (!m_parallel)
+            std::fprintf(stderr, "[gs-parallel] unavailable, drawing on the CPU\n");
+    }
+    // PS2X_GS_PARALLEL_FLUSH=0: only submit to the GPU at FINISH and presentation, not whenever the queue runs dry.
+    static const bool s_flushWhenDrained = []
+    {
+        const char *value = std::getenv("PS2X_GS_PARALLEL_FLUSH");
+        return !(value && *value == '0');
+    }();
+#endif
     for (;;)
     {
         QueuedCommand command;
@@ -249,7 +268,11 @@ void GS::workerLoop()
             m_queueReady.wait(lock, [this]() { return m_stopWorker || !m_queue.empty(); });
             m_workerSleeping = false;
             if (m_queue.empty())
+            {
+                lock.unlock();
+                m_parallel.reset(); // its Vulkan objects go with the thread that made them
                 return;
+            }
             command = std::move(m_queue.front());
             m_queue.pop_front();
             m_queuedCommands.store(m_queue.size(), std::memory_order_release);
@@ -258,7 +281,7 @@ void GS::workerLoop()
 
         const uint8_t *data = command.bytes.data();
         const uint32_t size = static_cast<uint32_t>(command.bytes.size());
-        if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow)
+        if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow && !m_parallel)
         {
             const double now = GsRecorder::sinceProcessStart();
             if (!recorder.started && now >= recorder.startAt && m_backend)
@@ -287,6 +310,9 @@ void GS::workerLoop()
                     writeGsTraceCommand(recorder.out, static_cast<uint8_t>(command.kind), command.registers, data, size);
             }
         }
+        if (m_parallel)
+            processWithParallel(command);
+        else
         for (GS *target : {this, m_shadow.get()})
         {
             if (!target)
@@ -310,6 +336,15 @@ void GS::workerLoop()
                     m_queuedLatchesDone.fetch_add(1u, std::memory_order_release);
                 }
                 break;
+            // Queued for paraLLEl-GS before it failed to start.
+            case QueuedCommand::Kind::Register:
+                if (target == this)
+                    writeRegister(static_cast<uint8_t>(command.registers[0]), command.registers[1]);
+                break;
+            case QueuedCommand::Kind::Call:
+                if (target == this)
+                    command.call();
+                break;
             }
         }
 
@@ -321,8 +356,12 @@ void GS::workerLoop()
         }
         // Batched primitives are finished once the EE has nothing more queued, before anyone waiting for
         // idle can observe VRAM.
-        if (drained && m_backend)
+        if (drained && m_backend && !m_parallel)
             m_backend->Flush();
+#if defined(PS2X_HAVE_PARALLEL_GS)
+        if (drained && m_parallel && s_flushWhenDrained)
+            m_parallel->flush();
+#endif
         if (drained && m_shadow)
             compareShadowVram();
         {
@@ -346,6 +385,60 @@ void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     command.kind = QueuedCommand::Kind::GifPacket;
     command.bytes.assign(data, data + sizeBytes);
     enqueue(std::move(command));
+}
+
+void GS::processWithParallel(const QueuedCommand &command)
+{
+    const uint8_t *data = command.bytes.data();
+    const uint32_t size = static_cast<uint32_t>(command.bytes.size());
+    switch (command.kind)
+    {
+    case QueuedCommand::Kind::GifPacket:
+    case QueuedCommand::Kind::NativePackedGifPacket:
+        m_parallel->gifTransfer(data, size);
+        break;
+    case QueuedCommand::Kind::NativeImageUpload:
+    {
+        if (!data || size == 0u)
+            break;
+        for (uint32_t i = 0; i < 4u; ++i) // BITBLTBUF, TRXPOS, TRXREG, TRXDIR
+            m_parallel->writeRegister(static_cast<uint8_t>(GS_REG_BITBLTBUF + i), command.registers[i]);
+        // The image data behind an IMAGE tag, padded to whole quadwords.
+        thread_local std::vector<uint8_t> packet;
+        const uint32_t qwords = (size + 15u) / 16u;
+        packet.assign(16u + qwords * 16u, 0u);
+        const uint64_t tag = qwords | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58);
+        std::memcpy(packet.data(), &tag, sizeof(tag));
+        std::memcpy(packet.data() + 16u, data, size);
+        m_parallel->gifTransfer(packet.data(), static_cast<uint32_t>(packet.size()));
+        ++m_nativeImageUploadCount;
+        break;
+    }
+    case QueuedCommand::Kind::PresentationLatch:
+        storePresentationFrame(m_parallel->present(command.displayRegisters));
+        m_queuedLatchesDone.fetch_add(1u, std::memory_order_release);
+        break;
+    case QueuedCommand::Kind::Register:
+        m_parallel->writeRegister(static_cast<uint8_t>(command.registers[0]), command.registers[1]);
+        break;
+    case QueuedCommand::Kind::Call:
+        command.call();
+        break;
+    }
+}
+
+void GS::runOnWorker(std::function<void()> work)
+{
+    if (!shouldQueue())
+    {
+        work();
+        return;
+    }
+    QueuedCommand command;
+    command.kind = QueuedCommand::Kind::Call;
+    command.call = std::move(work);
+    enqueue(std::move(command));
+    waitForIdle();
 }
 
 void GS::compareShadowVram()
@@ -380,6 +473,15 @@ void GS::enableAsync()
 {
     // Called by the runtime after init(). Library users (tests, tools) keep the synchronous GS, whose
     // VRAM is current as soon as a packet call returns.
+#if defined(PS2X_HAVE_PARALLEL_GS)
+    // paraLLEl-GS needs the GS thread (its Vulkan objects stay on one thread), and has no CPU reference to compare.
+    if (!m_isShadow && GSParallelRenderer::requested())
+    {
+        m_parallelRequested = true;
+        m_asyncEnabled = true;
+        return;
+    }
+#endif
     const char *sync = std::getenv("PS2X_GS_SYNC");
     if (m_isShadow || (sync && *sync == '1'))
         return;
@@ -499,6 +601,17 @@ void GS::snapshotVRAM()
     // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
     // feeding the GS while a backend performs host-side conversion. Keep the
     // selected backend alive and unswappable for the duration of the call.
+    if (m_parallelRequested)
+    {
+        std::vector<uint8_t> snapshot;
+        runOnWorker([&]() { if (m_parallel) m_parallel->readVram(snapshot); });
+        if (!snapshot.empty())
+        {
+            std::lock_guard<std::mutex> lock(m_snapshotMutex);
+            m_displaySnapshot.swap(snapshot);
+            return;
+        }
+    }
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
     if (!m_backend)
         return;
@@ -808,6 +921,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     if (!m_privRegs)
         return request;
     request.pmode = m_privRegs->pmode;
+    request.smode1 = m_privRegs->smode1;
     request.smode2 = m_privRegs->smode2;
     request.dispfb1 = m_privRegs->dispfb1;
     request.display1 = m_privRegs->display1;
@@ -825,6 +939,12 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    // paraLLEl-GS presents on the GS thread, after what is queued before it.
+    if (m_parallelRequested && shouldQueue())
+    {
+        queueHostPresentationLatch();
+        return;
+    }
     latchHostPresentationFrame(nullptr);
 }
 
@@ -873,6 +993,7 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         request.display2 = displayRegisters->display2;
         request.bgcolor = displayRegisters->bgcolor;
         request.vsyncTick = displayRegisters->vsyncTick;
+        request.smode1 = displayRegisters->smode1;
     }
 
     PresentationFrame frame{};
@@ -885,7 +1006,11 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
             frame = m_backend->Present(request);
         }
     }
+    storePresentationFrame(std::move(frame));
+}
 
+void GS::storePresentationFrame(PresentationFrame &&frame)
+{
     const bool hasFrame = static_cast<bool>(frame);
     const uint32_t displayFbp = frame.displayFbp;
     const uint32_t sourceFbp = frame.sourceFbp;
@@ -1472,6 +1597,16 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    // paraLLEl-GS: in queue order, without waiting (0x59-0x5f mirror display registers, no drawing state).
+    if (m_parallelRequested && shouldQueue() && (regAddr < 0x59u || regAddr > 0x5fu))
+    {
+        QueuedCommand command;
+        command.kind = QueuedCommand::Kind::Register;
+        command.registers[0] = regAddr;
+        command.registers[1] = value;
+        enqueue(std::move(command));
+        return;
+    }
     waitForIdle(); // the EE needs every earlier packet applied first
     if (m_shadow)
         m_shadow->writeRegister(regAddr, value);
@@ -1879,48 +2014,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_SIGNAL:
-    {
-        if (m_privRegs)
-        {
-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-            uint32_t mask = static_cast<uint32_t>(value >> 32);
-            uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
-            lo = (lo & ~mask) | (id & mask);
-            m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
-            if ((m_privRegs->csr.fetch_or(0x1) & 0x1) == 0)
-            {
-                g_gsCsrRaisedEdges.fetch_or(0x1);
-                ps2NotifyGsCsrEdge();
-            }
-        }
+        raiseSignal(value);
         break;
-    }
     case GS_REG_FINISH:
-    {
         if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
-        if (m_privRegs && (m_privRegs->csr.fetch_or(0x2) & 0x2) == 0)
-        {
-            g_gsCsrRaisedEdges.fetch_or(0x2);
-            ps2NotifyGsCsrEdge();
-        }
+        raiseFinish();
         break;
-    }
     case GS_REG_LABEL:
-    {
-        if (m_privRegs)
-        {
-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-            uint32_t mask = static_cast<uint32_t>(value >> 32);
-            uint32_t hi = static_cast<uint32_t>(m_privRegs->siglblid >> 32);
-            hi = (hi & ~mask) | (id & mask);
-            m_privRegs->siglblid = (static_cast<uint64_t>(hi) << 32) | (m_privRegs->siglblid & 0xFFFFFFFF);
-        }
+        setLabel(value);
         break;
-    }
     case 0x59:
         if (m_privRegs)
             m_privRegs->dispfb1 = value;
@@ -2038,8 +2144,47 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 }
 
 
+void GS::raiseSignal(uint64_t value)
+{
+    if (!m_privRegs)
+        return;
+    uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
+    uint32_t mask = static_cast<uint32_t>(value >> 32);
+    uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
+    lo = (lo & ~mask) | (id & mask);
+    m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
+    if ((m_privRegs->csr.fetch_or(0x1) & 0x1) == 0)
+    {
+        g_gsCsrRaisedEdges.fetch_or(0x1);
+        ps2NotifyGsCsrEdge();
+    }
+}
+
+void GS::raiseFinish()
+{
+    if (m_privRegs && (m_privRegs->csr.fetch_or(0x2) & 0x2) == 0)
+    {
+        g_gsCsrRaisedEdges.fetch_or(0x2);
+        ps2NotifyGsCsrEdge();
+    }
+}
+
+void GS::setLabel(uint64_t value)
+{
+    if (!m_privRegs)
+        return;
+    uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
+    uint32_t mask = static_cast<uint32_t>(value >> 32);
+    uint32_t hi = static_cast<uint32_t>(m_privRegs->siglblid >> 32);
+    hi = (hi & ~mask) | (id & mask);
+    m_privRegs->siglblid = (static_cast<uint64_t>(hi) << 32) | (m_privRegs->siglblid & 0xFFFFFFFF);
+}
+
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
+    // The clear packet the caller sends next draws it (sceGsSwapDBuffDc).
+    if (m_parallelRequested)
+        return true;
     waitForIdle(); // the EE needs every earlier packet applied first
     if (m_shadow)
         m_shadow->clearFramebufferContext(contextIndex, rgba);
@@ -2049,6 +2194,8 @@ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
+    if (m_parallelRequested)
+        return true;
     waitForIdle(); // the EE needs every earlier packet applied first
     if (m_shadow)
         m_shadow->clearActiveFramebuffer(rgba);
@@ -2058,6 +2205,24 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    if (m_parallelRequested)
+    {
+        uint32_t copied = 0u;
+        runOnWorker([&]()
+                    {
+            if (!m_parallel)
+            {
+                std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+                copied = m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+                return;
+            }
+            std::vector<uint8_t> words((maxBytes + 15u) & ~15u);
+            m_parallel->readTransferFifo(words.data(), static_cast<uint32_t>(words.size() / 16u));
+            if (dst)
+                std::memcpy(dst, words.data(), maxBytes);
+            copied = maxBytes; });
+        return copied;
+    }
     waitForIdle(); // the EE needs every earlier packet applied first
     if (m_shadow && dst)
     {
