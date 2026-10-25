@@ -188,10 +188,11 @@ static inline uint64_t Ps2Sub64Overflow(uint64_t lhs, uint64_t rhs, bool &overfl
 //   - exponent 255 is an ordinary exponent, so 0x7F800000 is 2^128 and the largest value is 0x7FFFFFFF;
 //   - exponent 0 is zero whatever the mantissa holds;
 //   - a result of 2^129 or more saturates to +-0x7FFFFFFF, one below 2^-126 becomes +-0;
-//   - x/0 gives +-0x7FFFFFFF.
+//   - x/0 gives +-0x7FFFFFFF;
+//   - ADD.S/SUB.S shift the smaller operand with a single guard bit and truncate the result toward zero.
 // A host float cannot hold the exponent-255 values, so anything that touches them is computed in double.
 // That path is rare and kept out of line; the inline part is the host operation and a range check.
-// One case is left to the host: ADD.S/SUB.S/MUL.S and the vector operations do not look for an operand with
+// One case is left to the host: MUL.S and the vector operations do not look for an operand with
 // exponent 0 and a non-zero mantissa, so it takes part with its tiny host value instead of as zero.
 // Checked against the hardware results in ps2autotests (tests/cpu/ee_fpu).
 #if defined(_MSC_VER)
@@ -240,6 +241,58 @@ inline float ps2_from_double(double d)
     }
     // A value that rounds up to 2^128 comes out as the host's Inf pattern, which is 2^128 on the PS2.
     return static_cast<float>(d);
+}
+
+// d rounded toward zero; |d| below 2^128.
+inline float ps2_ftrunc(double d)
+{
+    const float r = static_cast<float>(d);
+    if (std::fabs(static_cast<double>(r)) <= std::fabs(d))
+        return r;
+    uint32_t b = std::bit_cast<uint32_t>(r) - 1u;
+    if ((b & PS2_FLOAT_EXP_MASK) == 0u)
+        b &= PS2_FLOAT_SIGN_MASK;
+    return std::bit_cast<float>(b);
+}
+
+inline float ps2_from_double_trunc(double d)
+{
+    const double magnitude = std::fabs(d);
+    const uint32_t sign = std::signbit(d) ? PS2_FLOAT_SIGN_MASK : 0u;
+    if (magnitude >= 0x1p129)
+        return std::bit_cast<float>(sign | PS2_FLOAT_MAX_BITS);
+    if (magnitude < 0x1p-126)
+        return std::bit_cast<float>(sign);
+    if (magnitude >= 0x1p128)
+        return std::bit_cast<float>(std::bit_cast<uint32_t>(ps2_ftrunc(d * 0.5)) + 0x00800000u);
+    return ps2_ftrunc(d);
+}
+
+// The operand with the smaller exponent keeps one bit below the other's last mantissa bit; exponent 0 reads as zero.
+inline void ps2_falign(float &a, float &b)
+{
+    uint32_t ua = std::bit_cast<uint32_t>(a);
+    uint32_t ub = std::bit_cast<uint32_t>(b);
+    if ((ua & PS2_FLOAT_EXP_MASK) == 0u)
+        ua &= PS2_FLOAT_SIGN_MASK;
+    if ((ub & PS2_FLOAT_EXP_MASK) == 0u)
+        ub &= PS2_FLOAT_SIGN_MASK;
+    const int32_t diff = static_cast<int32_t>((ua >> 23) & 0xFFu) - static_cast<int32_t>((ub >> 23) & 0xFFu);
+    if (diff >= 25)
+        ub &= PS2_FLOAT_SIGN_MASK;
+    else if (diff > 0)
+        ub &= 0xFFFFFFFFu << (diff - 1);
+    else if (diff <= -25)
+        ua &= PS2_FLOAT_SIGN_MASK;
+    else if (diff < 0)
+        ua &= 0xFFFFFFFFu << (-diff - 1);
+    a = std::bit_cast<float>(ua);
+    b = std::bit_cast<float>(ub);
+}
+
+PS2_FLOAT_NOINLINE inline float ps2_fpu_add_slow(float a, float b)
+{
+    return ps2_from_double_trunc(ps2_to_double(a) + ps2_to_double(b));
 }
 
 PS2_FLOAT_NOINLINE inline float ps2_fadd_slow(float a, float b)
@@ -319,16 +372,17 @@ inline bool ps2_fnormal(float r)
     return (std::bit_cast<uint32_t>(r) * 2u + 0x01000000u) >= 0x02000000u;
 }
 
+// The aligned operands sum exactly in a double.
 inline float ps2_fadd(float a, float b)
 {
-    const float r = a + b;
-    return ps2_fnormal(r) ? r : ps2_fadd_slow(a, b);
+    ps2_falign(a, b);
+    const double sum = static_cast<double>(a) + static_cast<double>(b);
+    return ps2_fnormal(static_cast<float>(sum)) ? ps2_ftrunc(sum) : ps2_fpu_add_slow(a, b);
 }
 
 inline float ps2_fsub(float a, float b)
 {
-    const float r = a - b;
-    return ps2_fnormal(r) ? r : ps2_fsub_slow(a, b);
+    return ps2_fadd(a, std::bit_cast<float>(std::bit_cast<uint32_t>(b) ^ PS2_FLOAT_SIGN_MASK));
 }
 
 inline float ps2_fmul(float a, float b)

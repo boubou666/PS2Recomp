@@ -60,10 +60,10 @@ namespace
         uint32_t ft;
         uint32_t result;
         // 0: must match exactly.
-        // 1: the hardware does not round to nearest (ADD.S and MUL.S drop the low bits, the divide unit has its
-        //    own rule); rounding is not emulated, so the row differs in the last mantissa bit.
-        // 2: an ADD.S/SUB.S/MUL.S operand has exponent 0 and a non-zero mantissa. The hardware reads it as
-        //    zero; the fast path does not look for it. Not checked.
+        // 1: the hardware does not round to nearest (MUL.S drops the low bits, the divide unit has its own
+        //    rule); that rounding is not emulated, so the row differs in the last mantissa bit.
+        // 2: a MUL.S operand has exponent 0 and a non-zero mantissa. The hardware reads it as zero; the fast
+        //    path does not look for it. Not checked.
         int known;
     };
 
