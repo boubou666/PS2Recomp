@@ -680,6 +680,23 @@ void GS::enableAsync()
     }
 }
 
+bool GS::requestParallelRenderer()
+{
+#if defined(PS2X_HAVE_PARALLEL_GS)
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    if (m_parallelRequested)
+        return true;
+    const char *renderer = std::getenv("PS2X_GS_RENDERER");
+    if (m_isShadow || m_shadow || m_worker.joinable() || (renderer && *renderer))
+        return false;
+    m_parallelRequested = true;
+    m_asyncEnabled = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
 void GS::waitForIdle()
 {
     if (!m_asyncEnabled || t_onGsWorker)

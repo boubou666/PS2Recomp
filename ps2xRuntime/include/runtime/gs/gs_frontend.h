@@ -126,6 +126,9 @@ public:
     // Moves packet processing to a GS thread (unless PS2X_GS_SYNC=1). The runtime calls it after init();
     // without it the GS is synchronous.
     void enableAsync();
+    // Lets a game prefer paraLLEl-GS while the GS thread has not started yet (game overrides run after
+    // enableAsync). PS2X_GS_RENDERER set to anything else keeps the user's choice. Returns whether it is in use.
+    bool requestParallelRenderer();
     // Queues a GIF packet for the GS thread (processed in submission order), or processes it now when the
     // GS runs synchronously.
     void submitGIFPacket(const uint8_t *data, uint32_t sizeBytes);
