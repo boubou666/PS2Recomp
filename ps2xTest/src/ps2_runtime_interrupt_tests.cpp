@@ -198,6 +198,19 @@ namespace
         runtime->requestStop();
     }
 
+    constexpr uint32_t kVBlankSpinPc = 0x00271100u;
+
+    void schedulerSpinTwoVBlanks(uint8_t *, R5900Context *, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        while (scheduler.currentVSyncTick() < 2u)
+        {
+            if (scheduler.checkpointDue(10'000u))
+                return;
+        }
+        runtime->requestStop();
+    }
+
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
@@ -1209,6 +1222,24 @@ void register_ps2_runtime_interrupt_tests()
 
             t.IsTrue(g_gsCheckScheduled.load(), "the guest should have scheduled the GS check");
             t.IsTrue(idleNs < 2'000'000u, "the check's host time is on the vblank timeline, already past");
+            cleanupRuntime(env);
+        });
+
+        tc.Run("with catch-up off a late vblank does not let the next field run faster than real time", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kVBlankSpinPc, &schedulerSpinTwoVBlanks);
+            R5900Context mainContext{};
+            mainContext.pc = kVBlankSpinPc;
+            env.runtime.eeScheduler().setWallClockCatchUp(EeScheduler::WallClockCatchUp::Off);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            const auto start = std::chrono::steady_clock::now();
+            env.runtime.eeScheduler().run();
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+
+            t.IsTrue(elapsed >= std::chrono::milliseconds(12),
+                     "the field after a late vblank should still last about a field of host time");
             cleanupRuntime(env);
         });
     });
