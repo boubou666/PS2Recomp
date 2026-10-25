@@ -1852,6 +1852,18 @@ void register_code_generator_tests()
                      "VABS must flush denormal inputs to zero");
         });
 
+        tc.Run("VU0 macro VCLIP shares the VU CLIP judgement of Fs against Ft.w", [](TestCase &t) {
+            R5900Decoder decoder;
+            CodeGenerator gen({}, {});
+            const std::string clip = gen.translateInstruction(decoder.decodeInstruction(0x1087CCu, 0x4BC429FFu));
+            printGeneratedCode("vclipw.xyz $vf5, $vf4w", clip);
+            t.IsTrue(clip.find("_mm_store_ps(fs, ctx->vu0_vf[5])") != std::string::npos, "VCLIP must judge Fs (vf5)");
+            t.IsTrue(clip.find("_mm_store_ps(ft, ctx->vu0_vf[4])") != std::string::npos, "VCLIP must take the limit from Ft (vf4)");
+            t.IsTrue(clip.find("ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | ps2VuClipJudge(fs, ft[3])) & 0xFFFFFFu") !=
+                         std::string::npos,
+                     "VCLIP must shift in the shared judgement of Ft.w");
+        });
+
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
             Function func;
             func.name = "jal_test";

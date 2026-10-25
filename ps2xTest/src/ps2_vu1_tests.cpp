@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu_clip.h"
 
 #include <cmath>
 #include <cstdint>
@@ -1742,6 +1743,25 @@ void register_ps2_vu1_tests()
                      "FCGET on cycle four should observe the committed +X CLIP bit");
             t.Equals(vu1.state().clip, 1u,
                      "CLIP should shift and commit the six new comparison bits");
+        });
+
+        tc.Run("VU CLIP judgement puts +x, -x, +y, -y, +z, -z in bits 0 to 5 against |w|", [](TestCase &t)
+        {
+            const float plusX[3] = {2.0f, 0.5f, -0.5f};
+            t.Equals(ps2VuClipJudge(plusX, 1.0f), 0x01u, "x above +w sets bit 0");
+            const float minusX[3] = {-2.0f, 0.0f, 0.0f};
+            t.Equals(ps2VuClipJudge(minusX, 1.0f), 0x02u, "x below -w sets bit 1");
+            const float yz[3] = {0.0f, -3.0f, 3.0f};
+            t.Equals(ps2VuClipJudge(yz, 1.0f), 0x18u, "y below -w sets bit 3 and z above +w bit 4");
+            t.Equals(ps2VuClipJudge(yz, -1.0f), 0x18u, "the limit is |w|");
+            const float onPlane[3] = {1.0f, -1.0f, 0.0f};
+            t.Equals(ps2VuClipJudge(onPlane, 1.0f), 0u, "a component equal to |w| is inside");
+
+            float denormal = 0.0f;
+            const uint32_t denormalBits = 0x00000001u;
+            std::memcpy(&denormal, &denormalBits, sizeof(denormal));
+            const float signs[3] = {1e-30f, -1e-30f, denormal};
+            t.Equals(ps2VuClipJudge(signs, 0.0f), 0x09u, "a zero w judges signs; a denormal component exceeds nothing");
         });
 
         tc.Run("VU1 FMAC normalizes overflow and underflow before writing results", [](TestCase &t)
