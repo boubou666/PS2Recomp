@@ -183,6 +183,7 @@ namespace
         expect((rig.memory.read32(kDma4Chcr) & 0x01000000u) == 0u, "the start bit clears on completion");
         expect(rig.interrupts.size() == 1u && rig.interrupts[0] == 0x24, "completion raises the channel 4 interrupt");
         expect((rig.memory.read16(kBase + 0x344u) & 0x80u) != 0u, "STATX reports the DMA done");
+        expect(rig.memory.read32(kDma4Madr) == 0x10200u, "a completed transfer leaves MADR past its last word");
 
         // Read back through the same channel (SPU2 -> IOP).
         rig.memory.write16(kTsaH, 0x0001u);
@@ -217,6 +218,8 @@ namespace
         rig.memory.write32(kDma4Chcr, 0x01000201u);
         expect(rig.interrupts.empty(), "an AutoDMA transfer completes as the input consumes it");
         expect((rig.memory.read32(kDma4Chcr) & 0x01000000u) != 0u, "AutoDMA keeps the channel busy");
+        expect(rig.memory.read32(kDma4Madr) == 0x30400u, "the first chunk moves into the free input half at once");
+        expect((rig.memory.read32(kDma4Bcr) >> 16u) == 16u, "the block count goes down with it");
 
         rig.runSamples(256u + 16u);
         expect(rig.interrupts.size() == 1u && rig.interrupts[0] == 0x24, "AutoDMA completion raises the channel interrupt");
