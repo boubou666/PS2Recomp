@@ -1295,7 +1295,9 @@ GSCpuBackend::PixelPipeline GSCpuBackend::MakePixelPipeline(const GSDrawState &s
     p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
     p.zpsm = static_cast<uint8_t>(ctx.zbuf.psm);
     p.test = ctx.test;
-    p.ztst = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+    // ZTE=0 turns the depth test off (VP2 downsamples its post-processing buffers with TEST=0);
+    // ZTST alone would read 0, NEVER, and drop every pixel.
+    p.ztst = ((ctx.test >> 16) & 1u) != 0u ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
     p.alphaTest = (ctx.test & 0x1u) != 0u;
     p.dateNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u &&
                       (p.fpsm == GS_PSM_CT32 || p.fpsm == GS_PSM_CT16 || p.fpsm == GS_PSM_CT16S);

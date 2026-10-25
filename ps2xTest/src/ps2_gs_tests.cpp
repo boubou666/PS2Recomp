@@ -1461,6 +1461,58 @@ void register_ps2_gs_tests()
                      "pixel 4 lies outside [0, 3.5) and must stay untouched");
         });
 
+        tc.Run("GS draws with the depth test off when TEST.ZTE is 0", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, 150ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (3ull << 16) | (3ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0ull); // ZTE=0 (and ZTST=0, which would mean NEVER)
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80332211ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (4ull << 4) | ((4ull << 4) << 16));
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 2u, 2u), 0x80332211u,
+                     "TEST=0 should draw: ZTE=0 disables the depth test");
+        });
+
+        tc.Run("GS sprite at -0.5 covers pixels 0..N-1 and samples texel centers", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kTexels[4] = {0x800000FFu, 0x8000FF00u, 0x80FF0000u, 0x80FFFFFFu};
+            for (uint32_t y = 0u; y < 4u; ++y)
+                for (uint32_t x = 0u; x < 4u; ++x)
+                    writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, x, y, kTexels[x]);
+            // Like VP2's post-processing copies: XYOFFSET 8.0 with vertices at 7.5..11.5, UV 0..4,
+            // bilinear filtering. Each pixel center lands on a texel center: an exact copy.
+            gs.writeRegister(GS_REG_FRAME_1, 150ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, (8ull << 4) | ((8ull << 4) << 32));
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTexTbp | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                 (2ull << 26) | (2ull << 30) | (1ull << 34));
+            gs.writeRegister(GS_REG_TEX1_1, 0x60ull);
+            gs.writeRegister(GS_REG_CLAMP_1, 0x5ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 120ull | (120ull << 16)); // 7.5, 7.5
+            gs.writeRegister(GS_REG_UV, (4ull * 16ull) | ((4ull * 16ull) << 16));
+            gs.writeRegister(GS_REG_XYZ2, 184ull | (184ull << 16)); // 11.5, 11.5
+            for (uint32_t x = 0u; x < 4u; ++x)
+                t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, x, 1u), kTexels[x],
+                         "a half-pixel-aligned bilinear copy should reproduce each texel");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 4u, 1u), 0u, "pixel 4 lies outside [-0.5, 3.5)");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 1u, 3u), kTexels[1], "the last row should be drawn");
+        });
+
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
