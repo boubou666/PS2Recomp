@@ -343,6 +343,11 @@ public:
     // Applies the cycles advanceEeTimers() has been holding back (timer registers read the result).
     uint32_t flushEeTimers() noexcept;
 
+    // GS -> EE image data (TRXDIR = 1) that the VIF1 FIFO hands to the EE: VIF1 DMA with CHCR.DIR = 0, quadword
+    // reads of VIF1_FIFO, and VIF1_STAT.FQC while the EE has set VIF1_STAT.FDR.
+    using LocalToHostReader = std::function<uint32_t(uint8_t *, uint32_t)>;
+    void setLocalToHostReader(LocalToHostReader reader) { m_localToHostReader = std::move(reader); }
+
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
@@ -613,6 +618,12 @@ public:
     std::vector<uint8_t> readDmaSourceChain(uint32_t channelBase, uint32_t chcr, std::vector<DmaSegment> *segments = nullptr,
                                             uint32_t pendingQwc = 0, bool pendingEnds = false);
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+    LocalToHostReader m_localToHostReader;
+    std::vector<uint8_t> m_vif1DownloadFifo;
+    size_t m_vif1DownloadRead = 0;
+    uint32_t vif1DownloadQuadwords();
+    uint32_t readVif1Download(uint8_t *dst, uint32_t bytes);
+    void downloadVif1Dma(uint32_t channelBase);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
 };

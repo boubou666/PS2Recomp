@@ -108,6 +108,8 @@ namespace
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
     constexpr uint32_t kGsCsrReset = 1u << 9;
     constexpr uint32_t kVif1Channel = 0x10009000u;
+    constexpr uint32_t kVif1Stat = 0x10003C00u;
+    constexpr uint32_t kVif1StatFdr = 1u << 23;
     constexpr uint32_t kGifChannel = 0x1000A000u;
     constexpr uint32_t kGsImrRegOffset = 0x1010u;
 
@@ -417,6 +419,8 @@ bool PS2Memory::initialize(size_t ramSize)
     m_signalStalls.clear();
     m_path3Scan = {};
     m_vif1Direct = {};
+    m_vif1DownloadFifo.clear();
+    m_vif1DownloadRead = 0u;
     resetEeTimers();
 
     try
@@ -1033,6 +1037,13 @@ __m128i PS2Memory::read128(uint32_t address)
         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
     }
 
+    if (physAddr == 0x10005000u && m_localToHostReader)
+    {
+        alignas(16) uint8_t qword[16] = {};
+        readVif1Download(qword, sizeof(qword));
+        return _mm_load_si128(reinterpret_cast<const __m128i *>(qword));
+    }
+
     // 128-bit reads are primarily for quad-word loads in the EE, which are only valid for RAM areas
     // Return zeroes for unsupported areas
     return _mm_setzero_si128();
@@ -1499,6 +1510,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
         switch (address)
         {
+        case kVif1Stat:
+            if ((value & kVif1StatFdr) == 0u)
+            {
+                m_vif1DownloadFifo.clear();
+                m_vif1DownloadRead = 0u;
+            }
+            break;
         case 0x10003C10u:     // VIF1_FBRST
             if (value & 0x1u) // RST
             {
@@ -1584,6 +1602,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
+                return true;
+            }
+
+            if (channelBase == kVif1Channel && (value & 0x1u) == 0u && ((value >> 2) & 0x3u) == 0u && m_localToHostReader)
+            {
+                downloadVif1Dma(channelBase);
                 return true;
             }
 
@@ -1894,6 +1918,63 @@ std::vector<uint8_t> PS2Memory::readDmaSourceChain(uint32_t channelBase, uint32_
     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
     m_ioRegisters[channelBase + 0x00] = chcr;
     return chainBuf;
+}
+
+uint32_t PS2Memory::vif1DownloadQuadwords()
+{
+    constexpr size_t kRefillBytes = 64u * 1024u;
+    if (m_vif1DownloadRead >= m_vif1DownloadFifo.size())
+    {
+        m_vif1DownloadFifo.clear();
+        m_vif1DownloadRead = 0u;
+    }
+    if (m_vif1DownloadFifo.size() - m_vif1DownloadRead < 256u && m_localToHostReader)
+    {
+        waitForVif1();
+        const size_t kept = m_vif1DownloadFifo.size();
+        m_vif1DownloadFifo.resize(kept + kRefillBytes);
+        const uint32_t got = m_localToHostReader(m_vif1DownloadFifo.data() + kept, static_cast<uint32_t>(kRefillBytes));
+        m_vif1DownloadFifo.resize(kept + got);
+    }
+    return static_cast<uint32_t>((m_vif1DownloadFifo.size() - m_vif1DownloadRead + 15u) / 16u);
+}
+
+uint32_t PS2Memory::readVif1Download(uint8_t *dst, uint32_t bytes)
+{
+    uint32_t produced = 0u;
+    while (produced < bytes && vif1DownloadQuadwords() != 0u)
+    {
+        const size_t count = std::min<size_t>(bytes - produced, m_vif1DownloadFifo.size() - m_vif1DownloadRead);
+        std::memcpy(dst + produced, m_vif1DownloadFifo.data() + m_vif1DownloadRead, count);
+        m_vif1DownloadRead += count;
+        produced += static_cast<uint32_t>(count);
+    }
+    return produced;
+}
+
+void PS2Memory::downloadVif1Dma(uint32_t channelBase)
+{
+    const uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
+    const uint32_t bytes = (m_ioRegisters[channelBase + 0x20u] & 0xFFFFu) * 16u;
+    uint32_t offset = 0u;
+    bool inRam = !isScratchpad(madr);
+    try
+    {
+        offset = translateAddress(madr);
+    }
+    catch (const std::exception &)
+    {
+        inRam = false;
+    }
+    if (inRam && offset <= PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - offset)
+    {
+        const uint32_t produced = readVif1Download(m_rdram + offset, bytes);
+        std::memset(m_rdram + offset + produced, 0, bytes - produced);
+        markModified(offset, bytes);
+    }
+    m_ioRegisters[channelBase + 0x10u] = (madr + bytes) & 0x7FFFFFF0u;
+    m_ioRegisters[channelBase + 0x20u] = 0u;
+    completeDmacChannel(channelBase, 1u);
 }
 
 bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
@@ -2998,6 +3079,12 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
             break;
         }
         return val;
+    }
+
+    if (address == kVif1Stat && m_localToHostReader && (m_ioRegisters[address] & kVif1StatFdr) != 0u)
+    {
+        const uint32_t fqc = std::min<uint32_t>(vif1DownloadQuadwords(), 16u);
+        return (m_ioRegisters[address] & ~0x1F000000u) | (fqc << 24u);
     }
 
     if (address == 0x10003020u) // GIF_STAT

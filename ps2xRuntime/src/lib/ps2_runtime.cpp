@@ -1221,6 +1221,8 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.submitGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    m_memory.setLocalToHostReader([this](uint8_t *dst, uint32_t maxBytes)
+                                  { return m_gs.consumeLocalToHostBytes(dst, maxBytes); });
     // VIF1 MSCAL/MSCNT waits for the microprogram to end (E bit) on the real hardware: run it to
     // completion. A cap of 65536 cycles cut long batches (VP2 transforms hundreds of vertices per
     // call) in the middle, leaving VU memory half written and the next program working on it.
