@@ -2,6 +2,27 @@
 #include "ps2x/iop/ps2_path.h"
 #include "../../ps2xIOP/tests/iop_compat_test_support.h"
 
+namespace
+{
+    iop_test::Irx getOtherDataModule(uint32_t eeSource, uint32_t iopDestination, uint32_t size)
+    {
+        iop_test::Irx image;
+        image.words(0u, {
+            0x27BDFFE0u, 0xAFBF001Cu, // save ra
+            0x3C040000u,
+            0x3C050000u | (eeSource >> 16u), 0x34A50000u | (eeSource & 0xFFFFu),
+            0x3C060000u | (iopDestination >> 16u), 0x34C60000u | (iopDestination & 0xFFFFu),
+            0x3C070000u | (size >> 16u), 0x34E70000u | (size & 0xFFFFu),
+            0xAFA00010u,
+            0x0C00401Du, 0u, // jal 0x10074: sceSifGetOtherData
+            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0u,
+        });
+        image.words(0x60u, {0x41E00000u, 0u, 0x0101u, 0x63666973u, 0x0000646Du,
+                             0x03E00008u, 0x24000017u, 0u, 0u});
+        return image;
+    }
+}
+
 void register_ps2_iop_tests()
 {
     MiniTest::Case("PS2IopSubsystem", [](TestCase &tc)
@@ -69,6 +90,37 @@ void register_ps2_iop_tests()
             t.Equals(result.callbackPolicy, ps2x::iop::CallbackPolicy::RuntimeDefault,
                      "an unknown SID should preserve runtime callback handling");
 
+        });
+
+        tc.Run("sceSifGetOtherData copies EE memory into IOP RAM", [](TestCase &t)
+        {
+            constexpr uint32_t kEeSource = 0x800u;
+            constexpr uint32_t kIopDestination = 0x10400u;
+            constexpr uint8_t kPayload[8] = {0x53u, 0x49u, 0x46u, 0x21u, 0x01u, 0x02u, 0x03u, 0x04u};
+
+            iop_test::Host host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            t.IsTrue(host.writeGuest(kEeSource, kPayload, sizeof(kPayload)), "the EE payload should fit");
+            getOtherDataModule(kEeSource, kIopDestination, sizeof(kPayload)).install(host);
+
+            const ps2x::iop::ModuleLoadResult loaded = subsystem.loadModuleBuffer(0x1000u);
+            t.IsTrue(loaded.moduleId > 0, "the synthetic IRX should load");
+            t.Equals(loaded.startResult, 0, "sceSifGetOtherData should return 0 once the data is copied");
+
+            uint8_t copied[sizeof(kPayload)] = {};
+            t.IsTrue(subsystem.readMemory(kIopDestination, copied, sizeof(copied)), "the IOP destination should be readable");
+            t.IsTrue(std::memcmp(copied, kPayload, sizeof(kPayload)) == 0, "the IOP buffer should hold the EE payload");
+        });
+
+        tc.Run("sceSifGetOtherData fails for an EE range outside guest memory", [](TestCase &t)
+        {
+            iop_test::Host host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            getOtherDataModule(0x00100000u, 0x10400u, 16u).install(host);
+
+            const ps2x::iop::ModuleLoadResult loaded = subsystem.loadModuleBuffer(0x1000u);
+            t.IsTrue(loaded.moduleId > 0, "the synthetic IRX should load");
+            t.Equals(loaded.startResult, -1, "a source outside EE memory should fail the transfer");
         });
 
     });
