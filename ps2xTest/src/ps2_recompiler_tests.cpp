@@ -578,6 +578,12 @@ static bool writeMinimalMipsElfWithAddressTakenCallbacks(const std::filesystem::
     textWords[373] = 0x03E00008u; // jr ra
     textWords[374] = 0x27BD0010u; // addiu sp,sp,0x10 (delay slot)
 
+    // A pointer/id run names 0x001005E8, the delay slot of a branch, which holds a stack allocation.
+    textWords[377] = 0x10400002u; // beqz v0,0x001005F0
+    textWords[378] = 0x27BDFFF0u; // addiu sp,sp,-0x10 (delay slot at 0x001005E8)
+    textWords[379] = 0x03E00008u; // jr ra
+    textWords[380] = 0x27BD0010u; // addiu sp,sp,0x10 (delay slot)
+
     text->set_data(reinterpret_cast<const char *>(textWords.data()),
                    static_cast<ELFIO::Elf_Word>(textWords.size() * sizeof(uint32_t)));
 
@@ -587,7 +593,7 @@ static bool writeMinimalMipsElfWithAddressTakenCallbacks(const std::filesystem::
     rodata->set_addr_align(4);
     rodata->set_address(0x00200000u);
 
-    std::array<uint32_t, 32> tableWords{};
+    std::array<uint32_t, 48> tableWords{};
     tableWords[1] = 0x00100060u;
     tableWords[3] = 0x00100068u;
     // Retail class descriptor: name pointer, ordinary method, two reserved
@@ -602,6 +608,10 @@ static bool writeMinimalMipsElfWithAddressTakenCallbacks(const std::filesystem::
     tableWords[29] = 0x0000000Du;
     tableWords[30] = 0x00100380u; // long leaf, followed by a numeric id
     tableWords[31] = 0x0000000Bu;
+    tableWords[40] = 0x00100080u;
+    tableWords[41] = 0x0000000Cu;
+    tableWords[42] = 0x001005E8u; // delay slot, followed by a numeric id
+    tableWords[43] = 0x0000000Eu;
     rodata->set_data(reinterpret_cast<const char *>(tableWords.data()),
                      static_cast<ELFIO::Elf_Word>(tableWords.size() * sizeof(uint32_t)));
 
@@ -1792,6 +1802,8 @@ void register_ps2_recompiler_tests()
                      "a singleton data pointer loaded and consumed by JALR should be discovered");
             t.IsFalse(hasStart(0x00100588u),
                       "a data pointer must not split a function at a control-transfer delay slot");
+            t.IsFalse(hasStart(0x001005E8u),
+                      "a pointer table entry must not start a function in a branch delay slot");
             t.IsFalse(hasStart(0x00100300u),
                       "an isolated data pointer or non-callback code materialization must not become a function");
 
