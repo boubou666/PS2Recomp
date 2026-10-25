@@ -115,6 +115,8 @@ public:
         uint64_t waitNanoseconds = 0;
     };
     LagStats takeLagStats();
+    // EE cycles of drawing estimated for every packet queued so far (GsDrawEstimate).
+    uint64_t estimatedDrawCycles() const { return m_drawEstimate.totalCycles(); }
     GS();
     ~GS();
 

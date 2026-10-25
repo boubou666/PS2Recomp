@@ -1000,6 +1000,7 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 namespace
 {
     std::atomic<uint64_t> g_vu1MscalCount{0};
+    std::atomic<uint64_t> g_vu1Cycles{0};
 
     constexpr size_t kCallTraceSlots = PS2_RAM_SIZE / 4u;
 
@@ -1150,7 +1151,8 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
         const GS::LagStats lag = runtime.gs().takeLagStats();
         const auto [drainNanoseconds, drains] = GSCpuBackend::TakeDrainStats();
         text << "[state] gs frames=" << lag.frames << " ee waited " << lag.waitNanoseconds / 1000000u << " ms for the GS thread, "
-             << drains << " raster drains took " << drainNanoseconds / 1000000u << " ms";
+             << drains << " raster drains took " << drainNanoseconds / 1000000u << " ms, drawing estimate "
+             << runtime.gsForPresentation().estimatedDrawCycles() << " cycles";
         if (memory.vif1Threaded())
         {
             static uint64_t lastVif1WaitNs = 0;
@@ -1193,6 +1195,7 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
                  << " waiters=" << flag.waiters << '\n';
     }
     text << "[state] vu1 mscal=" << g_vu1MscalCount.load(std::memory_order_relaxed)
+         << " cycles=" << g_vu1Cycles.load(std::memory_order_relaxed)
          << " gif p1=" << ps2_gif_path_stats::packets(GifPathId::Path1) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path1)
          << "B p2=" << ps2_gif_path_stats::packets(GifPathId::Path2) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path2)
          << "B p3=" << ps2_gif_path_stats::packets(GifPathId::Path3) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path3)
@@ -1304,6 +1307,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                                                  m_gs, &m_memory, startPC, top, itop, kVu1ProgramCycleLimit); });
                                      g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
+                                     g_vu1Cycles.fetch_add(m_vu1.state().cycles - cyclesBefore, std::memory_order_relaxed);
                                      if (onWorker && m_memory.gsLag())
                                          m_memory.advanceVif1WorkerClock(m_vu1.state().cycles - cyclesBefore);
                                      if (cpuContext)
@@ -1340,6 +1344,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                                                 m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                                                 m_gs, &m_memory, top, itop, kVu1ProgramCycleLimit); });
                                      g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
+                                     g_vu1Cycles.fetch_add(m_vu1.state().cycles - cyclesBefore, std::memory_order_relaxed);
                                      if (onWorker && m_memory.gsLag())
                                          m_memory.advanceVif1WorkerClock(m_vu1.state().cycles - cyclesBefore);
                                      if (cpuContext)
