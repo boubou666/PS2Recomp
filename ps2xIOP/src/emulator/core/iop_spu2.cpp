@@ -31,6 +31,17 @@ namespace ps2x::iop::detail
         constexpr int32_t kFilterPositive[5] = {0, 60, 115, 98, 122};
         constexpr int32_t kFilterNegative[5] = {0, 0, -52, -55, -60};
 
+        uint32_t dmaBlockBytes(uint32_t bcr)
+        {
+            return std::max<uint32_t>(bcr & 0xFFFFu, 1u) * 4u;
+        }
+
+        uint32_t dmaTransferBytes(uint32_t bcr)
+        {
+            const uint32_t blocks = std::max<uint32_t>(bcr >> 16u, 1u);
+            return std::min<uint32_t>(dmaBlockBytes(bcr) * blocks, IopMemory::RamSize);
+        }
+
         int32_t clamp16(int32_t value)
         {
             return std::clamp(value, -0x8000, 0x7FFF);
@@ -570,9 +581,7 @@ namespace ps2x::iop::detail
     void IopSpu2::startDma(int coreIndex)
     {
         Core &core = m_cores[coreIndex];
-        const uint32_t wordsPerBlock = std::max<uint32_t>(core.bcr & 0xFFFFu, 1u);
-        const uint32_t blocks = std::max<uint32_t>(core.bcr >> 16u, 1u);
-        const uint32_t bytes = std::min<uint32_t>(wordsPerBlock * blocks * 4u, IopMemory::RamSize);
+        const uint32_t bytes = dmaTransferBytes(core.bcr);
         const bool toSpu = (core.chcr & 1u) != 0u;
         core.dmaBusy = true;
         core.statx |= 0x80u;
