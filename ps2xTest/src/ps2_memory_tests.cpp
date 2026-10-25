@@ -155,6 +155,40 @@ namespace
         appendU64(packet, 0u);
     }
 
+    constexpr uint64_t kGsSignalReg = 0x60u;
+    constexpr uint64_t kGsTexflushReg = 0x3Fu;
+    constexpr uint32_t kGsCsr = 0x12001000u;
+
+    GifArbiter makeSignalingArbiter(GSRegisters &regs, std::vector<std::vector<uint8_t>> &packets)
+    {
+        return GifArbiter([&regs, &packets](const uint8_t *data, uint32_t sizeBytes)
+        {
+            packets.emplace_back(data, data + sizeBytes);
+            GifSignalScan scan;
+            uint32_t offset = 0u;
+            while ((offset = scan.nextSignal(data, sizeBytes, offset)) < sizeBytes)
+            {
+                uint64_t value = 0u;
+                std::memcpy(&value, data + offset, sizeof(value));
+                ps2GsPostEvent(regs, GsCpuEvent::Signal, static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u), 0u, 0u);
+                scan.passQuadword();
+                offset += 16u;
+            }
+        });
+    }
+
+    uint64_t makeSignal(uint32_t id, uint32_t mask)
+    {
+        return static_cast<uint64_t>(id) | (static_cast<uint64_t>(mask) << 32u);
+    }
+
+    uint64_t packetWord(const std::vector<uint8_t> &packet, size_t offset)
+    {
+        uint64_t value = 0u;
+        std::memcpy(&value, packet.data() + offset, sizeof(value));
+        return value;
+    }
+
 }
 
 void register_ps2_memory_tests()
@@ -528,6 +562,272 @@ void register_ps2_memory_tests()
             t.Equals(ps2GsPostEvent(regs, GsCpuEvent::Finish, 0u, 0u, 100u, 0u), 0x0u, "a future event waits");
             t.Equals(ps2GsApplyDueEvents(regs, 99u), 0x0u, "not due yet");
             t.Equals(ps2GsApplyDueEvents(regs, 100u), 0x2u, "due events raise their CSR bits");
+            ps2GsResetEvents();
+        });
+
+        tc.Run("GIF signal scan finds A+D SIGNAL writes across blocks and skips REGLIST and IMAGE data", [](TestCase &t)
+        {
+            std::vector<uint8_t> stream;
+            appendU64(stream, makeGifTag(3u, GIF_FMT_REGLIST, 1u, false));
+            appendU64(stream, 0xEull);
+            appendU64(stream, makeSignal(1u, 1u));
+            appendU64(stream, kGsSignalReg);
+            appendU64(stream, 0u);
+            appendU64(stream, 0u);
+            appendU64(stream, makeGifTag(1u, GIF_FMT_IMAGE, 0u, false));
+            appendU64(stream, 0u);
+            appendU64(stream, makeSignal(1u, 1u));
+            appendU64(stream, kGsSignalReg);
+            appendU64(stream, makeGifTag(2u, GIF_FMT_PACKED, 2u, true));
+            appendU64(stream, 0x0Eull | (0x0Eull << 4u));
+            appendU64(stream, 0u);
+            appendU64(stream, kGsTexflushReg);
+            appendU64(stream, makeSignal(2u, 2u));
+            appendU64(stream, kGsSignalReg);
+            appendU64(stream, 0u);
+            appendU64(stream, kGsTexflushReg);
+            appendU64(stream, makeSignal(4u, 4u));
+            appendU64(stream, kGsSignalReg);
+
+            GifSignalScan scan;
+            const uint32_t size = static_cast<uint32_t>(stream.size());
+            t.Equals(scan.nextSignal(stream.data(), 112u, 0u), 112u, "a block cut inside a PACKED tag holds no SIGNAL");
+            t.IsTrue(scan.inTag(), "the scan should remember the open tag");
+            t.Equals(scan.nextSignal(stream.data(), size, 112u), 112u, "the first SIGNAL is the second register of the first loop");
+            scan.passQuadword();
+            t.Equals(scan.nextSignal(stream.data(), size, 128u), 144u, "the next SIGNAL is the second register of the second loop");
+            scan.passQuadword();
+            t.Equals(scan.nextSignal(stream.data(), size, 160u), size, "the stream holds no other SIGNAL");
+            t.IsFalse(scan.inTag(), "the scan should end between tags");
+        });
+
+        tc.Run("GIF DMA stops at a SIGNAL while CSR.SIGNAL is set and resumes from memory once it is acknowledged", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            GSRegisters &regs = mem.gs();
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter = makeSignalingArbiter(regs, packets);
+            mem.setGifArbiter(&arbiter);
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kTag = 0x00030000u;
+            uint8_t *rdram = mem.getRDRAM();
+            writeDmaTag(rdram, kTag, makeDmaTag(4u, 7u, 0u));
+            writeU64(rdram, kTag + 16u, makeGifTag(3u, GIF_FMT_PACKED, 1u, true));
+            writeU64(rdram, kTag + 24u, 0xEull);
+            writeGifAd(rdram, kTag + 32u, 0xAAull, kGsTexflushReg);
+            writeGifAd(rdram, kTag + 48u, makeSignal(2u, 2u), kGsSignalReg);
+            writeGifAd(rdram, kTag + 64u, 0xBBull, kGsTexflushReg);
+
+            t.Equals(ps2GsPostEvent(regs, GsCpuEvent::Signal, 1u, 1u, 0u, 0u), 0x1u, "an earlier SIGNAL holds CSR.SIGNAL");
+            mem.writeIORegister(kGifCh + 0x30u, kTag);
+            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
+
+            t.IsTrue((mem.readIORegister(kGifCh + 0x00u) & 0x100u) != 0u, "the channel stays busy at the SIGNAL");
+            t.IsTrue(mem.dmaChannelSignalStalled(kGifCh), "the channel is stalled on the SIGNAL");
+            t.Equals(mem.readIORegister(kGifCh + 0x10u), kTag + 48u, "MADR points at the SIGNAL");
+            t.Equals(mem.readIORegister(kGifCh + 0x20u), 2u, "QWC counts the SIGNAL and what follows it");
+            t.Equals(mem.readIORegister(kGifCh + 0x30u), kTag, "TADR stays on the END tag");
+            t.Equals(mem.readIORegister(kDStat) & 0x4u, 0u, "the channel has not completed");
+            t.Equals(packets.size(), static_cast<size_t>(1u), "the data before the SIGNAL reaches the GS");
+            t.Equals(packets[0].size(), static_cast<size_t>(32u), "only the register write before the SIGNAL is sent");
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 1u, "the stalled SIGNAL has not reached the GS");
+
+            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
+            t.IsTrue(mem.dmaChannelSignalStalled(kGifCh), "a start written to the busy channel is ignored");
+            writeGifAd(rdram, kTag + 64u, 0xCCull, kGsTexflushReg);
+
+            mem.write32(kGsCsr, 0x1u);
+            t.IsFalse(mem.dmaChannelSignalStalled(kGifCh), "the acknowledge resumes the channel");
+            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u, "the channel completes");
+            t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "QWC is spent");
+            t.Equals(mem.readIORegister(kGifCh + 0x30u), kTag, "TADR still points at the END tag");
+            t.Equals(mem.readIORegister(kDStat) & 0x4u, 0x4u, "the channel raises its D_STAT bit");
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 3u, "the resumed SIGNAL reaches the GS");
+            t.Equals(static_cast<uint32_t>(regs.csr.load()) & 0x1u, 0x1u, "the resumed SIGNAL sets CSR.SIGNAL");
+            t.Equals(packets.size(), static_cast<size_t>(2u), "the rest of the transfer reaches the GS");
+            t.Equals(packets[1].size(), static_cast<size_t>(48u), "the continued tag carries the SIGNAL and the last write");
+            t.Equals(packetWord(packets[1], 0u) & 0x7FFFull, 2ull, "the continued tag counts the two loops left");
+            t.Equals(packetWord(packets[1], 32u), 0xCCull, "the data after the SIGNAL is read from memory on resume");
+            mem.setGifArbiter(nullptr);
+            ps2GsResetEvents();
+        });
+
+        tc.Run("GIF DMA stops at its second SIGNAL until the first is acknowledged", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            GSRegisters &regs = mem.gs();
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter = makeSignalingArbiter(regs, packets);
+            mem.setGifArbiter(&arbiter);
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kTag = 0x00031000u;
+            constexpr uint32_t kRef = 0x00032000u;
+            uint8_t *rdram = mem.getRDRAM();
+            writeDmaTag(rdram, kTag, makeDmaTag(3u, 1u, 0u));
+            writeU64(rdram, kTag + 16u, makeGifTag(2u, GIF_FMT_PACKED, 1u, true));
+            writeU64(rdram, kTag + 24u, 0xEull);
+            writeGifAd(rdram, kTag + 32u, makeSignal(1u, 1u), kGsSignalReg);
+            writeGifAd(rdram, kTag + 48u, makeSignal(2u, 2u), kGsSignalReg);
+            writeDmaTag(rdram, kTag + 64u, makeDmaTag(2u, 0u, kRef));
+            writeU64(rdram, kRef, makeGifTag(1u, GIF_FMT_PACKED, 1u, true));
+            writeU64(rdram, kRef + 8u, 0xEull);
+            writeGifAd(rdram, kRef + 16u, 0xDDull, kGsTexflushReg);
+
+            mem.writeIORegister(kGifCh + 0x30u, kTag);
+            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 1u, "the first SIGNAL goes through");
+            t.IsTrue(mem.dmaChannelSignalStalled(kGifCh), "the second SIGNAL stalls the channel");
+            t.Equals(mem.readIORegister(kGifCh + 0x10u), kTag + 48u, "MADR points at the second SIGNAL");
+            t.Equals(mem.readIORegister(kGifCh + 0x20u), 1u, "QWC counts the second SIGNAL");
+            t.Equals(mem.readIORegister(kGifCh + 0x30u), kTag + 64u, "TADR points at the next tag");
+
+            mem.write32(kGsCsr, 0x1u);
+            t.IsFalse(mem.dmaChannelSignalStalled(kGifCh), "the acknowledge resumes the channel");
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 3u, "the second SIGNAL reaches the GS");
+            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u, "the chain runs to its REFE tag");
+            t.Equals(packetWord(packets.back(), packets.back().size() - 16u), 0xDDull, "the REFE payload follows the resumed SIGNAL");
+            mem.setGifArbiter(nullptr);
+            ps2GsResetEvents();
+        });
+
+        tc.Run("VIF1 DMA stops inside a DIRECT at a SIGNAL and continues the DIRECT once it is acknowledged", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            GSRegisters &regs = mem.gs();
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter = makeSignalingArbiter(regs, packets);
+            mem.setGifArbiter(&arbiter);
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00034000u;
+            uint8_t *rdram = mem.getRDRAM();
+            writeDmaTag(rdram, kTag, makeDmaTag(5u, 7u, 0u));
+            std::memset(rdram + kTag + 16u, 0, 16u);
+            const uint32_t direct = makeVifCmd(0x50u, 0u, 4u);
+            std::memcpy(rdram + kTag + 28u, &direct, sizeof(direct));
+            writeU64(rdram, kTag + 32u, makeGifTag(3u, GIF_FMT_PACKED, 1u, true));
+            writeU64(rdram, kTag + 40u, 0xEull);
+            writeGifAd(rdram, kTag + 48u, 0xAAull, kGsTexflushReg);
+            writeGifAd(rdram, kTag + 64u, makeSignal(1u, 1u), kGsSignalReg);
+            writeGifAd(rdram, kTag + 80u, 0xBBull, kGsTexflushReg);
+
+            t.Equals(ps2GsPostEvent(regs, GsCpuEvent::Signal, 2u, 2u, 0u, 0u), 0x1u, "the GIF path's SIGNAL holds CSR.SIGNAL");
+            mem.writeIORegister(kVif1Ch + 0x30u, kTag);
+            mem.writeIORegister(kVif1Ch + 0x00u, 0x104u);
+
+            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) != 0u, "the VIF1 channel stays busy at the SIGNAL");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x10u), kTag + 64u, "MADR points at the SIGNAL inside the DIRECT");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 2u, "QWC counts the SIGNAL and what follows it");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x30u), kTag, "TADR stays on the END tag");
+            t.Equals(packets.size(), static_cast<size_t>(1u), "the DIRECT data before the SIGNAL reaches the GS");
+            t.Equals(packets[0].size(), static_cast<size_t>(32u), "only the register write before the SIGNAL is sent");
+
+            mem.write32(kGsCsr, 0x1u);
+            t.IsFalse(mem.dmaChannelSignalStalled(kVif1Ch), "the acknowledge resumes the VIF1 channel");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x00u) & 0x100u, 0u, "the VIF1 channel completes");
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 3u, "the VIF1 SIGNAL reaches the GS");
+            t.Equals(packets.size(), static_cast<size_t>(2u), "the rest of the DIRECT reaches the GS");
+            t.Equals(packets[1].size(), static_cast<size_t>(48u), "the continued tag carries the SIGNAL and the last write");
+            t.Equals(packetWord(packets[1], 32u), 0xBBull, "the last register write follows the SIGNAL");
+            mem.setGifArbiter(nullptr);
+            ps2GsResetEvents();
+        });
+
+        tc.Run("GIF DMA held at a SIGNAL behind a VIF1 SIGNAL can be restarted after its END tag", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            GSRegisters &regs = mem.gs();
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter = makeSignalingArbiter(regs, packets);
+            mem.setGifArbiter(&arbiter);
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kVifTag = 0x00035000u;
+            constexpr uint32_t kGifTag = 0x00036000u;
+            uint8_t *rdram = mem.getRDRAM();
+            writeDmaTag(rdram, kVifTag, makeDmaTag(3u, 7u, 0u));
+            std::memset(rdram + kVifTag + 16u, 0, 16u);
+            const uint32_t direct = makeVifCmd(0x50u, 0u, 2u);
+            std::memcpy(rdram + kVifTag + 28u, &direct, sizeof(direct));
+            writeU64(rdram, kVifTag + 32u, makeGifTag(1u, GIF_FMT_PACKED, 1u, true));
+            writeU64(rdram, kVifTag + 40u, 0xEull);
+            writeGifAd(rdram, kVifTag + 48u, makeSignal(1u, 1u), kGsSignalReg);
+
+            auto writeGifSegment = [&](uint32_t tag, uint64_t drawn)
+            {
+                writeDmaTag(rdram, tag, makeDmaTag(3u, 7u, 0u));
+                writeU64(rdram, tag + 16u, makeGifTag(2u, GIF_FMT_PACKED, 1u, true));
+                writeU64(rdram, tag + 24u, 0xEull);
+                writeGifAd(rdram, tag + 32u, drawn, kGsTexflushReg);
+                writeGifAd(rdram, tag + 48u, makeSignal(2u, 2u), kGsSignalReg);
+            };
+            writeGifSegment(kGifTag, 0x11ull);
+            writeGifSegment(kGifTag + 64u, 0x22ull);
+
+            mem.writeIORegister(kVif1Ch + 0x30u, kVifTag);
+            mem.writeIORegister(kVif1Ch + 0x00u, 0x104u);
+            mem.writeIORegister(kGifCh + 0x30u, kGifTag);
+            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 1u, "the VIF1 segment's SIGNAL goes through");
+            t.IsTrue(mem.dmaChannelSignalStalled(kGifCh), "the GIF segment's SIGNAL waits");
+            t.Equals(mem.readIORegister(kGifCh + 0x20u), 1u, "QWC counts the stalled SIGNAL");
+
+            mem.write32(kGsCsr, 0x1u);
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 3u, "the GIF SIGNAL follows the acknowledge");
+            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u, "the GIF segment ends");
+            const uint32_t tadr = mem.readIORegister(kGifCh + 0x30u);
+            const uint32_t qwc = static_cast<uint32_t>(packetWord(std::vector<uint8_t>(rdram + tadr, rdram + tadr + 8u), 0u) & 0xFFFFu);
+            t.Equals(tadr + (qwc + 1u) * 16u, kGifTag + 64u, "TADR and the END tag's QWC lead to the next segment");
+
+            mem.write32(kGsCsr, 0x1u);
+            regs.siglblid = 0u;
+            mem.writeIORegister(kGifCh + 0x30u, tadr + (qwc + 1u) * 16u);
+            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
+            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u, "the restarted segment runs to its END tag");
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 2u, "the restarted segment's SIGNAL reaches the GS");
+            t.Equals(packetWord(packets.back(), 16u), 0x22ull, "the restarted segment's data reaches the GS");
+            mem.setGifArbiter(nullptr);
+            ps2GsResetEvents();
+        });
+
+        tc.Run("GIF DMA runs past a SIGNAL with PS2X_GS_SIGNAL_STALL off", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            mem.setSignalStallEnabled(false);
+            GSRegisters &regs = mem.gs();
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter = makeSignalingArbiter(regs, packets);
+            mem.setGifArbiter(&arbiter);
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kTag = 0x00037000u;
+            uint8_t *rdram = mem.getRDRAM();
+            writeDmaTag(rdram, kTag, makeDmaTag(2u, 7u, 0u));
+            writeU64(rdram, kTag + 16u, makeGifTag(1u, GIF_FMT_PACKED, 1u, true));
+            writeU64(rdram, kTag + 24u, 0xEull);
+            writeGifAd(rdram, kTag + 32u, makeSignal(2u, 2u), kGsSignalReg);
+
+            ps2GsPostEvent(regs, GsCpuEvent::Signal, 1u, 1u, 0u, 0u);
+            mem.writeIORegister(kGifCh + 0x30u, kTag);
+            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
+            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u, "the transfer completes at once");
+            t.IsFalse(mem.dmaChannelSignalStalled(kGifCh), "nothing is stalled");
+            t.Equals(packets.size(), static_cast<size_t>(1u), "the whole transfer reaches the GS");
+            mem.setGifArbiter(nullptr);
             ps2GsResetEvents();
         });
 
