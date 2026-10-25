@@ -246,6 +246,12 @@ namespace
     }
 
     constexpr uint32_t kIntcStatAddress = 0x1000F000u;
+    constexpr uint32_t kEeTimerBacklogLimit = 1u << 20;
+
+    uint32_t addTimerBacklog(uint32_t pending, uint64_t events)
+    {
+        return static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(pending) + events, kEeTimerBacklogLimit));
+    }
 
     constexpr uint64_t ticksUntilMatch(uint32_t count, uint32_t target)
     {
@@ -484,6 +490,9 @@ void ps2GsResetEvents()
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_timerOverflowBacklog = {};
+    m_timerCompareBacklog = {};
+    m_undeliveredTimerInterrupts = 0u;
     m_pendingTimerCycles = 0u;
     m_timerEventCycles = 0u;
     // The EE kernel keeps Timer 3 counting H-BLANKs for its alarms; games poll it unconfigured.
@@ -511,14 +520,17 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         m_gifFqcSet = false;
     }
     m_pendingTimerCycles += eeCycles;
-    if (m_pendingTimerCycles < m_timerEventCycles)
+    if (m_pendingTimerCycles < m_timerEventCycles && m_undeliveredTimerInterrupts == 0u)
         return 0u;
     return flushEeTimers();
 }
 
 uint32_t PS2Memory::flushEeTimers() noexcept
 {
-    const uint32_t interruptMask = m_pendingTimerCycles != 0u ? applyEeTimerCycles(m_pendingTimerCycles) : 0u;
+    uint32_t interruptMask = m_undeliveredTimerInterrupts;
+    m_undeliveredTimerInterrupts = 0u;
+    if (m_pendingTimerCycles != 0u)
+        interruptMask |= applyEeTimerCycles(m_pendingTimerCycles);
     m_pendingTimerCycles = 0u;
     m_timerEventCycles = eeTimerEventCycles();
     return interruptMask;
@@ -532,6 +544,8 @@ uint32_t PS2Memory::applyEeTimerCycles(uint64_t eeCycles) noexcept
         EeTimer &timer = m_eeTimers[index];
         if ((timer.mode & kEeTimerModeCue) == 0u)
         {
+            m_timerOverflowBacklog[index] = 0u;
+            m_timerCompareBacklog[index] = 0u;
             continue;
         }
 
@@ -552,11 +566,14 @@ uint32_t PS2Memory::applyEeTimerCycles(uint64_t eeCycles) noexcept
         const uint64_t overflowDistance = 0x10000ull - oldCount;
         const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
         const bool compareReached = ticks >= compareDistance;
-        bool overflowReached = false;
+        const uint64_t comparePeriod = zeroReturn && compare != 0u ? compare : 0x10000ull;
+        const uint64_t compareEvents = compareReached ? 1u + (ticks - compareDistance) / comparePeriod : 0u;
+        uint64_t overflowEvents = 0u;
 
         if (zeroReturn)
         {
-            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+            if (ticks >= overflowDistance && overflowDistance <= compareDistance)
+                overflowEvents = compare == 0u ? 1u + (ticks - overflowDistance) / 0x10000ull : 1u;
             if (compareReached)
             {
                 const uint64_t remaining = ticks - compareDistance;
@@ -571,19 +588,31 @@ uint32_t PS2Memory::applyEeTimerCycles(uint64_t eeCycles) noexcept
         }
         else
         {
-            overflowReached = ticks >= overflowDistance;
+            overflowEvents = (static_cast<uint64_t>(oldCount) + ticks) >> 16u;
             timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
         }
 
-        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+        if (compareEvents != 0u && (timer.mode & kEeTimerModeCmpe) != 0u)
         {
-            timer.mode |= kEeTimerModeEquf;
-            interruptMask |= 1u << index;
+            uint64_t missed = compareEvents;
+            if ((timer.mode & kEeTimerModeEquf) == 0u)
+            {
+                timer.mode |= kEeTimerModeEquf;
+                interruptMask |= 1u << index;
+                --missed;
+            }
+            m_timerCompareBacklog[index] = addTimerBacklog(m_timerCompareBacklog[index], missed);
         }
-        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+        if (overflowEvents != 0u && (timer.mode & kEeTimerModeOvfe) != 0u)
         {
-            timer.mode |= kEeTimerModeOvff;
-            interruptMask |= 1u << index;
+            uint64_t missed = overflowEvents;
+            if ((timer.mode & kEeTimerModeOvff) == 0u)
+            {
+                timer.mode |= kEeTimerModeOvff;
+                interruptMask |= 1u << index;
+                --missed;
+            }
+            m_timerOverflowBacklog[index] = addTimerBacklog(m_timerOverflowBacklog[index], missed);
         }
     }
     return interruptMask;
@@ -591,6 +620,8 @@ uint32_t PS2Memory::applyEeTimerCycles(uint64_t eeCycles) noexcept
 
 uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
 {
+    if (m_undeliveredTimerInterrupts != 0u)
+        return 1u;
     const uint64_t event = eeTimerEventCycles();
     if (event == std::numeric_limits<uint64_t>::max())
         return event;
@@ -1307,7 +1338,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
-        flushEeTimers();
+        m_undeliveredTimerInterrupts |= flushEeTimers();
         m_timerEventCycles = 0u; // recomputed from the new state at the next advance
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
@@ -1324,6 +1355,26 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
             {
                 timer.clockRemainder = 0u;
+            }
+            if ((timer.mode & kEeTimerModeCue) == 0u || (timer.mode & kEeTimerModeOvfe) == 0u)
+            {
+                m_timerOverflowBacklog[timerIndex] = 0u;
+            }
+            if ((timer.mode & kEeTimerModeCue) == 0u || (timer.mode & kEeTimerModeCmpe) == 0u)
+            {
+                m_timerCompareBacklog[timerIndex] = 0u;
+            }
+            if ((timer.mode & kEeTimerModeOvff) == 0u && m_timerOverflowBacklog[timerIndex] != 0u)
+            {
+                --m_timerOverflowBacklog[timerIndex];
+                timer.mode |= kEeTimerModeOvff;
+                m_undeliveredTimerInterrupts |= 1u << timerIndex;
+            }
+            if ((timer.mode & kEeTimerModeEquf) == 0u && m_timerCompareBacklog[timerIndex] != 0u)
+            {
+                --m_timerCompareBacklog[timerIndex];
+                timer.mode |= kEeTimerModeEquf;
+                m_undeliveredTimerInterrupts |= 1u << timerIndex;
             }
             break;
         }
@@ -2676,7 +2727,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
-        flushEeTimers();
+        m_undeliveredTimerInterrupts |= flushEeTimers();
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {

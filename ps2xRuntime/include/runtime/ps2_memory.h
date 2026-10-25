@@ -556,6 +556,9 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    std::array<uint32_t, 4> m_timerOverflowBacklog{};
+    std::array<uint32_t, 4> m_timerCompareBacklog{};
+    uint32_t m_undeliveredTimerInterrupts = 0;
     uint64_t m_pendingTimerCycles = 0;
     uint64_t m_timerEventCycles = 0;
     bool m_gifFqcSet = false;
