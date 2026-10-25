@@ -499,6 +499,40 @@ namespace
     bool HasReachableReturnByControlFlow(const ps2recomp::Section &section,
                                          uint32_t startOffset);
 
+    bool HasDelaySlot(uint32_t raw)
+    {
+        const uint32_t opcode = OPCODE(raw);
+        switch (opcode)
+        {
+        case OPCODE_J:
+        case OPCODE_JAL:
+        case OPCODE_BEQ:
+        case OPCODE_BNE:
+        case OPCODE_BLEZ:
+        case OPCODE_BGTZ:
+        case OPCODE_BEQL:
+        case OPCODE_BNEL:
+        case OPCODE_BLEZL:
+        case OPCODE_BGTZL:
+            return true;
+        case OPCODE_REGIMM:
+        {
+            const uint32_t rt = RT(raw);
+            return (rt >= REGIMM_BLTZ && rt <= REGIMM_BGEZL) || (rt >= REGIMM_BLTZAL && rt <= REGIMM_BGEZALL);
+        }
+        case OPCODE_SPECIAL:
+            return FUNCTION(raw) == SPECIAL_JR || FUNCTION(raw) == SPECIAL_JALR;
+        case OPCODE_COP0:
+            return RS(raw) == COP0_BC;
+        case OPCODE_COP1:
+            return RS(raw) == COP1_BC;
+        case OPCODE_COP2:
+            return RS(raw) == COP2_BC;
+        default:
+            return false;
+        }
+    }
+
     bool LooksLikeCallableEntry(const std::vector<ps2recomp::Section> &sections,
                                 uint32_t address,
                                 bool allowLeafThunk,
@@ -517,6 +551,14 @@ namespace
         }
 
         const uint32_t startOffset = address - section->address;
+        uint32_t previous = 0;
+        if (startOffset >= MIPS_INSTRUCTION_SIZE &&
+            ReadSectionWord(*section, startOffset - MIPS_INSTRUCTION_SIZE, previous) &&
+            HasDelaySlot(previous))
+        {
+            return false;
+        }
+
         constexpr uint32_t kStandardProbeWords = 8;
         // Retail initializer tables sometimes point at functions that materialize
         // a sizeable block of constants before allocating their stack frame.
