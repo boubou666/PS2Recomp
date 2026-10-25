@@ -98,6 +98,123 @@ namespace
         return 0u;
     }
 
+    // Decodes one UNPACK source vector (no mask, no row/col handling) into `out`; false for formats
+    // without a decoding (V2-5, V3-5).
+    inline bool decodeUnpackVector(uint8_t vl, uint8_t vn, int components, bool zeroExtend, const uint8_t *srcVec,
+                                   const uint8_t *payloadEnd, uint32_t out[4])
+    {
+        auto extend16 = [zeroExtend](uint16_t raw) -> uint32_t
+        {
+            if (zeroExtend)
+                return static_cast<uint32_t>(raw);
+            return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+        };
+
+        auto extend8 = [zeroExtend](uint8_t raw) -> uint32_t
+        {
+            if (zeroExtend)
+                return static_cast<uint32_t>(raw);
+            return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+        };
+
+        if (vl == 0u)
+        {
+            if (components == 1)
+            {
+                uint32_t scalar = 0;
+                std::memcpy(&scalar, srcVec, sizeof(scalar));
+                out[0] = scalar;
+                out[1] = scalar;
+                out[2] = scalar;
+                out[3] = scalar;
+            }
+            else
+            {
+                const uint32_t limit = components == 3 ? 4u : static_cast<uint32_t>(components);
+                for (uint32_t c = 0; c < limit; ++c)
+                {
+                    uint32_t scalar = 0;
+                    if (srcVec + c * 4u + 4u <= payloadEnd)
+                        std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
+                    out[c] = scalar;
+                }
+                if (components == 2)
+                {
+                    out[2] = out[0];
+                    out[3] = out[1];
+                }
+            }
+        }
+        else if (vl == 1u)
+        {
+            if (components == 1)
+            {
+                uint16_t raw = 0;
+                std::memcpy(&raw, srcVec, sizeof(raw));
+                const uint32_t scalar = extend16(raw);
+                out[0] = scalar;
+                out[1] = scalar;
+                out[2] = scalar;
+                out[3] = scalar;
+            }
+            else
+            {
+                const uint32_t limit = components == 3 ? 4u : static_cast<uint32_t>(components);
+                for (uint32_t c = 0; c < limit; ++c)
+                {
+                    uint16_t raw = 0;
+                    if (srcVec + c * 2u + 2u <= payloadEnd)
+                        std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                    out[c] = extend16(raw);
+                }
+                if (components == 2)
+                {
+                    out[2] = out[0];
+                    out[3] = out[1];
+                }
+            }
+        }
+        else if (vl == 2u)
+        {
+            if (components == 1)
+            {
+                const uint32_t scalar = extend8(srcVec[0]);
+                out[0] = scalar;
+                out[1] = scalar;
+                out[2] = scalar;
+                out[3] = scalar;
+            }
+            else
+            {
+                const uint32_t limit = components == 3 ? 4u : static_cast<uint32_t>(components);
+                for (uint32_t c = 0; c < limit; ++c)
+                {
+                    out[c] = srcVec + c < payloadEnd ? extend8(srcVec[c]) : 0u;
+                }
+                if (components == 2)
+                {
+                    out[2] = out[0];
+                    out[3] = out[1];
+                }
+            }
+        }
+        else if (vl == 3u && vn == 3u)
+        {
+            // V4-5: packed color-like format in a single 16-bit value.
+            uint16_t packed = 0;
+            std::memcpy(&packed, srcVec, sizeof(packed));
+            out[0] = (packed & 0x001Fu) << 3;
+            out[1] = (packed & 0x03E0u) >> 2;
+            out[2] = (packed & 0x7C00u) >> 7;
+            out[3] = (packed & 0x8000u) >> 8;
+        }
+        else
+        {
+            return false;
+        }
+        return true;
+    }
+
     // Executes the UNPACK VIFcode `cmd` (VIF0 or VIF1) into `vuData`, reading its payload from `payload`
     // (`available` bytes left in the stream). Returns the payload size in bytes, rounded up to a word.
     uint32_t executeVifUnpack(VIFRegisters &regs, uint8_t *vuData, uint32_t vuDataSize, uint32_t addrMask, uint32_t cmd,
@@ -201,120 +318,8 @@ namespace
                     decoded = true;
                 }
 
-                auto extend16 = [&](uint16_t raw) -> uint32_t
-                {
-                    if (zeroExtend)
-                        return static_cast<uint32_t>(raw);
-                    return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
-                };
-
-                auto extend8 = [&](uint8_t raw) -> uint32_t
-                {
-                    if (zeroExtend)
-                        return static_cast<uint32_t>(raw);
-                    return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
-                };
-
-                bool handledFormat = true;
-                if (!decoded)
-                {
-                    handledFormat = false;
-                }
-                else if (vl == 0u)
-                {
-                    if (components == 1)
-                    {
-                        uint32_t scalar = 0;
-                        std::memcpy(&scalar, srcVec, sizeof(scalar));
-                        decompressed[0] = scalar;
-                        decompressed[1] = scalar;
-                        decompressed[2] = scalar;
-                        decompressed[3] = scalar;
-                    }
-                    else
-                    {
-                        const uint32_t limit = components == 3 ? 4u : static_cast<uint32_t>(components);
-                        for (uint32_t c = 0; c < limit; ++c)
-                        {
-                            uint32_t scalar = 0;
-                            if (srcVec + c * 4u + 4u <= payloadEnd)
-                                std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
-                            decompressed[c] = scalar;
-                        }
-                        if (components == 2)
-                        {
-                            decompressed[2] = decompressed[0];
-                            decompressed[3] = decompressed[1];
-                        }
-                    }
-                }
-                else if (vl == 1u)
-                {
-                    if (components == 1)
-                    {
-                        uint16_t raw = 0;
-                        std::memcpy(&raw, srcVec, sizeof(raw));
-                        const uint32_t scalar = extend16(raw);
-                        decompressed[0] = scalar;
-                        decompressed[1] = scalar;
-                        decompressed[2] = scalar;
-                        decompressed[3] = scalar;
-                    }
-                    else
-                    {
-                        const uint32_t limit = components == 3 ? 4u : static_cast<uint32_t>(components);
-                        for (uint32_t c = 0; c < limit; ++c)
-                        {
-                            uint16_t raw = 0;
-                            if (srcVec + c * 2u + 2u <= payloadEnd)
-                                std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
-                            decompressed[c] = extend16(raw);
-                        }
-                        if (components == 2)
-                        {
-                            decompressed[2] = decompressed[0];
-                            decompressed[3] = decompressed[1];
-                        }
-                    }
-                }
-                else if (vl == 2u)
-                {
-                    if (components == 1)
-                    {
-                        const uint32_t scalar = extend8(srcVec[0]);
-                        decompressed[0] = scalar;
-                        decompressed[1] = scalar;
-                        decompressed[2] = scalar;
-                        decompressed[3] = scalar;
-                    }
-                    else
-                    {
-                        const uint32_t limit = components == 3 ? 4u : static_cast<uint32_t>(components);
-                        for (uint32_t c = 0; c < limit; ++c)
-                        {
-                            decompressed[c] = srcVec + c < payloadEnd ? extend8(srcVec[c]) : 0u;
-                        }
-                        if (components == 2)
-                        {
-                            decompressed[2] = decompressed[0];
-                            decompressed[3] = decompressed[1];
-                        }
-                    }
-                }
-                else if (vl == 3u && vn == 3u)
-                {
-                    // V4-5: packed color-like format in a single 16-bit value.
-                    uint16_t packed = 0;
-                    std::memcpy(&packed, srcVec, sizeof(packed));
-                    decompressed[0] = (packed & 0x001Fu) << 3;
-                    decompressed[1] = (packed & 0x03E0u) >> 2;
-                    decompressed[2] = (packed & 0x7C00u) >> 7;
-                    decompressed[3] = (packed & 0x8000u) >> 8;
-                }
-                else
-                {
-                    handledFormat = false;
-                }
+                const bool handledFormat =
+                    decoded && decodeUnpackVector(vl, vn, components, zeroExtend, srcVec, payloadEnd, decompressed);
 
                 // Unknown compressed format fallback: preserve legacy raw-copy behavior.
                 if (!handledFormat && decoded && !maskEnable && (regs.mode == 0u || regs.mode == 3u))
