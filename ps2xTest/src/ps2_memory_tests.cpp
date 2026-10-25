@@ -363,6 +363,26 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
         });
 
+        tc.Run("INTC_STAT latches raised causes and clears the bits written as ones", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kIntcStat = 0x1000F000u;
+            mem.write32(kIntcStat, 0x4u);
+            t.Equals(mem.read32(kIntcStat), 0u, "a write must not set INTC_STAT bits");
+
+            mem.raiseIntcStat((1u << 2u) | (1u << 3u) | (1u << 9u));
+            t.Equals(mem.read32(kIntcStat), 0x20Cu, "raised causes should stay latched");
+
+            mem.write32(kIntcStat, 0x4u);
+            t.Equals(mem.read32(kIntcStat), 0x208u, "writing VBON should clear only VBON");
+            mem.write32(kIntcStat, 0u);
+            t.Equals(mem.read32(kIntcStat), 0x208u, "writing zeros should leave INTC_STAT unchanged");
+            mem.write32(kIntcStat, 0xFFFFFFFFu);
+            t.Equals(mem.read32(kIntcStat), 0u, "writing ones should clear every latched bit");
+        });
+
         tc.Run("GS CSR reads its FIFO as empty", [](TestCase &t)
         {
             PS2Memory mem;

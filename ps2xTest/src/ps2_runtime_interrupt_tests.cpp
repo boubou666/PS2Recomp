@@ -75,6 +75,9 @@ namespace
     constexpr uint32_t kLatchWaitPc = 0x00160600u;
     constexpr uint32_t kLatchResumePc = 0x00160610u;
     constexpr uint32_t kLatchFinishPc = 0x00160620u;
+    constexpr uint32_t kIntcStatWaitPc = 0x00160700u;
+    constexpr uint32_t kIntcStatResumePc = 0x00160710u;
+    constexpr uint32_t kIntcStat = 0x1000F000u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -98,6 +101,9 @@ namespace
     std::atomic<bool> g_timer2Resumed{false};
     uint32_t g_irqObservedSp = 0u;
     uint32_t g_invocationQueueRuns = 0u;
+    uint32_t g_intcStatBeforeVBlank = 0u;
+    uint32_t g_intcStatAtResume = 0u;
+    uint32_t g_intcStatAfterAck = 0u;
     uint32_t g_invocationQueueSp = 0u;
     bool g_invocationQueueSpChanged = false;
 
@@ -403,6 +409,25 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+
+    void schedulerIntcStatWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        runtime->memory().write32(kIntcStat, 0xFFFFFFFFu);
+        g_intcStatBeforeVBlank = runtime->memory().read32(kIntcStat);
+        scheduler.setIrqCauseEnabled(false, 2u, false);
+        ctx->pc = kIntcStatResumePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerIntcStatResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_intcStatAtResume = runtime->memory().read32(kIntcStat);
+        runtime->memory().write32(kIntcStat, 1u << 2u);
+        g_intcStatAfterAck = runtime->memory().read32(kIntcStat);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -592,6 +617,25 @@ void register_ps2_runtime_interrupt_tests()
 
             const std::vector<int> expected{1, 3, 2, 4};
             t.IsTrue(g_dispatchTrace == expected, "the VBlank IRQ should stay pending until its cause is enabled");
+        });
+
+        tc.Run("VBlank start latches VBON in INTC_STAT while the cause is disabled", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kIntcStatWaitPc, schedulerIntcStatWait);
+            env.runtime.registerFunction(kIntcStatResumePc, schedulerIntcStatResume);
+
+            g_intcStatBeforeVBlank = 0xFFFFFFFFu;
+            g_intcStatAtResume = 0u;
+            g_intcStatAfterAck = 0xFFFFFFFFu;
+            R5900Context mainContext{};
+            mainContext.pc = kIntcStatWaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_intcStatBeforeVBlank, 0u, "INTC_STAT should read clear before the first vblank");
+            t.Equals(g_intcStatAtResume & (1u << 2u), 1u << 2u, "the vblank should latch VBON in INTC_STAT");
+            t.Equals(g_intcStatAfterAck & (1u << 2u), 0u, "writing VBON should acknowledge it");
         });
 
         tc.Run("IRQ callbacks use an isolated invocation stack", [](TestCase &t)
