@@ -2105,13 +2105,20 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                auto anchor = scheduled.hostDeadline;
+                if (wallClockCatchUp() == WallClockCatchUp::Off)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - anchor > m_vblankPeriod)
+                        anchor = now;
+                }
                 m_timelineCycle.store(scheduled.deadlineCycle, std::memory_order_relaxed);
-                m_timelineHostTicks.store(scheduled.hostDeadline.time_since_epoch().count(), std::memory_order_relaxed);
+                m_timelineHostTicks.store(anchor.time_since_epoch().count(), std::memory_order_relaxed);
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              anchor + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
-                              scheduled.hostDeadline + std::chrono::duration_cast<std::chrono::steady_clock::duration>(m_vblankPeriod),
+                              anchor + std::chrono::duration_cast<std::chrono::steady_clock::duration>(m_vblankPeriod),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

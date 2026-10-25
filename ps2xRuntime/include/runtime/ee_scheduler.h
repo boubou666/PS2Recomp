@@ -398,6 +398,8 @@ public:
     // pace: its EE-produced audio can underrun. Disabling it lets emulated time slow down instead.
     // OncePerField skips to at most one event per field: a game never sees more than one field go by
     // at once, which its late-frame paths may not expect. PS2X_EE_CATCHUP=0|field|1 overrides the mode.
+    // Off also never lets the EE run faster than real time to pay back a slow stretch: a vblank more than
+    // a field late starts the next field from the time it was handled.
     enum class WallClockCatchUp : uint8_t
     {
         Off,
