@@ -307,9 +307,19 @@ namespace ps2x::iop::detail
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
-        case 23:
-            setV0(0);
+        case 23: // sceSifGetOtherData(receiveData, eeSource, iopDestination, size, mode)
+        {
+            const uint32_t size = cpu.gpr[7];
+            bool copied = size == 0u;
+            if (!copied && size <= IopMemory::RamSize)
+            {
+                std::vector<uint8_t> data(size);
+                copied = m_host.readGuest(cpu.gpr[5], data.data(), data.size()) &&
+                         m_memory.writeRam(cpu.gpr[6], data.data(), data.size());
+            }
+            setV0(copied ? 0u : static_cast<uint32_t>(-1));
             return true;
+        }
         case 24: // RemoveRpc
         {
             const uint32_t serverData = cpu.gpr[4];
