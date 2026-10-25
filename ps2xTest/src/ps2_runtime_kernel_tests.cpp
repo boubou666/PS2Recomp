@@ -26,6 +26,7 @@ namespace
     constexpr int KE_UNKNOWN_THID = -407;
     constexpr int KE_UNKNOWN_SEMID = -408;
     constexpr int KE_DORMANT = -413;
+    constexpr int KE_NOT_SUSPEND = -415;
     constexpr int KE_SEMA_ZERO = -419;
     constexpr int KE_SEMA_OVF = -420;
     constexpr int KE_WAIT_DELETE = -425;
@@ -743,6 +744,35 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(invalid, 5, 128u);
             ChangeThreadPriority(env.rdram.data(), &invalid, &env.runtime);
             t.Equals(getRegS32(invalid, 2), -403, "an illegal priority should still return KE_ILLEGAL_PRIORITY");
+        });
+
+        tc.Run("Suspend/Resume/WakeupThread and their interrupt variants return the thread id", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+
+            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u,
+                                                                 0u, 120, 0u});
+            t.Equals(ee.startThread(id, 0u, env.ctx, false), KE_OK, "StartThread should make the thread ready");
+
+            const auto call = [&](uint32_t number, int target)
+            {
+                R5900Context ctx{};
+                setRegU32(ctx, 4, static_cast<uint32_t>(target));
+                t.IsTrue(callSyscall(number, env.rdram.data(), &ctx, &env.runtime), "the thread syscall should dispatch");
+                return getRegS32(ctx, 2);
+            };
+
+            t.Equals(call(0x37u, id), id, "SuspendThread should return the thread id");
+            t.Equals(call(static_cast<uint32_t>(-0x38), id), id, "iSuspendThread should return the thread id");
+            t.Equals(call(0x39u, id), id, "ResumeThread should return the thread id");
+            t.Equals(call(static_cast<uint32_t>(-0x3A), id), id, "iResumeThread should return the thread id");
+            t.Equals(call(0x39u, id), KE_NOT_SUSPEND, "ResumeThread of a thread that is not suspended should keep its error");
+            t.Equals(call(0x33u, id), id, "WakeupThread should return the thread id");
+            t.Equals(call(static_cast<uint32_t>(-0x34), id), id, "iWakeupThread should return the thread id");
+            t.Equals(call(0x33u, 0x7FFF), KE_UNKNOWN_THID, "WakeupThread should keep its error for unknown ids");
         });
 
         tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
