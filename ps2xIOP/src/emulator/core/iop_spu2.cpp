@@ -644,6 +644,8 @@ namespace ps2x::iop::detail
     {
         Core &core = m_cores[coreIndex];
         noteDma(coreIndex, 'F', 0u, false);
+        if (!core.admaRunning)
+            core.madr = (core.madr + dmaTransferBytes(core.bcr)) & 0x00FFFFFFu;
         core.dmaBusy = false;
         core.admaRunning = false;
         core.chcr &= ~kDmaStart;
@@ -676,6 +678,8 @@ namespace ps2x::iop::detail
         core.admaAddress += bytes;
         core.admaRemaining -= bytes;
         core.madr = core.admaAddress;
+        const uint32_t blockBytes = dmaBlockBytes(core.bcr);
+        core.bcr = (core.bcr & 0xFFFFu) | (((core.admaRemaining + blockBytes - 1u) / blockBytes) << 16u);
         m_stats.admaBytes += bytes;
         checkIrq(left, 0x100u);
         checkIrq(right, 0x100u);
