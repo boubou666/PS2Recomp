@@ -518,8 +518,10 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         if (std::chrono::steady_clock::now() >= hostDeadline)
         {
             m_lastCatchUpTick = m_vsyncTick;
-            accountCycles(static_cast<uint32_t>(std::min<uint64_t>(nextEventCycle - m_eeCycle,
-                                                                   std::numeric_limits<uint32_t>::max())));
+            const auto skipped = static_cast<uint32_t>(std::min<uint64_t>(nextEventCycle - m_eeCycle,
+                                                                          std::numeric_limits<uint32_t>::max()));
+            m_catchUpCycles.fetch_add(skipped, std::memory_order_relaxed);
+            accountCycles(skipped);
             m_checkpointPending.store(true, std::memory_order_release);
             m_transferToDispatcher = true;
             return true;

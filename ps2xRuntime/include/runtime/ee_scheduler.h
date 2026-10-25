@@ -307,6 +307,8 @@ public:
     };
     // Called on the executor thread after each idle wait (nullptr: off, nothing is collected).
     void setIdleObserver(std::function<void(const IdleRecord &)> observer) { m_idleObserver = std::move(observer); }
+    // EE cycles skipped by wall-clock catch-up (see WallClockCatchUp).
+    [[nodiscard]] uint64_t catchUpCycles() const noexcept { return m_catchUpCycles.load(std::memory_order_relaxed); }
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     // Set while guest code unwinds to the dispatcher (a checkpoint fired or a jump left the
     // function), cleared before each dispatch: the enclosing dispatchGuestBranch frames must not
@@ -528,6 +530,7 @@ private:
     std::function<void(const IdleRecord &)> m_idleObserver;
     [[nodiscard]] std::string describeBlockedThreads() const;
     void reportIdle(std::chrono::steady_clock::time_point start, std::string wokenBy, std::string blocked);
+    std::atomic<uint64_t> m_catchUpCycles{0};
     void noteIdleWait(std::chrono::steady_clock::time_point start) noexcept
     {
         m_idleWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

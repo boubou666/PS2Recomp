@@ -1122,7 +1122,16 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
     static constexpr const char *kStatus[] = {"run", "ready", "wait", "wait+susp", "susp", "dormant"};
     static constexpr const char *kWait[] = {"-", "sleep", "sema", "evflag", "vsync", "external", "mpeg"};
     std::ostringstream text;
-    text << "[state] ee cycle=" << ee.eeCycle << " idle=" << ee.idleCycles << " running=" << ee.runningThreadId << '\n';
+    {
+        static uint64_t lastIdleNs = 0;
+        static uint64_t lastCatchUp = 0;
+        const uint64_t idleNs = runtime.eeScheduler().idleWaitNanoseconds();
+        const uint64_t catchUp = runtime.eeScheduler().catchUpCycles();
+        text << "[state] ee cycle=" << ee.eeCycle << " idle=" << ee.idleCycles << " running=" << ee.runningThreadId
+             << " host-idle-ms=" << (idleNs - lastIdleNs) / 1000000u << " catch-up=" << (catchUp - lastCatchUp) << '\n';
+        lastIdleNs = idleNs;
+        lastCatchUp = catchUp;
+    }
     if (const auto profile = runtime.eeScheduler().takeGuestProfile(); !profile.empty())
     {
         uint64_t total = 0;
@@ -1141,7 +1150,15 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
         const GS::LagStats lag = runtime.gs().takeLagStats();
         const auto [drainNanoseconds, drains] = GSCpuBackend::TakeDrainStats();
         text << "[state] gs frames=" << lag.frames << " ee waited " << lag.waitNanoseconds / 1000000u << " ms for the GS thread, "
-             << drains << " raster drains took " << drainNanoseconds / 1000000u << " ms\n";
+             << drains << " raster drains took " << drainNanoseconds / 1000000u << " ms";
+        if (memory.vif1Threaded())
+        {
+            static uint64_t lastVif1WaitNs = 0;
+            const uint64_t vif1WaitNs = memory.vif1WaitNanoseconds();
+            text << ", waited " << (vif1WaitNs - lastVif1WaitNs) / 1000000u << " ms for the VIF1 worker";
+            lastVif1WaitNs = vif1WaitNs;
+        }
+        text << '\n';
     }
     text << "[state] ee timers:" << std::hex;
     for (uint32_t i = 0; i < 4u; ++i)
