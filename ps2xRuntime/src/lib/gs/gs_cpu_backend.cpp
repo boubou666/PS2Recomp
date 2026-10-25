@@ -16,6 +16,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -1517,7 +1518,7 @@ std::atomic<uint32_t> g_gsDumpGifPath{0u};
 
 // PS2X_GS_DUMP_AT=<sec>: once `sec` seconds have passed, the GS writes its next PS2X_GS_DUMP_COUNT (default 20000)
 // primitives and the GIF tags that produced them to PS2X_GS_DUMP_OUT (default gs_prims.txt). Returns the open
-// stream while the dump is in progress, else nullptr.
+// stream while the dump is in progress, else nullptr. PS2X_GS_DUMP_WHEN=<path> starts it once that file exists instead.
 FILE *gsDumpStream()
 {
     static const double dumpAt = []
@@ -1525,12 +1526,21 @@ FILE *gsDumpStream()
         const char *value = std::getenv("PS2X_GS_DUMP_AT");
         return value ? std::atof(value) : -1.0;
     }();
-    if (dumpAt < 0.0)
+    static const char *const dumpWhen = std::getenv("PS2X_GS_DUMP_WHEN");
+    if (dumpAt < 0.0 && !dumpWhen)
         return nullptr;
     static const auto start = std::chrono::steady_clock::now();
     static FILE *out = nullptr;
     static bool finished = false;
-    if (finished || std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < dumpAt)
+    if (finished)
+        return nullptr;
+    if (!out && dumpWhen)
+    {
+        static uint32_t polls = 0;
+        if ((polls++ & 0xFFFFu) != 0u || !std::filesystem::exists(dumpWhen))
+            return nullptr;
+    }
+    else if (!out && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < dumpAt)
         return nullptr;
     if (!out)
     {
