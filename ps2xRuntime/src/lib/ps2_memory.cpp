@@ -1986,9 +1986,9 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
 
     const bool fromScratchpad = channelBase == kSprFromChannel;
     const uint32_t mode = (chcr >> 2u) & 0x3u;
-    // Normal mode both ways; chain mode is a source chain for toSPR (DMAtags in main memory) and a
-    // destination chain for fromSPR (each block starts with a DMAtag in the scratchpad data).
-    if (mode > 1u)
+    // Normal and interleave modes both ways; chain mode is a source chain for toSPR (DMAtags in main memory)
+    // and a destination chain for fromSPR (each block starts with a DMAtag in the scratchpad data).
+    if (mode > 2u)
         return false;
 
     uint32_t scratchOffset = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
@@ -2056,6 +2056,24 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         if (!transfer(madr, qwc))
             return false;
         m_ioRegisters[channelBase + 0x10u] = (madr + qwc * 16u) & 0x7FFFFFF0u;
+    }
+    else if (mode == 2u)
+    {
+        constexpr uint32_t kDSqwc = 0x1000E030u;
+        const uint32_t sqwcReg = m_ioRegisters.count(kDSqwc) ? m_ioRegisters[kDSqwc] : 0u;
+        const uint32_t skip = sqwcReg & 0xFFu;
+        uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+        uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
+        const uint32_t block = ((sqwcReg >> 16u) & 0xFFu) != 0u ? (sqwcReg >> 16u) & 0xFFu : qwc;
+        while (qwc != 0u)
+        {
+            const uint32_t count = std::min(block, qwc);
+            if (!transfer(madr, count))
+                return false;
+            qwc -= count;
+            madr += (count + skip) * 16u;
+        }
+        m_ioRegisters[channelBase + 0x10u] = madr & 0x7FFFFFF0u;
     }
     else if (fromScratchpad)
     {
