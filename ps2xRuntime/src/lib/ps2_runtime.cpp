@@ -672,6 +672,7 @@ PS2Runtime::~PS2Runtime()
     {
         requestStop();
         m_memory.setVif1Threaded(false); // its transfers use m_vu1 and m_gs
+        setIopThreaded(false);
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -708,47 +709,82 @@ PS2Runtime::~PS2Runtime()
     }
 }
 
+namespace
+{
+    // IOP facade calls hold m_iopMutex (the IOP thread runs its slices under it); the depth tells
+    // advanceIopEeCycles not to wait for the IOP thread while this thread holds it.
+    thread_local int t_iopLockDepth = 0;
+
+    // The EE side announces itself (wanted) so that the IOP thread does not start another slice while it waits.
+    struct IopLock
+    {
+        IopLock(std::recursive_mutex &mutex, std::atomic<int> &wanted)
+        {
+            wanted.fetch_add(1, std::memory_order_acq_rel);
+            lock = std::unique_lock<std::recursive_mutex>(mutex);
+            wanted.fetch_sub(1, std::memory_order_acq_rel);
+            ++t_iopLockDepth;
+        }
+        explicit IopLock(std::recursive_mutex &mutex) : lock(mutex) { ++t_iopLockDepth; }
+        ~IopLock() { --t_iopLockDepth; }
+        std::unique_lock<std::recursive_mutex> lock;
+    };
+
+    constexpr uint64_t kEeClockHz = 294'912'000ull;
+    constexpr uint64_t kIopSliceEeCycles = kEeClockHz / 50u / 64u; // 0.3 ms of emulated time
+    constexpr uint64_t kIopWakeEeCycles = kIopSliceEeCycles / 2u;
+    constexpr uint64_t kIopMaxOwedEeCycles = kEeClockHz / 25u; // two PAL fields
+}
+
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBufferFromIop(uint32_t iopAddress, const void *arguments, uint32_t argumentSize)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModuleBufferFromIop(iopAddress, arguments, argumentSize);
 }
 
 bool PS2Runtime::sendIopSifCommand(uint32_t cid, const void *packet, uint32_t size)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem && m_iopSubsystem->sendSifCommand(cid, packet, size);
 }
 
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->stopModule(moduleId, result);
 }
 
 ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem->selectRpcAbi(request);
 }
 
 bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem->canBindRpc(sid);
 }
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -756,52 +792,175 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
-    m_iopSubsystem->runEeCycles(eeCycles);
+    if (!m_iopThreaded.load(std::memory_order_relaxed))
+    {
+        m_iopSubsystem->runEeCycles(eeCycles);
+        return;
+    }
+    const uint64_t before = m_iopOwedCycles.fetch_add(eeCycles, std::memory_order_acq_rel);
+    const uint64_t owed = before + eeCycles;
+    if (before < kIopWakeEeCycles && owed >= kIopWakeEeCycles)
+        m_iopWorkCv.notify_one();
+    if (owed > kIopMaxOwedEeCycles && t_iopLockDepth == 0)
+    {
+        std::unique_lock<std::mutex> lock(m_iopWorkMutex);
+        m_iopDrainCv.wait_for(lock, std::chrono::milliseconds(50), [this]()
+                              { return m_iopOwedCycles.load(std::memory_order_acquire) <= kIopMaxOwedEeCycles / 2u ||
+                                       m_iopThreadStop.load(std::memory_order_acquire); });
+    }
+}
+
+bool PS2Runtime::queueIopRpc(ps2x::iop::RpcRequest request, std::vector<uint8_t> send,
+                             std::function<void(const ps2x::iop::RpcResult &)> done)
+{
+    if (!m_iopThreaded.load(std::memory_order_relaxed))
+        return false;
+    {
+        IopLock iop(m_iopMutex, m_iopWanted);
+        if (!m_iopSubsystem->emulatesRpc(request.sid))
+            return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_iopWorkMutex);
+        m_iopJobs.push_back([this, request, send = std::move(send), done = std::move(done)]() mutable
+                            {
+                                ps2x::iop::RpcResult result;
+                                {
+                                    IopLock iop(m_iopMutex);
+                                    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+                                    request.callToken = scope.token();
+                                    request.sendData = send.empty() ? nullptr : send.data();
+                                    result = m_iopSubsystem->handleRpc(request);
+                                }
+                                m_eeScheduler->postTask([done = std::move(done), result]() { done(result); }); });
+    }
+    m_iopWorkCv.notify_one();
+    return true;
+}
+
+void PS2Runtime::iopThreadMain()
+{
+    ThreadNaming::SetCurrentThreadName("iop");
+    while (!m_iopThreadStop.load(std::memory_order_acquire))
+    {
+        std::function<void()> job;
+        {
+            std::lock_guard<std::mutex> lock(m_iopWorkMutex);
+            if (!m_iopJobs.empty())
+            {
+                job = std::move(m_iopJobs.front());
+                m_iopJobs.pop_front();
+            }
+        }
+        if (job)
+        {
+            job();
+            continue;
+        }
+        uint64_t owed = m_iopOwedCycles.load(std::memory_order_acquire);
+        if (owed < kIopWakeEeCycles)
+        {
+            std::unique_lock<std::mutex> lock(m_iopWorkMutex);
+            m_iopWorkCv.wait_for(lock, std::chrono::milliseconds(1), [this]()
+                                 { return m_iopThreadStop.load(std::memory_order_acquire) || !m_iopJobs.empty() ||
+                                          m_iopOwedCycles.load(std::memory_order_acquire) >= kIopWakeEeCycles; });
+            if (!m_iopJobs.empty())
+                continue;
+            owed = m_iopOwedCycles.load(std::memory_order_acquire);
+            if (owed == 0u)
+                continue;
+        }
+        const uint64_t slice = std::min(owed, kIopSliceEeCycles);
+        if (m_iopWanted.load(std::memory_order_acquire) != 0)
+        {
+            std::this_thread::yield();
+            continue;
+        }
+        {
+            IopLock iop(m_iopMutex);
+            m_iopSubsystem->runEeCycles(slice);
+        }
+        if (m_iopOwedCycles.fetch_sub(slice, std::memory_order_acq_rel) - slice <= kIopMaxOwedEeCycles / 2u)
+            m_iopDrainCv.notify_all();
+    }
+}
+
+void PS2Runtime::setIopThreaded(bool enabled)
+{
+    if (enabled == m_iopThreaded.load(std::memory_order_relaxed))
+        return;
+    if (enabled)
+    {
+        m_iopThreadStop.store(false, std::memory_order_release);
+        m_iopThreaded.store(true, std::memory_order_release);
+        m_iopThread = std::thread([this]() { iopThreadMain(); });
+        return;
+    }
+    m_iopThreadStop.store(true, std::memory_order_release);
+    m_iopWorkCv.notify_all();
+    m_iopDrainCv.notify_all();
+    if (m_iopThread.joinable())
+        m_iopThread.join();
+    m_iopThreaded.store(false, std::memory_order_release);
+    m_iopJobs.clear();
+    const uint64_t owed = m_iopOwedCycles.exchange(0u, std::memory_order_acq_rel);
+    if (owed != 0u && m_iopSubsystem)
+        m_iopSubsystem->runEeCycles(owed);
 }
 
 void PS2Runtime::resetIop()
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
+    m_iopOwedCycles.store(0u, std::memory_order_release);
     m_iopSubsystem->reset();
 }
 
 ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem->debugSnapshot();
 }
 
 uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
 }
 
 bool PS2Runtime::freeIopMemory(uint32_t address)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
 }
 
 bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
 }
 
 bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
 }
 
 bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
 }
 
 bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 {
+    IopLock iop(m_iopMutex, m_iopWanted);
     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
 }
 
@@ -897,6 +1056,8 @@ bool PS2Runtime::syncCoreSubsystems()
         m_memory.setVif1Threaded(true);
     if (const char *lag = std::getenv("PS2X_GS_LAG"); lag && lag[0] == '1')
         m_memory.setGsLag(true);
+    if (const char *iopThread = std::getenv("PS2X_IOP_THREAD"); iopThread && iopThread[0] == '1')
+        setIopThreaded(true);
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
@@ -1191,7 +1352,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         return false;
     }
 
-    m_iopSubsystem->reset();
+    resetIop();
 
     ps2_game_overrides::applyMatching(*this,
                                       elfPath,

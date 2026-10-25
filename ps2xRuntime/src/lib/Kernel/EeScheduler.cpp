@@ -133,6 +133,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     {
         std::lock_guard lock(m_eventMutex);
         m_events.clear();
+        m_tasks.clear();
         m_deadlines.clear();
         m_pendingInvocations.clear();
     }
@@ -377,6 +378,17 @@ void EeScheduler::postEvent(EeEvent event)
     {
         std::lock_guard lock(m_eventMutex);
         m_events.push_back(event);
+        m_checkpointPending.store(true, std::memory_order_release);
+    }
+    m_eventCv.notify_one();
+}
+
+void EeScheduler::postTask(std::function<void()> task)
+{
+    {
+        std::lock_guard lock(m_eventMutex);
+        m_tasks.push_back(std::move(task));
+        m_events.push_back(EeEvent{EeEventType::Task, 0u, 0u});
         m_checkpointPending.store(true, std::memory_order_release);
     }
     m_eventCv.notify_one();
@@ -1878,9 +1890,11 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                const auto waitStart = std::chrono::steady_clock::now();
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
+                noteIdleWait(waitStart);
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
@@ -2053,6 +2067,19 @@ void EeScheduler::processEvent(const EeEvent &event)
     case EeEventType::GsInterrupt:
         m_runtime.pollGsInterrupt(m_rdram);
         break;
+    case EeEventType::Task:
+    {
+        std::function<void()> task;
+        {
+            std::lock_guard lock(m_eventMutex);
+            if (m_tasks.empty())
+                break;
+            task = std::move(m_tasks.front());
+            m_tasks.pop_front();
+        }
+        task();
+        break;
+    }
     case EeEventType::Alarm:
     {
         auto it = m_alarms.find(static_cast<int>(event.id));
@@ -2148,8 +2175,10 @@ void EeScheduler::waitForEvent()
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
+        const auto waitStart = std::chrono::steady_clock::now();
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
+        noteIdleWait(waitStart);
         return;
     }
 
@@ -2179,9 +2208,11 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    const auto waitStart = std::chrono::steady_clock::now();
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
+    noteIdleWait(waitStart);
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

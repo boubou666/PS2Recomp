@@ -382,6 +382,8 @@ public:
     // Waits for the transfers queued before the last frame mark, and for the frames before that one to be presented
     // (setPresentedFramesProvider): the GS is at most one frame behind, which bounds the added input latency.
     void waitForVif1PreviousFrame();
+    // Host time threads other than the worker spent waiting for it (waitForVif1*).
+    [[nodiscard]] uint64_t vif1WaitNanoseconds() const noexcept { return m_vif1WaitNs.load(std::memory_order_relaxed); }
     using PresentedFramesProvider = std::function<uint64_t()>;
     void setPresentedFramesProvider(PresentedFramesProvider provider) { m_presentedFramesProvider = std::move(provider); }
     bool onVif1Worker() const;
@@ -490,6 +492,7 @@ public:
     void queueVif1Job(Vif1Job job);
     void waitForVif1Until(uint64_t queued) const;
     bool m_gsLag = false;
+    mutable std::atomic<uint64_t> m_vif1WaitNs{0};
     uint64_t m_vif1FrameMark = 0;
     uint64_t m_vif1FramesMarked = 0;
     PresentedFramesProvider m_presentedFramesProvider;

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <deque>
 #include <string>
 #include <string_view>
 #include <functional>
@@ -18,6 +19,8 @@
 #include <atomic>
 #include <array>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
@@ -297,6 +300,18 @@ public:
     [[nodiscard]] bool sendIopSifCommand(uint32_t cid, const void *packet, uint32_t size);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
+    // The IOP on its own thread: the EE cycles the recompiled code accounts are owed to the IOP, which runs them
+    // in slices on that thread instead of in lockstep on the EE thread. The IOP stays behind the EE; every other
+    // IOP entry point (RPC, SIF transfers and commands, IOP memory) runs between two slices, and the EE waits only
+    // if the IOP falls more than two fields behind. IOP -> EE SIF commands are queued to the EE thread
+    // (EeScheduler::postTask). PS2X_IOP_THREAD=1 enables it.
+    void setIopThreaded(bool enabled);
+    [[nodiscard]] bool iopThreaded() const noexcept { return m_iopThreaded.load(std::memory_order_relaxed); }
+    // With the IOP thread, runs an RPC to a server an IOP module registered on that thread and calls done with
+    // the result on the EE thread (EeScheduler::postTask); send is the send buffer copied at the call. False
+    // (nothing queued) without the IOP thread or for an HLE service: the caller runs the RPC itself.
+    bool queueIopRpc(ps2x::iop::RpcRequest request, std::vector<uint8_t> send,
+                     std::function<void(const ps2x::iop::RpcResult &)> done);
     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
     bool freeIopMemory(uint32_t address);
     bool readIopMemory(uint32_t address, void *destination, size_t size) const;
@@ -525,6 +540,17 @@ private:
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
+    void iopThreadMain();
+    mutable std::recursive_mutex m_iopMutex;
+    std::thread m_iopThread;
+    std::mutex m_iopWorkMutex;
+    std::condition_variable m_iopWorkCv;
+    std::condition_variable m_iopDrainCv;
+    std::atomic<uint64_t> m_iopOwedCycles{0};
+    std::atomic<bool> m_iopThreadStop{false};
+    std::atomic<bool> m_iopThreaded{false};
+    mutable std::atomic<int> m_iopWanted{0};
+    std::deque<std::function<void()>> m_iopJobs; // guarded by m_iopWorkMutex
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

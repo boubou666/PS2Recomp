@@ -1,4 +1,5 @@
 // Based on Blackline Interactive implementation
+#include "ThreadNaming.h"
 #include "runtime/ps2_memory.h"
 #include <chrono>
 #include <cstring>
@@ -764,7 +765,8 @@ void PS2Memory::waitForVif1PreviousFrame()
         return;
     // The GS thread presents the frames in order; give up after a second rather than hang if it stopped.
     const uint64_t target = m_vif1FramesMarked - 1u;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto waitStart = std::chrono::steady_clock::now();
+    const auto deadline = waitStart + std::chrono::seconds(1);
     for (uint32_t spin = 0; m_presentedFramesProvider() < target; ++spin)
     {
         if (spin < 64u)
@@ -774,6 +776,9 @@ void PS2Memory::waitForVif1PreviousFrame()
         else
             std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
+    m_vif1WaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - waitStart).count()),
+                           std::memory_order_relaxed);
 }
 
 void PS2Memory::waitForVif1Until(uint64_t queued) const
@@ -781,17 +786,28 @@ void PS2Memory::waitForVif1Until(uint64_t queued) const
     if (m_vif1Done.load(std::memory_order_acquire) >= queued)
         return;
 
+    const auto waitStart = std::chrono::steady_clock::now();
+    const auto noteWait = [&]()
+    {
+        m_vif1WaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - waitStart).count()),
+                               std::memory_order_relaxed);
+    };
     // Most waits are short (the frame's last transfers): spin a little before sleeping.
     for (uint32_t spin = 0; spin < 4096u; ++spin)
     {
         if (m_vif1Done.load(std::memory_order_acquire) >= queued)
+        {
+            noteWait();
             return;
+        }
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         _mm_pause();
 #endif
     }
     std::unique_lock<std::mutex> lock(m_vif1Mutex);
     m_vif1IdleCv.wait(lock, [&]() { return m_vif1Done.load(std::memory_order_acquire) >= queued; });
+    noteWait();
 }
 
 void PS2Memory::queueVif1Job(std::vector<uint8_t> data)
@@ -824,6 +840,7 @@ void PS2Memory::queueVif1Job(Vif1Job job)
 
 void PS2Memory::vif1WorkerMain()
 {
+    ThreadNaming::SetCurrentThreadName("vif1");
     t_onVif1Worker = true;
     for (;;)
     {

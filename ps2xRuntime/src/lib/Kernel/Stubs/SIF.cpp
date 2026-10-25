@@ -211,6 +211,16 @@ namespace ps2_stubs
         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
             return false;
 
+        // From the IOP thread (PS2Runtime::setIopThreaded): the handler is queued from the EE thread, which owns
+        // the scheduler and the EE context the invocation starts from.
+        if (!runtime->eeScheduler().onExecutorThread())
+        {
+            std::vector<uint8_t> copy(static_cast<const uint8_t *>(packet), static_cast<const uint8_t *>(packet) + packetSize);
+            runtime->eeScheduler().postTask([rdram, runtime, commandId, copy = std::move(copy)]()
+                                            { (void)dispatchSifCommand(rdram, runtime, commandId, copy.data(), copy.size()); });
+            return true;
+        }
+
         SifCmdHandler registered{};
         {
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);

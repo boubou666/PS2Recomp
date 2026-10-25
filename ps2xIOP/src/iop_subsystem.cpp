@@ -204,6 +204,11 @@ namespace ps2x::iop
         return m_impl->emulator.hasRpcServer(sid);
     }
 
+    bool IopSubsystem::emulatesRpc(uint32_t sid) const noexcept
+    {
+        return m_impl->emulator.hasRpcServer(sid);
+    }
+
     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
     {
         const auto route = m_impl->routes.find(request.sid);

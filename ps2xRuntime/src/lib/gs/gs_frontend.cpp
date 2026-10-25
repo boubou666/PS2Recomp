@@ -1,3 +1,4 @@
+#include "ThreadNaming.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_trace.h"
@@ -131,7 +132,12 @@ namespace
     thread_local bool t_onGsWorker = false;
     // Back-pressure: the EE waits once this much packet data is queued ahead of the GS thread.
     constexpr size_t kMaxQueuedBytes = 32u * 1024u * 1024u;
-    constexpr uint32_t kWorkerSpinIterations = 2000u;
+    // PS2X_GS_SPIN=<n> (measurements): spin iterations before sleeping.
+    const uint32_t kWorkerSpinIterations = []
+    {
+        const char *value = std::getenv("PS2X_GS_SPIN");
+        return value && *value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2000u;
+    }();
 
     inline void cpuRelax()
     {
@@ -228,6 +234,7 @@ void GS::enqueue(QueuedCommand &&command)
 
 void GS::workerLoop()
 {
+    ThreadNaming::SetCurrentThreadName("gs");
     t_onGsWorker = true;
     for (;;)
     {

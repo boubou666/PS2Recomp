@@ -237,6 +237,7 @@ enum class EeEventType : uint8_t
     ExternalWake,
     Alarm,
     GsInterrupt, // GS raised SIGNAL/FINISH; dispatch INTC cause 0 now rather than at the next VBlank
+    Task,        // postTask: run the next queued host task on the executor thread
 };
 
 struct EeEvent
@@ -279,6 +280,12 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
+    // Runs task on the executor thread at its next checkpoint (or wakes it). Thread-safe; for host threads
+    // (the IOP thread) that must reach EE state only the executor may touch.
+    void postTask(std::function<void()> task);
+    [[nodiscard]] bool onExecutorThread() const noexcept { return m_executorThread == std::this_thread::get_id(); }
+    // Host time the executor spent idle, every guest thread blocked (waiting for a vblank, an interrupt...).
+    [[nodiscard]] uint64_t idleWaitNanoseconds() const noexcept { return m_idleWaitNs.load(std::memory_order_relaxed); }
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     // Set while guest code unwinds to the dispatcher (a checkpoint fired or a jump left the
     // function), cleared before each dispatch: the enclosing dispatchGuestBranch frames must not
@@ -457,6 +464,14 @@ private:
     std::chrono::nanoseconds m_vblankPeriod{0};
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
+    std::deque<std::function<void()>> m_tasks; // guarded by m_eventMutex
+    std::atomic<uint64_t> m_idleWaitNs{0};
+    void noteIdleWait(std::chrono::steady_clock::time_point start) noexcept
+    {
+        m_idleWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start).count()),
+                               std::memory_order_relaxed);
+    }
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};

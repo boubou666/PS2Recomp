@@ -531,6 +531,46 @@ namespace ps2_syscalls
             completionSemaphore = endParameter;
         }
 
+        // A NOWAIT call without an end function to a server an IOP module registered, with the IOP on its own
+        // thread: the server runs there and the call returns at once, as on the hardware; the receive buffer fills
+        // and the client goes idle when the server is done (sceSifCheckStatRpc).
+        if ((mode & kSifRpcModeNowait) != 0u && endFunction == 0u && !server && runtime->iopThreaded())
+        {
+            ps2x::iop::RpcRequest request{};
+            request.clientAddress = clientPtr;
+            request.sid = sid;
+            request.function = rpcNum;
+            request.mode = mode;
+            request.send = {sendBuf, sendSize};
+            request.receive = {receiveBuffer, receiveSize};
+            std::vector<uint8_t> send;
+            if (sendBuf != 0u && sendSize != 0u)
+            {
+                send.resize(std::min<size_t>(sendSize, 1u * 1024u * 1024u));
+                for (size_t i = 0; i < send.size(); ++i)
+                {
+                    const uint8_t *byte = getConstMemPtr(rdram, sendBuf + static_cast<uint32_t>(i));
+                    send[i] = byte ? *byte : 0u;
+                }
+            }
+            const bool queued = runtime->queueIopRpc(request, std::move(send), [=](const ps2x::iop::RpcResult &result)
+                                                     {
+                                                         if (result.signalNowaitCompletion)
+                                                             (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                                                         if (result.signalCompletion)
+                                                             (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                                                         if (receiveBuffer != 0u && receiveSize != 0u && result.handled &&
+                                                             result.resultAddress != 0u && result.resultAddress != receiveBuffer)
+                                                             rpcCopyToRdram(rdram, receiveBuffer, result.resultAddress, receiveSize);
+                                                         std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                                                         g_rpc_clients[clientPtr].busy = false; });
+            if (queued)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+        }
+
         {
             ps2x::iop::RpcRequest request{};
             request.clientAddress = clientPtr;

@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include "ThreadNaming.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
@@ -591,7 +593,12 @@ namespace
 namespace
 {
     // Worker spin before sleeping, about 50 us: primitives of a frame arrive back to back.
-    constexpr uint32_t kWorkerSpinIterations = 2000u;
+    // PS2X_GS_SPIN=<n> (measurements): spin iterations before sleeping.
+    const uint32_t kWorkerSpinIterations = []
+    {
+        const char *value = std::getenv("PS2X_GS_SPIN");
+        return value && *value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2000u;
+    }();
     // Power of two. Deep enough that the producer can queue a whole frame while the workers draw
     // the previous one (Drakengard's mission: 4096 left the workers idle a quarter of the time).
     constexpr uint64_t kQueueSize = 16384u;
@@ -2279,6 +2286,7 @@ void GSCpuBackend::NoteBarrierRange(std::vector<std::pair<uint32_t, uint32_t>> &
 
 void GSCpuBackend::WorkerMain(uint32_t index)
 {
+    ThreadNaming::SetCurrentThreadName("gsraster" + std::to_string(index));
     uint64_t next = 0u;
     for (;;)
     {

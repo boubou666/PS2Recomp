@@ -320,9 +320,14 @@ namespace ps2x::iop::detail
             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
             if (copySize != 0u)
             {
-                std::vector<uint8_t> payload(copySize);
-                if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
-                    (void)m_memory.writeRam(server.buffer, payload.data(), payload.size());
+                if (request.sendData)
+                    (void)m_memory.writeRam(server.buffer, request.sendData, copySize);
+                else
+                {
+                    std::vector<uint8_t> payload(copySize);
+                    if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
+                        (void)m_memory.writeRam(server.buffer, payload.data(), payload.size());
+                }
             }
         }
 

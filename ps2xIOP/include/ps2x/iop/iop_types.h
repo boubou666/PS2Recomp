@@ -73,6 +73,9 @@ namespace ps2x::iop
         GuestBuffer receive;
         uint32_t endFunction = 0;
         uint32_t endParameter = 0;
+        // The send buffer as it was at the call, for an RPC run after the call returned (PS2Runtime::queueIopRpc);
+        // null: read it from EE memory at send.address.
+        const uint8_t *sendData = nullptr;
     };
 
     enum class IopHandleKind : uint32_t

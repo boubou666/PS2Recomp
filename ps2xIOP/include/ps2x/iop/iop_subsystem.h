@@ -36,6 +36,8 @@ namespace ps2x::iop
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+        // True when an IOP module registered sid (the RPC runs IOP code rather than an HLE service).
+        [[nodiscard]] bool emulatesRpc(uint32_t sid) const noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         void onSifTransfer(const SifTransfer &transfer);
 
