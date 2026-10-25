@@ -80,6 +80,9 @@ namespace ps2x::iop::detail
         void flush();
 
         [[nodiscard]] const Stats &stats() const noexcept { return m_stats; }
+        // The last DMA events (start, AutoDMA start, finish, stop by software), printed when an IOP thread is found
+        // waiting for a transfer that does not end.
+        void printDmaHistory() const;
         [[nodiscard]] std::vector<std::string> describe() const;
         // Sound RAM, 16-bit words.
         [[nodiscard]] uint16_t ramWord(uint32_t address) const noexcept { return m_ram[address & (RamWords - 1u)]; }
@@ -214,5 +217,19 @@ namespace ps2x::iop::detail
         InterruptSink m_interrupt;
         const uint64_t *m_clock = nullptr;
         Stats m_stats;
+        struct DmaEvent
+        {
+            uint64_t cycle = 0;
+            uint32_t bytes = 0;
+            uint8_t core = 0;
+            char kind = 0; // 'S' sound RAM transfer, 'A' AutoDMA, 'F' finished, 'C' stopped
+            bool toSpu = false;
+        };
+        std::array<DmaEvent, 64> m_dmaHistory{};
+        uint32_t m_dmaHistoryNext = 0;
+        void noteDma(int core, char kind, uint32_t bytes, bool toSpu)
+        {
+            m_dmaHistory[m_dmaHistoryNext++ % m_dmaHistory.size()] = {m_cycle, bytes, static_cast<uint8_t>(core), kind, toSpu};
+        }
     };
 }

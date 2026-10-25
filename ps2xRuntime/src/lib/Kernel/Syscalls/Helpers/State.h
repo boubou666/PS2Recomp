@@ -166,6 +166,14 @@ struct RpcClientState
     bool busy = false;
     uint32_t last_rpc = 0;
     uint32_t sid = 0;
+    // The last call, for the report sceSifCheckStatRpc prints when a client stays busy (RPC.cpp).
+    uint32_t mode = 0;
+    uint32_t end_function = 0;
+    uint32_t caller_ra = 0;
+    uint32_t thread_id = 0;
+    uint32_t stage = 0; // 1 called, 2 server function invoked, 3 end function invoked, 4 completed
+    int64_t call_ns = 0;
+    bool reported = false;
 };
 
 struct SifRpcDebugEvent

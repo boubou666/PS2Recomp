@@ -17,6 +17,8 @@ namespace ps2x::iop::detail
         void reset();
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
+        // A handler is registered for irq but the interrupt is disabled: it has to wait for EnableIntr.
+        [[nodiscard]] bool heldBack(int irq) const;
 
     private:
         struct Handler

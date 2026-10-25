@@ -3,11 +3,18 @@
 #include "../../ps2_iop_transport.h"
 
 #include <array>
+#include <chrono>
+#include <cstdio>
 
 namespace ps2_syscalls
 {
     namespace
     {
+        int64_t rpcNowNs()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
@@ -491,6 +498,13 @@ namespace ps2_syscalls
             auto &state = g_rpc_clients[clientPtr];
             state.busy = true;
             state.last_rpc = rpcNum;
+            state.mode = mode;
+            state.end_function = endFunction;
+            state.caller_ra = getRegU32(ctx, 31);
+            state.thread_id = static_cast<uint32_t>(runtime->eeScheduler().currentThreadId());
+            state.stage = 1;
+            state.call_ns = rpcNowNs();
+            state.reported = false;
             sid = state.sid;
             if (sid != 0u)
             {
@@ -654,6 +668,7 @@ namespace ps2_syscalls
                 {
                     std::lock_guard<std::mutex> lock(g_rpc_mutex);
                     g_rpc_clients[clientPtr].busy = false;
+                    g_rpc_clients[clientPtr].stage = 4;
                 }
                 SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", &base, runtime);
                 event.clientPtr = clientPtr;
@@ -720,6 +735,10 @@ namespace ps2_syscalls
             {
                 completeClient(base, true);
             };
+            {
+                std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                g_rpc_clients[clientPtr].stage = 3;
+            }
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 
@@ -739,6 +758,10 @@ namespace ps2_syscalls
             {
                 finishCall(&completed, parent);
             };
+            {
+                std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                g_rpc_clients[clientPtr].stage = 2;
+            }
             runtime->eeScheduler().invokeCurrent(std::move(invocation));
         }
         finishCall(nullptr, *ctx);
@@ -866,7 +889,20 @@ namespace ps2_syscalls
             setReturnS32(ctx, 0);
             return;
         }
-        setReturnS32(ctx, it->second.busy ? 1 : 0);
+        // A client busy for seconds is a lost completion: say how far its call went (once).
+        RpcClientState &state = it->second;
+        if (state.busy && !state.reported && rpcNowNs() - state.call_ns > 3000000000ll)
+        {
+            state.reported = true;
+            std::fprintf(stderr,
+                         "[rpc] client 0x%x busy for %.1f s: sid 0x%x function %u mode %u end function 0x%x, called from "
+                         "0x%x on thread %u, stage %u (1 called, 2 server invoked, 3 end function invoked); checked from "
+                         "0x%x on thread %d\n",
+                         clientPtr, (rpcNowNs() - state.call_ns) / 1e9, state.sid, state.last_rpc, state.mode,
+                         state.end_function, state.caller_ra, state.thread_id, state.stage, getRegU32(ctx, 31),
+                         runtime->eeScheduler().currentThreadId());
+        }
+        setReturnS32(ctx, state.busy ? 1 : 0);
     }
 
     void SifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

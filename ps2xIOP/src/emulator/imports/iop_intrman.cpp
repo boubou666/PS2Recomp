@@ -92,6 +92,13 @@ namespace ps2x::iop::detail
         }
     }
 
+    bool IopIntrman::heldBack(int irq) const
+    {
+        const auto enabled = m_enabled.find(irq);
+        const auto handler = m_handlers.find(irq);
+        return enabled != m_enabled.end() && !enabled->second && handler != m_handlers.end() && handler->second.function != 0u;
+    }
+
     bool IopIntrman::dispatchInterrupt(int irq, IopGuestExecutor &executor) const
     {
         const auto enabled = m_enabled.find(irq);

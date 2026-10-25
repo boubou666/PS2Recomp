@@ -2,6 +2,7 @@
 
 #include "iop_memory.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <cstring>
 #include <sstream>
@@ -560,6 +561,7 @@ namespace ps2x::iop::detail
         else if (core.dmaBusy)
         {
             // Stopped by software (sceSdStopTrans / BlockTrans stop): no completion interrupt.
+            noteDma(coreIndex, 'C', 0u, false);
             core.dmaBusy = false;
             core.admaRunning = false;
         }
@@ -578,6 +580,7 @@ namespace ps2x::iop::detail
         if (toSpu && (core.admas & (1u << coreIndex)) != 0u)
         {
             // AutoDMA: the sound data input consumes 512 bytes of L then 512 of R per 256 samples.
+            noteDma(coreIndex, 'A', bytes, true);
             core.admaRunning = true;
             core.admaAddress = core.madr;
             core.admaRemaining = bytes;
@@ -589,6 +592,7 @@ namespace ps2x::iop::detail
         }
 
         // Sound RAM transfer at TSA: SPU2 words are 16-bit.
+        noteDma(coreIndex, 'S', bytes, toSpu);
         const uint32_t words = bytes / 2u;
         std::vector<uint16_t> buffer(words);
         if (toSpu)
@@ -611,9 +615,26 @@ namespace ps2x::iop::detail
         core.dmaCompletionCycle = m_cycle + std::max<uint64_t>(static_cast<uint64_t>(bytes) / 2u, 64u);
     }
 
+    void IopSpu2::printDmaHistory() const
+    {
+        std::fprintf(stderr, "[spu2] DMA now (cycle %llu):", static_cast<unsigned long long>(m_cycle));
+        for (int i = 0; i < 2; ++i)
+            std::fprintf(stderr, " core %d busy %d adma %d admas 0x%x chcr 0x%x;", i, m_cores[i].dmaBusy ? 1 : 0,
+                         m_cores[i].admaRunning ? 1 : 0, m_cores[i].admas, m_cores[i].chcr);
+        std::fputc('\n', stderr);
+        for (uint32_t i = 0; i < m_dmaHistory.size(); ++i)
+        {
+            const DmaEvent &e = m_dmaHistory[(m_dmaHistoryNext + i) % m_dmaHistory.size()];
+            if (e.kind != 0)
+                std::fprintf(stderr, "[spu2]   %llu core %u %c %u bytes%s\n", static_cast<unsigned long long>(e.cycle), e.core,
+                             e.kind, e.bytes, e.kind == 'S' ? (e.toSpu ? " to SPU" : " from SPU") : "");
+        }
+    }
+
     void IopSpu2::finishDma(int coreIndex)
     {
         Core &core = m_cores[coreIndex];
+        noteDma(coreIndex, 'F', 0u, false);
         core.dmaBusy = false;
         core.admaRunning = false;
         core.chcr &= ~kDmaStart;

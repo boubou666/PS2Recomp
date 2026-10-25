@@ -27,6 +27,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <set>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -155,6 +156,7 @@ namespace ps2x::iop::detail
             vblank.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
+            heldInterrupts.clear();
             pendingGuestCallbacks.clear();
             pendingSifCommands.clear();
             sifCommandBuffer = 0u;
@@ -209,10 +211,24 @@ namespace ps2x::iop::detail
             schedulePendingDma();
         }
 
+        // PS2X_IOP_TRACE_DMA=1: DMA / SIO2 interrupt requests and their dispatch.
+        const bool traceDma = []
+        {
+            const char *value = std::getenv("PS2X_IOP_TRACE_DMA");
+            return value && *value == '1';
+        }();
+
         void schedulePendingDma()
         {
             if (const auto dma = memory.takeDmaStart())
+            {
+                if (traceDma)
+                    std::fprintf(stderr, "[iop:dma] irq %d requested at %llu (+%llu)%s, pc 0x%x\n", dma->irq,
+                                 static_cast<unsigned long long>(totalCycles), static_cast<unsigned long long>(dma->delayCycles),
+                                 pendingDmaInterrupts.count(dma->irq) ? " (one already pending)" : "",
+                                 activeCpu ? activeCpu->pc : 0u);
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+            }
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -325,6 +341,9 @@ namespace ps2x::iop::detail
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
+            // EnableIntr (6) on an interrupt that came while it was disabled: it is taken now (next instruction).
+            if (iequals(call.library, "intrman") && call.ordinal == 6u && heldInterrupts.erase(static_cast<int>(a0)) != 0u)
+                pendingDmaInterrupts[static_cast<int>(a0)] = totalCycles;
             if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
                 return ImportDisposition::Handled;
             if (iequals(call.library, "secrman"))
@@ -420,6 +439,12 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
+            if (nativeBitScan != 0u && physicalAddress(cpu.pc) == nativeBitScan && !cpu.branchPending)
+            {
+                runNativeBitScan(cpu);
+                return true;
+            }
+
             if (const auto import = imports.decode(cpu.pc))
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
@@ -439,6 +464,120 @@ namespace ps2x::iop::detail
             return running;
         }
 
+        // 989snd's voice search: the first voice from a1 (of 48, 24 per SPU2 core) set in the masks at a0 + 0x18,
+        // or -1. A fifth of TMB's IOP instructions in the match go through it (it divides by 24 at every voice), so
+        // when a module holds it, it runs natively: same registers, cycles and instruction count as the guest code.
+        static constexpr std::array<uint32_t, 28> kBitScanCode = {
+            0x28a20030u, 0x10400017u, 0x3c062aaau, 0x34c6aaabu, 0x24070001u, 0x00a60018u, 0x000517c3u,
+            0x00004010u, 0x00081883u, 0x00621823u, 0x00031040u, 0x00431021u, 0x000210c0u, 0x00a21023u,
+            0x00031880u, 0x00831821u, 0x8c630018u, 0x00471004u, 0x00621824u, 0x14600007u, 0x00a01021u,
+            0x24a50001u, 0x28a20030u, 0x1440ffeeu, 0x00a60018u, 0x03e00008u, 0x2402ffffu, 0x03e00008u};
+        uint32_t nativeBitScan = 0u; // physical address of the function, 0 if no module holds it
+
+        void findNativeFunctions(uint32_t base, uint32_t size)
+        {
+            for (uint32_t address = base; address + kBitScanCode.size() * 4u <= base + size; address += 4u)
+            {
+                bool match = true;
+                for (size_t i = 0; i < kBitScanCode.size() && match; ++i)
+                    match = memory.read32(address + static_cast<uint32_t>(i) * 4u) == kBitScanCode[i];
+                if (match)
+                {
+                    nativeBitScan = physicalAddress(address);
+                    return;
+                }
+            }
+        }
+
+        void runNativeBitScan(CpuState &cpu)
+        {
+            if (cpu.pendingLoad)
+            {
+                if (cpu.pendingLoadReg != 0u)
+                    cpu.gpr[cpu.pendingLoadReg] = cpu.pendingLoadValue;
+                cpu.pendingLoad = false;
+            }
+            // PS2X_IOP_NATIVE_CHECK=1: also interpret the guest code on a copy and compare.
+            static const bool check = []
+            {
+                const char *value = std::getenv("PS2X_IOP_NATIVE_CHECK");
+                return value && *value == '1';
+            }();
+            CpuState reference = cpu;
+            uint64_t referenceInstructions = 0u;
+            if (check)
+            {
+                const uint32_t returnAddress = cpu.gpr[31];
+                while (reference.pc != returnAddress && referenceInstructions < 10000u && !reference.stopped)
+                {
+                    (void)cpuCore.executeInstruction(reference);
+                    ++referenceInstructions;
+                }
+            }
+            const uint64_t instructionsBefore = totalInstructions;
+            int32_t voice = static_cast<int32_t>(cpu.gpr[5]);
+            uint64_t instructions = 3u; // slti, beq, lui
+            cpu.gpr[6] = 0x2AAA0000u;
+            uint32_t result = 0xFFFFFFFFu;
+            if (voice < 48)
+            {
+                cpu.gpr[6] = 0x2AAAAAABu;
+                cpu.gpr[7] = 1u;
+                instructions += 3u; // ori, addiu, mult
+                for (;;)
+                {
+                    const int64_t product = static_cast<int64_t>(voice) * 0x2AAAAAABll;
+                    cpu.hi = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32);
+                    cpu.lo = static_cast<uint32_t>(product);
+                    const int32_t quotient = (static_cast<int32_t>(cpu.hi) >> 2) - (voice >> 31);
+                    const int32_t remainder = voice - quotient * 24;
+                    const uint32_t mask = 1u << (static_cast<uint32_t>(remainder) & 31u);
+                    const uint32_t word = memory.read32(cpu.gpr[4] + static_cast<uint32_t>(quotient) * 4u + 0x18u);
+                    cpu.gpr[8] = cpu.hi;
+                    cpu.gpr[3] = word & mask;
+                    instructions += 15u;
+                    if (cpu.gpr[3] != 0u)
+                    {
+                        result = static_cast<uint32_t>(voice);
+                        cpu.gpr[2] = result;
+                        break;
+                    }
+                    ++voice;
+                    instructions += 4u; // addiu, slti, bne, mult
+                    if (voice >= 48)
+                    {
+                        const int64_t last = static_cast<int64_t>(voice) * 0x2AAAAAABll; // the delay slot's mult
+                        cpu.hi = static_cast<uint32_t>(static_cast<uint64_t>(last) >> 32);
+                        cpu.lo = static_cast<uint32_t>(last);
+                        break;
+                    }
+                }
+                cpu.gpr[5] = static_cast<uint32_t>(voice);
+            }
+            cpu.gpr[2] = result;
+            instructions += 2u; // jr ra and its delay slot
+            cpu.pc = cpu.gpr[31];
+            cpu.branchPending = false;
+            totalInstructions += instructions;
+            totalCycles += instructions;
+            schedulePendingDma();
+            if (check)
+            {
+                static uint64_t checks = 0u, mismatches = 0u;
+                ++checks;
+                const bool same = reference.gpr == cpu.gpr && reference.hi == cpu.hi && reference.lo == cpu.lo &&
+                                  reference.pc == cpu.pc && referenceInstructions == totalInstructions - instructionsBefore;
+                if (!same && mismatches++ < 10u)
+                    std::fprintf(stderr, "[iop:native] voice search differs (a1 0x%x): v0 0x%x/0x%x, %llu/%llu instructions\n",
+                                 reference.gpr[5], cpu.gpr[2], reference.gpr[2],
+                                 static_cast<unsigned long long>(totalInstructions - instructionsBefore),
+                                 static_cast<unsigned long long>(referenceInstructions));
+                if ((checks & 0xFFFFu) == 0u)
+                    std::fprintf(stderr, "[iop:native] voice search: %llu checked, %llu differ\n",
+                                 static_cast<unsigned long long>(checks), static_cast<unsigned long long>(mismatches));
+            }
+        }
+
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
         {
             CpuState *previous = activeCpu;
@@ -446,6 +585,8 @@ namespace ps2x::iop::detail
             const uint64_t start = totalInstructions;
             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
+                if (profiling && (totalInstructions & 63u) == 0u)
+                    profileSample(cpu.pc);
                 if (!step(cpu))
                     break;
                 if (totalCycles >= spu2.nextEventCycle())
@@ -457,6 +598,50 @@ namespace ps2x::iop::detail
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
+        }
+
+        // PS2X_IOP_PROFILE=1: one PC sample every 64 instructions; every 10 s of IOP clock, the busiest code (by
+        // 64-byte block, with its module) and threads (-1: inline calls such as RPC servers run from the EE).
+        const bool profiling = []
+        {
+            const char *value = std::getenv("PS2X_IOP_PROFILE");
+            return value && *value == '1';
+        }();
+        std::map<uint32_t, uint64_t> profileBlocks;
+        std::map<int, uint64_t> profileThreads;
+        uint64_t profileSamples = 0;
+        uint64_t profileNextReport = 0;
+
+        void profileSample(uint32_t pc)
+        {
+            ++profileBlocks[pc & ~63u];
+            const IopThread *thread = kernel.currentThread();
+            ++profileThreads[callDepth != 0u || !thread ? -1 : thread->id];
+            ++profileSamples;
+            if (totalCycles < profileNextReport)
+                return;
+            profileNextReport = totalCycles + 36'864'000ull * 10ull;
+            std::vector<std::pair<uint64_t, uint32_t>> top;
+            for (const auto &[block, count] : profileBlocks)
+                top.emplace_back(count, block);
+            std::sort(top.rbegin(), top.rend());
+            std::fprintf(stderr, "[iop:profile] %llu samples (x64 instructions); threads:", static_cast<unsigned long long>(profileSamples));
+            for (const auto &[id, count] : profileThreads)
+                std::fprintf(stderr, " %d:%.1f%%", id, 100.0 * count / profileSamples);
+            std::fputc('\n', stderr);
+            for (size_t i = 0; i < top.size() && i < 25u; ++i)
+            {
+                const uint32_t physical = top[i].second & 0x1FFFFFu;
+                const Module *owner = nullptr;
+                for (const auto &[id, module] : modules)
+                    if (physical >= module.base && physical < module.base + module.size)
+                        owner = &module;
+                std::fprintf(stderr, "[iop:profile]   %5.1f%% 0x%06x %s+0x%x\n", 100.0 * top[i].first / profileSamples,
+                             top[i].second, owner ? owner->name.c_str() : "?", owner ? physical - owner->base : physical);
+            }
+            profileBlocks.clear();
+            profileThreads.clear();
+            profileSamples = 0;
         }
 
         uint32_t callFunction(uint32_t address,
@@ -536,6 +721,39 @@ namespace ps2x::iop::detail
         // Run the other threads (and the interrupt/timer/SIF services) until `owner` is runnable
         // again or `deadline` passes. Never schedules `owner` itself: its real CPU context sits in
         // sceSifRpcLoop while the RPC function runs on a separate call frame.
+        // Pending events, then one slice of the next ready thread (or time up to the next event if none is): what
+        // the other threads get while an inline call keeps running.
+        void runOthersSlice(uint64_t deadline)
+        {
+            spu2.advanceTo(totalCycles);
+            servicePendingDmaInterrupts();
+            servicePendingSifCommands();
+            servicePendingGuestCallbacks();
+            timrman.serviceDue(totalCycles, *this);
+            vblank.serviceDue(totalCycles, *this);
+            uint64_t nextDelayWake = UINT64_MAX;
+            IopThread *next = kernel.beginNextReady(totalCycles, &nextDelayWake);
+            if (!next)
+            {
+                uint64_t nextWake = std::min(deadline, nextDelayWake);
+                for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                    nextWake = std::min(nextWake, completionCycle);
+                if (!pendingGuestCallbacks.empty())
+                    nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                nextWake = timrman.nextEventCycle(nextWake);
+                nextWake = vblank.nextEventCycle(nextWake);
+                nextWake = std::min(nextWake, spu2.nextEventCycle());
+                // Only so far: the polling thread may be waiting for time alone.
+                totalCycles = std::max(totalCycles + 1u, std::min(nextWake, totalCycles + kDefaultSlice));
+                return;
+            }
+            const uint64_t before = totalCycles;
+            runCpu(next->cpu, kDefaultSlice);
+            kernel.endTimeslice(*next, kThreadReturnSentinel);
+            if (totalCycles == before)
+                ++totalCycles;
+        }
+
         [[nodiscard]] bool runOthersUntilRunnable(IopThread &owner, uint64_t deadline)
         {
             while (!threadRunnable(owner))
@@ -573,6 +791,13 @@ namespace ps2x::iop::detail
             }
             return true;
         }
+
+        // Instructions an RPC server runs before the other threads get a slice (PS2X_IOP_CALL_BUDGET, for tests).
+        const uint32_t serverCallBudget = []
+        {
+            const char *value = std::getenv("PS2X_IOP_CALL_BUDGET");
+            return value && *value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : kMaxCallInstructions;
+        }();
 
         uint32_t executeGuestFunctionAsThread(uint32_t address,
                                               uint32_t a0,
@@ -612,11 +837,45 @@ namespace ps2x::iop::detail
             bool timedOut = false;
             kernel.setCurrentThread(owner);
             owner->state = IopThreadState::Running;
+            uint32_t preemptions = 0u;
             for (;;)
             {
-                runCpu(cpu, kMaxCallInstructions);
-                if (cpu.stopped || !cpu.yielded)
+                runCpu(cpu, preemptions == 0u ? serverCallBudget : kDefaultSlice);
+                if (cpu.stopped)
                     break;
+                if (!cpu.yielded)
+                {
+                    // A whole budget without blocking: the server polls for something another thread or an event
+                    // provides (989snd's command server, now and then while loading). Abandoning it there left
+                    // its reply unwritten and the game waiting for it forever; give the others a slice and go on.
+                    if (preemptions++ == 0u)
+                    {
+                        const uint32_t physical = cpu.pc & 0x1FFFFFu;
+                        const Module *where = nullptr;
+                        for (const auto &[id, module] : modules)
+                            if (physical >= module.base && physical < module.base + module.size)
+                                where = &module;
+                        std::fprintf(stderr, "[iop:call] 0x%x as thread %d still running after %u instructions, at "
+                                             "0x%x (%s+0x%x): letting the other threads run\n",
+                                     address, threadId, serverCallBudget, cpu.pc, where ? where->name.c_str() : "?",
+                                     where ? physical - where->base : physical);
+                        std::fprintf(stderr, "[iop:call]   cycle %llu, servicing DMA interrupts %d, I_STAT 0x%x I_MASK 0x%x "
+                                             "I_CTRL 0x%x, pending DMA interrupts:",
+                                     static_cast<unsigned long long>(totalCycles), servicingDmaInterrupts ? 1 : 0,
+                                     memory.interruptStatus(), memory.interruptMask(), memory.interruptControl());
+                        for (const auto &[irq, completion] : pendingDmaInterrupts)
+                            std::fprintf(stderr, " irq %d at %llu", irq, static_cast<unsigned long long>(completion));
+                        std::fputc('\n', stderr);
+                        spu2.printDmaHistory();
+                    }
+                    if (totalCycles >= deadline)
+                        break;
+                    owner->state = ownerState;
+                    runOthersSlice(deadline);
+                    kernel.setCurrentThread(owner);
+                    owner->state = IopThreadState::Running;
+                    continue;
+                }
                 cpu.yielded = false;
                 ++blocks;
                 if (!runOthersUntilRunnable(*owner, deadline))
@@ -635,6 +894,9 @@ namespace ps2x::iop::detail
                 const char *value = std::getenv("PS2X_IOP_TRACE_RPC");
                 return value && *value == '1';
             }();
+            if (preemptions != 0u)
+                std::fprintf(stderr, "[iop:call] 0x%x as thread %d: %s after %u slice(s) for the others\n", address,
+                             threadId, cpu.stopped ? "returned" : "gave up", preemptions);
             if (trace && (blocks != 0u || !cpu.stopped))
                 std::fprintf(stderr, "[iop:call] 0x%x as thread %d: %s after %u block(s), v0=0x%x\n", address, threadId,
                              cpu.stopped ? "returned" : (timedOut ? "gave up waiting" : "budget exhausted"), blocks,
@@ -675,7 +937,22 @@ namespace ps2x::iop::detail
             try
             {
                 for (const int irq : completed)
+                {
+                    // Disabled (libsd disables a DMA interrupt while it sets the next transfer up): it stays pending
+                    // until EnableIntr, as on the hardware. Dropping it lost 989snd's transfer callback now and then,
+                    // and its command server waited for it forever (the game hung in snd_SendIOPCommandNoWait).
+                    if (intrman.heldBack(irq))
+                    {
+                        static uint32_t reported = 0u;
+                        if (reported++ < 5u)
+                            std::fprintf(stderr, "[iop] irq %d came while disabled: held until EnableIntr\n", irq);
+                        heldInterrupts.insert(irq);
+                        continue;
+                    }
+                    if (traceDma)
+                        std::fprintf(stderr, "[iop:dma] irq %d dispatched at %llu\n", irq, static_cast<unsigned long long>(totalCycles));
                     (void)intrman.dispatchInterrupt(irq, *this);
+                }
             }
             catch (...)
             {
@@ -869,6 +1146,8 @@ namespace ps2x::iop::detail
             module.size = loaded.size;
             module.entry = loaded.entry;
             module.gp = loaded.gp;
+            if (nativeBitScan == 0u)
+                findNativeFunctions(module.base, module.size);
 
             // Like loadcore: start(argc, argv) with argv[0] the module path, then one entry per
             // NUL-separated argument. The block stays allocated, as resident modules may keep argv strings.
@@ -957,6 +1236,9 @@ namespace ps2x::iop::detail
             // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
+            if (nativeBitScan >= physicalAddress(it->second.base) &&
+                nativeBitScan < physicalAddress(it->second.base) + it->second.size)
+                nativeBitScan = 0u;
             imports.eraseRange(it->second.base, it->second.size);
             modules.erase(it);
             kernel.cleanupDeadThreads();
@@ -983,6 +1265,7 @@ namespace ps2x::iop::detail
         IopLoadcore loadcore;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
+        std::set<int> heldInterrupts; // came while disabled, delivered at EnableIntr
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         IopSio2 sio2;
         IopSpu2 spu2;
