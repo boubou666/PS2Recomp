@@ -78,6 +78,13 @@ namespace
     constexpr uint32_t kIntcStatWaitPc = 0x00160700u;
     constexpr uint32_t kIntcStatResumePc = 0x00160710u;
     constexpr uint32_t kIntcStat = 0x1000F000u;
+    constexpr uint32_t kGsHoldWaitPc = 0x00160800u;
+    constexpr uint32_t kGsHoldRaisePc = 0x00160810u;
+    constexpr uint32_t kGsHoldResumePc = 0x00160820u;
+    constexpr uint32_t kGsHoldHandlerPc = 0x00160830u;
+    constexpr uint32_t kGsSpinWaitPc = 0x00160900u;
+    constexpr uint32_t kGsSpinRaisePc = 0x00160910u;
+    constexpr uint32_t kGsSpinHandlerPc = 0x00160920u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -104,6 +111,9 @@ namespace
     uint32_t g_intcStatBeforeVBlank = 0u;
     uint32_t g_intcStatAtResume = 0u;
     uint32_t g_intcStatAfterAck = 0u;
+    uint64_t g_gsHandlerVSyncTick = 0u;
+    uint64_t g_gsSpinFirstTick = 0u;
+    uint64_t g_gsSpinLastTick = 0u;
     uint32_t g_invocationQueueSp = 0u;
     bool g_invocationQueueSpChanged = false;
 
@@ -420,6 +430,72 @@ namespace
         scheduler.waitVSync(scheduler.currentVSyncTick());
     }
 
+    void schedulerGsHoldWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.setFieldRate(EeScheduler::FieldRate{1u, 1u});
+        ctx->pc = kGsHoldRaisePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerGsHoldRaise(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.addIrqHandler(false, 0u, kGsHoldHandlerPc, true, 0u, 0u, 0u);
+        scheduler.dispatchIrq(false, 0u);
+        scheduler.accountCycles(static_cast<uint32_t>(EeScheduler::kEeClockHz));
+        ctx->pc = kGsHoldResumePc;
+    }
+
+    void schedulerGsHoldResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerGsHoldHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_gsHandlerVSyncTick = runtime->eeScheduler().currentVSyncTick();
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerGsSpinWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.setFieldRate(EeScheduler::FieldRate{10u, 1u});
+        ctx->pc = kGsSpinRaisePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerGsSpinRaise(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.addIrqHandler(false, 0u, kGsSpinHandlerPc, true, 0u, 0u, 0u);
+        scheduler.dispatchIrq(false, 0u);
+        scheduler.accountCycles(static_cast<uint32_t>(EeScheduler::kEeClockHz / 10u));
+        ctx->pc = kGsHoldResumePc;
+    }
+
+    void schedulerGsSpinHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (g_gsSpinFirstTick == 0u)
+        {
+            g_gsSpinFirstTick = scheduler.currentVSyncTick();
+        }
+        while (scheduler.currentVSyncTick() < 2u)
+        {
+            if (scheduler.checkpointDue(1000u))
+            {
+                return;
+            }
+        }
+        g_gsSpinLastTick = scheduler.currentVSyncTick();
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     void schedulerIntcStatResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_intcStatAtResume = runtime->memory().read32(kIntcStat);
@@ -636,6 +712,43 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(g_intcStatBeforeVBlank, 0u, "INTC_STAT should read clear before the first vblank");
             t.Equals(g_intcStatAtResume & (1u << 2u), 1u << 2u, "the vblank should latch VBON in INTC_STAT");
             t.Equals(g_intcStatAfterAck & (1u << 2u), 0u, "writing VBON should acknowledge it");
+        });
+
+        tc.Run("an interrupt raised before a due vblank runs before the vblank is processed", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kGsHoldWaitPc, schedulerGsHoldWait);
+            env.runtime.registerFunction(kGsHoldRaisePc, schedulerGsHoldRaise);
+            env.runtime.registerFunction(kGsHoldResumePc, schedulerGsHoldResume);
+            env.runtime.registerFunction(kGsHoldHandlerPc, schedulerGsHoldHandler);
+
+            g_gsHandlerVSyncTick = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kGsHoldWaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_gsHandlerVSyncTick, 1ull,
+                     "the GS handler should run before the vblank its EE cycles already reached");
+        });
+
+        tc.Run("a handler spinning on a held vblank sees it once its host deadline passes", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kGsSpinWaitPc, schedulerGsSpinWait);
+            env.runtime.registerFunction(kGsSpinRaisePc, schedulerGsSpinRaise);
+            env.runtime.registerFunction(kGsHoldResumePc, schedulerGsHoldResume);
+            env.runtime.registerFunction(kGsSpinHandlerPc, schedulerGsSpinHandler);
+
+            g_gsSpinFirstTick = 0u;
+            g_gsSpinLastTick = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kGsSpinWaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_gsSpinFirstTick, 1ull, "the GS handler should start before the held vblank");
+            t.Equals(g_gsSpinLastTick, 2ull, "the held vblank should still be processed once its host time has come");
         });
 
         tc.Run("IRQ callbacks use an isolated invocation stack", [](TestCase &t)
