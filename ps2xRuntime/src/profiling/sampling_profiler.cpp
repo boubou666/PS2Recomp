@@ -1,9 +1,14 @@
-// Opt-in in-process sampling profiler (Windows): PS2X_PROFILE=<seconds> samples every thread of the
-// process roughly every millisecond for that long (after an optional PS2X_PROFILE_DELAY=<seconds>), then
-// writes "<thread id> <leaf rva hex> <first in-exe caller rva hex> <count>" lines to PS2X_PROFILE_OUT
-// (default ps2x_profile.txt) for symbolization against the linker map file. For threads blocked in
-// system calls the leaf rva is 0 and the caller column says where in the runtime they are waiting.
+// Opt-in in-process sampling profiler: PS2X_PROFILE=<seconds> samples every thread of the process
+// roughly every millisecond for that long (after an optional PS2X_PROFILE_DELAY=<seconds>), then writes
+// histogram lines to PS2X_PROFILE_OUT (default ps2x_profile.txt).
+// Windows: "<thread id> <leaf rva hex> <first in-exe caller rva hex> <count>", for symbolization against
+// the linker map file. For threads blocked in system calls the leaf rva is 0 and the caller column says
+// where in the runtime they are waiting.
 // PS2X_PROFILE_GATED=1: samples only while ps2x::profiling::g_sampleGate is open (runtime/sampling_profiler_gate.h).
+// Linux: "<thread id> <thread name> <leaf offset hex> <count> [<library>:<symbol>]", sampled on each
+// thread's CPU-time clock (blocked threads are not sampled); offsets are relative to the executable's
+// load address (addr2line -f -C -e <exe> <offset>); code outside the executable has offset 0 and is
+// grouped by the shared library and exported symbol dladdr finds for it.
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -142,6 +147,234 @@ namespace
             const char *delay = std::getenv("PS2X_PROFILE_DELAY");
             const char *out = std::getenv("PS2X_PROFILE_OUT");
             std::thread(runSamplingProfiler, delay ? std::atof(delay) : 0.0, std::atof(duration),
+                        std::string(out && *out ? out : "ps2x_profile.txt"))
+                .detach();
+        }
+    };
+
+    const SamplingProfilerStarter g_samplingProfilerStarter;
+}
+#elif defined(__linux__)
+#include <csignal>
+#include <ctime>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <string>
+#include <thread>
+#include <tuple>
+
+namespace
+{
+    struct Sample
+    {
+        uint32_t tid;
+        uintptr_t pc;
+    };
+
+    constexpr size_t kSampleCapacity = 1u << 22;
+    Sample *g_samples = nullptr;
+    std::atomic<size_t> g_sampleCount{0};
+    std::atomic<bool> g_sampling{false};
+
+    void onProfileSignal(int, siginfo_t *, void *raw)
+    {
+        if (!g_sampling.load(std::memory_order_relaxed))
+            return;
+        const size_t index = g_sampleCount.fetch_add(1u, std::memory_order_relaxed);
+        if (index >= kSampleCapacity)
+            return;
+        const auto *context = static_cast<const ucontext_t *>(raw);
+#if defined(__x86_64__)
+        const auto pc = static_cast<uintptr_t>(context->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__aarch64__)
+        const auto pc = static_cast<uintptr_t>(context->uc_mcontext.pc);
+#else
+        const uintptr_t pc = 0u;
+#endif
+        g_samples[index] = Sample{static_cast<uint32_t>(syscall(SYS_gettid)), pc};
+    }
+
+    struct ExeRange
+    {
+        uintptr_t base = 0u;
+        uintptr_t begin = ~uintptr_t{0};
+        uintptr_t end = 0u;
+    };
+
+    ExeRange findExecutableRange()
+    {
+        ExeRange range;
+        dl_iterate_phdr([](dl_phdr_info *info, size_t, void *data)
+                        {
+                            auto *out = static_cast<ExeRange *>(data);
+                            if (info->dlpi_name && info->dlpi_name[0] != '\0')
+                                return 0;
+                            out->base = info->dlpi_addr;
+                            for (int i = 0; i < info->dlpi_phnum; ++i)
+                            {
+                                const ElfW(Phdr) &header = info->dlpi_phdr[i];
+                                if (header.p_type != PT_LOAD || (header.p_flags & PF_X) == 0)
+                                    continue;
+                                const uintptr_t begin = info->dlpi_addr + header.p_vaddr;
+                                out->begin = std::min(out->begin, begin);
+                                out->end = std::max(out->end, static_cast<uintptr_t>(begin + header.p_memsz));
+                            }
+                            return 1;
+                        },
+                        &range);
+        return range;
+    }
+
+    std::string threadName(pid_t tid)
+    {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", static_cast<int>(tid));
+        std::string name = "?";
+        if (FILE *file = std::fopen(path, "r"))
+        {
+            char buffer[64] = {};
+            if (std::fgets(buffer, sizeof(buffer), file))
+            {
+                name = buffer;
+                while (!name.empty() && (name.back() == '\n' || name.back() == ' '))
+                    name.pop_back();
+                for (char &c : name)
+                    if (c == ' ')
+                        c = '_';
+            }
+            std::fclose(file);
+        }
+        return name;
+    }
+
+    void runSamplingProfiler(double delaySeconds, double durationSeconds, long periodMicroseconds, std::string outPath)
+    {
+        std::this_thread::sleep_for(std::chrono::duration<double>(delaySeconds));
+        const pid_t self = static_cast<pid_t>(syscall(SYS_gettid));
+        std::unique_ptr<Sample[]> storage(new Sample[kSampleCapacity]);
+        g_samples = storage.get();
+
+        struct sigaction action{};
+        action.sa_sigaction = onProfileSignal;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGPROF, &action, nullptr);
+
+        std::map<pid_t, timer_t> timers;
+        std::map<pid_t, std::string> names;
+        auto refreshThreads = [&]()
+        {
+            DIR *dir = opendir("/proc/self/task");
+            if (!dir)
+                return;
+            while (const dirent *entry = readdir(dir))
+            {
+                const pid_t tid = static_cast<pid_t>(std::atoi(entry->d_name));
+                if (tid <= 0 || tid == self || timers.count(tid) != 0u)
+                    continue;
+                const clockid_t clock = static_cast<clockid_t>((~static_cast<clockid_t>(tid) << 3) | 6);
+                sigevent event{};
+                event.sigev_notify = SIGEV_THREAD_ID;
+                event.sigev_signo = SIGPROF;
+                event._sigev_un._tid = tid;
+                timer_t timer{};
+                if (timer_create(clock, &event, &timer) != 0)
+                    continue;
+                itimerspec spec{};
+                spec.it_interval.tv_nsec = periodMicroseconds * 1000;
+                spec.it_value.tv_nsec = periodMicroseconds * 1000;
+                timer_settime(timer, 0, &spec, nullptr);
+                timers[tid] = timer;
+                names[tid] = threadName(tid);
+            }
+            closedir(dir);
+        };
+
+        g_sampling.store(true, std::memory_order_release);
+        const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(durationSeconds);
+        while (std::chrono::steady_clock::now() < end)
+        {
+            refreshThreads();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        for (auto &[tid, timer] : timers)
+            timer_delete(timer);
+        g_sampling.store(false, std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        const ExeRange exe = findExecutableRange();
+        const size_t count = std::min(g_sampleCount.load(std::memory_order_acquire), kSampleCapacity);
+        std::map<uintptr_t, std::string> outsideNames;
+        auto outsideName = [&](uintptr_t pc) -> const std::string &
+        {
+            auto [it, inserted] = outsideNames.try_emplace(pc);
+            if (inserted)
+            {
+                Dl_info info{};
+                if (dladdr(reinterpret_cast<void *>(pc), &info) != 0 && info.dli_fname)
+                {
+                    const char *slash = std::strrchr(info.dli_fname, '/');
+                    it->second = std::string(slash ? slash + 1 : info.dli_fname) + ":" +
+                                 (info.dli_sname ? info.dli_sname : "?");
+                }
+                else
+                {
+                    it->second = "?:?";
+                }
+            }
+            return it->second;
+        };
+        std::map<std::tuple<uint32_t, uintptr_t, std::string>, uint64_t> histogram;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const Sample &sample = g_samples[i];
+            if (sample.pc >= exe.begin && sample.pc < exe.end)
+                ++histogram[{sample.tid, sample.pc - exe.base, std::string()}];
+            else
+                ++histogram[{sample.tid, 0u, outsideName(sample.pc)}];
+        }
+        if (FILE *file = std::fopen(outPath.c_str(), "w"))
+        {
+            for (const auto &[key, samples] : histogram)
+            {
+                const auto name = names.find(static_cast<pid_t>(std::get<0>(key)));
+                std::fprintf(file, "%u %s %llx %llu%s%s\n", std::get<0>(key),
+                             name != names.end() ? name->second.c_str() : "?",
+                             static_cast<unsigned long long>(std::get<1>(key)),
+                             static_cast<unsigned long long>(samples),
+                             std::get<2>(key).empty() ? "" : " ", std::get<2>(key).c_str());
+            }
+            std::fclose(file);
+        }
+        std::fprintf(stderr, "[profiler] wrote %zu samples to %s\n", count, outPath.c_str());
+        g_samples = nullptr;
+    }
+
+    struct SamplingProfilerStarter
+    {
+        SamplingProfilerStarter()
+        {
+            const char *duration = std::getenv("PS2X_PROFILE");
+            if (!duration || std::atof(duration) <= 0.0)
+                return;
+            const char *delay = std::getenv("PS2X_PROFILE_DELAY");
+            const char *out = std::getenv("PS2X_PROFILE_OUT");
+            const char *period = std::getenv("PS2X_PROFILE_PERIOD_US");
+            const long periodMicroseconds = period && std::atol(period) > 0 ? std::atol(period) : 1000;
+            std::thread(runSamplingProfiler, delay ? std::atof(delay) : 0.0, std::atof(duration),
+                        std::min(periodMicroseconds, 999999L),
                         std::string(out && *out ? out : "ps2x_profile.txt"))
                 .detach();
         }

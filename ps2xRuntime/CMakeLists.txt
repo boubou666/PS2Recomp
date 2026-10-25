@@ -594,15 +594,17 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
-# Opt-in sampling profiler (PS2X_PROFILE=<seconds>, Windows only). It includes <windows.h>, which clashes
-# with raylib names inside unity batches, so it is compiled on its own.
-if(WIN32 AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
+# Opt-in sampling profiler (PS2X_PROFILE=<seconds>, Windows and Linux). It includes <windows.h>, which
+# clashes with raylib names inside unity batches, so it is compiled on its own.
+if((WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
     set(PS2X_SAMPLING_PROFILER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
     target_sources(ps2EntryRunner PRIVATE "${PS2X_SAMPLING_PROFILER_SOURCE}")
     set_source_files_properties("${PS2X_SAMPLING_PROFILER_SOURCE}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
-    # raylib first: winmm exports a PlaySound too, and ahead of raylib on a MinGW link line it takes raylib's
-    # PlaySound calls, then clashes with raudio's definition.
-    target_link_libraries(ps2EntryRunner PRIVATE raylib winmm)
+    if(WIN32)
+        # raylib first: winmm exports a PlaySound too, and ahead of raylib on a MinGW link line it takes raylib's
+        # PlaySound calls, then clashes with raudio's definition.
+        target_link_libraries(ps2EntryRunner PRIVATE raylib winmm)
+    endif()
 endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
@@ -619,7 +621,7 @@ ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
 if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     add_executable(ps2_vu1_replay tools/ps2_vu1_replay.cpp)
     target_link_libraries(ps2_vu1_replay PRIVATE ps2_runtime)
-    if(WIN32)
+    if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_sources(ps2_vu1_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
     endif()
     ps2x_stage_ffmpeg_runtime_dlls(ps2_vu1_replay)
@@ -627,7 +629,7 @@ if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     # GS command streams recorded with PS2X_GS_RECORD: rasterizer timing and VRAM checks.
     add_executable(ps2_gs_replay tools/ps2_gs_replay.cpp)
     target_link_libraries(ps2_gs_replay PRIVATE ps2_runtime)
-    if(WIN32)
+    if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_sources(ps2_gs_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
     endif()
     ps2x_stage_ffmpeg_runtime_dlls(ps2_gs_replay)
