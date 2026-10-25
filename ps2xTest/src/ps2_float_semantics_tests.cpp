@@ -149,6 +149,24 @@ void register_ps2_float_semantics_tests()
             t.Equals(bitsOf(FPU_MUL_S(1.5f, 4.0f)), bitsOf(6.0f), "ordinary multiplication should be unchanged");
         });
 
+        tc.Run("FPU ADD.S/SUB.S keep one guard bit of the smaller operand and truncate", [](TestCase &t)
+        {
+            const float threeTwoPowMinus25 = floatOf(0x33C00000u);
+            t.Equals(bitsOf(FPU_ADD_S(1.0f, threeTwoPowMinus25)), 0x3F800000u,
+                     "1 + 1.5*2^-24 should drop the bits past the guard bit and stay 1");
+            t.Equals(bitsOf(FPU_SUB_S(1.0f, threeTwoPowMinus25)), 0x3F7FFFFFu,
+                     "1 - 1.5*2^-24 should be 1 - 2^-24, not the nearest-even 1 - 2^-23");
+            t.Equals(bitsOf(FPU_ADD_S(floatOf(0xBFFFFFFFu), -1.0f)), 0xC03FFFFFu,
+                     "a negative sum should truncate toward zero");
+            t.Equals(bitsOf(FPU_ADD_S(floatOf(0x7F7FFFFFu), floatOf(0x73000000u))), 0x7F7FFFFFu,
+                     "the largest host float plus half its ulp should truncate, not round up to 2^128");
+            t.Equals(bitsOf(FPU_ADD_S(floatOf(0x00400000u), floatOf(0x00800000u))), 0x00800000u,
+                     "an exponent-0 operand should read as zero");
+            t.Equals(bitsOf(FPU_SUB_S(floatOf(0x00800001u), floatOf(0x00800000u))), 0x00000000u,
+                     "a difference below 2^-126 should flush to +0");
+            t.Equals(bitsOf(FPU_SUB_S(-0.0f, 0.0f)), 0x80000000u, "-0 - +0 should be -0");
+        });
+
         tc.Run("FPU DIV.S by zero gives +-max with the sign of fs xor ft", [](TestCase &t)
         {
             t.Equals(bitsOf(FPU_DIV_S(1.0f, 0.0f)), kPlusMax, "1/+0 should be +max");
