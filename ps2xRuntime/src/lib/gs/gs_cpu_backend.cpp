@@ -34,6 +34,9 @@ namespace
 {
     uint32_t depthTestMethod(uint64_t test)
     {
+        constexpr uint32_t kZtstAlways = 1u;
+        if (((test >> 16) & 1u) == 0u)
+            return kZtstAlways;
         return static_cast<uint32_t>((test >> 17) & 3u);
     }
 
