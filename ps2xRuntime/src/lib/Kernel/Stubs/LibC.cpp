@@ -1165,40 +1165,30 @@ namespace ps2_stubs
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
         int ret = -1;
 
-        if (format_addr != 0)
+        std::string rendered = formatPs2StringWithVaList(rdram, runtime, formatOwned.c_str(), va_list_addr);
         {
-            std::string rendered = formatPs2StringWithVaList(rdram, runtime, formatOwned.c_str(), va_list_addr);
+            static std::mutex seenMutex;
+            static std::unordered_set<std::string> seenFormats;
+            std::lock_guard<std::mutex> lock(seenMutex);
+            if (seenFormats.size() < 32u && seenFormats.insert(formatOwned).second)
             {
-                static std::mutex seenMutex;
-                static std::unordered_set<std::string> seenFormats;
-                std::lock_guard<std::mutex> lock(seenMutex);
-                if (seenFormats.size() < 32u && seenFormats.insert(formatOwned).second)
-                {
-                    RUNTIME_LOG("[vsprintf] ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << " format=\""
-                                                   << sanitizeForLog(formatOwned) << "\" -> \""
-                                                   << sanitizeForLog(rendered) << "\"" << std::endl);
-                }
+                RUNTIME_LOG("[vsprintf] ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << " format=\""
+                                               << sanitizeForLog(formatOwned) << "\" -> \""
+                                               << sanitizeForLog(rendered) << "\"" << std::endl);
             }
-            if (rendered.size() >= kSafeVsprintfBytes)
-            {
-                rendered.resize(kSafeVsprintfBytes - 1);
-            }
-            if (writeGuestBytes(rdram, runtime, str_addr, reinterpret_cast<const uint8_t *>(rendered.c_str()), rendered.size() + 1u))
-            {
-                ret = static_cast<int>(rendered.size());
-            }
-            else
-            {
-                std::cerr << "vsprintf error: Failed to write destination buffer at 0x"
-                          << std::hex << str_addr << std::dec << std::endl;
-            }
+        }
+        if (rendered.size() >= kSafeVsprintfBytes)
+        {
+            rendered.resize(kSafeVsprintfBytes - 1);
+        }
+        if (writeGuestBytes(rdram, runtime, str_addr, reinterpret_cast<const uint8_t *>(rendered.c_str()), rendered.size() + 1u))
+        {
+            ret = static_cast<int>(rendered.size());
         }
         else
         {
-            std::cerr << "vsprintf error: Invalid address provided."
-                      << " Dest: 0x" << std::hex << str_addr
-                      << ", Format: 0x" << format_addr << std::dec
-                      << std::endl;
+            std::cerr << "vsprintf error: Failed to write destination buffer at 0x"
+                      << std::hex << str_addr << std::dec << std::endl;
         }
 
         setReturnS32(ctx, ret);
