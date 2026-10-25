@@ -25,6 +25,19 @@ using namespace ps2_syscalls;
 
 namespace
 {
+    // setenv/unsetenv are POSIX; Windows (MSVC, MinGW) has _putenv_s, where an empty value removes the variable.
+    void setTestEnv(const char *name, const char *value)
+    {
+#if defined(_WIN32)
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+#endif
+    }
+
     std::atomic<uint32_t> g_gsSyncCallbackHits{0u};
     std::atomic<uint32_t> g_gsSyncCallbackLastTick{0u};
     std::atomic<int32_t> g_gsSyncFirstField{-1};
@@ -444,13 +457,13 @@ void register_ps2_gs_tests()
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
-            setenv("PS2X_GS_RENDERER", "cpu", 1);
+            setTestEnv("PS2X_GS_RENDERER", "cpu");
             {
                 GS gs;
                 gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
                 t.IsFalse(gs.requestParallelRenderer(), "PS2X_GS_RENDERER=cpu keeps the CPU renderer");
             }
-            unsetenv("PS2X_GS_RENDERER");
+            setTestEnv("PS2X_GS_RENDERER", nullptr);
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
