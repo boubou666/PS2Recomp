@@ -1492,9 +1492,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
-    if (address >= 0x10008000u && address < 0x1000F000u && (address & 0xFFu) == 0u && dmaChannelSignalStalled(address))
+    if (address >= 0x10008000u && address < 0x1000F000u && (address & 0xFFu) <= 0x50u &&
+        dmaChannelSignalStalled(address & ~0xFFu))
     {
-        if ((value & 0x100u) != 0u)
+        if ((address & 0xFFu) != 0u || (value & 0x100u) != 0u)
             return true;
         m_signalStalls.erase(std::remove_if(m_signalStalls.begin(), m_signalStalls.end(),
                                             [address](const DmaSignalStall &stall)
