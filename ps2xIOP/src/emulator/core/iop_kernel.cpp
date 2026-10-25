@@ -733,11 +733,16 @@ namespace ps2x::iop::detail
         if (next == nullptr)
             return nullptr;
 
-        m_currentThread = next;
-        next->state = IopThreadState::Running;
-        next->cpu.stopped = false;
-        next->cpu.yielded = false;
+        beginThread(*next);
         return next;
+    }
+
+    void IopKernel::beginThread(IopThread &thread) noexcept
+    {
+        m_currentThread = &thread;
+        thread.state = IopThreadState::Running;
+        thread.cpu.stopped = false;
+        thread.cpu.yielded = false;
     }
 
     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
