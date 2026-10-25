@@ -2035,6 +2035,51 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "VIF1 QWC should be cleared after drain");
         });
 
+        tc.Run("VIF1 DMA with DIR=0 and VIF1_FIFO reads hand the GS download to the EE", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<uint8_t> download(80u);
+            for (size_t i = 0; i < download.size(); ++i)
+                download[i] = static_cast<uint8_t>(0x40u + i);
+            size_t served = 0u;
+            mem.setLocalToHostReader([&](uint8_t *dst, uint32_t maxBytes)
+            {
+                const uint32_t count = static_cast<uint32_t>(std::min<size_t>(maxBytes, download.size() - served));
+                std::memcpy(dst, download.data() + served, count);
+                served += count;
+                return count;
+            });
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kVif1Stat = 0x10003C00u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kDst = 0x00038000u;
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(rdram + kDst, 0xEE, 64u);
+
+            mem.writeIORegister(kVif1Stat, 1u << 23);
+            t.Equals((mem.readIORegister(kVif1Stat) >> 24) & 0x1Fu, 5u, "FQC counts the downloaded quadwords");
+            alignas(16) uint8_t first[16] = {};
+            _mm_store_si128(reinterpret_cast<__m128i *>(first), mem.read128(0x10005000u));
+            t.Equals(first[0], static_cast<uint8_t>(0x40u), "a VIF1_FIFO read returns the first downloaded quadword");
+            t.Equals((mem.readIORegister(kVif1Stat) >> 24) & 0x1Fu, 4u, "FQC drops by the quadword read");
+
+            mem.writeIORegister(kVif1Ch + 0x10u, kDst);
+            mem.writeIORegister(kVif1Ch + 0x20u, 4u);
+            mem.writeIORegister(kVif1Ch + 0x00u, 0x100u);
+            t.Equals(rdram[kDst], static_cast<uint8_t>(0x50u), "the DMA continues with the second quadword");
+            t.Equals(rdram[kDst + 63u], static_cast<uint8_t>(0x8Fu), "the DMA copies every requested quadword");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x00u) & 0x100u, 0u, "the download completes the channel");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x10u), kDst + 64u, "MADR moves past the written data");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "QWC is spent");
+            t.Equals(mem.readIORegister(kDStat) & 0x2u, 0x2u, "the download raises the VIF1 D_STAT bit");
+
+            mem.writeIORegister(kVif1Stat, 0u);
+            t.Equals((mem.readIORegister(kVif1Stat) >> 24) & 0x1Fu, 0u, "FQC reads zero once FDR is cleared");
+        });
+
         tc.Run("VIF1 DMA chain preserves compact tag high bytes for DIRECT packets", [](TestCase &t)
         {
             PS2Memory mem;
