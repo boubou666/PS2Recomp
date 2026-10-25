@@ -32,6 +32,11 @@ using namespace GSInternal;
 
 namespace
 {
+    uint32_t depthTestMethod(uint64_t test)
+    {
+        return static_cast<uint32_t>((test >> 17) & 3u);
+    }
+
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -987,7 +992,7 @@ namespace
         primitiveRows(batch, firstRow, lastRow);
         blocks.frame = rowBlocks(GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, ctx.frame.psm, firstRow, lastRow);
         blocks.writesZ = !ctx.zbuf.zmask;
-        blocks.readsZ = ((ctx.test >> 17) & 3u) >= 2u;
+        blocks.readsZ = depthTestMethod(ctx.test) >= 2u;
         if (blocks.writesZ || blocks.readsZ)
             blocks.z = rowBlocks(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, firstRow, lastRow);
         blocks.samples = batch.state.prim.tme;
@@ -1047,7 +1052,7 @@ namespace
     bool needsPixelOrder(const GSPrimitiveBatch &batch, const PrimitiveBlocks &blocks, bool checkSampling)
     {
         const auto &ctx = batch.state.context;
-        if (((ctx.test >> 17) & 3u) >= 2u || blocks.writesZ)
+        if (depthTestMethod(ctx.test) >= 2u || blocks.writesZ)
         {
             std::pair<uint32_t, uint32_t> z = blocks.z;
             if (!blocks.writesZ)
@@ -1322,9 +1327,7 @@ GSCpuBackend::PixelPipeline GSCpuBackend::MakePixelPipeline(const GSDrawState &s
     p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
     p.zpsm = static_cast<uint8_t>(ctx.zbuf.psm);
     p.test = ctx.test;
-    // ZTE=0 turns the depth test off (VP2 downsamples its post-processing buffers with TEST=0);
-    // ZTST alone would read 0, NEVER, and drop every pixel.
-    p.ztst = ((ctx.test >> 16) & 1u) != 0u ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
+    p.ztst = depthTestMethod(ctx.test);
     p.alphaTest = (ctx.test & 0x1u) != 0u;
     p.dateNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u &&
                       (p.fpsm == GS_PSM_CT32 || p.fpsm == GS_PSM_CT16 || p.fpsm == GS_PSM_CT16S);
