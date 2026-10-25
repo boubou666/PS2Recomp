@@ -1732,6 +1732,17 @@ bool PS2Runtime::hasFunction(uint32_t address) const
     return entry != nullptr && *entry != nullptr;
 }
 
+bool PS2Runtime::isTrivialReturnStub(uint32_t address) const
+{
+    const uint8_t *rdram = m_memory.getRDRAM();
+    const uint32_t physical = address & 0x1FFFFFFFu;
+    if (!rdram || (address & 3u) != 0u || physical + 8u > PS2_RAM_SIZE)
+        return false;
+    uint32_t words[2];
+    std::memcpy(words, rdram + physical, sizeof(words));
+    return words[0] == 0x03E00008u && words[1] == 0u; // jr $ra; nop
+}
+
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
 {
     switch (kind)
@@ -2005,6 +2016,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!hasFunction(targetPc))
     {
+        if (isTrivialReturnStub(targetPc))
+        {
+            ctx->pc = fallthroughPc; // the empty routine returns at once
+            return true;
+        }
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
         const MissingFunctionPolicy policy = missingFunctionPolicy();

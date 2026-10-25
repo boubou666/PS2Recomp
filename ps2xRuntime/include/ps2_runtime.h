@@ -357,6 +357,10 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+    // An address no recompiled function covers but holding `jr $ra` with a nop delay slot: an
+    // empty routine to return from (compilers reuse a function's final jr ra as an empty method,
+    // and games build such pointers at run time, out of reach of static entry discovery).
+    bool isTrivialReturnStub(uint32_t address) const;
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,

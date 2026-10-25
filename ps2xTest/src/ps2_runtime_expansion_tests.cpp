@@ -581,6 +581,27 @@ void register_ps2_runtime_expansion_tests()
                      "the callee's stack pointer belongs to the pending tail call");
         });
 
+        tc.Run("dispatchGuestBranch returns at once from an unregistered jr ra stub", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            uint8_t *rdram = runtime.memory().getRDRAM();
+            // An empty method no recompiled function covers: jr $ra; nop (e.g. a vtable slot built
+            // at run time pointing at the final jr ra of another function).
+            const uint32_t stub[2] = {0x03E00008u, 0u};
+            std::memcpy(rdram + 0x5000u, stub, sizeof(stub));
+            t.IsTrue(runtime.isTrivialReturnStub(0x5000u), "jr ra; nop is an empty routine");
+            t.IsFalse(runtime.isTrivialReturnStub(0x5004u), "a nop is not");
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            const bool returned = runtime.dispatchGuestBranch(rdram, &ctx, 0x5000u, 0x2000u, 0x2008u,
+                                                              PS2Runtime::GuestBranchKind::IndirectCall, "test-jalr");
+            t.IsTrue(returned, "the call should resume at its fallthrough");
+            t.Equals(ctx.pc, 0x2008u, "an empty routine returns to the caller");
+            t.IsFalse(runtime.isStopRequested(), "it is not a missing function");
+        });
+
         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
         {
             PS2Runtime runtime;

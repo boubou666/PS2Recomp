@@ -299,6 +299,11 @@ void EeScheduler::run()
 
         if (!m_runtime.hasFunction(context.pc))
         {
+            if (m_runtime.isTrivialReturnStub(context.pc))
+            {
+                context.pc = getRegU32(&context, 31); // an empty routine: return to the caller
+                continue;
+            }
             if (!running->invocations.empty())
             {
                 context.pc = 0u;
