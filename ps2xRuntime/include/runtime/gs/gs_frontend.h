@@ -131,6 +131,9 @@ public:
     // Lets a game prefer paraLLEl-GS while the GS thread has not started yet (game overrides run after
     // enableAsync). PS2X_GS_RENDERER set to anything else keeps the user's choice. Returns whether it is in use.
     bool requestParallelRenderer();
+    // A game's drawing speed for the GS event latency (GsDrawEstimate); PS2X_GS_PIXEL_CYCLES and
+    // PS2X_GS_PRIM_CYCLES still override each rate.
+    void setDrawRates(GsDrawEstimate::Rates rates);
     // Queues a GIF packet for the GS thread (processed in submission order), or processes it now when the
     // GS runs synchronously.
     void submitGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -285,6 +288,7 @@ private:
     size_t m_queuedBytes = 0;
     // FINISH writes queued for / drawn by the GS thread: bounds how many frames it may lag.
     GsDrawEstimate m_drawEstimate;
+    GsDrawEstimate::Rates m_drawRates{};
     uint64_t m_finishesQueued = 0;
     uint64_t m_finishesDrawn = 0;
     LagStats m_lagStats;

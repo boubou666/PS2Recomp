@@ -285,9 +285,8 @@ namespace
     }
 
     // PS2X_GS_PIXEL_CYCLES (EE cycles per 1024 pixels) and PS2X_GS_PRIM_CYCLES override the drawing rates.
-    GsDrawEstimate::Rates gsDrawRates()
+    GsDrawEstimate::Rates gsDrawRates(const GsDrawEstimate::Rates &defaults)
     {
-        const GsDrawEstimate::Rates defaults;
         return {envCycles("PS2X_GS_PIXEL_CYCLES", defaults.cyclesPer1024Pixels),
                 envCycles("PS2X_GS_PRIM_CYCLES", defaults.cyclesPerPrimitive)};
     }
@@ -714,11 +713,17 @@ void GS::waitForIdle()
     m_queueIdle.wait(lock, [this]() { return m_queue.empty() && !m_workerBusy; });
 }
 
+void GS::setDrawRates(GsDrawEstimate::Rates rates)
+{
+    m_drawRates = rates;
+    m_drawEstimate.setRates(gsDrawRates(m_drawRates));
+}
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     waitForIdle();
     m_drawEstimate = GsDrawEstimate{};
-    m_drawEstimate.setRates(gsDrawRates());
+    m_drawEstimate.setRates(gsDrawRates(m_drawRates));
     m_notedDrawingCycles = 0;
     g_gsBusyUntil.store(0u, std::memory_order_release);
     m_localMemoryStorage = vram;
