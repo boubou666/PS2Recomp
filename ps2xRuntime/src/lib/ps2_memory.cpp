@@ -245,6 +245,8 @@ namespace
         return false;
     }
 
+    constexpr uint32_t kIntcStatAddress = 0x1000F000u;
+
     constexpr uint64_t ticksUntilMatch(uint32_t count, uint32_t target)
     {
         const uint32_t distance = (target - count) & 0xFFFFu;
@@ -415,6 +417,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        m_intcStat.store(0u, std::memory_order_release);
 
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
@@ -1293,6 +1296,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (address == kIntcStatAddress) // write-one-to-clear
+    {
+        m_intcStat.fetch_and(~value, std::memory_order_acq_rel);
+        return true;
+    }
     if ((address >= 0x10003C00u && address < 0x10003E00u) || (address >= 0x10003000u && address < 0x10003100u))
         waitForVif1(); // VIF1 and GIF registers
     size_t timerIndex = 0u;
@@ -2660,6 +2668,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (address == kIntcStatAddress)
+        return m_intcStat.load(std::memory_order_acquire);
     if ((address >= 0x10003C00u && address < 0x10003E00u) || (address >= 0x10003000u && address < 0x10003100u))
         waitForVif1(); // VIF1 and GIF registers
     size_t timerIndex = 0u;

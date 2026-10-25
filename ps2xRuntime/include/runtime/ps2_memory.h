@@ -328,6 +328,7 @@ public:
     // Hardware register interface
     bool writeIORegister(uint32_t address, uint32_t value);
     uint32_t readIORegister(uint32_t address);
+    void raiseIntcStat(uint32_t bits) noexcept { m_intcStat.fetch_or(bits, std::memory_order_acq_rel); }
 
     // EE timers advance from the scheduler's emulated EE-cycle clock. The
     // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
@@ -442,6 +443,7 @@ public:
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    std::atomic<uint32_t> m_intcStat{0u};
 
     // Registers
     GSRegisters gs_regs;
