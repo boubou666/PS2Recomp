@@ -181,6 +181,23 @@ namespace
         return pred();
     }
 
+    constexpr uint32_t kGsCheckSpinPc = 0x00271000u;
+    constexpr uint64_t kGsCheckDelayCycles = 2'000'000u;
+    std::atomic<bool> g_gsCheckScheduled{false};
+
+    void schedulerGsCheckSpin(uint8_t *, R5900Context *, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (!g_gsCheckScheduled.exchange(true))
+            scheduler.scheduleGsInterruptCheck(kGsCheckDelayCycles);
+        while (scheduler.currentCycle() < kGsCheckDelayCycles + 100'000u)
+        {
+            if (scheduler.checkpointDue(10'000u))
+                return;
+        }
+        runtime->requestStop();
+    }
+
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
@@ -1174,6 +1191,24 @@ void register_ps2_runtime_interrupt_tests()
             t.IsFalse(schedulerThrew.load(std::memory_order_acquire),
                       "the scheduler stop path should not throw");
 
+            cleanupRuntime(env);
+        });
+
+        tc.Run("a GS interrupt check does not hold back an EE running behind real time", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kGsCheckSpinPc, &schedulerGsCheckSpin);
+            g_gsCheckScheduled.store(false);
+            R5900Context mainContext{};
+            mainContext.pc = kGsCheckSpinPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const uint64_t idleBefore = env.runtime.eeScheduler().idleWaitNanoseconds();
+            env.runtime.eeScheduler().run();
+            const uint64_t idleNs = env.runtime.eeScheduler().idleWaitNanoseconds() - idleBefore;
+
+            t.IsTrue(g_gsCheckScheduled.load(), "the guest should have scheduled the GS check");
+            t.IsTrue(idleNs < 2'000'000u, "the check's host time is on the vblank timeline, already past");
             cleanupRuntime(env);
         });
     });
