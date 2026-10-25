@@ -853,6 +853,34 @@ void register_ps2_gs_tests()
                      "AC=1 should source FGE from PRIM instead of PRMODE");
         });
 
+        tc.Run("TEST.ZTE=0 passes the depth test whatever ZTST says", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16));
+            gs.writeRegister(GS_REG_ZBUF_1, 32ull | (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+
+            auto drawPoint = [&](uint64_t test)
+            {
+                const uint32_t cleared = 0u;
+                std::memcpy(vram.data(), &cleared, sizeof(cleared));
+                gs.writeRegister(GS_REG_TEST_1, test);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80112233ull);
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                uint32_t pixel = 0u;
+                std::memcpy(&pixel, vram.data(), sizeof(pixel));
+                return pixel;
+            };
+
+            t.Equals(drawPoint(0ull), 0x80112233u, "ZTE=0 with ZTST=NEVER should draw");
+            t.Equals(drawPoint(3ull << 17), 0x80112233u, "ZTE=0 with ZTST=GREATER should draw over a nearer depth");
+            t.Equals(drawPoint(1ull << 16), 0u, "ZTE=1 with ZTST=NEVER should not draw");
+        });
+
         tc.Run("PABE bypasses alpha blend for low-alpha source pixels", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
