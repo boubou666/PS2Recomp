@@ -843,6 +843,18 @@ namespace
         const int size = std::max<int>(columns ? state.textureWidth : state.textureHeight, 1);
         first = 0;
         last = size - 1;
+        const uint64_t clamp = state.context.clamp;
+        const uint8_t wrap = static_cast<uint8_t>((clamp >> (columns ? 0 : 2)) & 0x3u);
+        if (wrap == 3u)
+        {
+            // REGION_REPEAT addresses (coordinate & MIN) | MAX whatever the coordinate, which can lie past the
+            // texture's size.
+            const int regionMask = static_cast<int>((clamp >> (columns ? 4 : 24)) & 0x3FFu);
+            const int regionFix = static_cast<int>((clamp >> (columns ? 14 : 34)) & 0x3FFu);
+            first = regionFix;
+            last = regionMask | regionFix;
+            return;
+        }
         int low = 0;
         int high = 0;
         float spriteLow = 0.0f;
@@ -900,8 +912,6 @@ namespace
                 high = static_cast<int>(maxCoord) + 2;
             }
         }
-        const uint64_t clamp = state.context.clamp;
-        const uint8_t wrap = static_cast<uint8_t>((clamp >> (columns ? 0 : 2)) & 0x3u);
         if (wrap == 2u)
         {
             // REGION_CLAMP clamps every texel coordinate into [min, max], a monotonic mapping.
@@ -909,14 +919,6 @@ namespace
             const int regionMax = static_cast<int>((clamp >> (columns ? 14 : 34)) & 0x3FFu);
             first = std::min(std::max(low, regionMin), regionMax);
             last = std::min(std::max(high, regionMin), regionMax);
-            return;
-        }
-        if (wrap == 3u)
-        {
-            // REGION_REPEAT addresses (coordinate & MIN) | MAX, which can lie past the texture's size.
-            const int regionMask = static_cast<int>((clamp >> (columns ? 4 : 24)) & 0x3FFu);
-            const int regionFix = static_cast<int>((clamp >> (columns ? 14 : 34)) & 0x3FFu);
-            last = std::max(last, regionMask | regionFix);
             return;
         }
         // REPEAT wraps out-of-range texels.
