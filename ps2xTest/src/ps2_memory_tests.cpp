@@ -802,6 +802,45 @@ void register_ps2_memory_tests()
             ps2GsResetEvents();
         });
 
+        tc.Run("GIF DMA stalled at a SIGNAL keeps its registers until STR=0 drops the stall", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            GSRegisters &regs = mem.gs();
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter = makeSignalingArbiter(regs, packets);
+            mem.setGifArbiter(&arbiter);
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kTag = 0x00039000u;
+            uint8_t *rdram = mem.getRDRAM();
+            writeDmaTag(rdram, kTag, makeDmaTag(2u, 7u, 0u));
+            writeU64(rdram, kTag + 16u, makeGifTag(1u, GIF_FMT_PACKED, 1u, true));
+            writeU64(rdram, kTag + 24u, 0xEull);
+            writeGifAd(rdram, kTag + 32u, makeSignal(2u, 2u), kGsSignalReg);
+
+            ps2GsPostEvent(regs, GsCpuEvent::Signal, 1u, 1u, 0u, 0u);
+            mem.writeIORegister(kGifCh + 0x30u, kTag);
+            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
+            t.IsTrue(mem.dmaChannelSignalStalled(kGifCh), "the channel stalls at the SIGNAL");
+
+            mem.writeIORegister(kGifCh + 0x10u, 0x1234560u);
+            mem.writeIORegister(kGifCh + 0x20u, 7u);
+            mem.writeIORegister(kGifCh + 0x30u, 0x40000u);
+            t.Equals(mem.readIORegister(kGifCh + 0x10u), kTag + 32u, "MADR ignores writes while stalled");
+            t.Equals(mem.readIORegister(kGifCh + 0x20u), 1u, "QWC ignores writes while stalled");
+            t.Equals(mem.readIORegister(kGifCh + 0x30u), kTag, "TADR ignores writes while stalled");
+
+            mem.writeIORegister(kGifCh + 0x00u, 0x004u);
+            t.IsFalse(mem.dmaChannelSignalStalled(kGifCh), "STR=0 drops the stall");
+            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u, "the channel reads idle");
+            mem.write32(kGsCsr, 0x1u);
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 1u, "a dropped stall does not resume on the acknowledge");
+            mem.setGifArbiter(nullptr);
+            ps2GsResetEvents();
+        });
+
         tc.Run("GIF DMA runs past a SIGNAL with PS2X_GS_SIGNAL_STALL off", [](TestCase &t)
         {
             PS2Memory mem;
