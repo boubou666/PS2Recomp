@@ -211,6 +211,20 @@ namespace ps2_stubs
         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
             return false;
 
+        // SET_SREG from the IOP is served by the EE kernel's sifcmd itself: header, then the register and its value,
+        // read back with sceSifGetSreg (EA's AUDIOPF.IRX hands the EE its buffer addresses this way).
+        constexpr uint32_t kSifCmdSetSreg = 0x80000001u;
+        if (commandId == kSifCmdSetSreg && packetSize >= 24u)
+        {
+            uint32_t reg = 0u;
+            uint32_t value = 0u;
+            std::memcpy(&reg, static_cast<const uint8_t *>(packet) + 16u, sizeof(reg));
+            std::memcpy(&value, static_cast<const uint8_t *>(packet) + 20u, sizeof(value));
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            g_sifSregs[reg] = value;
+            return true;
+        }
+
         // From the IOP thread (PS2Runtime::setIopThreaded): the handler is queued from the EE thread, which owns
         // the scheduler and the EE context the invocation starts from.
         if (!runtime->eeScheduler().onExecutorThread())

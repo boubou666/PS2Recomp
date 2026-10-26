@@ -27,6 +27,13 @@ namespace ps2x::iop::detail
         m_queueThreads.clear();
         m_nextDmaId = 1u;
         m_sifInitialized = false;
+        m_sregs.fill(0u);
+    }
+
+    void IopRpcBridge::setSreg(uint32_t reg, uint32_t value) noexcept
+    {
+        if (reg < m_sregs.size())
+            m_sregs[reg] = value;
     }
 
     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
@@ -189,10 +196,19 @@ namespace ps2x::iop::detail
             m_cmdHandlers.erase(cpu.gpr[4]);
             setV0(0);
             return true;
+        case 6: // sceSifGetSreg(reg)
+            setV0(cpu.gpr[4] < m_sregs.size() ? m_sregs[cpu.gpr[4]] : 0u);
+            return true;
+        case 7: // sceSifSetSreg(reg, value): returns the previous value
+        {
+            const uint32_t reg = cpu.gpr[4];
+            const uint32_t previous = reg < m_sregs.size() ? m_sregs[reg] : 0u;
+            setSreg(reg, cpu.gpr[5]);
+            setV0(previous);
+            return true;
+        }
         case 4: // InitCmd
         case 5:
-        case 6:
-        case 7:
         case 8:
         case 9:
         case 14: // InitRpc

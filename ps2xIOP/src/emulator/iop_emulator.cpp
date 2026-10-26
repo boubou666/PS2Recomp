@@ -1146,6 +1146,16 @@ namespace ps2x::iop::detail
         {
             if (!packet || size < 16u || size > kMaxSifCommandPacket)
                 return false;
+            // SET_SREG is served by the IOP kernel's sifcmd itself: header, then the register and its value.
+            if (cid == IopRpcBridge::kSifCmdSetSreg && size >= 24u)
+            {
+                uint32_t reg = 0u;
+                uint32_t value = 0u;
+                std::memcpy(&reg, static_cast<const uint8_t *>(packet) + 16u, sizeof(reg));
+                std::memcpy(&value, static_cast<const uint8_t *>(packet) + 20u, sizeof(value));
+                rpc.setSreg(reg, value);
+                return true;
+            }
             const auto handler = rpc.cmdHandler(cid);
             if (!handler)
                 return false;

@@ -1174,6 +1174,42 @@ int main()
         if (!expect(!iop.sendSifCommand(cmdId, packet, sizeof(packet)), "Unloading the IRX must drop its handler")) return 1;
     }
 
+    // EE SET_SREG (system command 0x80000001) needs no IRX handler: it sets an IOP software register that
+    // sceSifGetSreg reads back (EA's AUDIOPF.IRX polls register 0x1F during its boot handshake).
+    {
+        const uint32_t code[] = {
+            0x27BDFFE0u, // addiu sp, sp, -0x20
+            0xAFBF001Cu, // sw    ra, 0x1c(sp)
+            0x0C00400Du, // jal   0x10034 (sceSifGetSreg stub)
+            0x2404001Fu, // addiu a0, zero, 0x1f (delay slot)
+            0x8FBF001Cu, // lw    ra, 0x1c(sp)
+            0x00000000u, // nop   (load delay slot)
+            0x03E00008u, // jr    ra
+            0x27BD0020u, // addiu sp, sp, 0x20 (delay slot)
+            0x41E00000u, // IRX import magic
+            0x00000000u,
+            0x00000101u,
+            0x63666973u, // "sifc"
+            0x0000646Du, // "md"
+            0x03E00008u, // jr ra
+            0x24000006u, // addiu zero, zero, 6 (sceSifGetSreg)
+            0x00000000u,
+            0x00000000u,
+        };
+        writeCodeIrx(host, 0x100u, code, sizeof(code));
+        const ModuleLoadResult unset = iop.loadModuleBuffer(0x100u);
+        if (!expect(unset.handled && unset.startResult == 0, "An SREG nobody set must read 0")) return 1;
+        if (!expect(iop.stopModule(unset.moduleId, &stopResult), "SREG IRX stop failed")) return 1;
+
+        uint32_t packet[6]{};
+        packet[4] = 0x1Fu;
+        packet[5] = 0x00ABCDEFu;
+        if (!expect(iop.sendSifCommand(0x80000001u, packet, sizeof(packet)), "SET_SREG must be accepted without a handler")) return 1;
+        const ModuleLoadResult set = iop.loadModuleBuffer(0x100u);
+        if (!expect(set.handled && set.startResult == 0x00ABCDEF, "sceSifGetSreg must read the value SET_SREG wrote")) return 1;
+        if (!expect(iop.stopModule(set.moduleId, &stopResult), "SREG IRX stop failed")) return 1;
+    }
+
     constexpr uint32_t rpcSid = 0xF00DCAFEu;
     writeRpcServerIrx(host, 0x100u);
     const ModuleLoadResult rpcModule = iop.loadModuleBuffer(0x100u);

@@ -2,6 +2,7 @@
 
 #include "ps2x/iop/iop_types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -80,6 +81,11 @@ namespace ps2x::iop::detail
         };
         [[nodiscard]] std::optional<CmdHandler> cmdHandler(uint32_t cid) const;
 
+        // The IOP's 32 SIF software registers: sceSifGetSreg/sceSifSetSreg, and the EE's SET_SREG system command
+        // (0x80000001), which EA's AUDIOPF.IRX waits on to learn its EE buffer addresses.
+        static constexpr uint32_t kSifCmdSetSreg = 0x80000001u;
+        void setSreg(uint32_t reg, uint32_t value) noexcept;
+
     private:
         struct RpcServer
         {
@@ -101,5 +107,6 @@ namespace ps2x::iop::detail
         std::unordered_map<uint32_t, int> m_queueThreads; // sceSifSetRpcQueue: queue -> server thread
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
+        std::array<uint32_t, 32> m_sregs{};
     };
 }
