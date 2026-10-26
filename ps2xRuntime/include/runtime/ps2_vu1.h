@@ -47,6 +47,7 @@ struct Vu1Jit;
 class VU1Interpreter
 {
     friend struct Vu1Jit; // the recompiled blocks (ps2_vu1_jit.h) work on the interpreter's state directly
+    friend struct Vu1Lifted; // native code for loops of known microprograms (ps2_vu1_lifted.h)
 public:
     enum class Unit : uint8_t
     {
@@ -173,6 +174,20 @@ public:
         Unit unit = Unit::VU1; // the VU whose code memory it runs from
     };
     static void registerCompiledFragment(const CompiledFragment &fragment);
+    // Lifted microcode (ps2_vu1_lifted.h): `entry` runs in place of pair `pair` while the compiled fragment
+    // {firstPair, pairCount, codeHash} applies; *replaced gets the entry it stands in for (the compiled block), which
+    // it runs for what it leaves to the compiled code.
+    struct LiftedEntry
+    {
+        uint32_t firstPair = 0;
+        uint32_t pairCount = 0;
+        uint64_t codeHash = 0;
+        uint32_t pair = 0;
+        CompiledEntry entry = nullptr;
+        CompiledEntry *replaced = nullptr;
+        Unit unit = Unit::VU1;
+    };
+    static void registerLiftedEntry(const LiftedEntry &lifted);
     // Relaxed float mode of the recompiled VU1 microcode (ps2_vu_aot PS2X_VU_AOT_RELAXED=1, ps2_vu1_jit.h): VU1 runs
     // with the SSE denormals-are-zero and flush-to-zero modes, which give the PS2's zero for denormal operands and
     // results, and FMAC instructions are plain SSE operations clamped to +-FLT_MAX.

@@ -1021,6 +1021,31 @@ namespace
     }
 }
 
+namespace
+{
+    std::vector<VU1Interpreter::LiftedEntry> &liftedEntryRegistry()
+    {
+        static std::vector<VU1Interpreter::LiftedEntry> registry;
+        return registry;
+    }
+
+    // PS2X_VU_LIFTED=0 leaves lifted microcode out (the compiled blocks run instead).
+    bool liftedEntriesEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_VU_LIFTED");
+            return !(value && value[0] == '0');
+        }();
+        return enabled;
+    }
+}
+
+void VU1Interpreter::registerLiftedEntry(const LiftedEntry &lifted)
+{
+    liftedEntryRegistry().push_back(lifted);
+}
+
 void VU1Interpreter::registerCompiledFragment(const CompiledFragment &fragment)
 {
     // By length: refreshCompiledFragments() applies the longest matching fragment last (a whole program over the
@@ -1062,6 +1087,19 @@ void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t co
         if (m_compiledByPair.empty())
             m_compiledByPair.assign(pairCount, nullptr);
         std::copy_n(fragment.pairs, fragment.pairCount, m_compiledByPair.begin() + fragment.firstPair);
+    }
+    if (m_compiledByPair.empty() || !liftedEntriesEnabled())
+        return;
+    for (const LiftedEntry &lifted : liftedEntryRegistry())
+    {
+        if (lifted.unit != m_unit || lifted.firstPair + lifted.pairCount > pairCount || lifted.pair >= pairCount)
+            continue;
+        const auto range = std::find_if(rangeHashes.begin(), rangeHashes.end(), [&](const RangeHash &entry)
+                                        { return entry.firstPair == lifted.firstPair && entry.pairCount == lifted.pairCount; });
+        if (range == rangeHashes.end() || range->hash != lifted.codeHash || !m_compiledByPair[lifted.pair])
+            continue;
+        *lifted.replaced = m_compiledByPair[lifted.pair];
+        m_compiledByPair[lifted.pair] = lifted.entry;
     }
 }
 

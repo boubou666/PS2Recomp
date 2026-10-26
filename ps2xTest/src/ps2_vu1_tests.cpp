@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_inline.h"
 #include "runtime/ps2_vu_clip.h"
 
 #include <cmath>
@@ -1842,6 +1843,49 @@ void register_ps2_vu1_tests()
                      "reserved opcode should retain the diagnostic PC");
             t.Equals(vu1.state().vi[1], 0,
                      "instruction following a reserved opcode must not execute");
+        });
+
+        tc.Run("a lifted entry stands in for the compiled pair while its fragment applies", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(1u, 0u, 7), kVuUpperNop); // IADDIU vi1, vi0, 7
+            writeVuInstructionPair(fx.code, 8u, 0x8000033cu, 0x400002ffu);             // NOP, end
+            writeVuInstructionPair(fx.code, 16u, 0x8000033cu, kVuUpperNop);
+
+            static int compiledRuns = 0, liftedRuns = 0;
+            static VU1Interpreter::CompiledEntry replaced = nullptr;
+            static constexpr VU1Interpreter::DecodedInstructionPair kPair0 =
+                VU1Interpreter::decodePair(VU1Interpreter::Unit::VU1, (0x08u << 25) | (1u << 16) | 7u, kVuUpperNop);
+            static const VU1Interpreter::CompiledEntry kEntries[3] = {
+                [](VU1Interpreter &vu, const VU1Interpreter::RunContext &context)
+                {
+                    ++compiledRuns;
+                    return vu.stepPairInterpreted(kPair0, context);
+                },
+                nullptr, nullptr};
+            const uint64_t hash = VU1Interpreter::codeHash(fx.code, 24u);
+            VU1Interpreter::registerCompiledFragment({0u, 3u, hash, kEntries, VU1Interpreter::Unit::VU1});
+            VU1Interpreter::registerLiftedEntry(
+                {0u, 3u, hash, 0u,
+                 [](VU1Interpreter &vu, const VU1Interpreter::RunContext &context)
+                 {
+                     ++liftedRuns;
+                     return replaced(vu, context);
+                 },
+                 &replaced, VU1Interpreter::Unit::VU1});
+
+            VU1Interpreter vu1;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+            t.Equals(liftedRuns, 1, "the lifted entry runs at its pair");
+            t.Equals(compiledRuns, 1, "it gets the compiled entry it replaced");
+            t.Equals(vu1.state().vi[1], 7, "the program's result");
+
+            writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(1u, 0u, 9), kVuUpperNop); // other code: neither applies
+            VU1Interpreter other;
+            other.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+            t.Equals(liftedRuns, 1, "not for code it was not written for");
+            t.Equals(other.state().vi[1], 9, "the interpreter runs that code");
         });
     });
 }
