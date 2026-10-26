@@ -1814,6 +1814,31 @@ bool PS2Runtime::isTrivialReturnStub(uint32_t address) const
     return words[0] == 0x03E00008u && words[1] == 0u; // jr $ra; nop
 }
 
+const char *describeGuestInvocationKind(GuestInvocationKind kind)
+{
+    switch (kind)
+    {
+    case GuestInvocationKind::Interrupt:
+        return "Interrupt";
+    case GuestInvocationKind::Alarm:
+        return "Alarm";
+    case GuestInvocationKind::GsCallback:
+        return "GsCallback";
+    case GuestInvocationKind::RpcCallback:
+        return "RpcCallback";
+    case GuestInvocationKind::SyscallOverride:
+        return "SyscallOverride";
+    case GuestInvocationKind::ExitHandler:
+        return "ExitHandler";
+    case GuestInvocationKind::HleCall:
+        return "HleCall";
+    case GuestInvocationKind::SifCommand:
+        return "SifCommand";
+    default:
+        return "Unknown";
+    }
+}
+
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
 {
     switch (kind)
@@ -1978,7 +2003,15 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " source=0x" << std::hex << sourcePc
             << " target=0x" << targetPc
             << " pc=0x" << pc
-            << " ra=0x" << ra
+            << " thread=" << std::dec << eeScheduler().currentThreadId() << std::hex;
+        // A handler (interrupt, alarm, GS/RPC callback...) runs on its thread's invocation stack, innermost last.
+        if (const GuestThread *thread = eeScheduler().currentThread(); thread && !thread->invocations.empty())
+        {
+            const GuestInvocation &invocation = thread->invocations.back();
+            oss << " invocation=" << describeGuestInvocationKind(invocation.kind) << "/0x" << invocation.tag
+                << " depth=" << std::dec << thread->invocations.size() << std::hex;
+        }
+        oss << " ra=0x" << ra
             << " sp=0x" << sp
             << " gp=0x" << gp
             << " a0=0x" << a0
