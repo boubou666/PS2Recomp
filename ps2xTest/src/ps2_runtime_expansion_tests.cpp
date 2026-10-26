@@ -213,15 +213,13 @@ namespace
     constexpr uint32_t kMpegNoDuplicateImage = 0x00131000u;
     constexpr uint32_t kIpuInitMainPc = 0x00125100u;
     constexpr uint32_t kIpuInitResumePc = 0x00125104u;
-    constexpr uint32_t kIpuSetD4Pc = 0x00126428u;
+    constexpr uint32_t kIpuSetD4Pc = 0x00126428u; // one game's SetD4_CHCR helper, other code elsewhere
     std::atomic<uint32_t> gIpuSetD4Hits{0u};
-    std::atomic<uint32_t> gIpuSetD4Argument{0u};
     std::atomic<int32_t> gIpuInitResult{-999};
 
     void testIpuSetD4(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         gIpuSetD4Hits.fetch_add(1u, std::memory_order_acq_rel);
-        gIpuSetD4Argument.store(::getRegU32(ctx, 4), std::memory_order_release);
         ctx->pc = 0u;
     }
 
@@ -1121,7 +1119,7 @@ void register_ps2_runtime_expansion_tests()
                      "sceSdRemoteInit should restore idle voice status to complete");
         });
 
-        tc.Run("IPU init skips missing optional helper instead of dispatching the default trap", [](TestCase &t)
+        tc.Run("IPU init without guest code programs the IPU and returns", [](TestCase &t)
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
@@ -1131,14 +1129,14 @@ void register_ps2_runtime_expansion_tests()
             ps2_stubs::sceIpuInit(rdram.data(), &ctx, &runtime);
 
             t.IsFalse(runtime.isStopRequested(),
-                      "sceIpuInit should tolerate the missing optional SetD4 helper");
+                      "sceIpuInit should not stop the runtime");
             t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
                      "sceIpuInit should still program IPU_CTRL");
             t.Equals(runtime.memory().read32(0x10002000u), 0u,
                      "sceIpuInit should leave IPU_CMD reset after initialization");
         });
 
-        tc.Run("IPU init executes its guest helper as a scheduler invocation", [](TestCase &t)
+        tc.Run("IPU init sets D4_CHCR itself and runs no guest code at a fixed helper address", [](TestCase &t)
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
@@ -1146,7 +1144,6 @@ void register_ps2_runtime_expansion_tests()
             runtime.registerFunction(kIpuInitResumePc, testIpuInitResume);
             runtime.registerFunction(kIpuSetD4Pc, testIpuSetD4);
             gIpuSetD4Hits.store(0u, std::memory_order_release);
-            gIpuSetD4Argument.store(0u, std::memory_order_release);
             gIpuInitResult.store(-999, std::memory_order_release);
 
             R5900Context context{};
@@ -1154,14 +1151,14 @@ void register_ps2_runtime_expansion_tests()
             runtime.eeScheduler().reset(rdram.data(), context);
             runtime.eeScheduler().run();
 
-            t.Equals(gIpuSetD4Hits.load(std::memory_order_acquire), 1u,
-                     "the optional guest helper should execute exactly once through the dispatcher");
-            t.Equals(gIpuSetD4Argument.load(std::memory_order_acquire), 1u,
-                     "the invocation should receive the SetD4 enable argument");
+            t.Equals(gIpuSetD4Hits.load(std::memory_order_acquire), 0u,
+                     "the code at 0x126428 belongs to the game, not to libipu, and must not run");
+            t.Equals(runtime.memory().read32(0x1000B400u), 1u,
+                     "sceIpuInit should set D4_CHCR to 1 (from memory) like libipu's SetD4_CHCR(1)");
             t.Equals(gIpuInitResult.load(std::memory_order_acquire), 0,
-                     "the HLE completion should resume the preserved base context with success");
+                     "sceIpuInit should return 0 to its caller");
             t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
-                     "IPU initialization should finish only after the guest invocation completes");
+                     "sceIpuInit should program IPU_CTRL");
         });
 
         tc.Run("sprintf consumes EE varargs from a2 a3 t0 and preserves width formatting", [](TestCase &t)

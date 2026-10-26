@@ -1,6 +1,5 @@
 #include "Common.h"
 #include "IPU.h"
-#include "runtime/ee_scheduler.h"
 
 namespace
 {
@@ -9,7 +8,7 @@ namespace
     constexpr uint32_t REG_IPU_IN_FIFO = 0x10007010u;
     constexpr uint32_t IQVAL_BASE = 0x1721e0u;
     constexpr uint32_t VQVAL_BASE = 0x172230u;
-    constexpr uint32_t SETD4_CHCR_ENTRY = 0x126428u;
+    constexpr uint32_t REG_D4_CHCR = 0x1000B400u; // DMA channel 4, memory -> IPU (toIPU)
 
     void completeIpuInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -70,24 +69,11 @@ namespace ps2_stubs
             return;
         }
 
-        if (runtime->hasFunction(SETD4_CHCR_ENTRY))
-        {
-            EeScheduler &scheduler = runtime->eeScheduler();
-            scheduler.bindMainContextForSyscall(*ctx, rdram);
-            GuestInvocation invocation{};
-            invocation.kind = GuestInvocationKind::HleCall;
-            invocation.context = *ctx;
-            invocation.context.pc = SETD4_CHCR_ENTRY;
-            SET_GPR_U32(&invocation.context, 4, 1u);
-            SET_GPR_U32(&invocation.context, 29, 0u);
-            SET_GPR_U32(&invocation.context, 31, 0u);
-            invocation.onComplete = [rdram, runtime](const R5900Context &, R5900Context &parent)
-            {
-                completeIpuInit(rdram, &parent, runtime);
-            };
-            scheduler.invokeCurrent(std::move(invocation));
-        }
-
+        // libipu's sceIpuInit starts with its static SetD4_CHCR(1): D4_CHCR = 1 (direction from memory) with the
+        // DMA controller suspended around the write. That helper sits at a different address in every game, and the
+        // one this stub used to call (0x126428) is the middle of an unrelated function in other games (TTA: a draw
+        // method reached through a NULL object), so the stub writes the register itself.
+        runtime->memory().write32(REG_D4_CHCR, 1u);
         completeIpuInit(rdram, ctx, runtime);
     }
 
