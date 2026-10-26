@@ -516,8 +516,15 @@ namespace ps2x::iop::detail
                     counter->write();
             }
             if (const auto *traced = tracedPcs(); traced && traced->count(cpu.pc) != 0u)
-                std::fprintf(stderr, "[iop-pc] pc=0x%x v1=0x%x v0=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x\n", cpu.pc, cpu.gpr[3], cpu.gpr[2], cpu.gpr[4],
-                             cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[31]);
+            {
+                // With the context: running thread, cop0 status (interrupts enabled, in a handler), I_CTRL, and the
+                // depth of inline calls (RPC servers run from the EE's side), to tell who touches what when.
+                const IopThread *running = kernel.currentThread();
+                std::fprintf(stderr, "[iop-pc] pc=0x%x v1=0x%x v0=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x thread=%d status=0x%x ictrl=%u calls=%u cycle=%llu\n",
+                             cpu.pc, cpu.gpr[3], cpu.gpr[2], cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[31],
+                             running ? running->id : -1, cpu.cop0[12], memory.interruptControl(), callDepth,
+                             static_cast<unsigned long long>(totalCycles));
+            }
             if (nativeBitScan != 0u && physicalAddress(cpu.pc) == nativeBitScan && !cpu.branchPending)
             {
                 runNativeBitScan(cpu);
@@ -839,6 +846,34 @@ namespace ps2x::iop::detail
                 ++totalCycles;
         }
 
+        // The Ready threads an inline call as `owner` must wait for (executeGuestFunctionAsThread): a thread that ended
+        // its slice with interrupts disabled, then those at owner's priority or above, until they block. Bounded:
+        // a thread that never blocks would starve the server on the IOP too, but must not stall the EE.
+        void runThreadsAhead(const IopThread &owner, uint64_t deadline)
+        {
+            constexpr uint32_t kMaxSlicesAhead = 4096u; // ~1M IOP cycles
+            for (uint32_t slices = 0; slices < kMaxSlicesAhead && totalCycles < deadline; ++slices)
+            {
+                IopThread *ahead = resumeMaskedThread();
+                if (!ahead)
+                {
+                    ahead = kernel.readyAtOrAbove(owner.priority, owner.id);
+                    if (!ahead)
+                        return;
+                    static uint32_t reported = 0u;
+                    if (slices == 0u && reported++ < 5u)
+                        std::fprintf(stderr, "[iop:call] thread %d (priority %u) runs before an inline call as thread %d (priority %u)\n",
+                                     ahead->id, ahead->priority, owner.id, owner.priority);
+                    kernel.beginThread(*ahead);
+                }
+                const uint64_t before = totalCycles;
+                runCpu(ahead->cpu, kDefaultSlice);
+                endTimeslice(*ahead);
+                if (totalCycles == before)
+                    ++totalCycles;
+            }
+        }
+
         [[nodiscard]] bool runOthersUntilRunnable(IopThread &owner, uint64_t deadline)
         {
             while (!threadRunnable(owner))
@@ -941,19 +976,64 @@ namespace ps2x::iop::detail
 
             // Bound the wait in IOP time so a server that never gets woken cannot hang the EE.
             constexpr uint64_t kMaxBlockedCycles = 36'864'000ull * 20ull; // 20 s of IOP clock
+            const uint64_t deadline = totalCycles + kMaxBlockedCycles;
+            // On the IOP the server's thread only gets the CPU once the Ready threads that outrank it or tie with it
+            // have blocked: no thread preempts one of equal or higher priority. The inline call used to run at once,
+            // in the middle of whatever such a thread was doing when its slice ended: 989snd's voice thread was
+            // unlinking a voice when its command server, called inline, appended it again; the active-voice list
+            // looped on itself and the game froze in snd_SendIOPCommandNoWait.
+            runThreadsAhead(*owner, deadline);
             IopThread *previous = kernel.currentThread();
             const IopThreadState ownerState = owner->state;
-            const uint64_t deadline = totalCycles + kMaxBlockedCycles;
             uint32_t blocks = 0u;
             bool timedOut = false;
             kernel.setCurrentThread(owner);
             owner->state = IopThreadState::Running;
             uint32_t preemptions = 0u;
+            // A server that keeps running for hundreds of slices is stuck: where its pc spends the time, and the
+            // return addresses on its stack (the call chain), once, to see what it waits for.
+            std::map<uint32_t, uint32_t> stuckPcs;
+            const auto moduleOf = [&](uint32_t pc) -> std::pair<const Module *, uint32_t>
+            {
+                const uint32_t physical = pc & 0x1FFFFFu;
+                for (const auto &[id, module] : modules)
+                    if (physical >= module.base && physical < module.base + module.size)
+                        return {&module, physical - module.base};
+                return {nullptr, physical};
+            };
             for (;;)
             {
                 runCpu(cpu, preemptions == 0u ? serverCallBudget : kDefaultSlice);
                 if (cpu.stopped)
                     break;
+                if (preemptions >= 200u && preemptions < 1200u)
+                    ++stuckPcs[cpu.pc];
+                if (preemptions == 1200u)
+                {
+                    std::fprintf(stderr, "[iop:call] 0x%x as thread %d stuck (a0 0x%x a1 0x%x a2 0x%x a3 0x%x): pc 0x%x ra 0x%x sp 0x%x\n",
+                                 address, threadId, a0, a1, a2, a3, cpu.pc, cpu.gpr[31], cpu.gpr[29]);
+                    std::vector<std::pair<uint32_t, uint32_t>> hot(stuckPcs.begin(), stuckPcs.end());
+                    std::sort(hot.begin(), hot.end(), [](const auto &l, const auto &r) { return l.second > r.second; });
+                    for (size_t i = 0; i < hot.size() && i < 12u; ++i)
+                    {
+                        const auto [module, offset] = moduleOf(hot[i].first);
+                        std::fprintf(stderr, "[iop:call]   pc 0x%x (%s+0x%x) at the end of %u of 1000 slices\n", hot[i].first,
+                                     module ? module->name.c_str() : "?", offset, hot[i].second);
+                    }
+                    std::fprintf(stderr, "[iop:call]   code addresses on its stack:");
+                    for (uint32_t at = cpu.gpr[29]; at < cpu.gpr[29] + 0x400u; at += 4u)
+                    {
+                        const uint32_t word = memory.read32(at);
+                        const auto [module, offset] = moduleOf(word);
+                        if (module && (word & 3u) == 0u)
+                            std::fprintf(stderr, " [sp+0x%x] %s+0x%x", at - cpu.gpr[29], module->name.c_str(), offset);
+                    }
+                    std::fputc('\n', stderr);
+                    std::fprintf(stderr, "[iop:call]   registers:");
+                    for (int r = 1; r < 32; ++r)
+                        std::fprintf(stderr, " r%d=0x%x", r, cpu.gpr[r]);
+                    std::fputc('\n', stderr);
+                }
                 if (!cpu.yielded)
                 {
                     // A whole budget without blocking: the server polls for something another thread or an event

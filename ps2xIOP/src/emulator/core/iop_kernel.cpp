@@ -706,6 +706,19 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
+    IopThread *IopKernel::readyAtOrAbove(uint32_t priority, int excluded) noexcept
+    {
+        IopThread *best = nullptr;
+        for (auto &[id, thread] : m_threads)
+        {
+            if (id == excluded || thread.state != IopThreadState::Ready || thread.priority > priority)
+                continue;
+            if (best == nullptr || thread.priority < best->priority || (thread.priority == best->priority && id < best->id))
+                best = &thread;
+        }
+        return best;
+    }
+
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle, uint64_t *nextDelayWake)
     {
         // One pass: wake due delays, pick the best ready thread, and note the earliest pending wake.

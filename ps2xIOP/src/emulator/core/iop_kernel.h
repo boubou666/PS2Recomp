@@ -64,6 +64,9 @@ namespace ps2x::iop::detail
 
         // nextDelayWake (optional) receives the earliest wake cycle of the threads still delayed.
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle, uint64_t *nextDelayWake = nullptr);
+        // The best Ready thread at `priority` or above (numerically at most), `excluded` aside: one the IOP would run
+        // before a thread of that priority (no thread preempts one of equal or higher priority).
+        [[nodiscard]] IopThread *readyAtOrAbove(uint32_t priority, int excluded) noexcept;
         void beginThread(IopThread &thread) noexcept;
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
