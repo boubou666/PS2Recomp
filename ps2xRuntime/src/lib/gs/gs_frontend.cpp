@@ -1194,6 +1194,15 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         request.vsyncTick = displayRegisters->vsyncTick;
         request.smode1 = displayRegisters->smode1;
     }
+    {
+        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        if (request.dispfb1 != m_lastLatchedDispfb1 || request.dispfb2 != m_lastLatchedDispfb2)
+        {
+            m_displayFlips.fetch_add(1u, std::memory_order_relaxed);
+            m_lastLatchedDispfb1 = request.dispfb1;
+            m_lastLatchedDispfb2 = request.dispfb2;
+        }
+    }
 
     PresentationFrame frame{};
     {

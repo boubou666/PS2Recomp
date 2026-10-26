@@ -475,6 +475,45 @@ namespace
 
 bool latchPresentationOnVBlank(); // Kernel/EeScheduler.cpp
 
+// PS2X_SHOW_FPS=1, F3 toggles it: the game's frame rate at the top right of the window over the last half second,
+// from the frames its game layer reports (PS2Runtime::noteGameFrame) or else from the pictures it shows
+// (GS::displayFlips: the display buffer moving between vblanks). Not the host's redraws, which follow the monitor.
+static void DrawFpsOverlay(uint64_t gameFrames, uint64_t displayFlips, float screenWidth, float screenHeight)
+{
+    static bool s_visible = []
+    {
+        const char *value = std::getenv("PS2X_SHOW_FPS");
+        return value && *value == '1';
+    }();
+    if (IsKeyPressed(KEY_F3))
+        s_visible = !s_visible;
+    static auto s_windowStart = std::chrono::steady_clock::now();
+    static uint64_t s_windowFrames = gameFrames, s_windowFlips = displayFlips;
+    static double s_fps = 0.0;
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - s_windowStart).count();
+    if (elapsed >= 0.5)
+    {
+        const uint64_t frames = gameFrames != s_windowFrames ? gameFrames - s_windowFrames : displayFlips - s_windowFlips;
+        s_fps = static_cast<double>(frames) / elapsed;
+        s_windowStart = now;
+        s_windowFrames = gameFrames;
+        s_windowFlips = displayFlips;
+    }
+    if (!s_visible)
+        return;
+
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f fps", s_fps);
+    const int fontSize = std::max(18, static_cast<int>(screenHeight / 28.0f));
+    const int padding = fontSize / 3;
+    const int textWidth = MeasureText(text, fontSize);
+    const int x = static_cast<int>(screenWidth) - textWidth - 2 * padding;
+    DrawRectangle(x - padding, padding, textWidth + 2 * padding, fontSize + padding, Fade(BLACK, 0.6f));
+    const Color color = s_fps >= 47.0 ? GREEN : s_fps >= 30.0 ? YELLOW : RED;
+    DrawText(text, x, padding + padding / 2, fontSize, color);
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -3252,6 +3291,7 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), screenWidth, screenHeight);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

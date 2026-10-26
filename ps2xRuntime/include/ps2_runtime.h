@@ -431,6 +431,11 @@ public:
     void requestStop();
     bool isStopRequested() const;
 
+    // A game layer that knows where the game's frame ends reports each one here: the fps overlay (PS2X_SHOW_FPS)
+    // counts them, and counts display buffer flips (GS::displayFlips) for games that report nothing.
+    void noteGameFrame() { m_gameFrames.fetch_add(1u, std::memory_order_relaxed); }
+    uint64_t gameFrames() const { return m_gameFrames.load(std::memory_order_relaxed); }
+
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
     void postEeEvent(EeEvent event);
@@ -583,6 +588,7 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<uint64_t> m_gameFrames{0};
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

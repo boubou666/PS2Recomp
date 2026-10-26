@@ -164,6 +164,9 @@ public:
     void queueHostPresentationLatch();
     // Latches queueHostPresentationLatch() asked for that are done (the frame is presented).
     uint64_t queuedLatchesDone() const { return m_queuedLatchesDone.load(std::memory_order_acquire); }
+    // Pictures the game has shown: latches whose display buffer (DISPFB1/2) moved since the previous latch, as
+    // double buffering flips it every frame. The game's frame rate, for the fps overlay (PS2X_SHOW_FPS).
+    uint64_t displayFlips() const { return m_displayFlips.load(std::memory_order_relaxed); }
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -259,6 +262,8 @@ private:
     GSPresentationRequest buildPresentationRequestUnlocked() const;
     void latchHostPresentationFrame(const GSPresentationRequest *displayRegisters);
     std::atomic<uint64_t> m_queuedLatchesDone{0};
+    std::atomic<uint64_t> m_displayFlips{0};
+    uint64_t m_lastLatchedDispfb1 = 0, m_lastLatchedDispfb2 = 0; // under m_presentationMutex
 
 
     GSContext &activeContext();
