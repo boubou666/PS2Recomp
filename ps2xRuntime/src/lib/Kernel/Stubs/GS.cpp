@@ -1073,18 +1073,21 @@ namespace ps2_stubs
 
         uint32_t fbw = (w + 63) / 64;
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        // Like libgraph: scale to the 2560-clock NTSC line (MAGH), and offset
-        // from the standard NTSC origin (DX 652, DY 50 for interlaced output).
-        const uint32_t magh = std::clamp<uint32_t>(2560u / w, 1u, 16u) - 1u;
-        const int32_t sdx = static_cast<int16_t>(dx & 0xFFFFu);
-        const int32_t sdy = static_cast<int16_t>(dy & 0xFFFFu);
-        const uint32_t displayX = static_cast<uint32_t>(652 + sdx * static_cast<int32_t>(magh + 1u));
-        const uint32_t displayY = static_cast<uint32_t>(50 + sdy);
         // PMODE: read circuit 2 on, CRTMD=1, alpha from ALP, output alpha from
         // circuit 1 (SCE_GS_SET_PMODE(0, 1, 1, 1, 0, 0)). SMODE2 keeps the
         // interlace/field mode programmed by sceGsResetGraph.
         constexpr uint64_t kDefaultPmode = 0x66u;
         const uint64_t smode2 = runtime ? (runtime->memory().gs().smode2 & 0x3u) : 0x1u;
+        // Like libgraph: scale to the 2560-clock line (MAGH) and offset from the standard origin (NTSC DX 652,
+        // DY 50; PAL DX 656, DY 72, as in VP2's libgraph; half DY without interlace).
+        constexpr uint32_t kGsModePal = 3u;
+        const bool pal = g_gparam.omode == kGsModePal;
+        const uint32_t magh = std::clamp<uint32_t>(2560u / w, 1u, 16u) - 1u;
+        const int32_t sdx = static_cast<int16_t>(dx & 0xFFFFu);
+        const int32_t sdy = static_cast<int16_t>(dy & 0xFFFFu);
+        const int32_t originY = (pal ? 72 : 50) / ((smode2 & 0x1u) != 0u ? 1 : 2);
+        const uint32_t displayX = static_cast<uint32_t>((pal ? 656 : 652) + sdx * static_cast<int32_t>(magh + 1u));
+        const uint32_t displayY = static_cast<uint32_t>(originY + sdy);
         // DH counts frame lines. In interlaced FRAME mode (INT=1, FFMD=1) both fields show every line of an
         // h-line buffer, so the display is 2h lines high (Twisted Metal: Black's matches: 640x256 buffers, DH 511).
         const uint32_t displayLines = smode2 == 0x3u ? h * 2u : h;

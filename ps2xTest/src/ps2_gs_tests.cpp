@@ -4951,6 +4951,43 @@ void register_ps2_gs_tests()
                                     "sceGsResetGraph should free its temporary GIF packet");
         });
 
+        tc.Run("sceGsSetDefDispEnv starts PAL output at the PAL origin", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+
+            R5900Context resetCtx{};
+            setRegU32(resetCtx, 4, 0u);
+            setRegU32(resetCtx, 5, 1u); // SCE_GS_INTERLACE
+            setRegU32(resetCtx, 6, 3u); // SCE_GS_PAL
+            setRegU32(resetCtx, 7, 1u); // SCE_GS_FRAME
+            ps2_stubs::sceGsResetGraph(rdram.data(), &resetCtx, &runtime);
+
+            constexpr uint32_t kEnvAddr = 0x00100000u;
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            setRegU32(ctx, 5, 1u);   // PSMCT24
+            setRegU32(ctx, 6, 640u);
+            setRegU32(ctx, 7, 256u); // one field's worth of lines, shown in both fields
+            setRegU32(ctx, 8, 0u);
+            setRegU32(ctx, 9, 0u);
+            ps2_stubs::sceGsSetDefDispEnv(rdram.data(), &ctx, &runtime);
+
+            uint64_t smode2 = 0u;
+            uint64_t display = 0u;
+            std::memcpy(&smode2, rdram.data() + kEnvAddr + 8u, sizeof(smode2));
+            std::memcpy(&display, rdram.data() + kEnvAddr + 24u, sizeof(display));
+            t.Equals(smode2, static_cast<uint64_t>(3u), "SMODE2 should keep interlaced frame mode");
+            t.Equals(static_cast<uint32_t>((display >> 44) & 0x7FFu), 511u, "DH should cover 2h output lines");
+            t.Equals(static_cast<uint32_t>((display >> 32) & 0xFFFu), 2559u, "DW should span the 2560-clock line");
+            t.Equals(static_cast<uint32_t>(display & 0xFFFu), 656u, "DX should start at the PAL origin");
+            t.Equals(static_cast<uint32_t>((display >> 12) & 0x7FFu), 72u, "DY should start at the PAL origin");
+
+            setRegU32(resetCtx, 6, 2u); // back to the default NTSC mode for the tests that follow
+            ps2_stubs::sceGsResetGraph(rdram.data(), &resetCtx, &runtime);
+        });
+
         tc.Run("sceGsSyncV resumes through the scheduler with deterministic field parity", [](TestCase &t)
         {
             PS2Runtime runtime;
