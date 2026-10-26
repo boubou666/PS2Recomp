@@ -39,20 +39,7 @@ namespace ps2recomp
         CodeGenerator &cg = m_codeGenerator;
         std::stringstream ss;
         cg.m_currentFunctionName = function.name;
-
-        if (useHeaders)
-        {
-            ss << "#include <stdexcept>\n";
-            ss << "#include \"ps2_runtime_macros.h\"\n";
-            ss << "#include \"ps2_runtime.h\"\n";
-            ss << "#include <" << cg.functionsHeaderName() << ">\n";
-            ss << "#include <" << cg.stubsHeaderName() << ">\n\n";
-            ss << "#include \"ps2_syscalls.h\"\n";
-            ss << "#include \"ps2_stubs.h\"\n\n";
-            ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
-            ss << "#include \"ps2_log.h\"\n";
-            ss << "#endif\n\n";
-        }
+        cg.m_referencedFunctions.clear();
 
         CodeGenerator::AnalysisResult analysisResult = cg.collectInternalBranchTargets(function, instructions);
         std::vector<uint32_t> resumeTargets(analysisResult.resumeEntryPoints.begin(),
@@ -234,6 +221,33 @@ namespace ps2recomp
         }
 
         ss << "}\n";
-        return ss.str();
+
+        if (!useHeaders)
+        {
+            return ss.str();
+        }
+
+        // The body is known now: declare the generated functions it calls by name (a few files out of tens of
+        // thousands; the rest dispatch by address) rather than including the header that declares all of them.
+        std::stringstream file;
+        file << "#include <stdexcept>\n";
+        file << "#include \"ps2_runtime_macros.h\"\n";
+        file << "#include \"ps2_runtime.h\"\n";
+        file << "#include <" << cg.stubsHeaderName() << ">\n\n";
+        file << "#include \"ps2_syscalls.h\"\n";
+        file << "#include \"ps2_stubs.h\"\n\n";
+        file << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
+        file << "#include \"ps2_log.h\"\n";
+        file << "#endif\n\n";
+        for (const std::string &name : cg.m_referencedFunctions)
+        {
+            file << "void " << name << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+        }
+        if (!cg.m_referencedFunctions.empty())
+        {
+            file << "\n";
+        }
+        file << ss.str();
+        return file.str();
     }
 }

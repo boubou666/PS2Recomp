@@ -22,14 +22,14 @@ namespace ps2recomp
             ss << "    case " << index << ": {\n";
 
             std::string funcName = getFunctionName(target);
-            if (!funcName.empty())
+            if (funcName.empty())
             {
-                ss << "        " << funcName << "(rdram, ctx, runtime);\n";
+                std::stringstream fallbackName;
+                fallbackName << "func_" << std::hex << target;
+                funcName = fallbackName.str();
             }
-            else
-            {
-                ss << "        func_" << std::hex << target << std::dec << "(rdram, ctx,  runtime);\n";
-            }
+            m_referencedFunctions.insert(funcName);
+            ss << "        " << funcName << "(rdram, ctx, runtime);\n";
 
             ss << "        return;\n";
             ss << "    }\n";

@@ -182,8 +182,8 @@ void register_code_generator_tests()
         const std::string generated = gen.generateFunction(func, {makeNop(func.start)}, true);
         const std::string registration = gen.generateFunctionRegistration({func}, {});
 
-        t.IsTrue(generated.find("#include <ps2_recompiled_functions.h>") != std::string::npos,
-                 "function sources must resolve declarations through the configured include path");
+        t.IsTrue(generated.find("ps2_recompiled_functions.h") == std::string::npos,
+                 "function sources declare only what they call: a change to the function list must not rebuild them all");
         t.IsTrue(generated.find("#include <ps2_recompiled_stubs.h>") != std::string::npos,
                  "function sources must resolve stub declarations through the configured include path");
         t.IsTrue(registration.find("#include <ps2_recompiled_functions.h>") != std::string::npos,

@@ -193,8 +193,8 @@ void register_ps2_overlay_module_tests()
             const std::string generated = gen.generateFunction(func, {nop}, true);
             const std::string registration = gen.generateFunctionRegistration({func}, {});
 
-            t.IsTrue(generated.find("#include <mod7_functions.h>") != std::string::npos,
-                     "function sources should include the module header");
+            t.IsTrue(generated.find("mod7_functions.h") == std::string::npos,
+                     "function sources declare only what they call, not the whole module header");
             t.IsTrue(generated.find("#include <mod7_stubs.h>") != std::string::npos,
                      "function sources should include the module stub header");
             t.IsTrue(registration.find("#include \"ps2_overlay_modules.h\"") != std::string::npos,
