@@ -90,6 +90,21 @@ void register_ps2_vu_tests()
                      "a freshly constructed context must see VF00 = (0, 0, 0, 1)");
         });
 
+        tc.Run("FmacFlags_zero_sign_overflow_per_dest_field", [](TestCase &t)
+        {
+            uint32_t mac = 0xFFFFu;
+            uint16_t status = 0x0034u; // U (stale), I, D
+            // x = 1, y = -2, z = 0, w = -0 (not written: dest xyz)
+            ps2Vu0FmacFlags(mac, status, _mm_setr_ps(1.0f, -2.0f, 0.0f, -0.0f), 0xEu);
+            t.Equals(mac, 0x0042u, "MAC: Z for z (bit 1), S for y (bit 6), nothing for the masked w");
+            t.Equals(status, static_cast<uint16_t>(0x00F3u), "status: Z, S and their sticky bits; I/D kept, U cleared");
+
+            const float max = std::bit_cast<float>(0xFFFFFFFFu); // -max: an overflowed result
+            ps2Vu0FmacFlags(mac, status, _mm_setr_ps(max, 1.0f, 1.0f, 1.0f), 0xFu);
+            t.Equals(mac, 0x8080u, "MAC: O and S for x (bits 15 and 7)");
+            t.Equals(status, static_cast<uint16_t>(0x02FAu), "status: S and O now, sticky Z/S/O kept");
+        });
+
         tc.Run("MulVector_componentwise", [](TestCase &t)
         {
             VuEnv env;

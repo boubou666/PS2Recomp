@@ -1864,6 +1864,23 @@ void register_code_generator_tests()
                      "VCLIP must shift in the shared judgement of Ft.w");
         });
 
+        tc.Run("VU0 macro FMAC instructions set the MAC and status flags, MAX does not", [](TestCase &t) {
+            R5900Decoder decoder;
+            CodeGenerator gen({}, {});
+            // Drakengard's point-in-box test: the result goes to vf0, only the flags (CFC2 vi17) matter.
+            const std::string sub = gen.translateInstruction(decoder.decodeInstruction(0x1CBCC0u, 0x4BEC682Cu));
+            printGeneratedCode("vsub.xyzw $vf0, $vf13, $vf12", sub);
+            t.IsTrue(sub.find("ps2Vu0FmacFlags(ctx->vu0_mac_flags, ctx->vu0_status, res, 15u); }") != std::string::npos,
+                     "VSUB must set the flags of all four fields inside its block: " + sub);
+            const std::string mula = gen.translateInstruction(decoder.decodeInstruction(0x1000u, 0x4BE209BCu));
+            printGeneratedCode("vmulax.xyzw $ACC, $vf1, $vf2x", mula);
+            t.IsTrue(mula.find("ps2Vu0FmacFlags(ctx->vu0_mac_flags, ctx->vu0_status, res, 15u)") != std::string::npos,
+                     "the ACC forms set the flags too: " + mula);
+            const std::string max = gen.translateInstruction(decoder.decodeInstruction(0x1000u, 0x4BE208EBu));
+            printGeneratedCode("vmax.xyzw $vf3, $vf1, $vf2", max);
+            t.IsTrue(max.find("ps2Vu0FmacFlags") == std::string::npos, "MAX leaves the flags alone: " + max);
+        });
+
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
             Function func;
             func.name = "jal_test";

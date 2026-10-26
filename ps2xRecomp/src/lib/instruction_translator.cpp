@@ -125,6 +125,16 @@ namespace ps2recomp
     std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
         std::string code = translateUnchecked(inst, memoryHint);
+        // VU0 macro FMAC instructions (ADD/SUB/MUL/MADD/MSUB/OPMULA/OPMSUB and their ACC forms; every one computes
+        // `res` with PS2_VADD/VSUB/VMUL) set the MAC and status flags, which games read with CFC2 vi17/vi16 for
+        // sign tests (Drakengard: VSUB into vf0, then the MAC sign bits as an inside/outside test).
+        if (code.find("__m128 res = PS2_V") != std::string::npos)
+        {
+            const size_t blockEnd = code.rfind('}');
+            if (blockEnd != std::string::npos)
+                code.insert(blockEnd, fmt::format("ps2Vu0FmacFlags(ctx->vu0_mac_flags, ctx->vu0_status, res, {}u); ",
+                                                  static_cast<unsigned>(inst.vectorInfo.vectorField)));
+        }
         // VU0 vf0 is hard-wired to (0, 0, 0, 1); games use it as a discard destination (e.g. VSUB into
         // vf0 just to set flags). Undo any emitted write so later reads of vf0 stay constant.
         if (code.find("ctx->vu0_vf[0] =") != std::string::npos || code.find("ctx->vu0_vf[0]=") != std::string::npos)

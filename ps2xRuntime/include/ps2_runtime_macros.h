@@ -518,6 +518,23 @@ inline __m128 ps2_vmul(__m128 a, __m128 b)
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
+// MAC and status flags of a VU0 macro FMAC result, for the fields in dest (bit 3 = x .. bit 0 = w). MAC: Z in
+// bits 0-3, S in 4-7, O in 12-15, x in the highest bit of each group. Status: Z/S/O in bits 0, 1, 3 and their
+// sticky copies in 6, 7, 9. An overflow shows as a +-max result (0x7FFFFFFF); underflows are not seen (the result
+// is already flushed to zero, which sets Z), so U stays clear.
+inline void ps2Vu0FmacFlags(uint32_t &mac, uint16_t &status, __m128 res, uint32_t dest)
+{
+    // _mm_movemask_ps puts x in bit 0; the flag registers want it in bit 3.
+    static constexpr uint8_t kLanesToFields[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    const __m128i magnitude = _mm_and_si128(_mm_castps_si128(res), _mm_set1_epi32(0x7FFFFFFF));
+    const uint32_t zero = kLanesToFields[_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128())))] & dest;
+    const uint32_t sign = kLanesToFields[_mm_movemask_ps(res)] & dest;
+    const uint32_t over = kLanesToFields[_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(magnitude, _mm_set1_epi32(0x7FFFFFFF))))] & dest;
+    mac = zero | (sign << 4) | (over << 12);
+    const uint16_t current = static_cast<uint16_t>((zero ? 0x1u : 0u) | (sign ? 0x2u : 0u) | (over ? 0x8u : 0u));
+    status = static_cast<uint16_t>((status & ~0x000Fu) | current | (current << 6));
+}
+
 // Memory access helpers - Hybrid Fast/Slow Path
 // Fast path: Direct RDRAM access (masked).
 // Slow path: Full runtime->Load/Store
