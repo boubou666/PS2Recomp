@@ -636,6 +636,20 @@ namespace
 #endif
     }
 
+    // Spins until done() holds, then yields between checks: with more busy threads than cores (more workers, or the
+    // game's own threads), a worker spinning on one that has no core to finish on stalls both for whole time slices.
+    template <typename Done>
+    void spinUntil(Done done)
+    {
+        for (uint32_t spin = 0; !done(); ++spin)
+        {
+            if (spin < 4096u)
+                cpuRelax();
+            else
+                std::this_thread::yield();
+        }
+    }
+
     // Page size in pixels of a pixel storage format (the H formats live in CT32 pages).
     void pageGeometry(uint32_t psm, uint32_t &width, uint32_t &height)
     {
@@ -2142,8 +2156,7 @@ GSCpuBackend::QueuedPrimitive &GSCpuBackend::ReserveQueueSlotUnlocked()
     for (uint32_t i = 0; i < m_workerCount; ++i)
     {
         // Ring full: wait for the slowest worker to free the slot.
-        while (tail - m_workerProgress[i].done.load(std::memory_order_acquire) >= kQueueSize)
-            cpuRelax();
+        spinUntil([&]() { return tail - m_workerProgress[i].done.load(std::memory_order_acquire) < kQueueSize; });
     }
     QueuedPrimitive &item = m_queue[tail & (kQueueSize - 1u)];
     // A slot keeps its upload buffer when reused; left alone, every slot would end up holding
@@ -2283,8 +2296,7 @@ void GSCpuBackend::DrainUnlocked() const
     const uint64_t tail = m_queueTail.load(std::memory_order_acquire);
     for (uint32_t i = 0; i < m_workerCount; ++i)
     {
-        while (m_workerProgress[i].done.load(std::memory_order_acquire) < tail)
-            cpuRelax();
+        spinUntil([&]() { return m_workerProgress[i].done.load(std::memory_order_acquire) >= tail; });
     }
     g_drainNanoseconds.fetch_add(static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
@@ -2422,8 +2434,7 @@ void GSCpuBackend::WorkerMain(uint32_t index)
             {
                 for (uint32_t other = 0; other < m_workerCount; ++other)
                 {
-                    while (m_workerProgress[other].done.load(std::memory_order_acquire) < next)
-                        cpuRelax();
+                    spinUntil([&]() { return m_workerProgress[other].done.load(std::memory_order_acquire) >= next; });
                 }
                 // It samples what earlier primitives drew: cached pages and decoded copies may be
                 // out of date. (The immediate rasterizer's single page cache keeps written pages
