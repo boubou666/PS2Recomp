@@ -17,6 +17,7 @@ extern "C"
 #endif
 
 #include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <numeric>
 #include <sstream>
@@ -2606,6 +2607,17 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+        // PS2X_MPEG_SKIP=1 (testing): a movie ends once its first picture is shown.
+        static const bool skipMovies = []
+        {
+            const char *value = std::getenv("PS2X_MPEG_SKIP");
+            return value && value[0] == '1';
+        }();
+        if (skipMovies && playback.picturesServed > 0u)
+        {
+            setReturnS32(ctx, 1);
+            return;
+        }
         // Only the producer/demux EOF is authoritative. A sequence_end_code can
         // be observed while more PSS data is still buffered, and a decoder
         // failure before producer EOF may still recover on a later sequence.
