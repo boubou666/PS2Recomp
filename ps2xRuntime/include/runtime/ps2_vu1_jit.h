@@ -353,10 +353,11 @@ struct Vu1Jit
     // ---- Upper ----
     // An FMAC instruction whose flags no reader sees (kHintFlagsUnobserved): execUpper's result, normalized as
     // fmacFlags() does (its fast check first, then fmacFlagsWith on the operands), into target.
-    // execUpper's FMAC result, with the normalized operands fmacFlagsWith takes.
+    // execUpper's FMAC result, with the normalized operands fmacFlagsWith takes. Returned as a value: through
+    // memory, every dependent FMAC would wait for a store to forward.
     template <uint32_t kUpper, uint8_t kHints>
-    static PS2X_VU_INLINE void fmacResult(Vu &vu, float *result, __m128 vs, __m128 vt, __m128 acc, __m128 &left,
-                                          __m128 &right, __m128 &a)
+    static PS2X_VU_INLINE __m128 fmacResult(Vu &vu, __m128 vs, __m128 vt, __m128 acc, __m128 &left, __m128 &right,
+                                            __m128 &a)
     {
         constexpr FmacOperation kOperation = ps2_vu1_detail::decodeFmacOperation(kUpper);
         left = normalized<(kHints & Vu::kKnownNormalFs) != 0u>(vs);
@@ -373,18 +374,18 @@ struct Vu1Jit
         a = kProductSum ? normalized<(kHints & Vu::kKnownNormalAcc) != 0u>(acc) : _mm_setzero_ps();
 
         if constexpr (kOperation.kind == FmacKind::Add)
-            _mm_store_ps(result, ps2_vu1_detail::vuAdd4(left, right));
+            return ps2_vu1_detail::vuAdd4(left, right);
         else if constexpr (kOperation.kind == FmacKind::Sub)
-            _mm_store_ps(result, ps2_vu1_detail::vuAdd4(left, ps2_vu1_detail::negate4(right)));
+            return ps2_vu1_detail::vuAdd4(left, ps2_vu1_detail::negate4(right));
         else if constexpr (kOperation.kind == FmacKind::Mul)
-            _mm_store_ps(result, _mm_mul_ps(left, right));
+            return _mm_mul_ps(left, right);
         else if constexpr (kOperation.kind == FmacKind::Madd)
-            _mm_store_ps(result, ps2_vu1_detail::vuAdd4(a, _mm_mul_ps(left, right)));
+            return ps2_vu1_detail::vuAdd4(a, _mm_mul_ps(left, right));
         else if constexpr (kOperation.kind == FmacKind::Msub)
-            _mm_store_ps(result, ps2_vu1_detail::vuAdd4(a, ps2_vu1_detail::negate4(_mm_mul_ps(left, right))));
+            return ps2_vu1_detail::vuAdd4(a, ps2_vu1_detail::negate4(_mm_mul_ps(left, right)));
         else
         {
-            alignas(16) float l[4], r[4], c[4];
+            alignas(16) float l[4], r[4], c[4], result[4];
             _mm_store_ps(l, left);
             _mm_store_ps(r, right);
             _mm_store_ps(c, a);
@@ -401,6 +402,7 @@ struct Vu1Jit
                 result[2] = ps2_vu1_detail::vuSub(c[2], l[0] * r[1]);
             }
             result[3] = 0.0f;
+            return _mm_load_ps(result);
         }
     }
 
@@ -414,11 +416,10 @@ struct Vu1Jit
         constexpr uint8_t kDest = (kUpper >> 21) & 0xFu;
         if constexpr (kDest == 0u)
             return;
-        alignas(16) float result[4];
         __m128 left, right, a;
-        fmacResult<kUpper, kHints>(vu, result, vs, vt, acc, left, right, a);
-        normalizeUnobserved<kOperation>(vu, result, kDest, left, right, a);
-        target = blend<kDest>(target, _mm_load_ps(result));
+        __m128 value = fmacResult<kUpper, kHints>(vu, vs, vt, acc, left, right, a);
+        normalizeUnobserved<kOperation>(vu, value, kDest, left, right, a);
+        target = blend<kDest>(target, value);
     }
 
     // An FMAC instruction whose flags a reader can see: fmacFlags() on the operands, the entry queued at its issue
@@ -432,7 +433,7 @@ struct Vu1Jit
             return;
         alignas(16) float result[4];
         __m128 left, right, a;
-        fmacResult<kUpper, kHints>(vu, result, vs, vt, acc, left, right, a);
+        _mm_store_ps(result, fmacResult<kUpper, kHints>(vu, vs, vt, acc, left, right, a));
         uint32_t mac = 0u, status = 0u, sticky = 0u;
         vu.fmacFlagsWith(
             result, kDest, kOperation, [&]() { return left; }, [&]() { return right; }, [&]() { return a; }, mac,
@@ -529,24 +530,24 @@ struct Vu1Jit
     }
 
     template <FmacOperation kOperation>
-    static PS2X_VU_INLINE void normalizeUnobserved(Vu &vu, float *result, uint8_t dest, __m128 left, __m128 right,
+    static PS2X_VU_INLINE void normalizeUnobserved(Vu &vu, __m128 &value, uint8_t dest, __m128 left, __m128 right,
                                                    __m128 acc)
     {
         // As fmacFlags() with kHintFlagsUnobserved: lanes with exponent 2..253, and zeros whose exact result is a
         // zero of the same sign, stay as they are.
         static constexpr uint8_t kDestLanes[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
                                                    0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
-        const __m128i bits = _mm_load_si128(reinterpret_cast<const __m128i *>(result));
+        const __m128i bits = _mm_castps_si128(value);
         const __m128i exponent = _mm_and_si128(_mm_srli_epi32(bits, 23), _mm_set1_epi32(0xFF));
         const __m128i inRange = _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
                                               _mm_cmpgt_epi32(_mm_set1_epi32(254), exponent));
         uint32_t pending = kDestLanes[dest & 0xFu] & ~static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(inRange)));
         if (pending == 0u)
             return;
-        const auto zeroLanes = [](__m128i value)
+        const auto zeroLanes = [](__m128i lanes)
         {
             return static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
-                _mm_cmpeq_epi32(_mm_and_si128(value, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128()))));
+                _mm_cmpeq_epi32(_mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128()))));
         };
         if constexpr (kOperation.kind == FmacKind::Add || kOperation.kind == FmacKind::Sub ||
                       kOperation.kind == FmacKind::Mul)
@@ -556,10 +557,19 @@ struct Vu1Jit
                          (zeroLanes(_mm_castps_si128(left)) | zeroLanes(_mm_castps_si128(right))));
         if (pending == 0u)
             return;
+        value = fixUnobserved(vu, value, dest, kOperation, left, right, acc);
+    }
+    // normalizeUnobserved's rare case (a result out of the normal range), out of line: fmacFlagsWith's exact path.
+    PS2X_VU_COLD static __m128 fixUnobserved(Vu &vu, __m128 value, uint8_t dest, FmacOperation operation, __m128 left,
+                                             __m128 right, __m128 acc)
+    {
+        alignas(16) float result[4];
+        _mm_store_ps(result, value);
         uint32_t mac = 0u, status = 0u, sticky = 0u;
         vu.fmacFlagsWith(
-            result, dest, kOperation, [&]() { return left; }, [&]() { return right; }, [&]() { return acc; }, mac,
+            result, dest, operation, [&]() { return left; }, [&]() { return right; }, [&]() { return acc; }, mac,
             status, sticky);
+        return _mm_load_ps(result);
     }
 
     // MAX/MINI: raw sign-magnitude comparison (vuMax/vuMini: the larger or smaller key, else the second operand),

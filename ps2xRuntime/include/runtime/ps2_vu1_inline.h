@@ -21,9 +21,13 @@
 #if defined(_MSC_VER) && !defined(__clang__)
 #define PS2X_VU_INLINE __forceinline
 #define PS2X_VU_LAMBDA_INLINE [[msvc::forceinline]]
+#define PS2X_VU_COLD __declspec(noinline)
 #else
 #define PS2X_VU_INLINE inline __attribute__((always_inline))
 #define PS2X_VU_LAMBDA_INLINE __attribute__((always_inline))
+// Rare paths kept out of the compiled microcode: inlined into every instruction they made the blocks several times
+// their size, and the hot loops no longer fit the instruction caches.
+#define PS2X_VU_COLD __attribute__((noinline, cold))
 #endif
 
 namespace ps2_vu1_detail
@@ -177,27 +181,28 @@ namespace ps2_vu1_detail
             la[c] = vuAdd(la[c], lb[c]);
         return _mm_load_ps(la);
 #else
+        // Per operand, the mask that keeps its bits: ~0 << (other exponent - own), all ones when it is the larger
+        // or equal one, only the sign 24 or more steps below, all ones when either exponent is 0 (no alignment).
+        // Built so the chain from the operands to the add is short: compiled loops chain FMACs through it.
         const __m128i ia = _mm_castps_si128(a);
         const __m128i ib = _mm_castps_si128(b);
-        const __m128i exponentMask = _mm_set1_epi32(0xFF);
-        const __m128i allOnes = _mm_set1_epi32(-1);
-        const __m128i ea = _mm_and_si128(_mm_srli_epi32(ia, 23), exponentMask);
-        const __m128i eb = _mm_and_si128(_mm_srli_epi32(ib, 23), exponentMask);
         const __m128i zero = _mm_setzero_si128();
-        const __m128i inactive = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi32(ea, zero), _mm_cmpeq_epi32(eb, zero)),
-                                              _mm_cmpeq_epi32(ea, eb));
-        const __m128i aLarger = _mm_cmpgt_epi32(ea, eb);
-        const __m128i shift = _mm_abs_epi32(_mm_sub_epi32(ea, eb));
-        const __m128i one = _mm_set1_epi32(1);
-        const __m128i lowBits = _mm_sub_epi32(_mm_sllv_epi32(one, shift), one);
-        const __m128i far = _mm_cmpgt_epi32(shift, _mm_set1_epi32(23));
-        const __m128i keep = _mm_or_si128(_mm_andnot_si128(far, _mm_xor_si128(lowBits, allOnes)),
-                                          _mm_and_si128(far, _mm_set1_epi32(static_cast<int>(0x80000000u))));
-        // The operand with the smaller exponent loses its low bits.
-        const __m128i truncateA = _mm_andnot_si128(inactive, _mm_andnot_si128(aLarger, allOnes));
-        const __m128i truncateB = _mm_andnot_si128(inactive, aLarger);
-        const __m128i newA = _mm_and_si128(ia, _mm_or_si128(_mm_andnot_si128(truncateA, allOnes), keep));
-        const __m128i newB = _mm_and_si128(ib, _mm_or_si128(_mm_andnot_si128(truncateB, allOnes), keep));
+        const __m128i allOnes = _mm_cmpeq_epi32(zero, zero);
+        const __m128i ea = _mm_srli_epi32(_mm_slli_epi32(ia, 1), 24);
+        const __m128i eb = _mm_srli_epi32(_mm_slli_epi32(ib, 1), 24);
+        const __m128i aBelow = _mm_sub_epi32(eb, ea); // > 0: a is the smaller one, by that many steps
+        const __m128i bBelow = _mm_sub_epi32(ea, eb);
+        const __m128i kept = _mm_or_si128(_mm_cmpeq_epi32(_mm_min_epi32(ea, eb), zero),
+                                          _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        const __m128i farLimit = _mm_set1_epi32(23);
+        const __m128i maskA = _mm_or_si128(_mm_andnot_si128(_mm_cmpgt_epi32(aBelow, farLimit),
+                                                            _mm_sllv_epi32(allOnes, _mm_max_epi32(aBelow, zero))),
+                                           kept);
+        const __m128i maskB = _mm_or_si128(_mm_andnot_si128(_mm_cmpgt_epi32(bBelow, farLimit),
+                                                            _mm_sllv_epi32(allOnes, _mm_max_epi32(bBelow, zero))),
+                                           kept);
+        const __m128i newA = _mm_and_si128(ia, maskA);
+        const __m128i newB = _mm_and_si128(ib, maskB);
         return _mm_add_ps(_mm_castsi128_ps(newA), _mm_castsi128_ps(newB));
 #endif
     }

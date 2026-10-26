@@ -18,6 +18,14 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOGDI
+#define NOUSER
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 // ps2_runtime expects the generated runner to provide its function table; this tool runs no guest code.
 struct R5900Context;
@@ -111,6 +119,21 @@ namespace
     }
 }
 
+// The replay thread's own CPU time: other programs on the machine inflate wall time, not this. TSC cycles on
+// Windows (QueryThreadCycleTime), nanoseconds elsewhere.
+static uint64_t threadCpuTicks()
+{
+#if defined(_WIN32)
+    ULONG64 cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    return cycles;
+#else
+    timespec now{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    return static_cast<uint64_t>(now.tv_sec) * 1000000000ull + static_cast<uint64_t>(now.tv_nsec);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     std::vector<const char *> args;
@@ -202,9 +225,11 @@ int main(int argc, char **argv)
     size_t toleranceRuns = 0, toleranceExact = 0, cycleDiffer = 0, packetShapeDiffer = 0;
     uint64_t totalCycles = 0;
     double seconds = 0.0;
+    uint64_t cpuTicks = 0;
     for (int pass = 0; pass < repeat; ++pass)
     {
         const auto start = std::chrono::steady_clock::now();
+        const uint64_t startTicks = threadCpuTicks();
         for (size_t index = 0; index < records.size(); ++index)
         {
             const Vu1TraceRecord &record = records[index];
@@ -286,7 +311,10 @@ int main(int argc, char **argv)
             }
         }
         if (pass != 0 || repeat == 1)
+        {
             seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            cpuTicks += threadCpuTicks() - startTicks;
+        }
     }
 
     if (g_tolerance)
@@ -308,5 +336,10 @@ int main(int argc, char **argv)
     const int timedPasses = repeat > 1 ? repeat - 1 : 1;
     std::printf("time per pass=%.2f ms  (%.1f ns per VU cycle)\n", seconds * 1000.0 / timedPasses,
                 totalCycles ? seconds * 1e9 / timedPasses / static_cast<double>(totalCycles) : 0.0);
+#if defined(_WIN32)
+    std::printf("thread cpu per pass=%.2f Mcycles\n", static_cast<double>(cpuTicks) / 1e6 / timedPasses);
+#else
+    std::printf("thread cpu per pass=%.2f ms\n", static_cast<double>(cpuTicks) / 1e6 / timedPasses);
+#endif
     return mismatches == 0 ? 0 : 1;
 }
