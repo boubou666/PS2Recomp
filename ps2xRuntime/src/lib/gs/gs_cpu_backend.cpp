@@ -4385,6 +4385,11 @@ void GSCpuBackend::DumpUpdateUnlocked()
     }
     if (m_dumpRemaining != 0u || std::chrono::steady_clock::now() < m_dumpStart)
         return;
+    // PS2X_GS_DUMP_WHEN=<path>: start once that file exists rather than after a fixed time.
+    static const char *const dumpWhen = std::getenv("PS2X_GS_DUMP_WHEN");
+    static uint32_t dumpWhenPolls = 0;
+    if (dumpWhen && ((dumpWhenPolls++ & 0xFFFu) != 0u || !std::filesystem::exists(dumpWhen)))
+        return;
     // Start: finish queued work, then draw immediately (VRAM is exact at each primitive).
     DrainUnlocked();
     for (GSMem::TexturePageCache &cache : m_texturePageCaches)
@@ -4465,8 +4470,8 @@ void GSCpuBackend::DumpPrimitiveUnlocked(const GSPrimitiveBatch &batch)
     for (uint32_t i = 0; i < count; ++i)
     {
         const GSVertex &v = batch.vertices[i];
-        length += std::snprintf(vertices + length, sizeof(vertices) - length, " v%u=(%.1f,%.1f z=%.0f rgba=%02x%02x%02x%02x uv=%u,%u stq=%.4f,%.4f,%.4f)", i,
-                                v.x - (ctx.xyoffset.ofx >> 4), v.y - (ctx.xyoffset.ofy >> 4), v.z, v.r, v.g, v.b, v.a, v.u >> 4, v.v >> 4, v.s, v.t, v.q);
+        length += std::snprintf(vertices + length, sizeof(vertices) - length, " v%u=(%.1f,%.1f z=%.0f rgba=%02x%02x%02x%02x uv=%u,%u stq=%.4f,%.4f,%.4f f=%u)", i,
+                                v.x - (ctx.xyoffset.ofx >> 4), v.y - (ctx.xyoffset.ofy >> 4), v.z, v.r, v.g, v.b, v.a, v.u >> 4, v.v >> 4, v.s, v.t, v.q, v.fog);
     }
     int textureIndex = -1;
     if (state.prim.tme)
