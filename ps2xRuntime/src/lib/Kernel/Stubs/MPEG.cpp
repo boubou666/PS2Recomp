@@ -518,7 +518,12 @@ namespace ps2_stubs
         // the compressed video, not decoded pictures, so games may demux seconds ahead:
         // Valkyrie Profile 2 waits for 512 KiB of movie audio (about 2.7 s, 80 pictures at
         // 30 fps) before fetching its first picture. 128 pictures cost ~150 MB at 640x448.
-        constexpr size_t kMaxDecodedPicturesAhead = 128u;
+        // A game whose movie audio buffers hold less than that lead sets a smaller one
+        // (setMpegMaxPicturesAhead): the audio demuxed with the pictures has to fit.
+        constexpr size_t kDefaultMaxDecodedPicturesAhead = 128u;
+        // sceMpegDemuxPssRing takes its input this many bytes (one CD sector) at a time, checking the limit between.
+        constexpr uint32_t kDemuxChunkBytes = 2048u;
+        std::atomic<size_t> g_maxDecodedPicturesAhead{kDefaultMaxDecodedPicturesAhead};
 
         struct MpegPlaybackState
         {
@@ -1479,7 +1484,7 @@ namespace ps2_stubs
             // Important: do not park sceMpegDemuxPss/Ring here. Code Veronica
             // explicitly wakes its video thread before every demux call and that
             // thread sleeps again after presenting one picture. A single host
-            // decoder feed can enqueue more than kMaxDecodedPicturesAhead frames;
+            // decoder feed can enqueue more than the pictures-ahead limit;
             // parking the producer then leaves the consumer asleep after draining
             // just one frame, with nobody left to issue the next WakeupThread.
             // Returning 0 bytes consumed instead leaves the guest ring intact and
@@ -1487,7 +1492,7 @@ namespace ps2_stubs
             // still propagates naturally to sceCdStRead because the ring does not
             // advance while this is true.
             return !g_mpeg_stub_state.currentCdStreamEofSeen &&
-                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
+                   playback.decodedFrames.size() >= g_maxDecodedPicturesAhead.load(std::memory_order_relaxed);
         }
 
         void recordCdStreamBytesDemuxedUnlocked(
@@ -1926,6 +1931,11 @@ namespace ps2_stubs
         }
     }
 
+    void setMpegMaxPicturesAhead(size_t pictures)
+    {
+        g_maxDecodedPicturesAhead.store(std::max<size_t>(pictures, 1u), std::memory_order_relaxed);
+    }
+
     void abortMpegPlayback(PS2Runtime *runtime, uint32_t mpegAddr)
     {
         {
@@ -2304,15 +2314,30 @@ namespace ps2_stubs
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
             {
-                consumed = appendGuestRingBytes(
-                    mpegAddr,
-                    playback,
-                    rdram,
-                    dataAddr,
-                    availableBytes,
-                    ringBaseAddr,
-                    ringSize,
-                    callbackEvents);
+                // A sector at a time, stopping once the pictures-ahead limit is reached: games hand over their
+                // whole read buffer, and taking all of it at once decoded dozens of pictures and delivered
+                // their audio in one burst (Twisted Metal: Black's 320 KiB buffer, ~1 s of audio per call).
+                const bool ring = ringBaseAddr != 0u && ringSize != 0u && ringSize <= PS2_RAM_SIZE &&
+                                  ((dataAddr - ringBaseAddr) & PS2_RAM_MASK) < ringSize;
+                while (consumed < availableBytes && (consumed == 0u || !mpegDemuxBackpressured(playback)))
+                {
+                    const uint32_t chunk = std::min<uint32_t>(kDemuxChunkBytes, availableBytes - static_cast<uint32_t>(consumed));
+                    const uint32_t chunkAddr =
+                        ring ? ringBaseAddr + static_cast<uint32_t>((((dataAddr - ringBaseAddr) & PS2_RAM_MASK) + consumed) % ringSize)
+                             : dataAddr + static_cast<uint32_t>(consumed);
+                    const size_t taken = appendGuestRingBytes(
+                        mpegAddr,
+                        playback,
+                        rdram,
+                        chunkAddr,
+                        chunk,
+                        ringBaseAddr,
+                        ringSize,
+                        callbackEvents);
+                    consumed += taken;
+                    if (taken < chunk)
+                        break;
+                }
                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
             }
             decodedCount = playback.decodedFrames.size();

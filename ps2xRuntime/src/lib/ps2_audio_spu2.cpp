@@ -1,7 +1,8 @@
 // SPU2 output: the IOP emulator mixes 48 kHz stereo in emulated time; a raylib stream plays it in
 // real time. A time stretcher sits between the two, so that an emulation running slower or faster
 // than real time slows down or speeds up the sound (same pitch) instead of cutting it.
-// PS2X_SPU2_WAV=<path> also records the output to a WAV file.
+// PS2X_SPU2_WAV=<path> also records the output to a WAV file. PS2X_SPU2_STATS=1 prints, every second, the frames
+// the emulation produced and the device took, the stretcher's buffer fill and rate, underruns and dropped frames.
 
 #include "runtime/ps2_audio.h"
 #include "ps2_audio_stretch.h"
@@ -9,6 +10,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -49,11 +52,37 @@ struct PS2AudioBackend::Spu2Stream
     AudioTimeStretcher stretcher;
     std::ofstream wav;
     uint32_t wavBytes = 0;
+    const bool stats = []
+    {
+        const char *value = std::getenv("PS2X_SPU2_STATS");
+        return value && *value == '1';
+    }();
+    uint64_t pushedFrames = 0;
+    uint64_t pulledFrames = 0;
+    std::chrono::steady_clock::time_point nextStats = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+
+    void reportStats()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextStats)
+            return;
+        nextStats = now + std::chrono::seconds(1);
+        std::fprintf(stderr, "[spu2:stats] produced %llu taken %llu fill %zu rate %.2f underruns %llu dropped %llu\n",
+                     static_cast<unsigned long long>(pushedFrames), static_cast<unsigned long long>(pulledFrames),
+                     stretcher.fill(), stretcher.rate(), static_cast<unsigned long long>(stretcher.underruns()),
+                     static_cast<unsigned long long>(stretcher.dropped()));
+        pushedFrames = pulledFrames = 0;
+    }
 
     void push(const int16_t *frames, size_t count)
     {
         std::lock_guard<std::mutex> lock(mutex);
         stretcher.push(frames, count);
+        if (stats)
+        {
+            pushedFrames += count;
+            reportStats();
+        }
         if (wav.is_open())
         {
             wav.write(reinterpret_cast<const char *>(frames), static_cast<std::streamsize>(count * 4u));
@@ -65,6 +94,7 @@ struct PS2AudioBackend::Spu2Stream
     {
         std::lock_guard<std::mutex> lock(mutex);
         stretcher.pull(out, frames);
+        pulledFrames += frames;
     }
 
     void closeWav()

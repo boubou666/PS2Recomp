@@ -15,6 +15,10 @@ namespace ps2_stubs
     // the queued pictures, makes sceMpegIsEnd/sceMpegIsRefBuffEmpty report the end, and wakes
     // a thread blocked in sceMpegGetPicture.
     void abortMpegPlayback(PS2Runtime *runtime, uint32_t mpegAddr);
+    // How many decoded pictures sceMpegDemuxPss/Ring may run ahead of the ones served before it stops consuming
+    // (default 128). The movie audio demuxed with them goes to the game's audio callbacks without back-pressure,
+    // so a game whose audio buffers hold less needs a smaller lead.
+    void setMpegMaxPicturesAhead(size_t pictures);
     // The game fed all of a movie's data: decode what is buffered, then let sceMpegIsEnd report the
     // end once the queued pictures are drained. libmpeg players end a stream by appending a
     // sequence_end_code to the IPU ring (the ezmpeg sample's videoDecFlush) and may never read

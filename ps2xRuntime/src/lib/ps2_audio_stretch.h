@@ -41,7 +41,10 @@ public:
         for (size_t i = 0; i < count; ++i)
         {
             if (m_fill == kCapacityFrames)
+            {
                 discard(1u);
+                ++m_dropped;
+            }
             const size_t slot = (m_readFrame + m_fill) % kCapacityFrames;
             m_ring[slot * 2u] = frames[i * 2u];
             m_ring[slot * 2u + 1u] = frames[i * 2u + 1u];
@@ -71,6 +74,8 @@ public:
     [[nodiscard]] size_t fill() const noexcept { return m_fill; }
     [[nodiscard]] double rate() const noexcept { return m_rate; }
     [[nodiscard]] uint64_t underruns() const noexcept { return m_underruns; }
+    // Frames dropped because the buffer was full (the producer ran far ahead of real time).
+    [[nodiscard]] uint64_t dropped() const noexcept { return m_dropped; }
 
 private:
     [[nodiscard]] float sample(size_t frame, size_t channel) const noexcept
@@ -192,4 +197,5 @@ private:
     double m_rate = 1.0;
     bool m_primed = false;
     uint64_t m_underruns = 0;
+    uint64_t m_dropped = 0;
 };
