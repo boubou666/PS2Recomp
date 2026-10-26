@@ -716,7 +716,6 @@ namespace
         // Recompiled blocks first: their pairs only run alone when a block cannot start (or a jump lands inside
         // one), through the interpreter; compiling them pair by pair takes most of the build.
         std::vector<std::string> jitText(fragment.pairCount);
-        std::vector<bool> jitCovered(fragment.pairCount, false);
         if (jitEnabled)
             for (const auto &[first, end] : blocks)
             {
@@ -726,8 +725,6 @@ namespace
                     continue;
                 jitText[first] = jit.str();
                 jitStart[first] = true;
-                for (uint32_t pair = first; pair < end; ++pair)
-                    jitCovered[pair] = true;
             }
         std::vector<std::string> pairText(fragment.pairCount), blockText(fragment.pairCount);
         for (uint32_t pair = 0; pair < fragment.pairCount; ++pair)
@@ -737,11 +734,13 @@ namespace
             out << "\n    constexpr Vu::DecodedInstructionPair kPair" << id << " = " << decodeCall(pair) << ";\n"
                 << "    Vu::StepResult pair" << id << "(Vu &vu, const Vu::RunContext &context)\n"
                 << "    {\n";
-            if (jitCovered[pair])
+            // Under the JIT every pair alone goes through the interpreter: an inlined stepPair() for each pair outside
+            // the recompiled blocks took most of the build (MSVC: about 15 minutes for 64 of them).
+            if (jitEnabled)
                 out << "#if PS2X_VU1_JIT\n        return vu.stepPairInterpreted(kPair" << id << ", context);\n#else\n";
             out << "        return vu.stepPair" << (unobserved[pair] ? "<Vu::kHintFlagsUnobserved>" : "") << "(kPair" << id
                 << ", context);\n";
-            if (jitCovered[pair])
+            if (jitEnabled)
                 out << "#endif\n";
             out << "    }\n";
             pairText[pair] = out.str();
@@ -762,7 +761,9 @@ namespace
                 << "u);\n";
             if (jitStart[first])
                 out << "#if PS2X_VU1_JIT\n" << jitText[first] << "#endif\n";
-            if (jitStart[first])
+            // Without the JIT the block runs its pairs inlined in turn. Under the JIT a block it does not take runs
+            // its pairs alone (inlining them took minutes of the build for a few short blocks).
+            if (jitEnabled)
                 out << "#if !PS2X_VU1_JIT\n";
             for (uint32_t pair = first; pair < end; ++pair)
                 out << "    Vu::StepResult body" << (fragment.firstPair + pair) << "(Vu &vu, const Vu::RunContext &context)\n"
@@ -782,7 +783,7 @@ namespace
                 << "        return vu.runBlock<kBlockPlan" << id << ", kBlockBodies" << id << ", kBlockPairs" << id
                 << ">(context, &pair" << id << ");\n"
                 << "    }\n";
-            if (jitStart[first])
+            if (jitEnabled)
                 out << "#endif\n";
             blockText[first] = out.str();
         }
@@ -814,7 +815,8 @@ namespace
                     << ".." << (fragment.firstPair + partEnd - 1u);
             out << ".\n"
                 << "#include \"runtime/ps2_vu1_jit.h\"\n\n"
-                << "#if PS2X_VU1_JIT\n#define JIT_ENTRY(n) &jit##n\n#else\n#define JIT_ENTRY(n) &block##n\n#endif\n\n"
+                << "#if PS2X_VU1_JIT\n#define JIT_ENTRY(n) &jit##n\n#define BLOCK_ENTRY(n) &pair##n\n#else\n"
+                   "#define JIT_ENTRY(n) &block##n\n#define BLOCK_ENTRY(n) &block##n\n#endif\n\n"
                 << "namespace " << prefix << tag << "\n{\n"
                 << "    using Vu = VU1Interpreter;\n";
             if (relaxedFloat() && part == 0u)
@@ -837,14 +839,17 @@ namespace
                 if (jitStart[pair])
                     out << "#if PS2X_VU1_JIT\n    Vu::StepResult jit" << id << signature << "#else\n    Vu::StepResult block" << id
                         << signature << "#endif\n";
+                else if (blockStart[pair] && jitEnabled)
+                    out << "#if PS2X_VU1_JIT\n    Vu::StepResult pair" << id << signature << "#else\n    Vu::StepResult block" << id
+                        << signature << "#endif\n";
                 else
                     out << "    Vu::StepResult " << (blockStart[pair] ? "block" : "pair") << id << signature;
             }
             out << "\n    constexpr Vu::CompiledEntry kPairs[] = {";
             for (uint32_t pair = 0; pair < fragment.pairCount; ++pair)
                 out << (pair % 8u == 0u ? "\n        " : " ")
-                    << (jitStart[pair] ? "JIT_ENTRY(" : blockStart[pair] ? "&block" : "&pair") << (fragment.firstPair + pair)
-                    << (jitStart[pair] ? ")" : "") << ",";
+                    << (jitStart[pair] ? "JIT_ENTRY(" : !blockStart[pair] ? "&pair" : jitEnabled ? "BLOCK_ENTRY(" : "&block")
+                    << (fragment.firstPair + pair) << (jitStart[pair] || (blockStart[pair] && jitEnabled) ? ")" : "") << ",";
             out << "\n    };\n\n"
                 << "    const bool registered = (Vu::registerCompiledFragment({" << fragment.firstPair << "u, "
                 << fragment.pairCount << "u, 0x" << hex(fragment.hash, 16) << "ull, kPairs, " << unitName << "}), true);\n"
