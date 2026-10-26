@@ -667,6 +667,14 @@ namespace
     // primitives after a bounding box test instead of scanning their rows.
     constexpr uint32_t kOwnerShift = 5u;
 
+    // The worker owning a group of blocks (block number >> kOwnerShift): spread by a multiplicative hash rather than
+    // in turn, so that a buffer column one page wide (the 64-pixel strips of post-processing passes, where a
+    // buffer 4 pages wide would leave 2 owners out of 8) still spans most workers.
+    inline uint32_t blockGroupOwner(uint32_t group, uint32_t workers)
+    {
+        return ((group * 0x9E3779B1u) >> 16) % workers;
+    }
+
     // Block number (0-31) within its page of each 8x8-pixel cell of a page, for one format: with
     // the page index, the 256-byte block of a pixel without the general address computation.
     struct BlockLayout
@@ -845,16 +853,6 @@ namespace
         last = size - 1;
         const uint64_t clamp = state.context.clamp;
         const uint8_t wrap = static_cast<uint8_t>((clamp >> (columns ? 0 : 2)) & 0x3u);
-        if (wrap == 3u)
-        {
-            // REGION_REPEAT addresses (coordinate & MIN) | MAX whatever the coordinate, which can lie past the
-            // texture's size.
-            const int regionMask = static_cast<int>((clamp >> (columns ? 4 : 24)) & 0x3FFu);
-            const int regionFix = static_cast<int>((clamp >> (columns ? 14 : 34)) & 0x3FFu);
-            first = regionFix;
-            last = regionMask | regionFix;
-            return;
-        }
         int low = 0;
         int high = 0;
         float spriteLow = 0.0f;
@@ -911,6 +909,25 @@ namespace
                 low = static_cast<int>(minCoord) - 2; // bilinear taps and rounding
                 high = static_cast<int>(maxCoord) + 2;
             }
+        }
+        if (wrap == 3u)
+        {
+            // REGION_REPEAT addresses (coordinate & MIN) | MAX whatever the coordinate, which can lie past the
+            // texture's size. The AND only clears bits: for coordinates in [0, high] the result has no bit above
+            // high's top bit except MAX's (the channel-shuffle idiom reads a buffer's first rows this way).
+            const int regionMask = static_cast<int>((clamp >> (columns ? 4 : 24)) & 0x3FFu);
+            const int regionFix = static_cast<int>((clamp >> (columns ? 14 : 34)) & 0x3FFu);
+            int reach = regionMask;
+            if (low >= 0 && high < 0x400)
+            {
+                int bits = high;
+                for (int shift = 1; shift < 16; shift <<= 1)
+                    bits |= bits >> shift;
+                reach &= bits;
+            }
+            first = regionFix;
+            last = reach | regionFix;
+            return;
         }
         if (wrap == 2u)
         {
@@ -1235,7 +1252,7 @@ struct GSCpuBackend::RasterContext
         const uint32_t page = (uy >> layout->pageHeightShift) * pagesPerRow + (ux >> layout->pageWidthShift);
         const uint32_t cell = layout->cells[(uy & ((1u << layout->pageHeightShift) - 1u)) >> 3u]
                                            [(ux & ((1u << layout->pageWidthShift) - 1u)) >> 3u];
-        return ((((frameBase + page * 32u + cell) % kVramBlocks) >> kOwnerShift) % stripeCount) == stripe;
+        return blockGroupOwner(((frameBase + page * 32u + cell) % kVramBlocks) >> kOwnerShift, stripeCount) == stripe;
     }
 
     // Whether the worker owns a pixel of the rectangle (inclusive). Exact with whole-page ownership, else true.
@@ -1247,7 +1264,8 @@ struct GSCpuBackend::RasterContext
              py <= (static_cast<uint32_t>(y1) >> layout->pageHeightShift); ++py)
             for (uint32_t px = static_cast<uint32_t>(x0) >> layout->pageWidthShift;
                  px <= (static_cast<uint32_t>(x1) >> layout->pageWidthShift); ++px)
-                if (((((frameBase + (py * pagesPerRow + px) * 32u) % kVramBlocks) >> kOwnerShift) % stripeCount) == stripe)
+                if (blockGroupOwner(((frameBase + (py * pagesPerRow + px) * 32u) % kVramBlocks) >> kOwnerShift, stripeCount) ==
+                    stripe)
                     return true;
         return false;
     }
@@ -2063,11 +2081,11 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     const bool usesZ = writesZ || blocks.readsZ;
     if (usesZ)
     {
-        // The color layout deciding each depth word's owner: format, width, and base block
-        // modulo the worker count.
+        // The color layout deciding each depth word's owner: format, width, and base page (owners are hashed per
+        // page, so another base can change any page's owner).
         const auto &frame = state.context.frame;
         const uint32_t baseBlock = GSInternal::framePageBaseToBlock(frame.fbp);
-        zOwnerKey = (static_cast<uint64_t>(state.context.zbuf.zbp) << 40u) | (static_cast<uint64_t>((baseBlock >> kOwnerShift) % m_workerCount) << 24u) |
+        zOwnerKey = (static_cast<uint64_t>(state.context.zbuf.zbp) << 40u) | (static_cast<uint64_t>(baseBlock >> kOwnerShift) << 24u) |
                     (static_cast<uint64_t>(frame.fbw) << 8u) | static_cast<uint64_t>(frame.psm);
         for (const uint64_t key : m_zOwnerKeys)
             barrier = barrier || ((key >> 40u) == state.context.zbuf.zbp && key != zOwnerKey);
@@ -3856,7 +3874,7 @@ uint32_t GSCpuBackend::WriteUploadPixels(const GSTransferCommand &transfer,
         {
             ownerY = y;
             ownerColumn = x >> 3u;
-            owned = ((GSMem::BlockOf(dpsm, dbp, dbw, x, y) >> kOwnerShift) % rows->stripeCount) == rows->stripe;
+            owned = blockGroupOwner(GSMem::BlockOf(dpsm, dbp, dbw, x, y) >> kOwnerShift, rows->stripeCount) == rows->stripe;
         }
         if (owned)
             WriteVramUnlocked(dpsm, dbp, dbw, x, y, value);
