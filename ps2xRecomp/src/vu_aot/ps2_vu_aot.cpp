@@ -206,6 +206,14 @@ namespace
         return relaxed;
     }
 
+    // PS2X_VU_AOT_FAST=1: VU1 microcode accurate enough rather than exact (Vu1Jit::fastEnter): relaxed floats, the
+    // blocks' static schedule without readiness checks or tables. VU0 microcode stays exact.
+    bool fastVu1()
+    {
+        static const bool fast = std::getenv("PS2X_VU_AOT_FAST") != nullptr;
+        return fast;
+    }
+
     std::string vfName(uint32_t reg) { return "vf" + std::to_string(reg); }
     std::string viName(uint32_t reg) { return reg == 0u ? std::string("vi0") : "vi" + std::to_string(reg); }
 
@@ -213,7 +221,7 @@ namespace
     // block keeps the per-pair path (a branch or E bit anywhere but at its end, a delay slot it cannot recompile).
     bool writeJitBlock(std::ostream &out, const std::vector<VU1Interpreter::DecodedInstructionPair> &decoded,
                        uint32_t first, uint32_t end, uint32_t firstPair, const std::vector<bool> &unobserved,
-                       const VU1Interpreter::BlockPlan &plan, uint32_t pcMask)
+                       const VU1Interpreter::BlockPlan &plan, uint32_t pcMask, bool fast = false)
     {
         using Vu = VU1Interpreter;
         using J = Vu1Jit;
@@ -400,7 +408,7 @@ namespace
             {
             case J::Upper::Fmac:
             case J::Upper::FmacAcc:
-                if (relaxedFloat())
+                if (relaxedFloat() || fast)
                     up << "J::fmacRelaxed<" << hex32(upper) << ", " << (pi.liveFlags ? "true" : "false") << ">(vu, ";
                 else if (pi.liveFlags)
                     up << "J::fmacLive<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u, "
@@ -580,7 +588,8 @@ namespace
         out << "    Vu::StepResult jit" << id << "(Vu &vu, const Vu::RunContext &context)\n    {\n"
             << "        using J = Vu1Jit;\n"
             << "        uint64_t base = 0u;\n"
-            << "        if (!vu.blockReady<kBlockPlan" << id << ">(context, base))\n"
+            << (fast ? "        if (!J::fastEnter<kBlockPlan" : "        if (!vu.blockReady<kBlockPlan") << id
+            << (fast ? ">(vu, context, base))\n" : ">(context, base))\n")
             << "            return pair" << id << "(vu, context);\n"
             << "        VU1State &s = J::state(vu);\n"
             << "        [[maybe_unused]] __m128 vf0 = J::vf0();\n"
@@ -608,7 +617,10 @@ namespace
                 << "            s.branchDelay = 0;\n        }\n";
         if (eBitLast)
             out << "        s.ebit = true;\n";
-        out << "        J::leave<kBlockPlan" << id << ", kBlockPairs" << id << ">(vu, base);\n";
+        if (fast)
+            out << "        J::fastLeave<kBlockPlan" << id << ">(vu, base);\n";
+        else
+            out << "        J::leave<kBlockPlan" << id << ", kBlockPairs" << id << ">(vu, base);\n";
         if (lastViReg >= 0)
             out << "        J::recordViForBranch(vu, " << lastViReg << ", viLastOld);\n";
         out << "        return Vu::StepResult::" << (eBitEnd ? "Ended" : "Continue") << ";\n    }\n";
@@ -713,6 +725,7 @@ namespace
         for (const auto &[first, end] : blocks)
             blockStart[first] = true;
         const bool jitEnabled = std::getenv("PS2X_VU_AOT_NO_JIT") == nullptr;
+        const bool fast = fastVu1() && unit == VU1Interpreter::Unit::VU1;
         // Recompiled blocks first: their pairs only run alone when a block cannot start (or a jump lands inside
         // one), through the interpreter; compiling them pair by pair takes most of the build.
         std::vector<std::string> jitText(fragment.pairCount);
@@ -721,7 +734,7 @@ namespace
             {
                 std::ostringstream jit;
                 const Vu::BlockPlan plan = Vu::planBlock(decoded.data() + first, end - first);
-                if (!writeJitBlock(jit, decoded, first, end, fragment.firstPair, unobserved, plan, pcMask))
+                if (!writeJitBlock(jit, decoded, first, end, fragment.firstPair, unobserved, plan, pcMask, fast))
                     continue;
                 jitText[first] = jit.str();
                 jitStart[first] = true;
@@ -819,7 +832,7 @@ namespace
                    "#define JIT_ENTRY(n) &block##n\n#define BLOCK_ENTRY(n) &block##n\n#endif\n\n"
                 << "namespace " << prefix << tag << "\n{\n"
                 << "    using Vu = VU1Interpreter;\n";
-            if (relaxedFloat() && part == 0u)
+            if ((relaxedFloat() || fast) && part == 0u)
                 out << "#if PS2X_VU1_JIT\n    [[maybe_unused]] const bool kRelaxedFloat = Vu1Jit::enableRelaxedFloat();\n#endif\n";
             for (uint32_t pair = partBegin; pair < partEnd; ++pair)
                 out << pairText[pair];

@@ -454,6 +454,42 @@ struct Vu1Jit
         target = blend<kDest>(target, _mm_load_ps(result));
     }
 
+    // ---- Fast path (ps2_vu_aot with PS2X_VU_AOT_FAST=1, VU1 microcode only) ----
+    // Accurate enough rather than exact, as PCSX2's microVU: a block starts at the current cycle and runs the schedule
+    // planBlock gave it. Values from before it count as ready: a VF, VI or ACC the block before wrote late costs no
+    // stall (only cycle counts move, by a few). The DIV and EFU units are still waited for, since when their Q and P
+    // land decides what the block reads. No readiness tables are kept (fastLeave): the clock moves to the block's
+    // end, which still drives Q/P results, the flag queue and XGKICK. FMAC instructions are plain SSE (fmacRelaxed).
+    template <Vu::BlockLiveIn kLiveIn>
+    static PS2X_VU_INLINE void waitScalarUnit(const Vu &vu, uint64_t &base)
+    {
+        if constexpr (kLiveIn.kind == Vu::BlockLiveIn::Fdiv || kLiveIn.kind == Vu::BlockLiveIn::EfuResource ||
+                      kLiveIn.kind == Vu::BlockLiveIn::EfuEntries)
+        {
+            const uint64_t ready = vu.template blockLiveInReadyCycle<kLiveIn>();
+            if (ready > base + kLiveIn.issue)
+                base = ready - kLiveIn.issue;
+        }
+    }
+    template <const Vu::BlockPlan &kPlan>
+    static PS2X_VU_INLINE bool fastEnter(const Vu &vu, const Vu::RunContext &context, uint64_t &base)
+    {
+        base = vu.m_cycle;
+        [&]<size_t... kIndex>(std::index_sequence<kIndex...>) PS2X_VU_LAMBDA_INLINE
+        {
+            (waitScalarUnit<kPlan.liveIns[kIndex]>(vu, base), ...);
+        }(std::make_index_sequence<kPlan.liveInCount>{});
+        return !vu.m_logInFlight && !vu.m_state.branchPending && !vu.m_state.haltAfterDelaySlot && !vu.m_state.ebit &&
+               base + kPlan.issue[kPlan.pairCount - 1u] < context.budgetEnd &&
+               !(kPlan.usesDtBits && (vu.m_state.dBitEnabled || vu.m_state.tBitEnabled));
+    }
+    template <const Vu::BlockPlan &kPlan>
+    static PS2X_VU_INLINE void fastLeave(Vu &vu, uint64_t base)
+    {
+        vu.m_viBranchBackupValid = false;
+        vu.advanceTo(base + kPlan.issue[kPlan.pairCount - 1u] + 1u);
+    }
+
     // ---- Relaxed float mode (VU1Interpreter::setRelaxedFloat) ----
     static bool enableRelaxedFloat()
     {
@@ -465,10 +501,12 @@ struct Vu1Jit
     {
         return _mm_shuffle_ps(value, value, _MM_SHUFFLE(kIndex, kIndex, kIndex, kIndex));
     }
-    // An FMAC instruction as plain SSE: operands as they are (denormals are zero under DAZ), the sum of IEEE
-    // arithmetic instead of the PS2's (no operand truncation), the result clamped to +-FLT_MAX. kLiveFlags: the MAC
-    // and status flags a reader can see, from the result (zero, sign, overflow before the clamp), queued at the issue
-    // cycle (the caller advanced the clock to it).
+    // An FMAC instruction as plain SSE, PCSX2's way: operands as they are (denormals are zero under DAZ; no operand
+    // clamp, as PCSX2's default "normal" clamping), the result clamped to +-FLT_MAX, no exact flag fix-ups. The
+    // addition stays the PS2's (vuAdd4, the smaller operand truncated): with IEEE sums TMB's big vertex loop (pc
+    // 0x1d40) emitted different strips from its first packet; with vuAdd4 the 6000 recorded match runs come out
+    // identical to the exact path. kLiveFlags: the MAC and status flags a reader can see, from the result (zero, sign,
+    // overflow before the clamp), queued at the issue cycle (the caller advanced the clock to it).
     template <uint32_t kUpper, bool kLiveFlags>
     static PS2X_VU_INLINE void fmacRelaxed(Vu &vu, __m128 &target, __m128 vs, __m128 vt, __m128 acc)
     {
@@ -482,7 +520,7 @@ struct Vu1Jit
         else if constexpr (kOperation.right == FmacOperation::Right::Q)
             right = _mm_set1_ps(vu.m_state.q);
         else if constexpr (kOperation.right == FmacOperation::Right::I)
-            right = _mm_set1_ps(vu.m_state.i);
+            right = _mm_set1_ps(vu.normalizeOperand(vu.m_state.i));
         else
             right = vt;
         __m128 left = vs;
@@ -493,15 +531,15 @@ struct Vu1Jit
         }
         __m128 result;
         if constexpr (kOperation.kind == FmacKind::Add)
-            result = _mm_add_ps(left, right);
+            result = ps2_vu1_detail::vuAdd4(left, right);
         else if constexpr (kOperation.kind == FmacKind::Sub)
-            result = _mm_sub_ps(left, right);
+            result = ps2_vu1_detail::vuAdd4(left, ps2_vu1_detail::negate4(right));
         else if constexpr (kOperation.kind == FmacKind::Mul || kOperation.kind == FmacKind::CrossMul)
             result = _mm_mul_ps(left, right);
         else if constexpr (kOperation.kind == FmacKind::Madd)
-            result = _mm_add_ps(acc, _mm_mul_ps(left, right));
+            result = ps2_vu1_detail::vuAdd4(acc, _mm_mul_ps(left, right));
         else
-            result = _mm_sub_ps(acc, _mm_mul_ps(left, right));
+            result = ps2_vu1_detail::vuAdd4(acc, ps2_vu1_detail::negate4(_mm_mul_ps(left, right)));
         if constexpr (kOperation.kind == FmacKind::CrossMul || kOperation.kind == FmacKind::CrossMsub)
             result = _mm_blend_ps(result, _mm_setzero_ps(), 0x8);
         const __m128 maximum = _mm_set1_ps(std::numeric_limits<float>::max());

@@ -653,7 +653,16 @@ int main(int argc, char **argv)
                 bool sameShape = packets.size() == record.packets.size();
                 for (size_t p = 0; sameShape && p < packets.size(); ++p)
                     sameShape = packets[p].size() == record.packets[p].size();
-                if (!sameShape)
+                if (!sameShape && packetShapeDiffer++ < 10)
+                {
+                    size_t at = 0;
+                    while (at < packets.size() && at < record.packets.size() && packets[at].size() == record.packets[at].size())
+                        ++at;
+                    std::printf("#%zu pc=0x%x packet shape: %zu packets expected, %zu got; first different: #%zu, %zu bytes expected, %zu got\n",
+                                index, record.startPC, record.packets.size(), packets.size(), at,
+                                at < record.packets.size() ? record.packets[at].size() : 0u, at < packets.size() ? packets[at].size() : 0u);
+                }
+                else if (!sameShape)
                     ++packetShapeDiffer;
                 else
                     for (size_t p = 0; p < packets.size(); ++p)
