@@ -1023,7 +1023,13 @@ namespace
 
 void VU1Interpreter::registerCompiledFragment(const CompiledFragment &fragment)
 {
-    compiledFragmentRegistry().push_back(fragment);
+    // By length: refreshCompiledFragments() applies the longest matching fragment last (a whole program over the
+    // separately uploaded pieces it contains, whose blocks stop at the piece boundaries).
+    auto &registry = compiledFragmentRegistry();
+    registry.insert(std::upper_bound(registry.begin(), registry.end(), fragment,
+                                     [](const CompiledFragment &left, const CompiledFragment &right)
+                                     { return left.pairCount < right.pairCount; }),
+                    fragment);
 }
 
 void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp)
@@ -1033,12 +1039,25 @@ void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t co
     m_compiledCode = vuCode;
     m_compiledByPair.clear();
     const uint32_t pairCount = codeSize / 8u;
+    // Versions of one program share their ranges: hash each range once per refresh (games upload microcode often).
+    struct RangeHash
+    {
+        uint32_t firstPair;
+        uint32_t pairCount;
+        uint64_t hash;
+    };
+    std::vector<RangeHash> rangeHashes;
     for (const CompiledFragment &fragment : compiledFragmentRegistry())
     {
-        if (fragment.unit != m_unit)
+        if (fragment.unit != m_unit || fragment.firstPair + fragment.pairCount > pairCount)
             continue;
-        if (fragment.firstPair + fragment.pairCount > pairCount ||
-            codeHash(vuCode + fragment.firstPair * 8u, fragment.pairCount * 8u) != fragment.codeHash)
+        auto range = std::find_if(rangeHashes.begin(), rangeHashes.end(), [&](const RangeHash &entry)
+                                  { return entry.firstPair == fragment.firstPair && entry.pairCount == fragment.pairCount; });
+        if (range == rangeHashes.end())
+            range = rangeHashes.insert(rangeHashes.end(),
+                                       {fragment.firstPair, fragment.pairCount,
+                                        codeHash(vuCode + fragment.firstPair * 8u, fragment.pairCount * 8u)});
+        if (range->hash != fragment.codeHash)
             continue;
         if (m_compiledByPair.empty())
             m_compiledByPair.assign(pairCount, nullptr);
