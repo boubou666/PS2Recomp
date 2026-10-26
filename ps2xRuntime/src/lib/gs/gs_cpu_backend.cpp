@@ -816,7 +816,8 @@ namespace
         const int offset = (columns ? ctx.xyoffset.ofx : ctx.xyoffset.ofy) >> 4;
         int p0 = static_cast<int>(columns ? v0.x : v0.y) - offset;
         int p1 = static_cast<int>(columns ? v1.x : v1.y) - offset;
-        if (p0 > p1)
+        const bool flipped = p0 > p1; // the texture coordinates stay at their vertex's corner (DrawSprite)
+        if (flipped)
             std::swap(p0, p1);
         const int span = std::max(1, p1 - p0);
         const int scissor0 = columns ? ctx.scissor.x0 : ctx.scissor.y0;
@@ -838,6 +839,8 @@ namespace
             c0 = ((columns ? v0.s : v0.t) / fabsQ(v0.q)) * size;
             c1 = ((columns ? v1.s : v1.t) / fabsQ(v1.q)) * size;
         }
+        if (flipped)
+            std::swap(c0, c1);
         const float a = c0 + (c1 - c0) * ((static_cast<float>(draw0 - p0) + 0.5f) / static_cast<float>(span));
         const float b = c0 + (c1 - c0) * ((static_cast<float>(draw1 - p0) + 0.5f) / static_cast<float>(span));
         low = std::min(a, b);
@@ -3237,9 +3240,13 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
     float fy1 = v1.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
     u32 z1 = gsDepthBits(v1.z);
 
-    if (fx0 > fx1)
+    // Each vertex keeps its texture coordinates at its own corner: a sprite given right to left or bottom to top
+    // is not mirrored (the texture coordinates are swapped with the edges below).
+    const bool flipX = fx0 > fx1;
+    const bool flipY = fy0 > fy1;
+    if (flipX)
         std::swap(fx0, fx1);
-    if (fy0 > fy1)
+    if (flipY)
         std::swap(fy0, fy1);
 
     // The GS covers the pixels whose integer coordinates satisfy x0 <= x < x1 (and the same for
@@ -3294,6 +3301,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
             u1f = (v1.s / q1) * static_cast<float>(texW);
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
+        if (flipX)
+            std::swap(u0f, u1f);
+        if (flipY)
+            std::swap(v0f, v1f);
 
         float spriteW = static_cast<float>(spanX);
         float spriteH = static_cast<float>(spanY);

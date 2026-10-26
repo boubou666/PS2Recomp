@@ -1787,6 +1787,44 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("FST sprite given bottom-right to top-left keeps each vertex's UV at its corner (no mirroring)", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint64_t kFrame = (150ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor = (0ull << 0) | (3ull << 16) | (0ull << 32) | (3ull << 48);
+            constexpr uint64_t kTex0 = (static_cast<uint64_t>(kTexTbp) << 0) | (1ull << 14) |
+                                       (static_cast<uint64_t>(GS_PSM_CT32) << 20) | (2ull << 26) | (2ull << 30) | (1ull << 34);
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8);
+            for (uint32_t y = 0u; y < 4u; ++y)
+                for (uint32_t x = 0u; x < 4u; ++x)
+                    writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, x, y, 0x80000000u | (y << 8) | x);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, (4ull * 16ull) | ((4ull * 16ull) << 16));
+            gs.writeRegister(GS_REG_XYZ2, (static_cast<uint64_t>(4u << 4) << 0) | (static_cast<uint64_t>(4u << 4) << 16));
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+
+            bool same = true;
+            for (uint32_t y = 0u; y < 4u; ++y)
+                for (uint32_t x = 0u; x < 4u; ++x)
+                    same = same && readReferenceFramePSMCT32Pixel(vram, 150u, 1u, x, y) == (0x80000000u | (y << 8) | x);
+            t.IsTrue(same, "pixel (x, y) should sample texel (x, y) whatever the vertex order");
+        });
+
         tc.Run("sprite ending at a half pixel covers its last whole pixel", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
