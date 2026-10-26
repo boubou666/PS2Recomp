@@ -3,6 +3,7 @@
 // writes "<thread id> <leaf rva hex> <first in-exe caller rva hex> <count>" lines to PS2X_PROFILE_OUT
 // (default ps2x_profile.txt) for symbolization against the linker map file. For threads blocked in
 // system calls the leaf rva is 0 and the caller column says where in the runtime they are waiting.
+// PS2X_PROFILE_GATED=1: samples only while ps2x::profiling::g_sampleGate is open (runtime/sampling_profiler_gate.h).
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -17,6 +18,8 @@
 #include <string>
 #include <thread>
 #include <tuple>
+
+#include "runtime/sampling_profiler_gate.h"
 
 namespace
 {
@@ -35,6 +38,11 @@ namespace
         std::map<DWORD, HANDLE> threads;
         uint64_t samples = 0u;
 
+        static const bool s_gated = []
+        {
+            const char *value = std::getenv("PS2X_PROFILE_GATED");
+            return value && *value == '1';
+        }();
         timeBeginPeriod(1);
         const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(durationSeconds);
         auto nextRefresh = std::chrono::steady_clock::now();
@@ -64,6 +72,11 @@ namespace
                     CloseHandle(snapshot);
             }
 
+            if (s_gated && !ps2x::profiling::g_sampleGate.load(std::memory_order_relaxed))
+            {
+                Sleep(1);
+                continue;
+            }
             for (const auto &[tid, handle] : threads)
             {
                 if (SuspendThread(handle) == static_cast<DWORD>(-1))
