@@ -643,7 +643,7 @@ namespace
     {
         for (uint32_t spin = 0; !done(); ++spin)
         {
-            if (spin < 4096u)
+            if (spin < 32768u)
                 cpuRelax();
             else
                 std::this_thread::yield();
