@@ -2355,6 +2355,51 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
     std::memcpy(m_rdram + physical, &value, sizeof(value));
 }
 
+std::string EeScheduler::describeBlockedThreads() const
+{
+    std::vector<const GuestThread *> blocked;
+    for (const auto &[id, thread] : m_threads)
+        if (thread.status == EeThreadStatus::Waiting || thread.status == EeThreadStatus::WaitingSuspended)
+            blocked.push_back(&thread);
+    std::sort(blocked.begin(), blocked.end(), [](const GuestThread *a, const GuestThread *b) { return a->id < b->id; });
+    std::string out;
+    char text[96];
+    for (const GuestThread *thread : blocked)
+    {
+        std::string what;
+        switch (thread->wait.reason)
+        {
+        case EeWaitReason::Semaphore:
+            what = "S" + std::to_string(std::get<EeSemaphoreWait>(thread->wait.payload).id);
+            break;
+        case EeWaitReason::EventFlag:
+            what = "E" + std::to_string(std::get<EeEventFlagWait>(thread->wait.payload).id);
+            break;
+        case EeWaitReason::VSync: what = "V"; break;
+        case EeWaitReason::Sleep: what = "Z"; break;
+        case EeWaitReason::External:
+            what = "X" + std::to_string(std::get<EeExternalWait>(thread->wait.payload).type);
+            break;
+        case EeWaitReason::Mpeg: what = "M"; break;
+        default: what = "?"; break;
+        }
+        std::snprintf(text, sizeof(text), "%st%dp%d:%s@%x", out.empty() ? "" : " ", thread->id, thread->currentPriority,
+                      what.c_str(), static_cast<uint32_t>(_mm_extract_epi32(thread->activeContext().r[31], 0)));
+        out += text;
+    }
+    return out;
+}
+
+void EeScheduler::reportIdle(std::chrono::steady_clock::time_point start, std::string wokenBy, std::string blocked)
+{
+    IdleRecord record;
+    record.nanoseconds = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    record.wokenBy = std::move(wokenBy);
+    record.blocked = std::move(blocked);
+    m_idleObserver(record);
+}
+
 void EeScheduler::waitForEvent()
 {
     std::unique_lock lock(m_eventMutex);
@@ -2366,15 +2411,20 @@ void EeScheduler::waitForEvent()
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
+        std::string blocked = m_idleObserver ? describeBlockedThreads() : std::string();
         const auto waitStart = std::chrono::steady_clock::now();
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
         noteIdleWait(waitStart);
+        if (m_idleObserver)
+            reportIdle(waitStart, m_events.empty() ? "stop" : "ev:" + std::to_string(static_cast<int>(m_events.front().type)),
+                       std::move(blocked));
         return;
     }
 
     uint64_t deadlineCycle = 0u;
     auto hostDeadline = std::chrono::steady_clock::time_point::max();
+    std::string deadlineKind = "timer";
     if (!m_deadlines.empty())
     {
         const auto next = std::min_element(m_deadlines.begin(), m_deadlines.end(),
@@ -2388,6 +2438,7 @@ void EeScheduler::waitForEvent()
                                            });
         deadlineCycle = next->deadlineCycle;
         hostDeadline = next->hostDeadline;
+        deadlineKind = "deadline:" + std::to_string(static_cast<int>(next->event.type));
     }
     if (hasTimerDeadline)
     {
@@ -2396,14 +2447,22 @@ void EeScheduler::waitForEvent()
         {
             deadlineCycle = m_eeCycle + timerCycles;
             hostDeadline = timerHostDeadline;
+            deadlineKind = "timer";
         }
     }
 
+    std::string blocked = m_idleObserver ? describeBlockedThreads() : std::string();
     const auto waitStart = std::chrono::steady_clock::now();
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
     noteIdleWait(waitStart);
+    if (m_idleObserver)
+        reportIdle(waitStart,
+                   !signaled ? deadlineKind
+                             : (m_events.empty() ? std::string("stop")
+                                                 : "ev:" + std::to_string(static_cast<int>(m_events.front().type))),
+                   std::move(blocked));
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

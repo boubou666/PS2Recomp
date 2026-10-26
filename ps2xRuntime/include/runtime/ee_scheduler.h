@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <variant>
@@ -293,6 +294,19 @@ public:
     [[nodiscard]] bool onExecutorThread() const noexcept { return m_executorThread == std::this_thread::get_id(); }
     // Host time the executor spent idle, every guest thread blocked (waiting for a vblank, an interrupt...).
     [[nodiscard]] uint64_t idleWaitNanoseconds() const noexcept { return m_idleWaitNs.load(std::memory_order_relaxed); }
+    // One idle wait, for a game layer that wants to know what its frames wait on (setIdleObserver).
+    struct IdleRecord
+    {
+        uint64_t nanoseconds = 0;
+        // What ended it: the first posted event ("ev:<type>") or the deadline that came ("deadline:<type>",
+        // "timer" for an EE timer interrupt).
+        std::string wokenBy;
+        // The blocked guest threads, by id: "t<id>p<priority>:<what>@<return address>", what being S<id>
+        // (semaphore), E<id> (event flag), V (vsync), Z (sleep), X<type> (external), M (MPEG).
+        std::string blocked;
+    };
+    // Called on the executor thread after each idle wait (nullptr: off, nothing is collected).
+    void setIdleObserver(std::function<void(const IdleRecord &)> observer) { m_idleObserver = std::move(observer); }
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     // Set while guest code unwinds to the dispatcher (a checkpoint fired or a jump left the
     // function), cleared before each dispatch: the enclosing dispatchGuestBranch frames must not
@@ -511,6 +525,9 @@ private:
     std::thread::id m_executorThread{};
     std::deque<std::function<void()>> m_tasks; // guarded by m_eventMutex
     std::atomic<uint64_t> m_idleWaitNs{0};
+    std::function<void(const IdleRecord &)> m_idleObserver;
+    [[nodiscard]] std::string describeBlockedThreads() const;
+    void reportIdle(std::chrono::steady_clock::time_point start, std::string wokenBy, std::string blocked);
     void noteIdleWait(std::chrono::steady_clock::time_point start) noexcept
     {
         m_idleWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
