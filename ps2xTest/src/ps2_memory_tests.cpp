@@ -2231,6 +2231,36 @@ void register_ps2_memory_tests()
             mem.setVif1Threaded(false);
         });
 
+        tc.Run("GS lag: the EE is held at the VIF1 worker's clock only while the worker has work", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setVif1Threaded(true);
+            mem.setGsLag(true);
+            t.IsFalse(mem.vif1BehindEe(~0ull - 1u), "an idle worker should not hold the EE back");
+
+            std::atomic<bool> advanced{false};
+            std::atomic<bool> release{false};
+            mem.queueVif1Callback([&]()
+                                  {
+                                      mem.advanceVif1WorkerClock(500u);
+                                      advanced.store(true);
+                                      while (!release.load())
+                                          std::this_thread::yield();
+                                  });
+            while (!advanced.load())
+                std::this_thread::yield();
+            t.Equals(mem.vif1WorkerCycle(), static_cast<uint64_t>(500u), "VU1 work should advance the worker's clock");
+            t.IsFalse(mem.vif1BehindEe(400u), "the EE may run up to the worker's clock");
+            t.IsTrue(mem.vif1BehindEe(600u), "the EE should wait once past the busy worker's clock");
+
+            release.store(true);
+            mem.waitForVif1();
+            t.IsFalse(mem.vif1BehindEe(600u), "the worker going idle should release the EE");
+            mem.setGsLag(false);
+            mem.setVif1Threaded(false);
+        });
+
         tc.Run("VIF1 DMA chain preserves compact tag high bytes when qwc is zero", [](TestCase &t)
         {
             PS2Memory mem;

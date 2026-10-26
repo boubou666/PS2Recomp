@@ -1281,11 +1281,14 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled = (vu0Fbrst & (1u << 11)) != 0u;
                                      g_vu1MscalCount.fetch_add(1u, std::memory_order_relaxed);
                                      g_gsDumpVu1ProgramPc.store(startPC, std::memory_order_relaxed);
+                                     const uint64_t cyclesBefore = m_vu1.state().cycles;
                                      Vu1Recorder::instance().run(m_vu1, m_memory, false, startPC, top, itop, kVu1ProgramCycleLimit, [&]
                                                                  { m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                                                  m_gs, &m_memory, startPC, top, itop, kVu1ProgramCycleLimit); });
                                      g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
+                                     if (onWorker && m_memory.gsLag())
+                                         m_memory.advanceVif1WorkerClock(m_vu1.state().cycles - cyclesBefore);
                                      if (cpuContext)
                                          cpuContext->vu0_vpu_stat =
                                              (cpuContext->vu0_vpu_stat & ~0x0600u) |
@@ -1314,11 +1317,14 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().dBitEnabled = (vu0Fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (vu0Fbrst & (1u << 11)) != 0u;
                                      g_gsDumpVu1ProgramPc.store(0x10000u | m_vu1.state().pc, std::memory_order_relaxed);
+                                     const uint64_t cyclesBefore = m_vu1.state().cycles;
                                      Vu1Recorder::instance().run(m_vu1, m_memory, true, m_vu1.state().pc, top, itop, kVu1ProgramCycleLimit, [&]
                                                                  { m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                                                 m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                                                 m_gs, &m_memory, top, itop, kVu1ProgramCycleLimit); });
                                      g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
+                                     if (onWorker && m_memory.gsLag())
+                                         m_memory.advanceVif1WorkerClock(m_vu1.state().cycles - cyclesBefore);
                                      if (cpuContext)
                                          cpuContext->vu0_vpu_stat =
                                              (cpuContext->vu0_vpu_stat & ~0x0600u) |
@@ -3006,10 +3012,20 @@ const EeScheduler &PS2Runtime::eeScheduler() const
     return *m_eeScheduler;
 }
 
+bool ps2OnVif1WorkerClock()
+{
+    PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);
+    return runtime && runtime->memory().gsLag() && runtime->memory().onVif1Worker();
+}
+
 uint64_t ps2CurrentEeCycle()
 {
     PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);
-    return runtime ? runtime->eeScheduler().currentCycle() : 0u;
+    if (!runtime)
+        return 0u;
+    if (ps2OnVif1WorkerClock())
+        return runtime->memory().vif1WorkerCycle();
+    return runtime->eeScheduler().currentCycle();
 }
 
 bool ps2GsFifoEmpty()
@@ -3023,7 +3039,7 @@ bool ps2ScheduleGsInterruptCheck(uint64_t delayCycles)
     PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);
     if (!runtime)
         return false;
-    runtime->eeScheduler().scheduleGsInterruptCheck(delayCycles);
+    runtime->eeScheduler().scheduleGsInterruptCheckAt(ps2CurrentEeCycle() + delayCycles);
     return true;
 }
 

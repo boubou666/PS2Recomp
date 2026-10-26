@@ -423,6 +423,18 @@ public:
     // by the GS may behave differently with it.
     void setGsLag(bool enabled) { m_gsLag = enabled; }
     bool gsLag() const { return m_gsLag && m_vif1Threaded; }
+    // With the GS lag the worker keeps its own EE-cycle clock: a job starts no earlier than the EE cycle it was
+    // queued at, and the VU1 microprograms it runs advance it by their VU cycles. The EE may run ahead of the
+    // worker's clock only while the worker is idle (vif1Horizon is then unbounded): past it, waitForVif1Clock
+    // blocks until the worker gets there, so events the worker raises (SIGNAL, FINISH) reach the EE at the cycle
+    // they belong to instead of after the EE has run past them.
+    [[nodiscard]] bool vif1BehindEe(uint64_t eeCycle) const
+    {
+        return eeCycle > m_vif1Horizon.load(std::memory_order_acquire);
+    }
+    void waitForVif1Clock(uint64_t eeCycle) const;
+    [[nodiscard]] uint64_t vif1WorkerCycle() const { return m_vif1WorkerCycle.load(std::memory_order_acquire); }
+    void advanceVif1WorkerClock(uint64_t cycles);
     void queueVif1Callback(std::function<void()> callback);
     // Marks the end of a frame in the queue (the presentation latch).
     void markVif1Frame();
@@ -570,6 +582,7 @@ public:
         Kind kind = Kind::Vif1;
         std::vector<uint8_t> data;
         uint32_t vu0Fbrst = 0;
+        uint64_t queueCycle = 0;
         uint32_t address = 0;
         uint64_t value = 0;
         std::function<void()> callback;
@@ -592,6 +605,9 @@ public:
     std::deque<Vif1Job> m_vif1Jobs;
     std::atomic<uint64_t> m_vif1Queued{0};
     std::atomic<uint64_t> m_vif1Done{0};
+    std::atomic<uint64_t> m_vif1Horizon{~0ull};
+    std::atomic<uint64_t> m_vif1WorkerCycle{0};
+    mutable std::atomic<bool> m_vif1ClockWaiter{false};
     bool m_vif1Stop = false;
     uint32_t m_vif1JobVu0Fbrst = 0;
     Vu0FbrstProvider m_vu0FbrstProvider;

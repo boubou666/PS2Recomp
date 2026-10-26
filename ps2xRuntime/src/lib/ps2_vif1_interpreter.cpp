@@ -794,6 +794,8 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     return std::min(pos, sizeBytes);
 }
 
+uint64_t ps2CurrentEeCycle();
+
 namespace
 {
     thread_local bool t_onVif1Worker = false;
@@ -886,6 +888,48 @@ void PS2Memory::waitForVif1Until(uint64_t queued) const
     noteWait();
 }
 
+void PS2Memory::advanceVif1WorkerClock(uint64_t cycles)
+{
+    const uint64_t cycle = m_vif1WorkerCycle.load(std::memory_order_relaxed) + cycles;
+    m_vif1WorkerCycle.store(cycle, std::memory_order_release);
+    uint64_t horizon = m_vif1Horizon.load(std::memory_order_relaxed);
+    while (horizon != ~0ull && horizon < cycle &&
+           !m_vif1Horizon.compare_exchange_weak(horizon, cycle, std::memory_order_acq_rel))
+    {
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (m_vif1ClockWaiter.load(std::memory_order_relaxed))
+    {
+        std::lock_guard<std::mutex> lock(m_vif1Mutex);
+        m_vif1IdleCv.notify_all();
+    }
+}
+
+void PS2Memory::waitForVif1Clock(uint64_t eeCycle) const
+{
+    if (!vif1BehindEe(eeCycle))
+        return;
+    const auto waitStart = std::chrono::steady_clock::now();
+    for (uint32_t spin = 0; vif1BehindEe(eeCycle); ++spin)
+    {
+        if (spin < 256u)
+        {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+            _mm_pause();
+#endif
+            continue;
+        }
+        m_vif1ClockWaiter.store(true, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        std::unique_lock<std::mutex> lock(m_vif1Mutex);
+        m_vif1IdleCv.wait_for(lock, std::chrono::milliseconds(1), [&]() { return !vif1BehindEe(eeCycle); });
+    }
+    m_vif1ClockWaiter.store(false, std::memory_order_relaxed);
+    m_vif1WaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - waitStart).count()),
+                           std::memory_order_relaxed);
+}
+
 void PS2Memory::queueVif1Job(std::vector<uint8_t> data)
 {
     if (data.empty())
@@ -906,8 +950,12 @@ void PS2Memory::queueVif1Callback(std::function<void()> callback)
 void PS2Memory::queueVif1Job(Vif1Job job)
 {
     job.vu0Fbrst = m_vu0FbrstProvider ? m_vu0FbrstProvider() : 0u;
+    job.queueCycle = ps2CurrentEeCycle();
     {
         std::lock_guard<std::mutex> lock(m_vif1Mutex);
+        if (gsLag() && m_vif1Horizon.load(std::memory_order_relaxed) == ~0ull)
+            m_vif1Horizon.store(std::max(m_vif1WorkerCycle.load(std::memory_order_relaxed), job.queueCycle),
+                                std::memory_order_release);
         m_vif1Jobs.push_back(std::move(job));
         m_vif1Queued.fetch_add(1u, std::memory_order_release);
     }
@@ -928,6 +976,12 @@ void PS2Memory::vif1WorkerMain()
                 return;
             job = std::move(m_vif1Jobs.front());
             m_vif1Jobs.pop_front();
+            if (gsLag())
+            {
+                const uint64_t start = std::max(m_vif1WorkerCycle.load(std::memory_order_relaxed), job.queueCycle);
+                m_vif1WorkerCycle.store(start, std::memory_order_release);
+                m_vif1Horizon.store(start, std::memory_order_release);
+            }
         }
         m_vif1JobVu0Fbrst = job.vu0Fbrst;
         switch (job.kind)
@@ -953,6 +1007,8 @@ void PS2Memory::vif1WorkerMain()
         {
             std::lock_guard<std::mutex> lock(m_vif1Mutex);
             m_vif1Done.fetch_add(1u, std::memory_order_release);
+            if (m_vif1Jobs.empty())
+                m_vif1Horizon.store(~0ull, std::memory_order_release);
         }
         m_vif1IdleCv.notify_all();
     }

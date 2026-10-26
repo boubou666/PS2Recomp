@@ -133,6 +133,7 @@ namespace
 void ps2NotifyGsCsrEdge();
 uint64_t ps2CurrentEeCycle();
 bool ps2ScheduleGsInterruptCheck(uint64_t delayCycles);
+bool ps2OnVif1WorkerClock();
 
 namespace
 {
@@ -316,10 +317,18 @@ void GS::noteQueuedDrawing()
 }
 
 // PS2X_GS_EVENT_LATENCY overrides the base latency.
+// Packets the VIF1 worker sends carry its clock, which VU1 microprograms advance: the GS draws them while VU1
+// computes the next ones, so the event comes once the drawing queued so far is done, not after all of it again.
 uint64_t GS::gsEventDelay()
 {
     static const uint64_t base = envCycles("PS2X_GS_EVENT_LATENCY", kGsEventBaseCycles);
-    return base + m_drawEstimate.takeCycles();
+    const uint64_t sinceLastEvent = m_drawEstimate.takeCycles();
+    if (!ps2OnVif1WorkerClock())
+        return base + sinceLastEvent;
+    const uint64_t now = ps2CurrentEeCycle();
+    const uint64_t busyUntil = std::max(g_gsBusyUntil.load(std::memory_order_acquire), now) +
+                               (m_drawEstimate.totalCycles() - m_notedDrawingCycles);
+    return base + (busyUntil - now);
 }
 
 void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)

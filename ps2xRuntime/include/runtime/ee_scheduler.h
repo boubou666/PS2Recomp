@@ -356,8 +356,12 @@ public:
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     [[nodiscard]] uint64_t currentCycle() const noexcept { return m_eeCycle; }
-    // Re-checks the GS interrupt once `delayCycles` EE cycles have passed.
+    // Re-checks the GS interrupt once `delayCycles` EE cycles have passed, and not before the host
+    // time those cycles map to on the vblank timeline: an EE running behind real time is not held back
+    // further, one running ahead waits as it would for the next vblank.
     void scheduleGsInterruptCheck(uint64_t delayCycles);
+    // The same at an absolute EE cycle; callable from other host threads (the VIF1 worker).
+    void scheduleGsInterruptCheckAt(uint64_t cycle);
     // PS2X_EE_PROFILE=1: EE cycles accounted at each checkpoint, by the guest pc it resumes at
     // (loop heads); returns and clears the counts gathered since the last call.
     [[nodiscard]] std::vector<std::pair<uint32_t, uint64_t>> takeGuestProfile();
@@ -447,6 +451,7 @@ private:
     void writeGuestU32(uint32_t address, uint32_t value);
     void waitForEvent();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
+    [[nodiscard]] std::chrono::steady_clock::time_point timelineHostTime(uint64_t cycle) const;
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
@@ -498,6 +503,9 @@ private:
     uint64_t m_iopVblankEnd = 0; // IOP cycle at which the current vblank's frame ends
     FieldRate m_fieldRate = kNtscFieldRate;
     uint64_t m_vblankPeriodCycles = 0;
+    // The vblank timeline (cycle and host time of the last vblank start), read by other host threads.
+    std::atomic<uint64_t> m_timelineCycle{0};
+    std::atomic<std::chrono::steady_clock::rep> m_timelineHostTicks{0};
     std::chrono::nanoseconds m_vblankPeriod{0};
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};

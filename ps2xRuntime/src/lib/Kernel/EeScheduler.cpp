@@ -188,8 +188,11 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
+    const auto now = std::chrono::steady_clock::now();
+    m_timelineCycle.store(m_eeCycle, std::memory_order_relaxed);
+    m_timelineHostTicks.store(now.time_since_epoch().count(), std::memory_order_relaxed);
     scheduleEvent(m_eeCycle + m_vblankPeriodCycles,
-                  std::chrono::steady_clock::now() + m_vblankPeriod,
+                  now + m_vblankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -464,6 +467,8 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         m_transferToDispatcher = true;
         return true;
     }
+    if (m_runtime.memory().vif1BehindEe(m_eeCycle))
+        m_runtime.memory().waitForVif1Clock(m_eeCycle);
 
     if (m_heldUntilEi)
     {
@@ -554,8 +559,23 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
 void EeScheduler::scheduleGsInterruptCheck(uint64_t delayCycles)
 {
-    scheduleEvent(m_eeCycle + delayCycles, std::chrono::steady_clock::now() + eeCyclesToHostDuration(delayCycles),
-                  EeEvent{EeEventType::GsInterrupt, 0u, 0u});
+    scheduleGsInterruptCheckAt(m_eeCycle + delayCycles);
+}
+
+void EeScheduler::scheduleGsInterruptCheckAt(uint64_t cycle)
+{
+    scheduleEvent(cycle, timelineHostTime(cycle), EeEvent{EeEventType::GsInterrupt, 0u, 0u});
+}
+
+std::chrono::steady_clock::time_point EeScheduler::timelineHostTime(uint64_t cycle) const
+{
+    const uint64_t timelineCycle = m_timelineCycle.load(std::memory_order_relaxed);
+    const auto timelineHost = std::chrono::steady_clock::time_point(
+        std::chrono::steady_clock::duration(m_timelineHostTicks.load(std::memory_order_relaxed)));
+    if (cycle <= timelineCycle)
+        return timelineHost;
+    return timelineHost + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                              eeCyclesToHostDuration(cycle - timelineCycle));
 }
 
 std::vector<std::pair<uint32_t, uint64_t>> EeScheduler::takeGuestProfile()
@@ -2078,6 +2098,8 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                m_timelineCycle.store(scheduled.deadlineCycle, std::memory_order_relaxed);
+                m_timelineHostTicks.store(scheduled.hostDeadline.time_since_epoch().count(), std::memory_order_relaxed);
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
