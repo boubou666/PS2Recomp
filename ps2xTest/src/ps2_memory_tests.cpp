@@ -2261,6 +2261,31 @@ void register_ps2_memory_tests()
             mem.setVif1Threaded(false);
         });
 
+        tc.Run("GS lag: a GIF DMA queued to the worker still completes its channel", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setVif1Threaded(true);
+            mem.setGsLag(true);
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kSrc = 0x00022000u;
+            t.IsTrue(mem.writeIORegister(kGifCh + 0x10u, kSrc), "write MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, 2u), "write QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR should succeed");
+            mem.processPendingTransfers();
+
+            t.IsTrue((mem.readIORegister(kGifCh + 0x00u) & 0x100u) == 0u, "GIF CHCR STR should be cleared");
+            t.IsTrue((mem.readIORegister(kDStat) & (1u << 2)) != 0u, "D_STAT should flag the GIF channel");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.IsTrue(std::find(causes.begin(), causes.end(), 2u) != causes.end(),
+                     "the GIF channel's DMAC interrupt should be queued");
+            mem.waitForVif1();
+            mem.setGsLag(false);
+            mem.setVif1Threaded(false);
+        });
+
         tc.Run("VIF1 DMA chain preserves compact tag high bytes when qwc is zero", [](TestCase &t)
         {
             PS2Memory mem;

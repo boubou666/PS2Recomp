@@ -2315,9 +2315,11 @@ void PS2Memory::processPendingTransfers()
     bool gifStalled = false;
     bool vif1Stalled = false;
     // With the GS lag, PATH3 packets join the worker's queue after the PATH1/PATH2 packets before them.
+    // Their data is copied, so the GIF channel still completes now (games wait for its DMAC interrupt).
     const bool queueGif = gsLag();
-    const bool hadGif = !m_pendingGifTransfers.empty() && !queueGif;
-    if (hadGif)
+    const bool hadGif = !m_pendingGifTransfers.empty();
+    const bool gifHere = hadGif && !queueGif;
+    if (gifHere)
         waitForVif1(); // PATH3 after the queued PATH1/PATH2 packets
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
@@ -2594,7 +2596,7 @@ void PS2Memory::processPendingTransfers()
     m_pendingVif1Transfers.clear();
 
     // With the VIF1 worker, the arbiter is the worker's until the EE waits for it (PATH3 above).
-    if (m_gifArbiter && (!m_vif1Threaded || hadGif))
+    if (m_gifArbiter && (!m_vif1Threaded || gifHere))
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
