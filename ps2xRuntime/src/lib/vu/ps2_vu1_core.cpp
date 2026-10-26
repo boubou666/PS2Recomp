@@ -872,8 +872,34 @@ bool VU1Interpreter::pipelinesPending() const
 
 void VU1Interpreter::flushPipelines()
 {
+    // Nothing executes, so the clock jumps from one completion to the next (advanceTo applies everything ready),
+    // ending on the same cycle as ticking would: PATH1 to the end of the current GIFtag's data, else to the
+    // last pending result.
     while (pipelinesPending())
-        advanceOneCycle();
+    {
+        uint64_t target = m_cycle + 1u;
+        if (m_xgkick.active)
+        {
+            if (m_xgkick.currentTagEnd != 0u && m_xgkick.copiedBytes < m_xgkick.currentTagEnd)
+            {
+                const uint64_t needed = static_cast<uint64_t>(m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u * 2u;
+                if (needed > m_xgkick.cycleCredit)
+                    target = m_cycle + (needed - m_xgkick.cycleCredit);
+            }
+        }
+        else
+        {
+            if (m_fdiv.valid)
+                target = std::max(target, m_fdiv.readyCycle);
+            for (const ScalarPipelineEntry &entry : m_efu)
+                if (entry.valid)
+                    target = std::max(target, entry.readyCycle);
+            target = std::max(target, m_lastWritebackCycle);
+            if (m_flagCount != 0u)
+                target = std::max(target, m_flagPipeline[(m_flagHead + m_flagCount - 1u) % kMaxFlagEntries].readyCycle);
+        }
+        advanceTo(target);
+    }
 }
 
 const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstructionPairForPc(
