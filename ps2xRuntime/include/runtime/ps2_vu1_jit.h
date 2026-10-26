@@ -199,15 +199,112 @@ struct Vu1Jit
     {
         return pc >= context.codeSize ? pc - context.codeSize : pc;
     }
-    // The block's end: when its results land (markPairWritesAt), the clock after its last pair, and the VI value a
-    // branch right after the block would read (recordViWriteForBranch).
+    // What markPairWritesAt() on each pair of a block, in order, leaves behind, as cycles after the block's base
+    // (-1: not written): each lane's ready cycle is its last writer's (the lower write before the upper one in a
+    // pair), and the per-register and writeback maxima are maxima over all the writes.
+    struct BlockWrites
+    {
+        std::array<std::array<int32_t, 4>, 32> vfLane{};
+        std::array<int32_t, 32> vfMax{};
+        std::array<int32_t, 16> vi{};
+        std::array<int32_t, 4> accLane{};
+        int32_t accMax = -1;
+        int32_t writebackMax = -1;
+    };
+    template <const Vu::BlockPlan &kPlan, const auto &kPairs>
+    static constexpr BlockWrites blockWrites()
+    {
+        BlockWrites writes;
+        for (auto &lanes : writes.vfLane)
+            lanes = {-1, -1, -1, -1};
+        writes.vfMax.fill(-1);
+        writes.vi.fill(-1);
+        writes.accLane = {-1, -1, -1, -1};
+        const auto setLanes = [](std::array<int32_t, 4> &laneCycles, uint8_t lanes, int32_t ready)
+        {
+            for (uint32_t lane = 0; lane < 4u; ++lane)
+                if ((lanes & (0x8u >> lane)) != 0u)
+                    laneCycles[lane] = ready;
+        };
+        const auto vfWrite = [&](Vu::VfAccess write, const Vu::InstructionUsage &usage, int32_t issue)
+        {
+            const int32_t ready = issue + (usage.vfLatency != 0u ? usage.vfLatency : usage.latency);
+            setLanes(writes.vfLane[write.reg], write.lanes, ready);
+            writes.vfMax[write.reg] = std::max(writes.vfMax[write.reg], ready);
+            writes.writebackMax = std::max(writes.writebackMax, ready);
+        };
+        for (uint32_t index = 0; index < kPlan.pairCount; ++index)
+        {
+            const auto &decoded = kPairs[index];
+            const int32_t issue = kPlan.issue[index];
+            if (const Vu::VfAccess write = decoded.lowerUsage.vfWrite; write.reg != 0u && decoded.suppressedLowerVf != write.reg)
+                vfWrite(write, decoded.lowerUsage, issue);
+            if (const Vu::VfAccess write = decoded.upperUsage.vfWrite; write.reg != 0u)
+                vfWrite(write, decoded.upperUsage, issue);
+            if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
+            {
+                const int32_t ready = issue + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency
+                                                                                 : decoded.lowerUsage.latency);
+                for (uint32_t reg = 1; reg < 16u; ++reg)
+                    if ((viWrites & (1u << reg)) != 0u)
+                        writes.vi[reg] = ready;
+                writes.writebackMax = std::max(writes.writebackMax, ready);
+            }
+            if (decoded.upperUsage.accWrite != 0u)
+            {
+                const int32_t ready = issue + static_cast<int32_t>(Vu::kAccForwardLatency);
+                setLanes(writes.accLane, decoded.upperUsage.accWrite, ready);
+                writes.accMax = std::max(writes.accMax, ready);
+                writes.writebackMax = std::max(writes.writebackMax, ready);
+            }
+        }
+        return writes;
+    }
+    template <std::array<int32_t, 4> kLanes>
+    static PS2X_VU_INLINE void setReadyLanes(std::array<uint64_t, 4> &laneCycles, uint64_t base)
+    {
+        if constexpr (kLanes[0] >= 0)
+            laneCycles[0] = base + static_cast<uint32_t>(kLanes[0]);
+        if constexpr (kLanes[1] >= 0)
+            laneCycles[1] = base + static_cast<uint32_t>(kLanes[1]);
+        if constexpr (kLanes[2] >= 0)
+            laneCycles[2] = base + static_cast<uint32_t>(kLanes[2]);
+        if constexpr (kLanes[3] >= 0)
+            laneCycles[3] = base + static_cast<uint32_t>(kLanes[3]);
+    }
+    template <const BlockWrites &kWrites, size_t kReg>
+    static PS2X_VU_INLINE void leaveVf(Vu &vu, uint64_t base)
+    {
+        if constexpr (kWrites.vfMax[kReg] >= 0)
+        {
+            setReadyLanes<kWrites.vfLane[kReg]>(vu.m_vfReady[kReg], base);
+            vu.m_vfReadyMax[kReg] = std::max(vu.m_vfReadyMax[kReg], base + static_cast<uint32_t>(kWrites.vfMax[kReg]));
+        }
+        if constexpr (kReg < 16u && kWrites.vi[kReg] >= 0)
+            vu.m_viReady[kReg] = base + static_cast<uint32_t>(kWrites.vi[kReg]);
+    }
+    template <const Vu::BlockPlan &kPlan, const auto &kPairs>
+    static constexpr BlockWrites kBlockWrites = blockWrites<kPlan, kPairs>();
+
+    // The block's end: when its results land (markPairWritesAt on each pair, folded at compile time into one
+    // store per written lane), the clock after its last pair, and the VI value a branch right after the block
+    // would read (recordViWriteForBranch).
     template <const Vu::BlockPlan &kPlan, const auto &kPairs>
     static PS2X_VU_INLINE void leave(Vu &vu, uint64_t base)
     {
-        [&]<size_t... kIndex>(std::index_sequence<kIndex...>) PS2X_VU_LAMBDA_INLINE
+        constexpr const BlockWrites &kWrites = kBlockWrites<kPlan, kPairs>;
+        [&]<size_t... kReg>(std::index_sequence<kReg...>) PS2X_VU_LAMBDA_INLINE
         {
-            (vu.markPairWritesAt(kPairs[kIndex], base + kPlan.issue[kIndex]), ...);
-        }(std::make_index_sequence<kPlan.pairCount>{});
+            (leaveVf<kWrites, kReg>(vu, base), ...);
+        }(std::make_index_sequence<32>{});
+        if constexpr (kWrites.accMax >= 0)
+        {
+            setReadyLanes<kWrites.accLane>(vu.m_accReady, base);
+            vu.m_accReadyMax = std::max(vu.m_accReadyMax, base + static_cast<uint32_t>(kWrites.accMax));
+        }
+        if constexpr (kWrites.writebackMax >= 0)
+            vu.m_lastWritebackCycle =
+                std::max(vu.m_lastWritebackCycle, base + static_cast<uint32_t>(kWrites.writebackMax));
         vu.m_viBranchBackupValid = false;
         vu.advanceTo(base + kPlan.issue[kPlan.pairCount - 1u] + 1u);
     }

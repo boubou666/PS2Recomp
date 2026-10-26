@@ -223,15 +223,13 @@ namespace ps2_vu1_detail
     // normalizeOperand() on four lanes: denormals become signed zero, exponent 255 becomes +-FLT_MAX.
     PS2X_VU_INLINE void normalizeVector(const float *source, float *target)
     {
+        // On the magnitude bits: at most FLT_MAX's (exponent 255 clamps), zero below the smallest normal's.
         const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source));
-        const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
-        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
-        const __m128i exponent = _mm_and_si128(bits, exponentMask);
-        const __m128i zeroExponent = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
-        const __m128i maxExponent = _mm_cmpeq_epi32(exponent, exponentMask);
-        __m128i result = _mm_or_si128(_mm_andnot_si128(zeroExponent, bits), _mm_and_si128(zeroExponent, sign));
-        result = _mm_or_si128(_mm_andnot_si128(maxExponent, result),
-                              _mm_and_si128(maxExponent, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
+        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
+        const __m128i magnitude = _mm_and_si128(bits, magnitudeMask);
+        const __m128i normal = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x007FFFFF));
+        const __m128i clamped = _mm_and_si128(_mm_min_epi32(magnitude, _mm_set1_epi32(0x7F7FFFFF)), normal);
+        const __m128i result = _mm_or_si128(_mm_andnot_si128(magnitudeMask, bits), clamped);
         _mm_storeu_si128(reinterpret_cast<__m128i *>(target), result);
     }
 
@@ -2946,7 +2944,7 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairBody(const Dec
 constexpr VU1Interpreter::BlockPlan VU1Interpreter::planBlock(const DecodedInstructionPair *pairs, uint32_t count)
 {
     BlockPlan plan{};
-    if (count < 2u || count > kMaxBlockPairs)
+    if (count == 0u || count > kMaxBlockPairs)
         return plan;
     constexpr int32_t kExternal = -1;
     std::array<std::array<int32_t, 4>, 32> vfReady{};

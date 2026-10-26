@@ -658,7 +658,7 @@ namespace
             uint32_t end = first + 1u;
             while (end < count && !starts[end] && end - first < Vu::kMaxBlockPairs)
                 ++end;
-            if (!alone[first] && end - first >= 2u && Vu::planBlock(pairs.data() + first, end - first).valid)
+            if (!alone[first] && Vu::planBlock(pairs.data() + first, end - first).valid)
                 blocks.push_back({first, end});
             first = end;
         }

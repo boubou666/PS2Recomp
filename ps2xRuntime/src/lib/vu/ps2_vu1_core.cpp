@@ -13,6 +13,55 @@
 #include <filesystem>
 #include <ps2_log.h>
 
+namespace
+{
+    // The VU rounds toward zero: run() sets it for the SSE float math (MXCSR) and the x87 long double exact checks
+    // (control word), as std::fesetround(FE_TOWARDZERO) does, and puts the caller's mode back. Written directly:
+    // MinGW's fegetround/fesetround cost about 3% of the VU1 thread, called on every run.
+    class VuRoundingScope
+    {
+    public:
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+        VuRoundingScope()
+        {
+            m_csr = _mm_getcsr();
+            __asm__ volatile("fnstcw %0" : "=m"(m_cw));
+            if ((m_csr & kCsrTowardZero) != kCsrTowardZero)
+                _mm_setcsr(m_csr | kCsrTowardZero);
+            if ((m_cw & kCwTowardZero) != kCwTowardZero)
+            {
+                const uint16_t towardZero = static_cast<uint16_t>(m_cw | kCwTowardZero);
+                __asm__ volatile("fldcw %0" : : "m"(towardZero));
+            }
+        }
+        ~VuRoundingScope()
+        {
+            if ((m_csr & kCsrTowardZero) != kCsrTowardZero)
+                _mm_setcsr((_mm_getcsr() & ~kCsrTowardZero) | (m_csr & kCsrTowardZero));
+            if ((m_cw & kCwTowardZero) != kCwTowardZero)
+                __asm__ volatile("fldcw %0" : : "m"(m_cw));
+        }
+
+    private:
+        static constexpr unsigned int kCsrTowardZero = 0x6000u;
+        static constexpr uint16_t kCwTowardZero = 0x0C00u;
+        unsigned int m_csr = 0u;
+        uint16_t m_cw = 0u;
+#else
+        VuRoundingScope() : m_previous(std::fegetround()), m_set(std::fesetround(FE_TOWARDZERO) == 0) {}
+        ~VuRoundingScope()
+        {
+            if (m_set && m_previous != -1)
+                std::fesetround(m_previous);
+        }
+
+    private:
+        int m_previous;
+        bool m_set;
+#endif
+    };
+}
+
 VU1Interpreter::VU1Interpreter(Unit unit)
     : m_unit(unit)
 {
@@ -226,7 +275,7 @@ void VU1Interpreter::foldDeadSticky()
     m_deadSticky = 0u;
 }
 
-void VU1Interpreter::commitFlags()
+void VU1Interpreter::commitLandedFlags()
 {
     while (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
     {
@@ -1006,8 +1055,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
-    const int previousRoundingMode = std::fegetround();
-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    const VuRoundingScope rounding;
     const bool relaxed = m_unit == Unit::VU1 && relaxedFloat();
     const unsigned int previousCsr = relaxed ? _mm_getcsr() : 0u;
     if (relaxed)
@@ -1085,6 +1133,4 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_state.cycles = m_cycle;
     if (relaxed)
         _mm_setcsr((_mm_getcsr() & ~0x8040u) | (previousCsr & 0x8040u));
-    if (useVuRounding && previousRoundingMode != -1)
-        std::fesetround(previousRoundingMode);
 }

@@ -328,7 +328,13 @@ private:
     FlagPipelineEntry *pushFlagEntry(bool upper, uint32_t overflowCode);
     // Applies the flag writes whose latency has elapsed. Flags are committed lazily: only their
     // readers (FMxxx, FSxxx, FCxxx), the Q status write and the end of a run need them current.
-    void commitFlags();
+    // Inline check first: most calls find nothing landed.
+    void commitFlags()
+    {
+        if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
+            commitLandedFlags();
+    }
+    void commitLandedFlags();
     template <typename Fn>
     void forEachFlagEntryIssuedThisCycle(Fn &&fn)
     {
