@@ -2255,6 +2255,31 @@ void register_ps2_memory_tests()
             mem.setVif1Threaded(false);
         });
 
+        tc.Run("GS lag: a GIF DMA queued to the VIF1 worker still completes its channel for the EE", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            GifArbiter arbiter([](const uint8_t *, uint32_t) {});
+            mem.setGifArbiter(&arbiter);
+            mem.setVif1Threaded(true);
+            mem.setGsLag(true);
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kSrc = 0x00026000u;
+            const uint64_t eopTag[2] = {1ull << 15, 0u};
+            std::memcpy(mem.getRDRAM() + kSrc, eopTag, sizeof(eopTag));
+            mem.writeIORegister(kGifCh + 0x10u, kSrc);
+            mem.writeIORegister(kGifCh + 0x20u, 1u);
+            mem.writeIORegister(kGifCh + 0x00u, 0x101u);
+
+            t.IsTrue((mem.readIORegister(kGifCh + 0x00u) & 0x100u) == 0u, "CHCR.STR should clear once the packet is queued");
+            t.IsTrue((mem.readIORegister(kDStat) & (1u << 2)) != 0u, "D_STAT should report the GIF channel done");
+            mem.setGsLag(false);
+            mem.setVif1Threaded(false);
+            mem.setGifArbiter(nullptr);
+        });
+
         tc.Run("GS lag: display register writes apply after the queued work, CSR stays live", [](TestCase &t)
         {
             PS2Memory mem;
