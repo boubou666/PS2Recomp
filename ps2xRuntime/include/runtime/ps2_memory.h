@@ -339,6 +339,22 @@ public:
     uint64_t takeTimerSpinCycles() noexcept { return m_timerSpinCycles.exchange(0u, std::memory_order_acq_rel); }
     uint64_t pendingTimerSpinCycles() const noexcept { return m_timerSpinCycles.load(std::memory_order_acquire); }
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
+    // Timer registers as last updated (no flush, no side effects): for diagnostics from any thread.
+    struct EeTimerState
+    {
+        uint32_t count = 0;
+        uint32_t mode = 0;
+        uint32_t compare = 0;
+        uint32_t compareBacklog = 0;
+        uint32_t overflowBacklog = 0;
+    };
+    [[nodiscard]] EeTimerState eeTimerState(size_t index) const noexcept
+    {
+        if (index >= m_eeTimers.size())
+            return {};
+        return {m_eeTimers[index].count, m_eeTimers[index].mode, m_eeTimers[index].compare,
+                m_timerCompareBacklog[index], m_timerOverflowBacklog[index]};
+    }
     void resetEeTimers() noexcept;
     // Applies the cycles advanceEeTimers() has been holding back (timer registers read the result).
     uint32_t flushEeTimers() noexcept;

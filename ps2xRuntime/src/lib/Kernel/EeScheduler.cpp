@@ -47,6 +47,29 @@ namespace
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
+    // Pending invocations (interrupt handlers, alarm, GS, CD, SIF and RPC callbacks) run in
+    // interrupt context on the PS2, which DI masks: a thread's critical section must not see them.
+    bool runsInInterruptContext(GuestInvocationKind kind) noexcept
+    {
+        switch (kind)
+        {
+        case GuestInvocationKind::Interrupt:
+        case GuestInvocationKind::Alarm:
+        case GuestInvocationKind::GsCallback:
+        case GuestInvocationKind::RpcCallback:
+        case GuestInvocationKind::SifCommand:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool guestInterruptsEnabled(const R5900Context &context) noexcept
+    {
+        constexpr uint32_t kStatusEie = 0x10000u;
+        return (context.cop0_status & kStatusEie) != 0u;
+    }
+
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
         return (microseconds * EeScheduler::kEeClockHz + 999999ull) / 1000000ull;
@@ -123,6 +146,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
+    m_heldUntilEi = false;
     m_pendingEeTimerInterrupts = 0u;
     m_deadlinesHeldUntil = {};
     m_eeCycle = 0u;
@@ -285,7 +309,12 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_pendingInvocations.empty() && running->invocations.empty())
+        const bool invocationDue = !m_pendingInvocations.empty() && running->invocations.empty();
+        if (invocationDue && !guestInterruptsEnabled(context))
+        {
+            m_heldUntilEi = true;
+        }
+        else if (invocationDue)
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
@@ -351,7 +380,7 @@ void EeScheduler::run()
         }
 
         processPendingEvents();
-        if (m_rescheduleRequested && m_currentThreadId != 0)
+        if (m_rescheduleRequested && m_currentThreadId != 0 && !threadSwitchDeferred())
         {
             GuestThread *preempted = currentThread();
             assert(preempted != nullptr);
@@ -436,6 +465,17 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return true;
     }
 
+    if (m_heldUntilEi)
+    {
+        if (!threadSwitchDeferred())
+        {
+            m_heldUntilEi = false;
+            m_checkpointPending.store(true, std::memory_order_release);
+            m_transferToDispatcher = true;
+            return true;
+        }
+    }
+
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
@@ -497,6 +537,11 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (running != nullptr && (sliceEqual || running->currentPriority > 0) &&
         hasReadyAtOrAbovePriority(running->currentPriority - (sliceEqual ? 0 : 1)))
     {
+        if (threadSwitchDeferred())
+        {
+            m_heldUntilEi = true; // the slice ends at EI
+            return false;
+        }
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
         m_transferToDispatcher = true;
@@ -1656,6 +1701,10 @@ void EeScheduler::publishSnapshot()
     next.nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
     next.idleCycles = m_idleCycles;
     next.runningThreadId = m_currentThreadId;
+    next.enabledIntcMask = m_enabledIntcMask;
+    next.pendingIntcMask = m_pendingIntcMask;
+    next.pendingInvocations = static_cast<uint32_t>(m_pendingInvocations.size());
+    next.heldUntilEi = m_heldUntilEi;
     next.threads.reserve(m_threads.size());
     for (const auto &[id, item] : m_threads)
     {
@@ -1899,6 +1948,11 @@ void EeScheduler::applyPendingPreemption()
         m_timeSliceExpired = false;
         return;
     }
+    if (threadSwitchDeferred())
+    {
+        m_heldUntilEi = true;
+        return;
+    }
     GuestThread *self = currentThread();
     assert(self != nullptr);
     enqueueReady(*self, !m_timeSliceExpired);
@@ -2034,6 +2088,24 @@ void EeScheduler::processDueDeadlines()
             processEvent(scheduled.event);
         }
     }
+}
+
+bool EeScheduler::threadSwitchDeferred() const noexcept
+{
+    const GuestThread *running = m_currentThreadId != 0 ? currentThread() : nullptr;
+    if (running == nullptr)
+    {
+        return false;
+    }
+    if (running->invocations.empty())
+    {
+        return !guestInterruptsEnabled(running->context);
+    }
+    // A handler that wakes a higher-priority thread (iSignalSema) must finish first: resuming it later,
+    // after that thread ran, leaves it working on stale state (VP2's timer handler walking its counter
+    // list while the woken thread reused a counter it had just freed).
+    return std::any_of(running->invocations.begin(), running->invocations.end(),
+                       [](const GuestInvocation &invocation) { return runsInInterruptContext(invocation.kind); });
 }
 
 bool EeScheduler::interruptInvocationPending() const

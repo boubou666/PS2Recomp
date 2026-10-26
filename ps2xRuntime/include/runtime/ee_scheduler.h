@@ -226,6 +226,10 @@ struct EeKernelSnapshot
     uint64_t nextEventCycle = 0;
     uint64_t idleCycles = 0; // EE cycles skipped while no thread was ready
     int runningThreadId = 0;
+    uint32_t enabledIntcMask = 0;
+    uint32_t pendingIntcMask = 0;   // causes raised while disabled
+    uint32_t pendingInvocations = 0; // queued handlers not started yet
+    bool heldUntilEi = false;        // ... or a thread switch, because the running thread executed DI
     std::vector<EeThreadSnapshot> threads;
     std::vector<EeSemaphoreSnapshot> semaphores;
     std::vector<EeEventFlagSnapshot> eventFlags;
@@ -433,6 +437,9 @@ private:
     void processPendingEvents();
     void processDueDeadlines();
     [[nodiscard]] bool interruptInvocationPending() const;
+    // The running thread executed DI outside a handler, or runs an interrupt-context handler: on the
+    // PS2 the thread switch waits for its EI or for the handler's return (ERET).
+    [[nodiscard]] bool threadSwitchDeferred() const noexcept;
     void processEvent(const EeEvent &event);
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
@@ -478,6 +485,10 @@ private:
     bool m_timeSliceExpired = false;
     bool m_transferToDispatcher = false;
     bool m_insideInterrupt = false;
+    // A pending invocation or a thread switch waits because the running thread executed DI
+    // (Status.EIE clear) or runs a handler (see threadSwitchDeferred). checkpointDue() returns to
+    // the dispatcher once it executes EI; a handler's return reaches the dispatcher anyway.
+    bool m_heldUntilEi = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_idleCycles = 0;

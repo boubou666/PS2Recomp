@@ -72,6 +72,21 @@ namespace
     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
+    constexpr uint32_t kDiQueuePc = 0x00160560u;
+    constexpr uint32_t kDiCriticalPc = 0x00160570u;
+    constexpr uint32_t kDiAfterEiPc = 0x00160580u;
+    constexpr uint32_t kDiHandlerPc = 0x00160590u;
+    constexpr uint32_t kSliceMainPc = 0x001605A0u;
+    constexpr uint32_t kSliceAPc = 0x001605B0u;
+    constexpr uint32_t kSliceASpinPc = 0x001605C0u;
+    constexpr uint32_t kSliceBPc = 0x001605D0u;
+    constexpr uint32_t kHandlerWakeMainPc = 0x001605E0u;
+    constexpr uint32_t kHandlerWakeWaiterPc = 0x001605F0u;
+    constexpr uint32_t kHandlerWakeWaiterResumePc = 0x00160800u;
+    constexpr uint32_t kHandlerWakeLowPc = 0x00160810u;
+    constexpr uint32_t kHandlerWakeLowSpinPc = 0x00160820u;
+    constexpr uint32_t kHandlerWakeFirstPc = 0x00160830u;
+    constexpr uint32_t kHandlerWakeSecondPc = 0x00160840u;
     constexpr uint32_t kLatchWaitPc = 0x00160600u;
     constexpr uint32_t kLatchResumePc = 0x00160610u;
     constexpr uint32_t kLatchFinishPc = 0x00160620u;
@@ -391,6 +406,150 @@ namespace
     {
         ctx->pc = 0u;
         runtime->requestStop();
+    }
+
+    // DI, then an interrupt arrives inside the critical section.
+    void schedulerDiQueue(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        ctx->cop0_status &= ~0x10000u; // di
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.context.pc = kDiHandlerPc;
+        setRegU32(invocation.context, 31, 0u);
+        runtime->eeScheduler().queueInvocation(std::move(invocation));
+        ctx->pc = kDiCriticalPc;
+    }
+
+    void schedulerDiCritical(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_dispatchTrace.push_back(3);
+        ctx->cop0_status |= 0x10000u; // ei
+        ctx->pc = kDiAfterEiPc;
+    }
+
+    void schedulerDiAfterEi(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(4);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerDiHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_dispatchTrace.push_back(2);
+        ctx->pc = 0u;
+    }
+
+    // Two threads of equal priority; A runs past several time slices with interrupts disabled.
+    uint32_t g_sliceSpins = 0u;
+    uint32_t g_sliceSpinsWhenBRan = 0u;
+
+    void schedulerSliceMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        EeThreadCreateParams params{};
+        params.stackSize = 0x1000u;
+        params.priority = 10;
+        params.entry = kSliceAPc;
+        params.stack = 0x1C000u;
+        scheduler.startThread(scheduler.createThread(params), 0u, *ctx, false);
+        params.entry = kSliceBPc;
+        params.stack = 0x1D000u;
+        scheduler.startThread(scheduler.createThread(params), 0u, *ctx, false);
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        ctx->pc = kSliceMainPc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerSliceA(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->cop0_status &= ~0x10000u; // di
+        ctx->pc = kSliceASpinPc;
+    }
+
+    void schedulerSliceASpin(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++g_sliceSpins;
+        (void)runtime->eeScheduler().checkpointDue(static_cast<uint32_t>(EeScheduler::kDefaultTimeSliceCycles));
+        if (g_sliceSpins < 3u)
+        {
+            ctx->pc = kSliceASpinPc;
+            return;
+        }
+        ctx->cop0_status |= 0x10000u; // ei
+        ctx->pc = 0u;
+    }
+
+    void schedulerSliceB(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_sliceSpinsWhenBRan = g_sliceSpins;
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // A low-priority thread takes an interrupt whose handler wakes a higher-priority waiter, then goes
+    // on through the dispatcher (a checkpoint inside the handler) before returning.
+    int g_handlerWakeSema = 0;
+
+    void schedulerHandlerWakeMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_handlerWakeSema = scheduler.createSemaphore(0, 1, 0u, 0u);
+        EeThreadCreateParams params{};
+        params.stackSize = 0x1000u;
+        params.entry = kHandlerWakeWaiterPc;
+        params.stack = 0x1C000u;
+        params.priority = 10;
+        scheduler.startThread(scheduler.createThread(params), 0u, *ctx, false);
+        params.entry = kHandlerWakeLowPc;
+        params.stack = 0x1D000u;
+        params.priority = 20;
+        scheduler.startThread(scheduler.createThread(params), 0u, *ctx, false);
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        ctx->pc = kHandlerWakeMainPc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerHandlerWakeWaiter(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = kHandlerWakeWaiterResumePc;
+        runtime->eeScheduler().waitSemaphore(g_handlerWakeSema);
+    }
+
+    void schedulerHandlerWakeWaiterResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(3);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerHandlerWakeLow(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.context.pc = kHandlerWakeFirstPc;
+        setRegU32(invocation.context, 31, 0u);
+        runtime->eeScheduler().queueInvocation(std::move(invocation));
+        ctx->pc = kHandlerWakeLowSpinPc;
+    }
+
+    void schedulerHandlerWakeLowSpin(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = kHandlerWakeLowSpinPc;
+    }
+
+    void schedulerHandlerWakeFirst(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        runtime->eeScheduler().signalSemaphore(g_handlerWakeSema, true); // iSignalSema
+        ctx->pc = kHandlerWakeSecondPc;
+    }
+
+    void schedulerHandlerWakeSecond(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_dispatchTrace.push_back(2);
+        ctx->pc = 0u;
     }
 }
 
@@ -805,6 +964,71 @@ void register_ps2_runtime_interrupt_tests()
             t.IsFalse(exhausted, "queued callbacks must not consume one invocation stack per pending item");
             t.Equals(g_invocationQueueRuns, 96u, "every queued callback should execute exactly once");
             t.IsFalse(g_invocationQueueSpChanged, "sequential callbacks should reuse the same stack depth");
+        });
+
+        tc.Run("pending interrupt waits while the running thread has interrupts disabled", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kDiQueuePc, schedulerDiQueue);
+            env.runtime.registerFunction(kDiCriticalPc, schedulerDiCritical);
+            env.runtime.registerFunction(kDiAfterEiPc, schedulerDiAfterEi);
+            env.runtime.registerFunction(kDiHandlerPc, schedulerDiHandler);
+            g_dispatchTrace.clear();
+
+            R5900Context mainContext{};
+            mainContext.pc = kDiQueuePc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_dispatchTrace.size(), static_cast<size_t>(4), "every step should run once");
+            if (g_dispatchTrace.size() == 4u)
+            {
+                t.Equals(g_dispatchTrace[1], 3, "the critical section should finish before the handler");
+                t.Equals(g_dispatchTrace[2], 2, "the handler should run as soon as EI executes");
+            }
+        });
+
+        tc.Run("a thread with interrupts disabled keeps the CPU past its time slice", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kSliceMainPc, schedulerSliceMain);
+            env.runtime.registerFunction(kSliceAPc, schedulerSliceA);
+            env.runtime.registerFunction(kSliceASpinPc, schedulerSliceASpin);
+            env.runtime.registerFunction(kSliceBPc, schedulerSliceB);
+            g_sliceSpins = 0u;
+            g_sliceSpinsWhenBRan = 0u;
+
+            R5900Context mainContext{};
+            mainContext.pc = kSliceMainPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_sliceSpinsWhenBRan, 3u, "the equal-priority thread should run only once the other executes EI");
+        });
+
+        tc.Run("a handler that wakes a higher-priority thread finishes before the switch", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kHandlerWakeMainPc, schedulerHandlerWakeMain);
+            env.runtime.registerFunction(kHandlerWakeWaiterPc, schedulerHandlerWakeWaiter);
+            env.runtime.registerFunction(kHandlerWakeWaiterResumePc, schedulerHandlerWakeWaiterResume);
+            env.runtime.registerFunction(kHandlerWakeLowPc, schedulerHandlerWakeLow);
+            env.runtime.registerFunction(kHandlerWakeLowSpinPc, schedulerHandlerWakeLowSpin);
+            env.runtime.registerFunction(kHandlerWakeFirstPc, schedulerHandlerWakeFirst);
+            env.runtime.registerFunction(kHandlerWakeSecondPc, schedulerHandlerWakeSecond);
+            g_dispatchTrace.clear();
+
+            R5900Context mainContext{};
+            mainContext.pc = kHandlerWakeMainPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_dispatchTrace.size(), static_cast<size_t>(3), "handler halves and waiter should each run once");
+            if (g_dispatchTrace.size() == 3u)
+            {
+                t.Equals(g_dispatchTrace[1], 2, "the handler should return before the woken thread runs");
+                t.Equals(g_dispatchTrace[2], 3, "the woken thread should run right after the handler");
+            }
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)
