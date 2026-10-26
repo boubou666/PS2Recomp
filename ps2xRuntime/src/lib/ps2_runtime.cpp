@@ -478,7 +478,7 @@ bool latchPresentationOnVBlank(); // Kernel/EeScheduler.cpp
 // PS2X_SHOW_FPS=1, F3 toggles it: the game's frame rate at the top right of the window over the last half second,
 // from the frames its game layer reports (PS2Runtime::noteGameFrame) or else from the pictures it shows
 // (GS::displayFlips: the display buffer moving between vblanks). Not the host's redraws, which follow the monitor.
-static void DrawFpsOverlay(uint64_t gameFrames, uint64_t displayFlips, float screenWidth, float screenHeight)
+static void DrawFpsOverlay(uint64_t gameFrames, uint64_t displayFlips, uint64_t eeCycles, float screenWidth, float screenHeight)
 {
     static bool s_visible = []
     {
@@ -488,23 +488,26 @@ static void DrawFpsOverlay(uint64_t gameFrames, uint64_t displayFlips, float scr
     if (IsKeyPressed(KEY_F3))
         s_visible = !s_visible;
     static auto s_windowStart = std::chrono::steady_clock::now();
-    static uint64_t s_windowFrames = gameFrames, s_windowFlips = displayFlips;
+    static uint64_t s_windowFrames = gameFrames, s_windowFlips = displayFlips, s_windowCycles = eeCycles;
     static double s_fps = 0.0;
+    static double s_eeSpeed = 0.0;
     const auto now = std::chrono::steady_clock::now();
     const double elapsed = std::chrono::duration<double>(now - s_windowStart).count();
     if (elapsed >= 0.5)
     {
         const uint64_t frames = gameFrames != s_windowFrames ? gameFrames - s_windowFrames : displayFlips - s_windowFlips;
         s_fps = static_cast<double>(frames) / elapsed;
+        s_eeSpeed = static_cast<double>(eeCycles - s_windowCycles) / (elapsed * static_cast<double>(EeScheduler::kEeClockHz)) * 100.0;
         s_windowStart = now;
         s_windowFrames = gameFrames;
         s_windowFlips = displayFlips;
+        s_windowCycles = eeCycles;
     }
     if (!s_visible)
         return;
 
-    char text[32];
-    std::snprintf(text, sizeof(text), "%.1f fps", s_fps);
+    char text[48];
+    std::snprintf(text, sizeof(text), "%.1f fps  EE %.0f%%", s_fps, s_eeSpeed);
     const int fontSize = std::max(18, static_cast<int>(screenHeight / 28.0f));
     const int padding = fontSize / 3;
     const int textWidth = MeasureText(text, fontSize);
@@ -3329,7 +3332,7 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), screenWidth, screenHeight);
+        DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), eeScheduler().currentCycle(), screenWidth, screenHeight);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
