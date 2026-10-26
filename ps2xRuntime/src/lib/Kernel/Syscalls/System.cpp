@@ -574,6 +574,14 @@ namespace ps2_syscalls
             heapLimit = heapEnd;
         }
 
+        // A pinned runtime heap (PS2Runtime::pinGuestHeap) stays where the game override put it; the game's own sbrk
+        // gets the span from its base up to EndOfHeap.
+        if (runtime && runtime->guestHeapPinned())
+        {
+            setReturnU32(ctx, heapBase);
+            return;
+        }
+
         if (runtime)
         {
             runtime->configureGuestHeap(heapBase, heapLimit);
@@ -602,8 +610,9 @@ namespace ps2_syscalls
 
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
 
+        // With a pinned runtime heap the game's sbrk ends where that heap starts.
         const uint32_t ret = runtime
-                                 ? runtime->guestHeapLimit()
+                                 ? (runtime->guestHeapPinned() ? runtime->guestHeapBase() : runtime->guestHeapLimit())
                                  : kDefaultGuestHeapEnd;
 
         setReturnU32(ctx, ret);

@@ -4,6 +4,7 @@
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ee_scheduler.h"
+#include "Syscalls/Helpers/State.h"
 
 #include <algorithm>
 #include <cstring>
@@ -50,6 +51,8 @@ namespace ps2_stubs
         };
 
         std::unordered_map<uint32_t, SifCmdHandler> g_sifCmdHandlers;
+        std::array<bool, kSifCmdPacketPoolCount> g_sifCmdPacketSlotUsed{};
+        bool g_sifCmdPacketPoolFullLogged = false;
         uint32_t g_sifCmdBuffer = 0u;
         uint32_t g_sifSysCmdBuffer = 0u;
         bool g_sifCmdInitialized = false;
@@ -62,11 +65,49 @@ namespace ps2_stubs
         constexpr uint32_t kSifRegMsCom = 0x80000002u;
         constexpr uint32_t kSifBootReadyMask = 0x00020000u;
 
+        // A slot of the SIF command packet pool (Syscalls/Helpers/State.h); the guest heap only when every slot is in
+        // flight.
+        uint32_t allocSifCmdPacket(PS2Runtime *runtime, uint32_t size)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                for (uint32_t slot = 0; slot < kSifCmdPacketPoolCount; ++slot)
+                {
+                    if (!g_sifCmdPacketSlotUsed[slot])
+                    {
+                        g_sifCmdPacketSlotUsed[slot] = true;
+                        return reservedPoolAddress(kSifCmdPacketPoolOffset + slot * kSifCmdPacketSlotBytes);
+                    }
+                }
+                if (!g_sifCmdPacketPoolFullLogged)
+                {
+                    g_sifCmdPacketPoolFullLogged = true;
+                    std::cerr << "[SIF] " << kSifCmdPacketPoolCount
+                              << " command packets in flight, falling back to the guest heap" << std::endl;
+                }
+            }
+            return runtime->guestMalloc(size, 16u);
+        }
+
+        void freeSifCmdPacket(PS2Runtime *runtime, uint32_t address)
+        {
+            const uint32_t pool = reservedPoolAddress(kSifCmdPacketPoolOffset);
+            if (address >= pool && address < pool + kSifCmdPacketSlotBytes * kSifCmdPacketPoolCount)
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                g_sifCmdPacketSlotUsed[(address - pool) / kSifCmdPacketSlotBytes] = false;
+                return;
+            }
+            runtime->guestFree(address);
+        }
+
         void seedDefaultSifRegsLocked()
         {
             g_sifRegs.clear();
             g_sifSregs.clear();
             g_sifCmdHandlers.clear();
+            g_sifCmdPacketSlotUsed.fill(false);
+            g_sifCmdPacketPoolFullLogged = false;
             g_sifCmdBuffer = 0u;
             g_sifSysCmdBuffer = 0u;
             g_sifCmdInitialized = false;
@@ -247,7 +288,7 @@ namespace ps2_stubs
         if (!runtime->hasFunction(registered.function))
             return false;
 
-        const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
+        const uint32_t packetAddress = allocSifCmdPacket(runtime, static_cast<uint32_t>(packetSize));
         if (packetAddress == 0u)
             return false;
 
@@ -255,7 +296,7 @@ namespace ps2_stubs
         uint8_t *const last = getMemPtr(rdram, packetAddress + static_cast<uint32_t>(packetSize - 1u));
         if (!first || !last || last < first || static_cast<size_t>(last - first) != packetSize - 1u)
         {
-            runtime->guestFree(packetAddress);
+            freeSifCmdPacket(runtime, packetAddress);
             return false;
         }
 
@@ -277,14 +318,14 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 31, 0u);
             invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
             {
-                runtime->guestFree(packetAddress);
+                freeSifCmdPacket(runtime, packetAddress);
             };
             runtime->eeScheduler().queueInvocation(std::move(invocation));
             return true;
         }
         catch (...)
         {
-            runtime->guestFree(packetAddress);
+            freeSifCmdPacket(runtime, packetAddress);
             return false;
         }
     }

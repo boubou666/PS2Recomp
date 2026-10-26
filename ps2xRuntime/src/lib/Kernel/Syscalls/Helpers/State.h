@@ -270,7 +270,15 @@ static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
 
 static constexpr uint32_t kBootModePoolOffset = 0x00030000;
 static constexpr uint32_t kBootModePoolBytes = 0x00001000;
-static_assert(kBootModePoolOffset + kBootModePoolBytes <= PS2Runtime::kReservedPoolBytes,
+
+// IOP -> EE SIF command packets copied for the game's handlers (at most 112 bytes; handlers are queued, so several
+// can be in flight). Not on the guest heap: a game with its own sbrk owns everything from the end of its BSS up to
+// EndOfHeap, and a packet there lands inside the game's allocator (EA's dlmalloc lost its top chunk header that way).
+static constexpr uint32_t kSifCmdPacketPoolOffset = 0x00031000;
+static constexpr uint32_t kSifCmdPacketSlotBytes = 0x80;
+static constexpr uint32_t kSifCmdPacketPoolCount = 128;
+static_assert(kSifCmdPacketPoolOffset >= kBootModePoolOffset + kBootModePoolBytes, "SIF command pool overlaps");
+static_assert(kSifCmdPacketPoolOffset + kSifCmdPacketSlotBytes * kSifCmdPacketPoolCount <= PS2Runtime::kReservedPoolBytes,
               "HLE pools must fit in the runtime-reserved pool area");
 
 inline uint32_t reservedPoolAddress(uint32_t offset)

@@ -399,6 +399,12 @@ public:
     void handleTLBP(uint8_t *rdram, R5900Context *ctx);
     void clearLLBit(R5900Context *ctx);
     void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_RAM_SIZE);
+    // A game that runs its own sbrk owns guest RAM from the end of its BSS up to EndOfHeap, the same span the runtime's
+    // guest heap (HLE DMA packets, thread stacks, ...) takes by default. pinGuestHeap moves the runtime's heap to
+    // [guestBase, guestLimit) for good: SetupHeap no longer moves it and EndOfHeap returns guestBase, so the game's sbrk
+    // stops below it. For game overrides.
+    void pinGuestHeap(uint32_t guestBase, uint32_t guestLimit);
+    bool guestHeapPinned() const;
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
@@ -582,6 +588,7 @@ private:
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     uint32_t m_guestHeapHardLimit = 0x01F00000u;
     bool m_guestHeapConfigured = false;
+    bool m_guestHeapPinned = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 

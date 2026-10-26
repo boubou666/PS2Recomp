@@ -1036,6 +1036,26 @@ void register_ps2_runtime_kernel_tests()
             env.runtime.configureReservedMemory(0x01F00000u, PS2_RAM_SIZE, 0x01F00000u);
         });
 
+        tc.Run("a pinned runtime heap keeps HLE allocations out of the game's sbrk span", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.pinGuestHeap(0x01E00000u, 0x01F00000u);
+            t.IsTrue(env.runtime.guestHeapPinned(), "pinGuestHeap should pin");
+
+            setRegU32(env.ctx, 4, 0x00448E10u);
+            setRegU32(env.ctx, 5, 0x02000000u);
+            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), 0x00448E10u, "SetupHeap returns the game's base");
+            t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
+            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), 0x01E00000u,
+                     "the game's sbrk must stop where the pinned heap starts");
+
+            const uint32_t packet = env.runtime.guestMalloc(128u, 16u);
+            t.IsTrue(packet >= 0x01E00000u && packet + 128u <= 0x01F00000u,
+                     "HLE allocations must come from the pinned range, not from the game's heap");
+            env.runtime.guestFree(packet);
+        });
+
         tc.Run("setup heap and allocator primitives track end-of-heap", [](TestCase &t)
         {
             TestEnv env;
