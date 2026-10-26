@@ -3073,7 +3073,7 @@ uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::Textu
         c11 = samplePoint(u1, v1);
     }
 
-#if defined(__SSE4_1__)
+#if defined(__SSE4_1__) || defined(__AVX__) // MSVC defines no __SSE4_1__, only __AVX__/__AVX2__ (/arch:AVX2)
     // lerpChannel on the four channels at once (the same integer arithmetic, so the same result).
     const __m128i zero = _mm_setzero_si128();
     auto widen = [&](uint32_t c) { return _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(static_cast<int>(c)), zero), zero); };
@@ -3287,6 +3287,29 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
 
     uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
 
+    // kLanes pixels at a time when their order cannot matter (needsPixelOrder), as DrawTriangle does: each lane comes
+    // out as the per-pixel code below would draw it. WritePixelBlock takes depth-tested lanes: the test runs first.
+    constexpr int N = kLanes;
+    const PixelPipeline &pixel = *raster.pixel;
+    const bool blocks = !raster.pixelOrder;
+    const auto depthTestedLanes = [&](int xb, int y, uint32_t live)
+    {
+        if (pixel.ztst == 0u)
+            return 0u;
+        if (pixel.ztst >= 2u)
+        {
+            for (int i = 0; i < N; ++i)
+            {
+                if (!((live >> i) & 1u))
+                    continue;
+                const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, xb + i, y);
+                if (pixel.ztst == 2u ? z1 < storedZ : z1 <= storedZ)
+                    live &= ~(1u << i);
+            }
+        }
+        return live;
+    };
+
     if (state.prim.tme)
     {
         const auto &tex = ctx.tex0;
@@ -3330,6 +3353,56 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
             float texVf = v0f + (v1f - v0f) * ty;
 
             for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
+            {
+            if (blocks)
+            {
+                for (int xb = runStart; xb <= runEnd; xb += N)
+                {
+                    const uint32_t live = depthTestedLanes(xb, y, (1u << std::min(N, runEnd - xb + 1)) - 1u);
+                    if (live == 0u)
+                        continue;
+                    float is[N], it[N], iq[N];
+                    uint16_t iu[N], iv[N];
+                    for (int i = 0; i < N; ++i)
+                    {
+                        const float tx = (static_cast<float>(xb + i - unclippedX0) + 0.5f) / spriteW;
+                        const float texUf = u0f + (u1f - u0f) * tx;
+                        if (state.prim.fst)
+                        {
+                            iu[i] = static_cast<uint16_t>(clampInt(static_cast<int>((texUf * 16.0f) + 0.5f), 0, 0xFFFF));
+                            iv[i] = static_cast<uint16_t>(clampInt(static_cast<int>((texVf * 16.0f) + 0.5f), 0, 0xFFFF));
+                            is[i] = 0.0f;
+                            it[i] = 0.0f;
+                        }
+                        else
+                        {
+                            iu[i] = 0u;
+                            iv[i] = 0u;
+                            is[i] = texUf / static_cast<float>(texW);
+                            it[i] = texVf / static_cast<float>(texH);
+                        }
+                        iq[i] = 1.0f;
+                    }
+                    uint32_t texel[N];
+                    SampleTextureBlock(*raster.texture, *raster.cache, is, it, iq, iu, iv, live, texel);
+                    uint32_t zs[N];
+                    int32_t cr[N], cg[N], cb[N], ca[N], fog[N];
+                    for (int i = 0; i < N; ++i)
+                    {
+                        const TextureCombineResult color =
+                            combineTexture(tex, r, g, b, a, static_cast<uint8_t>(texel[i] & 0xFF), static_cast<uint8_t>((texel[i] >> 8) & 0xFF),
+                                           static_cast<uint8_t>((texel[i] >> 16) & 0xFF), static_cast<uint8_t>((texel[i] >> 24) & 0xFF));
+                        cr[i] = color.r;
+                        cg[i] = color.g;
+                        cb[i] = color.b;
+                        ca[i] = color.a;
+                        zs[i] = z1;
+                        fog[i] = v1.fog;
+                    }
+                    WritePixelBlock(pixel, xb, y, live, zs, cr, cg, cb, ca, fog);
+                }
+                continue;
+            }
             for (int x = runStart; x <= runEnd; ++x)
             {
                 float tx =(static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
@@ -3356,6 +3429,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
                 WritePixel(*raster.pixel, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
             }
+            }
         }
     }
     else
@@ -3363,8 +3437,32 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
         for (int y = drawY0; y <= drawY1; ++y)
         {
             for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
+            {
+                if (blocks)
+                {
+                    for (int xb = runStart; xb <= runEnd; xb += N)
+                    {
+                        const uint32_t live = depthTestedLanes(xb, y, (1u << std::min(N, runEnd - xb + 1)) - 1u);
+                        if (live == 0u)
+                            continue;
+                        uint32_t zs[N];
+                        int32_t cr[N], cg[N], cb[N], ca[N], fog[N];
+                        for (int i = 0; i < N; ++i)
+                        {
+                            cr[i] = r;
+                            cg[i] = g;
+                            cb[i] = b;
+                            ca[i] = a;
+                            zs[i] = z1;
+                            fog[i] = v1.fog;
+                        }
+                        WritePixelBlock(pixel, xb, y, live, zs, cr, cg, cb, ca, fog);
+                    }
+                    continue;
+                }
                 for (int x = runStart; x <= runEnd; ++x)
                     WritePixel(*raster.pixel, x, y, z1, r, g, b, a, v1.fog);
+            }
         }
     }
 }
