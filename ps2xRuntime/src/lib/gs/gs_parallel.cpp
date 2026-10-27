@@ -1,5 +1,8 @@
 // paraLLEl-GS as a GS stream renderer (gs_stream_renderer.h). Compiled only with PS2X_ENABLE_PARALLEL_GS.
 #include "runtime/gs/gs_stream_renderer.h"
+#include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_state_image.h"
+#include "runtime/gs/ps2_gs_memory.h"
 
 #include "context.hpp"
 #include "device.hpp"
@@ -114,6 +117,23 @@ namespace
             m_interface.write_register(static_cast<RegisterAddr>(address), value);
         }
 
+        void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir, const uint8_t *data,
+                         uint32_t sizeBytes) override
+        {
+            if (!data || sizeBytes == 0u)
+                return;
+            const uint64_t registers[4] = {bitbltbuf, trxpos, trxreg, trxdir};
+            for (uint32_t i = 0; i < 4u; ++i)
+                writeRegister(static_cast<uint8_t>(GS_REG_BITBLTBUF + i), registers[i]);
+            // The image data behind an IMAGE tag, padded to whole quadwords.
+            const uint32_t qwords = (sizeBytes + 15u) / 16u;
+            m_packet.assign(16u + qwords * 16u, 0u);
+            const uint64_t tag = qwords | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58);
+            std::memcpy(m_packet.data(), &tag, sizeof(tag));
+            std::memcpy(m_packet.data() + 16u, data, sizeBytes);
+            gifTransfer(m_packet.data(), static_cast<uint32_t>(m_packet.size()));
+        }
+
         void flush() override { m_interface.flush(); }
 
         PresentationFrame present(const GSPresentationRequest &request) override
@@ -221,9 +241,153 @@ namespace
             out.assign(vram, vram + m_vramSize);
         }
 
+        void writeVram(const uint8_t *data, uint32_t sizeBytes) override
+        {
+            const uint32_t bytes = std::min(sizeBytes, m_vramSize);
+            if (!data || bytes == 0u)
+                return;
+            std::memcpy(m_interface.map_vram_write(0, bytes), data, bytes);
+            m_interface.end_vram_write(0, bytes);
+        }
+
+        uint32_t readVramPixel(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) override
+        {
+            // Read-only: the pixel readers take a mutable pointer but do not write through it.
+            auto *vram = const_cast<uint8_t *>(static_cast<const uint8_t *>(m_interface.map_vram_read(0, m_vramSize)));
+            return GSCpuBackend::ReadVramPixel(vram, psm, base, bw, x, y);
+        }
+
+        void writeVramPixel(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
+        {
+            const size_t offset = (size_t(GSMem::PageOf(psm, base, bw, x, y)) * kPageBytes) % m_vramSize;
+            uint8_t *page = static_cast<uint8_t *>(m_interface.map_vram_write(offset, kPageBytes));
+            // The pixel writers address the whole of VRAM; only this page is mapped for writing.
+            GSCpuBackend::WriteVramPixel(page - offset, psm, base, bw, x, y, value);
+            m_interface.end_vram_write(offset, kPageBytes);
+        }
+
+        // paraLLEl keeps the vertex queue and the CLUT buffer to itself: the image has neither (flags clear).
+        // PRMODE is folded into PRIM as paraLLEl holds it, which a renderer loading the image resolves the same way.
+        void saveState(GSStateImage &image) override
+        {
+            const RegisterState &r = m_interface.get_register_state();
+            image = GSStateImage{};
+            for (uint8_t i = 0; i < 2u; ++i)
+            {
+                const ContextState &c = r.ctx[i];
+                image.setReg(GS_REG_TEX0_1 + i, c.tex0.bits);
+                image.setReg(GS_REG_CLAMP_1 + i, c.clamp.bits);
+                image.setReg(GS_REG_TEX1_1 + i, c.tex1.bits);
+                image.setReg(GS_REG_XYOFFSET_1 + i, c.xyoffset.bits);
+                image.setReg(GS_REG_MIPTBP1_1 + i, c.miptbl_1_3.bits);
+                image.setReg(GS_REG_MIPTBP2_1 + i, c.miptbl_4_6.bits);
+                image.setReg(GS_REG_SCISSOR_1 + i, c.scissor.bits);
+                image.setReg(GS_REG_ALPHA_1 + i, c.alpha.bits);
+                image.setReg(GS_REG_TEST_1 + i, c.test.bits);
+                image.setReg(GS_REG_FBA_1 + i, c.fba.bits);
+                image.setReg(GS_REG_FRAME_1 + i, c.frame.bits);
+                image.setReg(GS_REG_ZBUF_1 + i, c.zbuf.bits);
+            }
+            image.setReg(GS_REG_PRIM, r.prim.bits);
+            image.setReg(GS_REG_PRMODE, r.prim.bits);
+            image.setReg(GS_REG_PRMODECONT, r.prmodecont.bits);
+            image.setReg(GS_REG_RGBAQ, r.rgbaq.bits);
+            image.setReg(GS_REG_ST, r.st.bits);
+            image.setReg(GS_REG_UV, r.uv.bits);
+            image.setReg(GS_REG_FOG, r.fog.bits);
+            image.setReg(GS_REG_TEXCLUT, r.texclut.bits);
+            image.setReg(GS_REG_TEXA, r.texa.bits);
+            image.setReg(GS_REG_FOGCOL, r.fogcol.bits);
+            image.setReg(GS_REG_DIMX, r.dimx.bits);
+            image.setReg(GS_REG_DTHE, r.dthe.bits);
+            image.setReg(GS_REG_COLCLAMP, r.colclamp.bits);
+            image.setReg(GS_REG_PABE, r.pabe.bits);
+            image.setReg(GS_REG_SCANMSK, r.scanmsk.bits);
+            image.setReg(GS_REG_BITBLTBUF, r.bitbltbuf.bits);
+            image.setReg(GS_REG_TRXPOS, r.trxpos.bits);
+            image.setReg(GS_REG_TRXREG, r.trxreg.bits);
+            image.setReg(GS_REG_TRXDIR, r.trxdir.bits);
+            image.clutCbp = {r.cached_cbp[0], r.cached_cbp[1]};
+        }
+
+        void loadState(const GSStateImage &image) override
+        {
+            const bool prmodecont = (image.reg(GS_REG_PRMODECONT) & 1u) != 0u;
+            const uint64_t prim = prmodecont ? image.reg(GS_REG_PRIM)
+                                             : (image.reg(GS_REG_PRMODE) & ~0x7ull) | (image.reg(GS_REG_PRIM) & 0x7u);
+            writeRegister(GS_REG_PRMODECONT, 1u);
+            writeRegister(GS_REG_PRIM, prim);
+            writeRegister(GS_REG_PRMODECONT, image.reg(GS_REG_PRMODECONT));
+
+            if ((image.flags & GSStateImage::HasClut) != 0u)
+                loadClut(image.clut);
+
+            // TEX0 without its CLUT load (the buffer was just restored); TEX0 regenerates MIPTBP1 when TEX1.MTBA
+            // is set, so MIPTBP comes after it.
+            static constexpr uint8_t kContextRegisters[] = {GS_REG_TEX1_1, GS_REG_TEX0_1, GS_REG_CLAMP_1,
+                                                            GS_REG_XYOFFSET_1, GS_REG_SCISSOR_1, GS_REG_ALPHA_1,
+                                                            GS_REG_TEST_1, GS_REG_FBA_1, GS_REG_FRAME_1,
+                                                            GS_REG_ZBUF_1, GS_REG_MIPTBP1_1, GS_REG_MIPTBP2_1};
+            for (uint8_t i = 0; i < 2u; ++i)
+                for (const uint8_t address : kContextRegisters)
+                {
+                    uint64_t value = image.reg(address + i);
+                    if (address == GS_REG_TEX0_1)
+                        value &= ~(7ull << 61);
+                    writeRegister(static_cast<uint8_t>(address + i), value);
+                }
+            for (const uint8_t address : {GS_REG_TEXCLUT, GS_REG_TEXA, GS_REG_FOGCOL, GS_REG_DIMX, GS_REG_DTHE,
+                                          GS_REG_COLCLAMP, GS_REG_PABE, GS_REG_SCANMSK, GS_REG_BITBLTBUF,
+                                          GS_REG_TRXPOS, GS_REG_TRXREG})
+                writeRegister(address, image.reg(address));
+
+            if ((image.flags & GSStateImage::HasVertexQueue) != 0u)
+                for (uint32_t i = 0; i < std::min(image.vertexCount, GSStateImage::kMaxQueuedVertices); ++i)
+                {
+                    const GSStateImage::Vertex &vertex = image.vertexQueue[i];
+                    writeRegister(GS_REG_RGBAQ, vertex.rgbaq);
+                    writeRegister(GS_REG_ST, vertex.st);
+                    writeRegister(GS_REG_UV, vertex.uv);
+                    writeRegister(GS_REG_FOG, uint64_t(vertex.fog) << 56);
+                    writeRegister(GS_REG_XYZ3, vertex.xyz);
+                }
+            for (const uint8_t address : {GS_REG_RGBAQ, GS_REG_ST, GS_REG_UV, GS_REG_FOG})
+                writeRegister(address, image.reg(address));
+
+            RegisterState &r = m_interface.get_register_state();
+            r.trxdir.bits = image.reg(GS_REG_TRXDIR);
+            const uint32_t qBits = static_cast<uint32_t>(image.reg(GS_REG_RGBAQ) >> 32);
+            std::memcpy(&r.internal_q, &qBits, sizeof(qBits));
+            if ((image.flags & GSStateImage::HasClut) != 0u)
+            {
+                r.cached_cbp[0] = image.clutCbp[0];
+                r.cached_cbp[1] = image.clutCbp[1];
+            }
+        }
+
         void reset() override { m_interface.reset_context_state(); }
 
     private:
+        static constexpr size_t kPageBytes = 8192u;
+
+        // Fills paraLLEl's CLUT buffer by having it load the image as a CSM1 CT32 palette from page 0, then puts
+        // page 0 back.
+        void loadClut(const std::array<uint16_t, 512> &clut)
+        {
+            std::vector<uint8_t> saved(kPageBytes);
+            uint8_t *page = static_cast<uint8_t *>(m_interface.map_vram_write(0, kPageBytes));
+            std::memcpy(saved.data(), page, kPageBytes);
+            for (uint32_t y = 0; y < 16u; ++y)
+                for (uint32_t x = 0; x < 16u; ++x)
+                    GSCpuBackend::WriteVramPixel(page, GS_PSM_CT32, 0u, 1u, x, y, clutPalettePixel(clut, x, y));
+            m_interface.end_vram_write(0, kPageBytes);
+            const uint64_t tex0 = (uint64_t(GS_PSM_T8) << 20) | (uint64_t(GS_PSM_CT32) << 51) | (1ull << 61);
+            writeRegister(GS_REG_TEX0_1, tex0);
+            std::memcpy(m_interface.map_vram_write(0, kPageBytes), saved.data(), kPageBytes);
+            m_interface.end_vram_write(0, kPageBytes);
+        }
+
+        std::vector<uint8_t> m_packet;
         uint32_t m_vramSize;
         Signals m_signals;
         Context m_context;

@@ -49,5 +49,9 @@ struct GSStateImage
     void setReg(uint8_t address, uint64_t value) { registers[address & 0x7Fu] = value; }
 };
 
+// The CLUT buffer as a 16x16 CT32 palette: loading it with TEX0 PSM T8, CPSM CT32, CSM1, CSA 0, CLD 1 refills the
+// whole buffer with `clut`.
+uint32_t clutPalettePixel(const std::array<uint16_t, 512> &clut, uint32_t x, uint32_t y);
+
 std::vector<uint8_t> serializeGsStateImage(const GSStateImage &image);
 bool deserializeGsStateImage(const uint8_t *data, size_t size, GSStateImage &image, size_t *consumed = nullptr);

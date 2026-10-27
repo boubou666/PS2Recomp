@@ -580,26 +580,18 @@ void GS::processWithStreamRenderer(const QueuedCommand &command)
     switch (command.kind)
     {
     case QueuedCommand::Kind::GifPacket:
-    case QueuedCommand::Kind::NativePackedGifPacket:
         m_streamRenderer->gifTransfer(data, size);
         break;
+    case QueuedCommand::Kind::NativePackedGifPacket:
+        m_streamRenderer->nativePackedGifTransfer(data, size);
+        break;
     case QueuedCommand::Kind::NativeImageUpload:
-    {
         if (!data || size == 0u)
             break;
-        for (uint32_t i = 0; i < 4u; ++i) // BITBLTBUF, TRXPOS, TRXREG, TRXDIR
-            m_streamRenderer->writeRegister(static_cast<uint8_t>(GS_REG_BITBLTBUF + i), command.registers[i]);
-        // The image data behind an IMAGE tag, padded to whole quadwords.
-        thread_local std::vector<uint8_t> packet;
-        const uint32_t qwords = (size + 15u) / 16u;
-        packet.assign(16u + qwords * 16u, 0u);
-        const uint64_t tag = qwords | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58);
-        std::memcpy(packet.data(), &tag, sizeof(tag));
-        std::memcpy(packet.data() + 16u, data, size);
-        m_streamRenderer->gifTransfer(packet.data(), static_cast<uint32_t>(packet.size()));
+        m_streamRenderer->uploadImage(command.registers[0], command.registers[1], command.registers[2],
+                                      command.registers[3], data, size);
         ++m_nativeImageUploadCount;
         break;
-    }
     case QueuedCommand::Kind::PresentationLatch:
         storePresentationFrame(m_streamRenderer->present(command.displayRegisters));
         m_queuedLatchesDone.fetch_add(1u, std::memory_order_release);
@@ -689,7 +681,7 @@ void GS::enableAsync()
 
 bool GS::requestStreamRenderer(GSStreamRendererKind kind)
 {
-    if (!GSStreamRenderer::available(kind))
+    if (!GSStreamRenderer::available(kind) || !GSStreamRenderer::hostedByFrontend(kind))
         return false;
     std::lock_guard<std::mutex> lock(m_queueMutex);
     if (m_streamRendererRequested)

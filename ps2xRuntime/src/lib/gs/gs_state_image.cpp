@@ -28,6 +28,13 @@ namespace
     };
 }
 
+uint32_t clutPalettePixel(const std::array<uint16_t, 512> &clut, uint32_t x, uint32_t y)
+{
+    const uint32_t position = ((y & 0xFu) << 4) | (x & 0xFu);
+    const uint32_t entry = (position & ~0x18u) | ((position & 0x08u) << 1) | ((position & 0x10u) >> 1);
+    return uint32_t(clut[entry]) | (uint32_t(clut[entry + 256u]) << 16);
+}
+
 std::vector<uint8_t> serializeGsStateImage(const GSStateImage &image)
 {
     std::vector<uint8_t> out;
