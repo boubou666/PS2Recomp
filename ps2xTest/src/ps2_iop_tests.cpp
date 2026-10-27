@@ -1,9 +1,39 @@
 #include "MiniTest.h"
 #include "ps2x/iop/ps2_path.h"
 #include "../../ps2xIOP/tests/iop_compat_test_support.h"
+#include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
+#include "../../ps2xIOP/src/emulator/core/iop_memory.h"
+
+#include <memory>
 
 namespace
 {
+    using ps2x::iop::detail::IopKernel;
+    using ps2x::iop::detail::IopThread;
+    using ps2x::iop::detail::IopThreadState;
+
+    constexpr uint32_t kSentinel = 0x1FFFFF00u;
+    constexpr uint32_t kRotateThreadReadyQueue = 16u;
+
+    struct SchedulerFixture
+    {
+        std::unique_ptr<ps2x::iop::detail::IopMemory> memory = std::make_unique<ps2x::iop::detail::IopMemory>();
+        IopKernel kernel{*memory};
+
+        IopThread &ready(int id, uint32_t priority)
+        {
+            IopThread &thread = kernel.hostThread(id, priority);
+            thread.cpu.pc = 0x1000u;
+            thread.state = IopThreadState::Ready;
+            return thread;
+        }
+
+        int next()
+        {
+            IopThread *thread = kernel.beginNextReady(0u);
+            return thread != nullptr ? thread->id : 0;
+        }
+    };
     iop_test::Irx getOtherDataModule(uint32_t eeSource, uint32_t iopDestination, uint32_t size)
     {
         iop_test::Irx image;
@@ -121,6 +151,58 @@ void register_ps2_iop_tests()
             const ps2x::iop::ModuleLoadResult loaded = subsystem.loadModuleBuffer(0x1000u);
             t.IsTrue(loaded.moduleId > 0, "the synthetic IRX should load");
             t.Equals(loaded.startResult, -1, "a source outside EE memory should fail the transfer");
+        });
+
+        tc.Run("IOP scheduler keeps a thread whose slice ended ahead of its equal-priority peers", [](TestCase &t)
+        {
+            SchedulerFixture f;
+            f.ready(1, 39u);
+            IopThread &sliced = f.ready(2, 39u);
+            f.kernel.beginThread(sliced);
+            f.kernel.endTimeslice(sliced, kSentinel);
+            t.Equals(sliced.state, IopThreadState::Ready, "a thread at the end of its slice should be Ready again");
+            t.Equals(f.next(), 2, "the sliced thread should keep the CPU over a lower-id peer of equal priority");
+            f.kernel.endTimeslice(sliced, kSentinel);
+            t.Equals(f.next(), 2, "the sliced thread should keep the CPU slice after slice");
+        });
+
+        tc.Run("IOP scheduler lets a strictly higher priority preempt a sliced thread", [](TestCase &t)
+        {
+            SchedulerFixture f;
+            f.ready(1, 39u);
+            IopThread &sliced = f.ready(2, 39u);
+            f.kernel.beginThread(sliced);
+            f.kernel.endTimeslice(sliced, kSentinel);
+            f.ready(3, 20u);
+            t.Equals(f.next(), 3, "a ready thread of higher priority should run before the sliced thread");
+        });
+
+        tc.Run("IOP scheduler runs the equal-priority peer once the sliced thread blocks", [](TestCase &t)
+        {
+            SchedulerFixture f;
+            f.ready(1, 39u);
+            IopThread &sliced = f.ready(2, 39u);
+            f.kernel.beginThread(sliced);
+            f.kernel.endTimeslice(sliced, kSentinel);
+            t.Equals(f.next(), 2, "the sliced thread should run first");
+            sliced.state = IopThreadState::Sleep;
+            sliced.cpu.yielded = true;
+            f.kernel.endTimeslice(sliced, kSentinel);
+            t.Equals(f.next(), 1, "the peer should run once the sliced thread blocks");
+        });
+
+        tc.Run("IOP scheduler RotateThreadReadyQueue moves the caller behind its equal-priority peers", [](TestCase &t)
+        {
+            SchedulerFixture f;
+            f.ready(1, 39u);
+            IopThread &sliced = f.ready(2, 39u);
+            f.kernel.beginThread(sliced);
+            f.kernel.endTimeslice(sliced, kSentinel);
+            t.Equals(f.next(), 2, "the sliced thread should run first");
+            t.IsTrue(f.kernel.dispatchThreadImport(kRotateThreadReadyQueue, sliced.cpu, 0u),
+                     "RotateThreadReadyQueue should be handled");
+            f.kernel.endTimeslice(sliced, kSentinel);
+            t.Equals(f.next(), 1, "a rotated thread should give the CPU to its equal-priority peer");
         });
 
     });
