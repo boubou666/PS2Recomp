@@ -5,6 +5,9 @@
 // fast memory paths (inline), and free functions for everything that goes through PS2Runtime (out of line, defined in
 // ps2_recomp_abi.cpp). Generated code includes this instead of ps2_runtime.h, so a change to a runtime header
 // recompiles the runtime but not the generated code. ps2_runtime.h includes it too.
+// Everything here is part of the ABI with generated code: a change to it (R5900Context's layout, an inline fast
+// path, a declaration) recompiles all generated code, which the build does by itself (see the size check in
+// ps2_recomp_abi.cpp for objects built outside it).
 
 #include <cstdint>
 #include <cstring>

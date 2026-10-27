@@ -4,6 +4,10 @@
 #include "ps2_recomp_abi.h"
 #include "ps2_runtime.h"
 
+// Generated code is compiled against R5900Context from ps2_recomp_abi.h; the build recompiles it when that header
+// changes, but an object built elsewhere would not be. A layout change must update this size (and regenerate).
+static_assert(sizeof(R5900Context) == 1648, "R5900Context layout changed: update the size and rebuild all generated code");
+
 uint8_t ps2rLoad8(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr) { return runtime->Load8(rdram, ctx, vaddr); }
 uint16_t ps2rLoad16(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr) { return runtime->Load16(rdram, ctx, vaddr); }
 uint32_t ps2rLoad32(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr) { return runtime->Load32(rdram, ctx, vaddr); }
