@@ -1,4 +1,5 @@
 // Based on Blackline Interactive implementation
+#include <cstdlib>
 #include <string>
 #include <algorithm>
 #include <map>
@@ -885,6 +886,8 @@ void PS2Memory::setVif1Threaded(bool enabled)
         return;
     }
     m_vif1Stop = false;
+    if (const char *slack = std::getenv("PS2X_VIF1_SLACK"))
+        m_vif1Slack = std::strtoull(slack, nullptr, 10);
     m_vif1Threaded = true;
     m_vif1Thread = std::thread([this]() { vif1WorkerMain(); });
 }

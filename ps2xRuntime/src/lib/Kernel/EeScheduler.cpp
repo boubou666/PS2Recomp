@@ -1740,6 +1740,22 @@ void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
     }
 }
 
+std::optional<bool> EeScheduler::guestFrameWaiting()
+{
+    if (m_frameWaitPcEnd == 0u)
+        return std::nullopt;
+    const auto it = m_threads.find(m_frameWaitThread);
+    if (it == m_threads.end())
+        return std::nullopt;
+    GuestThread &thread = it->second;
+    // Blocked on something else (a semaphore, a sleep): neither drawing nor waiting for its vblank.
+    if (thread.status != EeThreadStatus::Running && thread.status != EeThreadStatus::Ready)
+        return std::nullopt;
+    const R5900Context *context = currentThread() == &thread ? currentContext() : &thread.activeContext();
+    const uint32_t pc = context ? context->pc : 0u;
+    return pc >= m_frameWaitPcBegin && pc < m_frameWaitPcEnd;
+}
+
 std::string EeScheduler::deadlineSummary() const
 {
     std::lock_guard lock(m_eventMutex);
@@ -2154,7 +2170,7 @@ void EeScheduler::processDueDeadlines()
                 uint64_t deadlineCycle = scheduled.deadlineCycle;
                 auto anchor = scheduled.hostDeadline;
                 const bool held = m_vblankHeldSince != std::chrono::steady_clock::time_point{};
-                if (m_vblankHold.load(std::memory_order_relaxed))
+                if (m_vblankHold.load(std::memory_order_relaxed) || (m_frameWaitHoldsVBlank && guestFrameWaiting() == false))
                 {
                     // Held (setVBlankHold): again in a moment, unless it has waited its limit.
                     constexpr auto kHoldStep = std::chrono::microseconds(250);
@@ -2254,7 +2270,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         {
             constexpr uint32_t kMaxVBlanksWithoutLatch = 3u;
             static uint32_t s_vblanksWithoutLatch = 0u;
-            bool frameComplete = false;
+            bool frameComplete = guestFrameWaiting() == true;
             for (const auto &[id, candidate] : m_threads)
             {
                 (void)id;

@@ -279,9 +279,12 @@ public:
     // worker's clock only while the worker is idle (vif1Horizon is then unbounded): past it, waitForVif1Clock
     // blocks until the worker gets there, so events the worker raises (SIGNAL, FINISH) reach the EE at the cycle
     // they belong to instead of after the EE has run past them.
+    // PS2X_VIF1_SLACK=<EE cycles> lets the EE run that far past the horizon (the worker's events may reach it up to
+    // that late) instead of stopping at the start of every microprogram the worker runs.
     [[nodiscard]] bool vif1BehindEe(uint64_t eeCycle) const
     {
-        return eeCycle > m_vif1Horizon.load(std::memory_order_acquire);
+        const uint64_t horizon = m_vif1Horizon.load(std::memory_order_acquire);
+        return horizon != ~0ull && eeCycle > horizon + m_vif1Slack;
     }
     void waitForVif1Clock(uint64_t eeCycle) const;
     [[nodiscard]] uint64_t vif1WorkerCycle() const { return m_vif1WorkerCycle.load(std::memory_order_acquire); }
@@ -472,6 +475,7 @@ public:
     std::atomic<uint64_t> m_vif1Done{0};
     std::atomic<uint64_t> m_vif1Horizon{~0ull};
     std::atomic<uint64_t> m_vif1WorkerCycle{0};
+    uint64_t m_vif1Slack = 0;
     mutable std::atomic<bool> m_vif1ClockWaiter{false};
     bool m_vif1Stop = false;
     uint32_t m_vif1JobVu0Fbrst = 0;
