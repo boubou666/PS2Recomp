@@ -268,6 +268,23 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.pullIpuInput(16u).empty(), "nothing is pulled after the channel is disabled");
         });
 
+        tc.Run("toIPU DMA parked for the decoder completes when the guest drives the IPU itself", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setIpuInputEnabled(true);
+
+            uint8_t *rdram = mem.getRDRAM();
+            const uint64_t nextTag = (uint64_t{0x30000u} << 32) | (2ull << 28) | 1u;
+            std::memcpy(rdram + 0x30000u, &nextTag, sizeof(nextTag));
+            mem.writeIORegister(0x1000B430u, 0x30000u);
+            mem.writeIORegister(0x1000B400u, 0x105u);
+
+            (void)mem.read32(0x10002010u);
+            t.IsTrue((mem.read32(0x1000B400u) & 0x100u) == 0u, "reading IPU_CTRL completes the parked transfer");
+            t.IsTrue(mem.pullIpuInput(16u).empty(), "nothing is left to pull after the release");
+        });
+
         tc.Run("toIPU DMA completes the channel after an end tag", [](TestCase &t)
         {
             PS2Memory mem;
