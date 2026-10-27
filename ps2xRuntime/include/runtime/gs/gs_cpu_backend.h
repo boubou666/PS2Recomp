@@ -53,6 +53,11 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // One pixel of a local memory image laid out as the GS stores it, in the PSM's own format.
+    static uint32_t ReadVramPixel(uint8_t *vram, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+    static void WriteVramPixel(uint8_t *vram, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y,
+                               uint32_t value);
+
     // The current CLUT (GS::saveDrawingState / loadDrawingState); waits for queued drawing.
     std::vector<uint8_t> SaveClutState();
     void LoadClutState(const uint8_t *data, size_t size);
@@ -154,6 +159,7 @@ private:
     using ReadVramFunc = uint32_t (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t);
 
     static constexpr size_t kPsmHandlerCount = 1u << 6u;
+    static std::pair<ReadVramFunc, WriteVramFunc> PsmHandlers(uint32_t psm);
     mutable std::mutex m_mutex;
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;

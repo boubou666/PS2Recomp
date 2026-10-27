@@ -1430,6 +1430,53 @@ GSCpuBackend::TextureSampler GSCpuBackend::MakeTextureSampler(const GSDrawState 
     return s;
 }
 
+std::pair<GSCpuBackend::ReadVramFunc, GSCpuBackend::WriteVramFunc> GSCpuBackend::PsmHandlers(uint32_t psm)
+{
+    using namespace GSMem;
+    switch (psm & 0x3Fu)
+    {
+    case GS_PSM_CT32:
+        return {ReadCT32, WriteCT32};
+    case GS_PSM_CT24:
+        return {ReadCT24, WriteCT24};
+    case GS_PSM_CT16:
+        return {ReadCT16, WriteCT16};
+    case GS_PSM_CT16S:
+        return {ReadCT16S, WriteCT16S};
+    case GS_PSM_T8:
+        return {ReadP8, WriteP8};
+    case GS_PSM_T8H:
+        return {ReadP8H, WriteP8H};
+    case GS_PSM_T4:
+        return {ReadP4, WriteP4};
+    case GS_PSM_T4HH:
+        return {ReadP4HH, WriteP4HH};
+    case GS_PSM_T4HL:
+        return {ReadP4HL, WriteP4HL};
+    case GS_PSM_Z32:
+        return {ReadZ32, WriteZ32};
+    case GS_PSM_Z24:
+        return {ReadZ24, WriteZ24};
+    case GS_PSM_Z16:
+        return {ReadZ16, WriteZ16};
+    case GS_PSM_Z16S:
+        return {ReadZ16S, WriteZ16S};
+    default:
+        return {ReadNull, WriteNull};
+    }
+}
+
+uint32_t GSCpuBackend::ReadVramPixel(uint8_t *vram, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+{
+    return PsmHandlers(psm).first(vram, base, bw, x, y);
+}
+
+void GSCpuBackend::WriteVramPixel(uint8_t *vram, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y,
+                                  uint32_t value)
+{
+    PsmHandlers(psm).second(vram, base, bw, x, y, value);
+}
+
 GSCpuBackend::GSCpuBackend()
 {
     using namespace GSMem;
@@ -1437,67 +1484,7 @@ GSCpuBackend::GSCpuBackend()
     std::call_once(lookupTablesOnce, []()
                    { InitLookupTables(); });
     for (size_t i = 0; i < kPsmHandlerCount; ++i)
-    {
-        switch (i)
-        {
-        case GS_PSM_CT32:
-            m_readVramFuncs[i] = ReadCT32;
-            m_writeVramFuncs[i] = WriteCT32;
-            break;
-        case GS_PSM_CT24:
-            m_readVramFuncs[i] = ReadCT24;
-            m_writeVramFuncs[i] = WriteCT24;
-            break;
-        case GS_PSM_CT16:
-            m_readVramFuncs[i] = ReadCT16;
-            m_writeVramFuncs[i] = WriteCT16;
-            break;
-        case GS_PSM_CT16S:
-            m_readVramFuncs[i] = ReadCT16S;
-            m_writeVramFuncs[i] = WriteCT16S;
-            break;
-        case GS_PSM_T8:
-            m_readVramFuncs[i] = ReadP8;
-            m_writeVramFuncs[i] = WriteP8;
-            break;
-        case GS_PSM_T8H:
-            m_readVramFuncs[i] = ReadP8H;
-            m_writeVramFuncs[i] = WriteP8H;
-            break;
-        case GS_PSM_T4:
-            m_readVramFuncs[i] = ReadP4;
-            m_writeVramFuncs[i] = WriteP4;
-            break;
-        case GS_PSM_T4HH:
-            m_readVramFuncs[i] = ReadP4HH;
-            m_writeVramFuncs[i] = WriteP4HH;
-            break;
-        case GS_PSM_T4HL:
-            m_readVramFuncs[i] = ReadP4HL;
-            m_writeVramFuncs[i] = WriteP4HL;
-            break;
-        case GS_PSM_Z32:
-            m_readVramFuncs[i] = ReadZ32;
-            m_writeVramFuncs[i] = WriteZ32;
-            break;
-        case GS_PSM_Z24:
-            m_readVramFuncs[i] = ReadZ24;
-            m_writeVramFuncs[i] = WriteZ24;
-            break;
-        case GS_PSM_Z16:
-            m_readVramFuncs[i] = ReadZ16;
-            m_writeVramFuncs[i] = WriteZ16;
-            break;
-        case GS_PSM_Z16S:
-            m_readVramFuncs[i] = ReadZ16S;
-            m_writeVramFuncs[i] = WriteZ16S;
-            break;
-        default:
-            m_readVramFuncs[i] = ReadNull;
-            m_writeVramFuncs[i] = WriteNull;
-            break;
-        }
-    }
+        std::tie(m_readVramFuncs[i], m_writeVramFuncs[i]) = PsmHandlers(static_cast<uint32_t>(i));
     Reset();
     m_texturePageCaches.resize(1u);
     m_decodedCaches.resize(1u);
