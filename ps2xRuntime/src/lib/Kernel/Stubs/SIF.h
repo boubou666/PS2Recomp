@@ -15,6 +15,7 @@ namespace ps2_stubs
     // gets the receiveSize bytes the server returned (empty when the call could not be served).
     bool findEeRpcServerForIop(uint8_t *rdram, uint32_t sid, uint32_t &serverData, uint32_t &buffer, uint32_t &callbackBuffer) noexcept;
     using IopRpcReply = std::function<void(const std::vector<uint8_t> &)>;
+    void clearIopRpcRequests(); // resetSifState: requests left by a previous runtime
     bool queueEeRpcFromIop(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t function, std::vector<uint8_t> send, uint32_t receiveSize,
                            IopRpcReply reply);
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

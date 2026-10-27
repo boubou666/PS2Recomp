@@ -129,6 +129,8 @@ namespace ps2x::iop::detail
         };
         std::unordered_map<uint32_t, uint32_t> m_eeClients; // client address -> EE sid
         std::unordered_map<uint64_t, EeCall> m_eeCalls;     // token -> call
+        // The wake cycle of a caller waiting for the EE reply: a delay that never expires.
+        static constexpr uint64_t kEeRpcWaitCycle = ~uint64_t{0};
         uint64_t m_nextEeCallToken = 1u;
         bool bindEeRpc(IopCpuState &cpu);
         bool callEeRpc(IopCpuState &cpu);

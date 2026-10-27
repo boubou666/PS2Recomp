@@ -245,6 +245,17 @@ namespace ps2x::iop::detail
 
         IopThread *const caller = m_kernel.currentThread();
         const bool wait = (mode & kRpcNowait) == 0u && caller != nullptr;
+        if ((mode & kRpcNowait) == 0u && caller == nullptr)
+        {
+            // No IOP thread to put to sleep (a module start run inline): the call cannot wait, so the IRX goes on
+            // before the reply is in its receive buffer. Said every time, since the IRX reads that buffer early.
+            char message[160];
+            std::snprintf(message, sizeof(message),
+                          "[IOP sifcmd] sceSifCallRpc sid=0x%x fno=%u with WAIT outside any IOP thread (ra=0x%x): it "
+                          "returns before the EE reply",
+                          bound->second, function, cpu.gpr[31]);
+            m_host.log(LogLevel::Warning, message);
+        }
         EeCall pending;
         pending.thread = wait ? caller->id : 0;
         pending.receive = receive;
@@ -262,8 +273,10 @@ namespace ps2x::iop::detail
             return true;
         }
         cpu.gpr[2] = 0u;
+        // The caller waits in a delay that never expires, which only the reply ends: on the IOP sifrpc waits on its
+        // own event, so a WakeupThread aimed at the thread (it only wakes Sleep) must not end the call early.
         if (wait && m_eeCalls.count(token) != 0u)
-            m_kernel.sleepCurrent(cpu);
+            m_kernel.delayCurrentUntil(kEeRpcWaitCycle, cpu);
         return true;
     }
 
@@ -283,7 +296,8 @@ namespace ps2x::iop::detail
         }
         if (call.thread != 0)
         {
-            if (IopThread *thread = m_kernel.thread(call.thread); thread && thread->state == IopThreadState::Sleep)
+            if (IopThread *thread = m_kernel.thread(call.thread);
+                thread && thread->state == IopThreadState::Delay && thread->wakeCycle == kEeRpcWaitCycle)
             {
                 thread->cpu.gpr[2] = 0u;
                 thread->state = IopThreadState::Ready;

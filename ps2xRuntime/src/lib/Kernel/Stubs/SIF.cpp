@@ -243,8 +243,11 @@ namespace ps2_stubs
 
     void resetSifState()
     {
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        seedDefaultSifRegsLocked();
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            seedDefaultSifRegsLocked();
+        }
+        clearIopRpcRequests();
     }
 
     bool dispatchSifCommand(uint8_t *rdram,
@@ -675,6 +678,11 @@ namespace ps2_stubs
         }
     }
 
+    void clearIopRpcRequests()
+    {
+        g_iopRpcRequests.clear();
+    }
+
     bool findEeRpcServerForIop(uint8_t *rdram, uint32_t sid, uint32_t &serverData, uint32_t &buffer, uint32_t &callbackBuffer) noexcept
     {
         uint32_t address = 0u;
@@ -754,8 +762,13 @@ namespace ps2_stubs
         const uint32_t sendSize = static_cast<uint32_t>(served->send.size());
         if (sendSize != 0u && (buffer == 0u || !writeEeRange(rdram, buffer, served->send.data(), sendSize)))
         {
+            // Refused: running the server over a buffer that does not hold this call's data answers garbage.
             std::cerr << "[sifrpc] IOP -> EE call sid=0x" << std::hex << served->sid << ": the send data does not fit the buffer 0x"
-                      << buffer << std::dec << std::endl;
+                      << buffer << std::dec << ", refused" << std::endl;
+            if (served->reply)
+                served->reply({});
+            sceSifRpcLoop(rdram, ctx, runtime);
+            return;
         }
 
         GuestInvocation invocation{};
