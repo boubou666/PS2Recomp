@@ -34,7 +34,8 @@ namespace ps2x::iop::detail
 
     // SIO2 controller (IOP 0x1F808200-0x1F808284): transfers queued in SEND3, data through the
     // DATAIN/DATAOUT FIFOs or DMA channels 11/12, completion signalled by interrupt 17.
-    // Port 0 holds a DualShock 2; the other ports (pad 2, memory cards) report no device.
+    // Ports 0 and 1 hold a DualShock 2 each while the host reports one connected (port 0 always by default);
+    // the other ports (memory cards) report no device.
     class IopSio2
     {
     public:
@@ -47,7 +48,9 @@ namespace ps2x::iop::detail
         explicit IopSio2(IopMemory &memory) noexcept;
 
         void reset();
-        void setPadStateReader(IopDualShock2::StateReader reader) { m_readPadState = std::move(reader); }
+        void setPadStateReader(int port, IopDualShock2::StateReader reader) { m_readPadState[port & 1] = std::move(reader); }
+        // Whether a controller is plugged into port 0 or 1 (default: port 0 only).
+        void setPadPresence(std::function<bool(int port)> presence) { m_padPresent = std::move(presence); }
 
         [[nodiscard]] static bool handles(uint32_t address) noexcept { return address >= Base && address <= End; }
         [[nodiscard]] uint32_t read32(uint32_t address);
@@ -61,8 +64,9 @@ namespace ps2x::iop::detail
         void runTransfer();
 
         IopMemory &m_memory;
-        IopDualShock2 m_pad;
-        IopDualShock2::StateReader m_readPadState;
+        std::array<IopDualShock2, 2> m_pads;
+        std::array<IopDualShock2::StateReader, 2> m_readPadState;
+        std::function<bool(int port)> m_padPresent;
         std::array<uint32_t, 16> m_send3{};
         std::array<uint32_t, 8> m_send12{};
         std::deque<uint8_t> m_in;

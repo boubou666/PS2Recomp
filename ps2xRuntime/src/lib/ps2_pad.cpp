@@ -192,9 +192,30 @@ uint16_t ps2PadLiveInputButtonsAt(const char *lines, double addedAt, double seco
     return buttonsDownAt(presses, seconds);
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+namespace
+{
+    uint16_t pad2ScriptedButtonsDown()
+    {
+        static const std::vector<ScriptedPress> script = parsePadScript(std::getenv("PS2X_PAD2_SCRIPT"));
+        if (script.empty())
+            return 0;
+        return buttonsDownAt(script, std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count());
+    }
+}
+
+bool PSPadBackend::connected(int port) const
+{
+    if (port == 0)
+        return true;
+    static const bool pad2Script = std::getenv("PS2X_PAD2_SCRIPT") != nullptr;
+    return port == 1 && (pad2Script || IsGamepadAvailable(1));
+}
+
+bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
+        return false;
+    if (port != 0 && !connected(port))
         return false;
 
     std::memset(data, 0, 32);
@@ -205,7 +226,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
+    const int kGamepad = port == 1 ? 1 : 0;
     const bool useGamepad = IsGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
@@ -254,7 +275,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else
+    else if (port == 0)
     {
         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
             clearBit(PAD_UP);
@@ -286,7 +307,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_SELECT);
     }
 
-    btns &= static_cast<uint16_t>(~scriptedButtonsDown());
+    btns &= static_cast<uint16_t>(~(port == 1 ? pad2ScriptedButtonsDown() : scriptedButtonsDown()));
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);

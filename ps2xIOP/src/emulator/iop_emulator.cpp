@@ -207,8 +207,10 @@ namespace ps2x::iop::detail
                                   { pendingDmaInterrupts[irq] = totalCycles; });
             spu2.setOutputSink([this](const int16_t *frames, size_t count)
                                { host.submitAudio(frames, count); });
-            sio2.setPadStateReader([this](uint8_t *state, size_t size)
-                                   { return host.readPadState(0, state, size); });
+            for (int port = 0; port < 2; ++port)
+                sio2.setPadStateReader(port, [this, port](uint8_t *state, size_t size)
+                                       { return host.readPadState(port, state, size); });
+            sio2.setPadPresence([this](int port) { return host.padConnected(port); });
             reset();
         }
 

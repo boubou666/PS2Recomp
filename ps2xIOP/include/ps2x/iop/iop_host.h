@@ -140,6 +140,9 @@ namespace ps2x::iop
             return false;
         }
 
+        // Whether a controller is plugged into a port (0 or 1). The default: port 0 only.
+        virtual bool padConnected(int port) { return port == 0; }
+
         // SPU2 output: interleaved 16-bit stereo frames at 48 kHz of emulated time. The default
         // discards them.
         virtual void submitAudio(const int16_t *frames, size_t count)

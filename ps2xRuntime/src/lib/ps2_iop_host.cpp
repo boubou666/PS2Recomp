@@ -528,6 +528,11 @@ bool PS2IopHostAdapter::readPadState(int port, uint8_t *state, size_t size)
     return m_runtime.padBackend().readState(port, 0, state, size);
 }
 
+bool PS2IopHostAdapter::padConnected(int port)
+{
+    return m_runtime.padBackend().connected(port);
+}
+
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
 {
     const char *prefix = "[ps2xIOP]";

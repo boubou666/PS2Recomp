@@ -143,7 +143,8 @@ namespace ps2x::iop::detail
 
     void IopSio2::reset()
     {
-        m_pad.reset();
+        for (IopDualShock2 &pad : m_pads)
+            pad.reset();
         m_send3.fill(0u);
         m_send12.fill(0u);
         m_in.clear();
@@ -253,9 +254,10 @@ namespace ps2x::iop::detail
             command.resize(std::max(inSize, outSize), 0x00u);
 
             std::vector<uint8_t> reply;
-            if (port == 0u)
+            const bool padPresent = port < 2u && (m_padPresent ? m_padPresent(static_cast<int>(port)) : port == 0u);
+            if (padPresent)
             {
-                reply = m_pad.exchange(command, m_readPadState);
+                reply = m_pads[port].exchange(command, m_readPadState[port]);
                 m_recv1 = kRecv1Connected;
             }
             else
