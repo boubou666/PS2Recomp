@@ -315,13 +315,12 @@ namespace
         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
     }
 
-    // Bilinear blend with 8-bit fixed-point weights (0..256): integer only, since the CRT
-    // rounding calls it replaces dominated movie playback (four per channel per pixel).
+    // Bilinear blend with the GS's 4-bit weights (0..16), rounded once at the end.
     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, int fx, int fy)
     {
-        const int top = (static_cast<int>(c00) << 8) + (static_cast<int>(c10) - static_cast<int>(c00)) * fx;
-        const int bottom = (static_cast<int>(c01) << 8) + (static_cast<int>(c11) - static_cast<int>(c01)) * fx;
-        return clampU8(((top << 8) + (bottom - top) * fy + 0x8000) >> 16);
+        const int top = (static_cast<int>(c00) << 4) + (static_cast<int>(c10) - static_cast<int>(c00)) * fx;
+        const int bottom = (static_cast<int>(c01) << 4) + (static_cast<int>(c11) - static_cast<int>(c01)) * fx;
+        return clampU8(((top << 4) + (bottom - top) * fy + 0x80) >> 8);
     }
 
     int floorToInt(float value)
@@ -3265,14 +3264,14 @@ uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::Textu
         return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
     }
 
-    const float sampleU = texUf - 0.5f;
-    const float sampleV = texVf - 0.5f;
-    const int u0 = floorToInt(sampleU);
-    const int v0 = floorToInt(sampleV);
+    const int sampleU = floorToInt(texUf * 16.0f) - 8;
+    const int sampleV = floorToInt(texVf * 16.0f) - 8;
+    const int u0 = sampleU >> 4;
+    const int v0 = sampleV >> 4;
     const int u1 = u0 + 1;
     const int v1 = v0 + 1;
-    const int fx = static_cast<int>((sampleU - static_cast<float>(u0)) * 256.0f + 0.5f);
-    const int fy = static_cast<int>((sampleV - static_cast<float>(v0)) * 256.0f + 0.5f);
+    const int fx = sampleU & 15;
+    const int fy = sampleV & 15;
     if ((fx | fy) == 0)
     {
         return samplePoint(u0, v0); // texel-aligned (e.g. 1:1 movie frames): the blend is c00
@@ -3318,10 +3317,10 @@ uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::Textu
     auto widen = [&](uint32_t c) { return _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(static_cast<int>(c)), zero), zero); };
     const __m128i p00 = widen(c00), p10 = widen(c10), p01 = widen(c01), p11 = widen(c11);
     const __m128i vfx = _mm_set1_epi32(fx), vfy = _mm_set1_epi32(fy);
-    const __m128i top = _mm_add_epi32(_mm_slli_epi32(p00, 8), _mm_mullo_epi32(_mm_sub_epi32(p10, p00), vfx));
-    const __m128i bottom = _mm_add_epi32(_mm_slli_epi32(p01, 8), _mm_mullo_epi32(_mm_sub_epi32(p11, p01), vfx));
+    const __m128i top = _mm_add_epi32(_mm_slli_epi32(p00, 4), _mm_mullo_epi32(_mm_sub_epi32(p10, p00), vfx));
+    const __m128i bottom = _mm_add_epi32(_mm_slli_epi32(p01, 4), _mm_mullo_epi32(_mm_sub_epi32(p11, p01), vfx));
     const __m128i blended = _mm_srai_epi32(
-        _mm_add_epi32(_mm_add_epi32(_mm_slli_epi32(top, 8), _mm_mullo_epi32(_mm_sub_epi32(bottom, top), vfy)), _mm_set1_epi32(0x8000)), 16);
+        _mm_add_epi32(_mm_add_epi32(_mm_slli_epi32(top, 4), _mm_mullo_epi32(_mm_sub_epi32(bottom, top), vfy)), _mm_set1_epi32(0x80)), 8);
     const __m128i bytes = _mm_packus_epi16(_mm_packus_epi32(blended, zero), zero);
     return static_cast<uint32_t>(_mm_cvtsi128_si32(bytes));
 #else
@@ -3429,12 +3428,12 @@ void GSCpuBackend::SampleTextureBlock(const TextureSampler &sampler, GSMem::Text
     int u0[N], v0[N], u1[N], v1[N], fx[N], fy[N];
     for (int i = 0; i < N; ++i)
     {
-        const float sampleU = texUf[i] - 0.5f;
-        const float sampleV = texVf[i] - 0.5f;
-        const int iu = floorToInt(sampleU);
-        const int iv = floorToInt(sampleV);
-        fx[i] = static_cast<int>((sampleU - static_cast<float>(iu)) * 256.0f + 0.5f);
-        fy[i] = static_cast<int>((sampleV - static_cast<float>(iv)) * 256.0f + 0.5f);
+        const int sampleU = floorToInt(texUf[i] * 16.0f) - 8;
+        const int sampleV = floorToInt(texVf[i] * 16.0f) - 8;
+        const int iu = sampleU >> 4;
+        const int iv = sampleV >> 4;
+        fx[i] = sampleU & 15;
+        fy[i] = sampleV & 15;
         u0[i] = wrap(iu, repeatU, maskU, texW);
         v0[i] = wrap(iv, repeatV, maskV, texH);
         u1[i] = wrap(iu + 1, repeatU, maskU, texW);
@@ -3469,9 +3468,9 @@ void GSCpuBackend::SampleTextureBlock(const TextureSampler &sampler, GSMem::Text
             const int p10 = static_cast<int>((c10[i] >> shift) & 0xFFu);
             const int p01 = static_cast<int>((c01[i] >> shift) & 0xFFu);
             const int p11 = static_cast<int>((c11[i] >> shift) & 0xFFu);
-            const int top = (p00 << 8) + (p10 - p00) * fx[i];
-            const int bottom = (p01 << 8) + (p11 - p01) * fx[i];
-            result |= static_cast<uint32_t>(clampU8(((top << 8) + (bottom - top) * fy[i] + 0x8000) >> 16)) << shift;
+            const int top = (p00 << 4) + (p10 - p00) * fx[i];
+            const int bottom = (p01 << 4) + (p11 - p01) * fx[i];
+            result |= static_cast<uint32_t>(clampU8(((top << 4) + (bottom - top) * fy[i] + 0x80) >> 8)) << shift;
         }
         out[i] = result;
     }
