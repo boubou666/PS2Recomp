@@ -1605,6 +1605,67 @@ void register_ps2_gs_tests()
             t.IsTrue(immediate == async, "worker threads should sample the rows a region repeat fixes after they are drawn");
         });
 
+        tc.Run("asynchronous rasterization draws mipmapped primitives on the workers, after what they draw into a level", [](TestCase &t)
+        {
+            // Each frame redraws mip level 1, then samples it with LOD 1 over the whole frame buffer: the level lies away
+            // from the frame, so the mipmapped sprite is queued behind the level's drawing rather than drawn serially.
+            constexpr uint64_t kFbw = 4u;
+            constexpr uint64_t kLevel0Fbp = 64u;
+            constexpr uint64_t kLevel1Fbp = 81u;
+            auto xyz = [](uint32_t x, uint32_t y)
+            {
+                return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16);
+            };
+            auto draw = [&](std::vector<uint8_t> &vram, bool async)
+            {
+                GSCpuBackend::SetAsyncRasterization(async);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                gs.writeRegister(GS_REG_SCISSOR_1, (255ull << 16) | (63ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_CLAMP_1, 1ull | (1ull << 2));
+                (void)GSCpuBackend::TakeDrainStats();
+                for (uint32_t frame = 0u; frame < 8u; ++frame)
+                {
+                    gs.writeRegister(GS_REG_FRAME_1, kLevel1Fbp | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                    for (uint32_t row = 0u; row < 8u; ++row)
+                    {
+                        gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull | (((row * 29u + frame * 11u) & 0xFFu) << 8));
+                        gs.writeRegister(GS_REG_XYZ2, xyz(0u, row));
+                        gs.writeRegister(GS_REG_XYZ2, xyz(8u, row + 1u));
+                    }
+
+                    gs.writeRegister(GS_REG_FRAME_1, 0ull | (kFbw << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_TEX1_1, 1ull | (1ull << 2) | (2ull << 6) | (16ull << 32));
+                    gs.writeRegister(GS_REG_MIPTBP1_1, (kLevel1Fbp * 32ull) | (1ull << 14));
+                    gs.writeRegister(GS_REG_TEX0_1, (kLevel0Fbp * 32ull) | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                        (4ull << 26) | (4ull << 30) | (1ull << 34) | (1ull << 35));
+                    gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                    gs.writeRegister(GS_REG_UV, 0ull);
+                    gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+                    gs.writeRegister(GS_REG_UV, (16ull << 4) | ((16ull << 4) << 16));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(256u, 64u));
+                }
+                const uint64_t drains = GSCpuBackend::TakeDrainStats().second;
+                (void)gs.ReadVram(GS_PSM_CT32, 0u, static_cast<uint32_t>(kFbw), 0u, 0u);
+                GSCpuBackend::SetAsyncRasterization(false);
+                return drains;
+            };
+
+            std::vector<uint8_t> immediate(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> async(PS2_GS_VRAM_SIZE, 0u);
+            draw(immediate, false);
+            const uint64_t drains = draw(async, true);
+            t.Equals(readReferencePSMCT32Pixel(immediate, 0u, kFbw, 200u, 60u) & 0xFF00u, ((7u * 29u + 7u * 11u) & 0xFFu) << 8,
+                     "the sprite should sample the last frame's level 1, row 7");
+            t.IsTrue(immediate == async, "worker threads should sample a mip level after the primitives drawing it");
+            t.Equals(drains, uint64_t{0}, "mipmapped primitives away from the frame should not wait for the workers");
+        });
+
         tc.Run("FBA forces the framebuffer alpha high bit on CT32 writes", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
