@@ -81,6 +81,9 @@ namespace ps2x::iop::detail
             return it == m_threads.end() ? nullptr : &it->second;
         }
         [[nodiscard]] IopThread *currentThread() const noexcept { return m_currentThread; }
+        // A Dormant thread the host runs guest code on (module start routines), so that code can block like it
+        // would in MODLOAD's thread. Its id is outside CreateThread's range and it has no stack of its own.
+        IopThread &hostThread(int id, uint32_t priority);
         void setCurrentThread(IopThread *thread) noexcept { m_currentThread = thread; }
         // One line per thread (state, pc, entry, priority, wait object) for debug snapshots.
         [[nodiscard]] std::vector<std::string> describeThreads() const;

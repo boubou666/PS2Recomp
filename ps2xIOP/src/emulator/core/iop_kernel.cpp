@@ -779,6 +779,20 @@ namespace ps2x::iop::detail
         cleanupDeadThreads();
     }
 
+    IopThread &IopKernel::hostThread(int id, uint32_t priority)
+    {
+        auto it = m_threads.find(id);
+        if (it == m_threads.end())
+        {
+            IopThread thread;
+            thread.id = id;
+            thread.priority = priority;
+            thread.initialPriority = priority;
+            it = m_threads.emplace(id, std::move(thread)).first;
+        }
+        return it->second;
+    }
+
     void IopKernel::cleanupDeadThreads()
     {
         for (auto thread = m_threads.begin(); thread != m_threads.end();)
