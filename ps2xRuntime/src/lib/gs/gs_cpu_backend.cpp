@@ -1190,6 +1190,7 @@ struct GSCpuBackend::PixelPipeline
     bool colclamp = true;
     bool dither = false;
     int8_t dimx[4][4]{};
+    uint32_t zmax = 0xFFFFFFFFu;
     ReadVramFunc readFrame = nullptr;
     ReadVramFunc readZ = nullptr;
     WriteVramFunc writeFrame = nullptr;
@@ -1410,6 +1411,7 @@ GSCpuBackend::PixelPipeline GSCpuBackend::MakePixelPipeline(const GSDrawState &s
     p.frame24 = p.fpsm == GS_PSM_CT24;
     p.colclamp = (state.colclamp & 1u) != 0u;
     p.dither = (state.dthe & 1u) != 0u && p.frame16;
+    p.zmax = p.zpsm == GS_PSM_Z24 ? 0xFFFFFFu : (p.zpsm == GS_PSM_Z16 || p.zpsm == GS_PSM_Z16S) ? 0xFFFFu : 0xFFFFFFFFu;
     for (int row = 0; row < 4; ++row)
         for (int column = 0; column < 4; ++column)
         {
@@ -2243,7 +2245,7 @@ void GSCpuBackend::DrawWith(const GSPrimitiveBatch &batch, const RasterContext &
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
         if (raster.owns(px, py))
-            WritePixel(*raster.pixel, px, py, gsDepthBits(v.z), v.r, v.g, v.b, v.a, v.fog);
+            WritePixel(*raster.pixel, px, py, std::min(gsDepthBits(v.z), raster.pixel->zmax), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
     default:
@@ -3296,7 +3298,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
     float fy0 = v0.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
     float fx1 = v1.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
     float fy1 = v1.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
-    u32 z1 = gsDepthBits(v1.z);
+    u32 z1 = std::min(gsDepthBits(v1.z), raster.pixel->zmax);
 
     // Each vertex keeps its texture coordinates at its own corner: a sprite given right to left or bottom to top
     // is not mirrored (the texture coordinates are swapped with the edges below).
@@ -3624,7 +3626,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                 for (int i = 0; i < N; ++i)
                 {
                     const double z = v0.z * w0[i] + v1.z * w1[i] + v2.z * w2[i];
-                    zs[i] = gsDepthBits(z + 0.5);
+                    zs[i] = std::min(gsDepthBits(z + 0.5), pixel.zmax);
                 }
                 if (earlyZ)
                 {
@@ -3766,7 +3768,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                 continue;
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
-            const u32 pixelZ = gsDepthBits(z + 0.5);
+            const u32 pixelZ = std::min(gsDepthBits(z + 0.5), pixel.zmax);
             if (earlyZ)
             {
                 const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, x, y);
@@ -3889,7 +3891,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch, const RasterContext &
         double z = (v0.z + (v1.z - v0.z) * t);
         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
         if (raster.owns(x0, y0))
-            WritePixel(*raster.pixel, x0, y0, gsDepthBits(z), r, g, b, a, fog);
+            WritePixel(*raster.pixel, x0, y0, std::min(gsDepthBits(z), raster.pixel->zmax), r, g, b, a, fog);
 
         if (x0 == x1 && y0 == y1)
             break;
