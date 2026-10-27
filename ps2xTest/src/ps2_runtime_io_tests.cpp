@@ -234,6 +234,51 @@ namespace
         gCdCbTrace.push_back(3);
         ctx->pc = 0u;
     }
+
+    // A completion that arrives while the callback runs (the callback reads the next chunk of a stream itself) must
+    // run once the callback returns, without sceCdSync.
+    constexpr uint32_t K_CDST_MAIN = 0x00301200u;
+    constexpr uint32_t K_CDST_MAIN_RESUME = 0x00301204u;
+    constexpr uint32_t K_CDST_CALLBACK = 0x00301300u;
+    int gCdStCalls = 0;
+    int gCdStCallsSeenByMain = 0;
+
+    void cdStreamMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_CDST_MAIN)
+        {
+            setRegU32(*ctx, 4, 5u);
+            setRegU32(*ctx, 5, K_CDCB_STACK);
+            setRegU32(*ctx, 6, 0x800u);
+            ps2_stubs::sceCdInitEeCB(rdram, ctx, runtime);
+            setRegU32(*ctx, 4, K_CDST_CALLBACK);
+            ps2_stubs::sceCdCallback(rdram, ctx, runtime);
+            setRegU32(*ctx, 4, 0u);
+            setRegU32(*ctx, 5, 1u);
+            setRegU32(*ctx, 6, K_CDCB_BUFFER);
+            ps2_stubs::sceCdRead(rdram, ctx, runtime);
+            // Yield once: the higher-priority callback thread runs every completion before main resumes.
+            ctx->pc = K_CDST_MAIN_RESUME;
+            setRegU32(*ctx, 4, 10u);
+            RotateThreadReadyQueue(rdram, ctx, runtime);
+            return;
+        }
+        gCdStCallsSeenByMain = gCdStCalls;
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void cdStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (++gCdStCalls == 1)
+        {
+            setRegU32(*ctx, 4, 1u);
+            setRegU32(*ctx, 5, 1u);
+            setRegU32(*ctx, 6, K_CDCB_BUFFER);
+            ps2_stubs::sceCdRead(rdram, ctx, runtime);
+        }
+        ctx->pc = 0u;
+    }
 }
 
 void register_ps2_runtime_io_tests()
@@ -889,6 +934,45 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, 0u);
             ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &test.runtime);
             for (uint32_t address : {K_CDCB_MAIN, K_CDCB_MAIN_RESUME, K_CDCB_CALLBACK, K_CDCB_CALLBACK_RESUME})
+                test.runtime.registerFunction(address, nullptr);
+        });
+
+        tc.Run("a CD completion that arrives while the callback runs starts it again once it returns", [](TestCase &t)
+        {
+            TestContext test;
+            const std::filesystem::path imagePath = test.paths.base / "disc.iso";
+            {
+                std::vector<uint8_t> sectors(2u * 2048u, 0x5Au);
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(sectors.data()), static_cast<std::streamsize>(sectors.size()));
+            }
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            gCdStCalls = gCdStCallsSeenByMain = 0;
+            test.runtime.registerFunction(K_CDST_MAIN, cdStreamMain);
+            test.runtime.registerFunction(K_CDST_MAIN_RESUME, cdStreamMain);
+            test.runtime.registerFunction(K_CDST_CALLBACK, cdStreamCallback);
+            std::memset(&test.ctx, 0, sizeof(test.ctx));
+            test.ctx.pc = K_CDST_MAIN;
+            setRegU32(test.ctx, 29, 0x00022000u);
+            EeScheduler &ee = test.runtime.eeScheduler();
+            ee.reset(test.rdram.data(), test.ctx);
+            ee.thread(EeScheduler::kMainThreadId)->currentPriority = 10;
+            ee.thread(EeScheduler::kMainThreadId)->initialPriority = 10;
+            ee.run();
+
+            t.Equals(gCdStCallsSeenByMain, 2,
+                     "the read issued from the callback should run the callback again after it returns");
+
+            setRegU32(test.ctx, 4, 0u);
+            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &test.runtime);
+            for (uint32_t address : {K_CDST_MAIN, K_CDST_MAIN_RESUME, K_CDST_CALLBACK})
                 test.runtime.registerFunction(address, nullptr);
         });
 
