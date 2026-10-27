@@ -1093,7 +1093,8 @@ namespace
     {
         std::pair<uint32_t, uint32_t> frame;
         std::pair<uint32_t, uint32_t> z;
-        std::pair<uint32_t, uint32_t> texture;
+        std::array<std::pair<uint32_t, uint32_t>, 7> textures{};
+        uint32_t textureCount = 0;
         bool writesZ = false;
         bool readsZ = false;
         bool samples = false;
@@ -1147,16 +1148,49 @@ namespace
         if (blocks.writesZ || blocks.readsZ)
             blocks.z = rowBlocks(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, firstRow, lastRow);
         blocks.samples = batch.state.prim.tme;
-        if (blocks.samples && mipmapped(batch.state))
+        if (!blocks.samples)
+            return blocks;
+        textureRows(batch, firstRow, lastRow);
+        blocks.textures[0] = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, std::min(lastRow, 2047));
+        blocks.textureCount = 1;
+        if (!mipmapped(batch.state))
+            return blocks;
+        const uint64_t clamp = ctx.clamp;
+        const uint32_t wrapU = static_cast<uint32_t>(clamp & 0x3u);
+        const uint32_t wrapV = static_cast<uint32_t>((clamp >> 2) & 0x3u);
+        const uint32_t regionU = static_cast<uint32_t>(((clamp >> 4) | (clamp >> 14)) & 0x3FFu);
+        const uint32_t regionV = static_cast<uint32_t>(((clamp >> 24) | (clamp >> 34)) & 0x3FFu);
+        uint32_t pageWidth = 0u;
+        uint32_t pageHeight = 0u;
+        pageGeometry(ctx.tex0.psm, pageWidth, pageHeight);
+        const uint32_t maxLevel = std::min<uint32_t>(static_cast<uint32_t>((ctx.tex1 >> 2) & 7u), 6u);
+        for (uint32_t n = 1; n <= maxLevel; ++n)
         {
-            blocks.texture = {0u, kVramBlocks};
-        }
-        else if (blocks.samples)
-        {
-            textureRows(batch, firstRow, lastRow);
-            blocks.texture = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, std::min(lastRow, 2047));
+            const MipLevelGeometry level = mipLevelGeometry(ctx, n);
+            const int lastColumn = std::max(level.width - 1, wrapU >= 2u ? static_cast<int>(regionU >> n) : 0);
+            const int lastLevelRow = std::max(level.height - 1, wrapV >= 2u ? static_cast<int>(regionV >> n) : 0);
+            const uint32_t pagesPerRow = std::max(1u, (std::max(level.tbw, 1u) * 64u + pageWidth - 1u) / pageWidth);
+            const int carriedRows = static_cast<int>(static_cast<uint32_t>(lastColumn) / pageWidth / pagesPerRow * pageHeight);
+            blocks.textures[blocks.textureCount++] =
+                rowBlocks(level.tbp, level.tbw, ctx.tex0.psm, 0, std::min(lastLevelRow + carriedRows, 2047));
         }
         return blocks;
+    }
+
+    bool texturesOverlap(const PrimitiveBlocks &blocks, std::pair<uint32_t, uint32_t> range)
+    {
+        for (uint32_t i = 0; i < blocks.textureCount; ++i)
+            if (blocksOverlap(blocks.textures[i], range))
+                return true;
+        return false;
+    }
+
+    bool texturesOverlapAny(const PrimitiveBlocks &blocks, const std::vector<std::pair<uint32_t, uint32_t>> &ranges)
+    {
+        for (uint32_t i = 0; i < blocks.textureCount; ++i)
+            if (overlapsAny(blocks.textures[i], ranges))
+                return true;
+        return false;
     }
 
     // Writes in 24-bit formats keep the top byte of each word, which the T8H/T4HL/T4HH texture formats read alone:
@@ -1182,8 +1216,7 @@ namespace
         const bool topByteTexture = readsTopByteOnly(ctx.tex0.psm);
         const bool frameConflicts = !(topByteTexture && keepsTopByte(ctx.frame.psm));
         const bool zConflicts = blocks.writesZ && !(topByteTexture && keepsTopByte(ctx.zbuf.psm));
-        if (!((frameConflicts && blocksOverlap(blocks.texture, blocks.frame)) ||
-              (zConflicts && blocksOverlap(blocks.texture, blocks.z))))
+        if (!((frameConflicts && texturesOverlap(blocks, blocks.frame)) || (zConflicts && texturesOverlap(blocks, blocks.z))))
             return false;
         if ((ctx.tex0.tbp0 % 32u) != 0u || mipmapped(batch.state))
             return true; // not page aligned: its texels do not map to whole pages
@@ -2217,7 +2250,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
             // Decoded texels match what the page cache returns while nothing wrote the texture since TEXFLUSH emptied
             // the cache: each page it copies then holds the same texels.
             if (m_workerCount == 0u && primitiveArea(batch) >= kDecodedMinPixelsSerial && !m_textureWrittenSinceFlush &&
-                !overlapsAny(blocks.texture, m_writesSinceTextureFlush))
+                !texturesOverlapAny(blocks, m_writesSinceTextureFlush))
                 texture.decoded = FindDecodedTexture(m_decodedCaches[0], texture);
         }
         RasterContext raster{&pixel, &texture, &m_texturePageCaches[0], 0u, 1u};
@@ -2242,9 +2275,9 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     const auto &frameReads = frameKeepsTopByte ? m_wideReadsSinceBarrier : m_readsSinceBarrier;
     const auto &zReads = zKeepsTopByte ? m_wideReadsSinceBarrier : m_readsSinceBarrier;
     bool barrier = m_barrierRequested ||
-                   (blocks.samples && (topByteTexture ? overlapsAny(blocks.texture, m_topByteWritesSinceBarrier)
-                                                      : (overlapsAny(blocks.texture, m_pixelWritesSinceBarrier) ||
-                                                         overlapsAny(blocks.texture, m_zWritesSinceBarrier)))) ||
+                   (blocks.samples && (topByteTexture ? texturesOverlapAny(blocks, m_topByteWritesSinceBarrier)
+                                                      : (texturesOverlapAny(blocks, m_pixelWritesSinceBarrier) ||
+                                                         texturesOverlapAny(blocks, m_zWritesSinceBarrier)))) ||
                    overlapsAny(blocks.frame, frameReads) || overlapsAny(blocks.frame, m_zWritesSinceBarrier) ||
                    (blocks.writesZ && overlapsAny(blocks.z, zReads)) ||
                    ((blocks.writesZ || blocks.readsZ) && overlapsAny(blocks.z, m_pixelWritesSinceBarrier));
@@ -2298,9 +2331,12 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     }
     if (blocks.samples)
     {
-        NoteBarrierRange(m_readsSinceBarrier, blocks.texture);
-        if (!topByteTexture)
-            NoteBarrierRange(m_wideReadsSinceBarrier, blocks.texture);
+        for (uint32_t i = 0; i < blocks.textureCount; ++i)
+        {
+            NoteBarrierRange(m_readsSinceBarrier, blocks.textures[i]);
+            if (!topByteTexture)
+                NoteBarrierRange(m_wideReadsSinceBarrier, blocks.textures[i]);
+        }
     }
     PublishQueueSlotUnlocked();
 }
