@@ -1215,6 +1215,24 @@ void register_ps2_runtime_kernel_tests()
                      "sceSifStopDma has nothing in flight to stop because SIF DMA completes immediately");
         });
 
+        tc.Run("StartThread returns the started thread's id", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+            env.runtime.registerFunction(K_SCHED_HIGH, [](uint8_t *, R5900Context *, PS2Runtime *) {});
+
+            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u,
+                                                                0u, 120, 0u});
+            R5900Context ctx{};
+            setRegU32(ctx, 4, static_cast<uint32_t>(id));
+            setRegU32(ctx, 5, 0u);
+            t.IsTrue(callSyscall(0x22u, env.rdram.data(), &ctx, &env.runtime), "StartThread should dispatch");
+            t.Equals(getRegS32(ctx, 2), id,
+                     "games keep StartThread's result as the thread id (Smash Court Tennis Pro Tournament 2 wakes it later)");
+        });
+
         tc.Run("setup heap and thread invalid ids use documented kernel errors", [](TestCase &t)
         {
             TestEnv env;
