@@ -17,6 +17,7 @@
 #include "runtime/gs/gs_backend.h"
 
 class GSStreamRenderer;
+struct GSStateImage;
 enum class GSStreamRendererKind : uint8_t;
 enum class GsCpuEvent : uint8_t;
 
@@ -192,6 +193,9 @@ public:
     // in progress.
     std::vector<uint8_t> saveDrawingState();
     bool loadDrawingState(const std::vector<uint8_t> &state);
+    // The same state as raw register values any renderer can load (GSStateImage); same calling rule.
+    void saveState(GSStateImage &image);
+    void loadState(const GSStateImage &image);
     GSRasterBackend *rasterBackend() { return m_backend.get(); }
 
     void refreshDisplaySnapshot();

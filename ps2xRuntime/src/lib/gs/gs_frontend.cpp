@@ -2,6 +2,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_registers.h"
+#include "runtime/gs/gs_state_image.h"
 #include "runtime/gs/gs_stream_renderer.h"
 #include "runtime/gs/gs_trace.h"
 #include "runtime/gs/ps2_gs_memory.h"
@@ -2542,4 +2543,189 @@ bool GS::loadDrawingState(const std::vector<uint8_t> &state)
     if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
         cpu->LoadClutState(state.data() + offset, clutSize);
     return true;
+}
+
+namespace
+{
+    uint32_t floatBits(float value)
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
+    float bitsFloat(uint32_t bits)
+    {
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    GSStateImage::Vertex encodeVertex(const GSVertex &v)
+    {
+        GSStateImage::Vertex out;
+        const uint64_t x = static_cast<uint64_t>(v.x * 16.0f) & 0xFFFFu;
+        const uint64_t y = static_cast<uint64_t>(v.y * 16.0f) & 0xFFFFu;
+        out.xyz = x | (y << 16) | (static_cast<uint64_t>(static_cast<uint32_t>(v.z)) << 32);
+        out.rgbaq = uint64_t(v.r) | (uint64_t(v.g) << 8) | (uint64_t(v.b) << 16) | (uint64_t(v.a) << 24) |
+                    (uint64_t(floatBits(v.q)) << 32);
+        out.st = uint64_t(floatBits(v.s)) | (uint64_t(floatBits(v.t)) << 32);
+        out.uv = uint64_t(v.u) | (uint64_t(v.v) << 16);
+        out.fog = v.fog;
+        return out;
+    }
+
+    GSVertex decodeVertex(const GSStateImage::Vertex &in)
+    {
+        GSVertex v;
+        v.x = static_cast<float>(in.xyz & 0xFFFF) / 16.0f;
+        v.y = static_cast<float>((in.xyz >> 16) & 0xFFFF) / 16.0f;
+        v.z = static_cast<double>((in.xyz >> 32) & 0xFFFFFFFF);
+        v.r = static_cast<uint8_t>(in.rgbaq);
+        v.g = static_cast<uint8_t>(in.rgbaq >> 8);
+        v.b = static_cast<uint8_t>(in.rgbaq >> 16);
+        v.a = static_cast<uint8_t>(in.rgbaq >> 24);
+        v.q = bitsFloat(static_cast<uint32_t>(in.rgbaq >> 32));
+        if (v.q == 0.0f)
+            v.q = 1.0f;
+        v.s = bitsFloat(static_cast<uint32_t>(in.st));
+        v.t = bitsFloat(static_cast<uint32_t>(in.st >> 32));
+        v.u = static_cast<uint16_t>(in.uv & 0x3FFFu);
+        v.v = static_cast<uint16_t>((in.uv >> 16) & 0x3FFFu);
+        v.fog = in.fog;
+        return v;
+    }
+}
+
+void GS::saveState(GSStateImage &image)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    image = GSStateImage{};
+    image.setReg(GS_REG_PRIM, GSReg::encodePrim(m_primRegister));
+    image.setReg(GS_REG_PRMODE, GSReg::encodePrim(m_prmodeRegister));
+    image.setReg(GS_REG_PRMODECONT, m_prmodecont ? 1u : 0u);
+    image.setReg(GS_REG_RGBAQ, uint64_t(m_curR) | (uint64_t(m_curG) << 8) | (uint64_t(m_curB) << 16) |
+                                   (uint64_t(m_curA) << 24) | (uint64_t(floatBits(m_curQ)) << 32));
+    image.setReg(GS_REG_ST, uint64_t(floatBits(m_curS)) | (uint64_t(floatBits(m_curT)) << 32));
+    image.setReg(GS_REG_UV, uint64_t(m_curU) | (uint64_t(m_curV) << 16));
+    image.setReg(GS_REG_FOG, uint64_t(m_curFog) << 56);
+    for (uint8_t i = 0; i < 2u; ++i)
+    {
+        const GSContext &ctx = m_ctx[i];
+        image.setReg(GS_REG_TEX0_1 + i, GSReg::encodeTex0(ctx.tex0));
+        image.setReg(GS_REG_CLAMP_1 + i, ctx.clamp);
+        image.setReg(GS_REG_TEX1_1 + i, ctx.tex1);
+        image.setReg(GS_REG_XYOFFSET_1 + i, GSReg::encodeXyoffset(ctx.xyoffset));
+        image.setReg(GS_REG_MIPTBP1_1 + i, ctx.miptbp1);
+        image.setReg(GS_REG_MIPTBP2_1 + i, ctx.miptbp2);
+        image.setReg(GS_REG_SCISSOR_1 + i, GSReg::encodeScissor(ctx.scissor));
+        image.setReg(GS_REG_ALPHA_1 + i, ctx.alpha);
+        image.setReg(GS_REG_TEST_1 + i, ctx.test);
+        image.setReg(GS_REG_FBA_1 + i, ctx.fba);
+        image.setReg(GS_REG_FRAME_1 + i, GSReg::encodeFrame(ctx.frame));
+        image.setReg(GS_REG_ZBUF_1 + i, GSReg::encodeZbuf(ctx.zbuf));
+    }
+    image.setReg(GS_REG_TEXCLUT, GSReg::encodeTexclut(m_texclut));
+    image.setReg(GS_REG_SCANMSK, m_scanmsk);
+    image.setReg(GS_REG_TEXA, GSReg::encodeTexa(m_texa));
+    image.setReg(GS_REG_FOGCOL, uint64_t(m_fogR) | (uint64_t(m_fogG) << 8) | (uint64_t(m_fogB) << 16));
+    image.setReg(GS_REG_DIMX, m_dimx);
+    image.setReg(GS_REG_DTHE, m_dthe);
+    image.setReg(GS_REG_COLCLAMP, m_colclamp);
+    image.setReg(GS_REG_PABE, m_pabe ? 1u : 0u);
+    image.setReg(GS_REG_BITBLTBUF, GSReg::encodeBitbltbuf(m_bitbltbuf));
+    image.setReg(GS_REG_TRXPOS, GSReg::encodeTrxpos(m_trxpos));
+    image.setReg(GS_REG_TRXREG, GSReg::encodeTrxreg(m_trxreg));
+    image.setReg(GS_REG_TRXDIR, m_trxdir);
+
+    image.flags |= GSStateImage::HasVertexQueue;
+    image.vertexCount = static_cast<uint32_t>(m_vtxCount);
+    for (uint32_t i = 0; i < GSStateImage::kMaxQueuedVertices; ++i)
+        image.vertexQueue[i] = encodeVertex(m_vtxQueue[i]);
+
+    if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
+    {
+        const std::vector<uint8_t> clut = cpu->SaveClutState();
+        if (clut.size() == sizeof(image.clut) + sizeof(image.clutCbp))
+        {
+            std::memcpy(image.clut.data(), clut.data(), sizeof(image.clut));
+            std::memcpy(image.clutCbp.data(), clut.data() + sizeof(image.clut), sizeof(image.clutCbp));
+            image.flags |= GSStateImage::HasClut;
+        }
+    }
+}
+
+void GS::loadState(const GSStateImage &image)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_primRegister = GSReg::decodePrim(image.reg(GS_REG_PRIM));
+    m_prmodeRegister = GSReg::decodePrim(image.reg(GS_REG_PRMODE));
+    m_prmodecont = (image.reg(GS_REG_PRMODECONT) & 1u) != 0u;
+    m_prim = m_prmodecont ? m_primRegister : m_prmodeRegister;
+    m_prim.type = m_primRegister.type;
+
+    const uint64_t rgbaq = image.reg(GS_REG_RGBAQ);
+    m_curR = static_cast<uint8_t>(rgbaq);
+    m_curG = static_cast<uint8_t>(rgbaq >> 8);
+    m_curB = static_cast<uint8_t>(rgbaq >> 16);
+    m_curA = static_cast<uint8_t>(rgbaq >> 24);
+    m_curQ = bitsFloat(static_cast<uint32_t>(rgbaq >> 32));
+    if (m_curQ == 0.0f)
+        m_curQ = 1.0f;
+    const uint64_t st = image.reg(GS_REG_ST);
+    m_curS = bitsFloat(static_cast<uint32_t>(st));
+    m_curT = bitsFloat(static_cast<uint32_t>(st >> 32));
+    m_curU = static_cast<uint16_t>(image.reg(GS_REG_UV) & 0x3FFFu);
+    m_curV = static_cast<uint16_t>((image.reg(GS_REG_UV) >> 16) & 0x3FFFu);
+    m_curFog = static_cast<uint8_t>(image.reg(GS_REG_FOG) >> 56);
+
+    for (uint8_t i = 0; i < 2u; ++i)
+    {
+        GSContext &ctx = m_ctx[i];
+        ctx.tex0 = GSReg::decodeTex0(image.reg(GS_REG_TEX0_1 + i));
+        ctx.clamp = image.reg(GS_REG_CLAMP_1 + i);
+        ctx.tex1 = image.reg(GS_REG_TEX1_1 + i);
+        ctx.xyoffset = GSReg::decodeXyoffset(image.reg(GS_REG_XYOFFSET_1 + i));
+        ctx.miptbp1 = image.reg(GS_REG_MIPTBP1_1 + i);
+        ctx.miptbp2 = image.reg(GS_REG_MIPTBP2_1 + i);
+        ctx.scissor = GSReg::decodeScissor(image.reg(GS_REG_SCISSOR_1 + i));
+        ctx.alpha = image.reg(GS_REG_ALPHA_1 + i);
+        ctx.test = image.reg(GS_REG_TEST_1 + i);
+        ctx.fba = image.reg(GS_REG_FBA_1 + i);
+        ctx.frame = GSReg::decodeFrame(image.reg(GS_REG_FRAME_1 + i));
+        ctx.zbuf = GSReg::decodeZbuf(image.reg(GS_REG_ZBUF_1 + i));
+    }
+    m_texclut = GSReg::decodeTexclut(image.reg(GS_REG_TEXCLUT));
+    m_scanmsk = image.reg(GS_REG_SCANMSK);
+    m_texa = GSReg::decodeTexa(image.reg(GS_REG_TEXA));
+    const uint64_t fogcol = image.reg(GS_REG_FOGCOL);
+    m_fogR = static_cast<uint8_t>(fogcol);
+    m_fogG = static_cast<uint8_t>(fogcol >> 8);
+    m_fogB = static_cast<uint8_t>(fogcol >> 16);
+    m_dimx = image.reg(GS_REG_DIMX);
+    m_dthe = image.reg(GS_REG_DTHE);
+    m_colclamp = image.reg(GS_REG_COLCLAMP);
+    m_pabe = (image.reg(GS_REG_PABE) & 1u) != 0u;
+    m_bitbltbuf = GSReg::decodeBitbltbuf(image.reg(GS_REG_BITBLTBUF));
+    m_trxpos = GSReg::decodeTrxpos(image.reg(GS_REG_TRXPOS));
+    m_trxreg = GSReg::decodeTrxreg(image.reg(GS_REG_TRXREG));
+    m_trxdir = static_cast<uint32_t>(image.reg(GS_REG_TRXDIR) & 0x3u);
+
+    m_vtxIndex = 0;
+    m_vtxCount = 0;
+    if ((image.flags & GSStateImage::HasVertexQueue) != 0u)
+    {
+        m_vtxCount = static_cast<int>(image.vertexCount);
+        for (uint32_t i = 0; i < GSStateImage::kMaxQueuedVertices; ++i)
+            m_vtxQueue[i] = decodeVertex(image.vertexQueue[i]);
+    }
+
+    if ((image.flags & GSStateImage::HasClut) != 0u)
+        if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
+        {
+            std::vector<uint8_t> clut(sizeof(image.clut) + sizeof(image.clutCbp));
+            std::memcpy(clut.data(), image.clut.data(), sizeof(image.clut));
+            std::memcpy(clut.data() + sizeof(image.clut), image.clutCbp.data(), sizeof(image.clutCbp));
+            cpu->LoadClutState(clut.data(), clut.size());
+        }
 }

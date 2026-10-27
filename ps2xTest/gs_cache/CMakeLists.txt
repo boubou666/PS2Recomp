@@ -15,6 +15,7 @@ add_library(ps2_gs_cache_backend_under_test STATIC
     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_backend.cpp"
     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
+    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_state_image.cpp"
     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_stream_renderer.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/gs_cache_runtime_stubs.cpp"
 )
