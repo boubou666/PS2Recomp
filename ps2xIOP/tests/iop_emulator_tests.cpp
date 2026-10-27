@@ -75,6 +75,23 @@ namespace
 
         std::vector<uint8_t> guest;
         std::vector<std::string> logs;
+
+        // IOP -> EE RPC: one EE server (eeRpcSid), and the calls the IOP handed over.
+        bool findEeRpcServer(uint32_t sid, EeRpcServer &server) const override
+        {
+            if (sid != eeRpcSid)
+                return false;
+            server = eeRpcServer;
+            return true;
+        }
+        bool callEeRpc(EeRpcCall call) override
+        {
+            eeRpcCalls.push_back(std::move(call));
+            return true;
+        }
+        uint32_t eeRpcSid = 0u;
+        EeRpcServer eeRpcServer{};
+        std::vector<EeRpcCall> eeRpcCalls;
         std::string cdRoot;
     };
 
@@ -275,6 +292,201 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
         std::memcpy(host.guest.data() + address + codeOffset + importTableOffset,
                     importTable, sizeof(importTable));
+    }
+
+    // IRX whose entry binds the EE server `sid` with client 0x10200 and calls it SIF_RPC_M_NOWAIT: fno 5, 6 bytes from
+    // 0x10300 ("IOPRPC"), 4 bytes back to 0x10400 (a whole quadword moves, so 16).
+    void writeEeRpcClientIrx(TestHost &host, uint32_t address, uint32_t sid)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t importTableOffset = 0x80u;
+        constexpr uint32_t bindStub = loadAddress + importTableOffset + 20u;
+        constexpr uint32_t callStub = bindStub + 8u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        const uint32_t code[] = {
+            0x27BDFFC0u, // addiu sp, sp, -0x40
+            0xAFBF003Cu, // sw    ra, 0x3c(sp)
+            0x3C040001u, // lui   a0, 1
+            0x34840200u, // ori   a0, a0, 0x200 (client)
+            0x3C050000u | ((sid >> 16u) & 0xFFFFu), // lui a1, SID upper
+            0x34A50000u | (sid & 0xFFFFu),          // ori a1, a1, SID lower
+            0x00003021u, // addu  a2, zero, zero (mode)
+            0x0C000000u | ((bindStub >> 2u) & 0x03FFFFFFu), // jal sceSifBindRpc
+            0x00000000u, // nop
+            0x3C040001u, // lui   a0, 1
+            0x34840200u, // ori   a0, a0, 0x200 (client)
+            0x24050005u, // addiu a1, zero, 5 (fno)
+            0x24060001u, // addiu a2, zero, 1 (SIF_RPC_M_NOWAIT)
+            0x3C070001u, // lui   a3, 1
+            0x34E70300u, // ori   a3, a3, 0x300 (send)
+            0x24080006u, // addiu t0, zero, 6
+            0xAFA80010u, // sw    t0, 0x10(sp) (send size)
+            0x3C080001u, // lui   t0, 1
+            0x35080400u, // ori   t0, t0, 0x400
+            0xAFA80014u, // sw    t0, 0x14(sp) (receive)
+            0x24080004u, // addiu t0, zero, 4
+            0xAFA80018u, // sw    t0, 0x18(sp) (receive size)
+            0xAFA0001Cu, // sw    zero, 0x1c(sp) (end function)
+            0xAFA00020u, // sw    zero, 0x20(sp) (end parameter)
+            0x0C000000u | ((callStub >> 2u) & 0x03FFFFFFu), // jal sceSifCallRpc
+            0x00000000u, // nop
+            0x8FBF003Cu, // lw    ra, 0x3c(sp)
+            0x00001021u, // addu  v0, zero, zero
+            0x27BD0040u, // addiu sp, sp, 0x40
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        const uint32_t importTable[] = {
+            0x41E00000u, // IRX import magic
+            0x00000000u,
+            0x00000101u,
+            0x63666973u, // "sifc"
+            0x0000646Du, // "md"
+            0x03E00008u, // jr ra
+            0x2400000Fu, // addiu zero, zero, 15 (sceSifBindRpc)
+            0x03E00008u, // jr ra
+            0x24000010u, // addiu zero, zero, 16 (sceSifCallRpc)
+            0x00000000u,
+            0x00000000u,
+        };
+        const char send[] = "IOPRPC";
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = 0x310u;
+        program.memsz = 0x500u;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::fill(host.guest.begin() + address, host.guest.end(), 0u);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
+        std::memcpy(host.guest.data() + address + codeOffset + importTableOffset, importTable, sizeof(importTable));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x300u, send, 6u);
+    }
+
+    // IRX with two threads. The waiter (priority 20) binds the EE server `sid` and calls it with WAIT: fno 5, "IOPRPC"
+    // from 0x10380, 4 bytes back to 0x10400; it writes 1 to 0x10480 once the call has returned. The waker (priority 30,
+    // so it runs once the waiter waits) calls WakeupThread(waiter) and writes 1 to 0x10484: that must not end the call.
+    void writeEeRpcWaitIrx(TestHost &host, uint32_t address, uint32_t sid)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t waiterAddress = loadAddress + 0x100u;
+        constexpr uint32_t wakerAddress = loadAddress + 0x1A0u;
+        constexpr uint32_t thbaseTable = loadAddress + 0x200u;
+        constexpr uint32_t createThreadStub = thbaseTable + 20u;
+        constexpr uint32_t startThreadStub = createThreadStub + 8u;
+        constexpr uint32_t wakeupThreadStub = startThreadStub + 8u;
+        constexpr uint32_t sifcmdTable = loadAddress + 0x240u;
+        constexpr uint32_t bindStub = sifcmdTable + 20u;
+        constexpr uint32_t callStub = bindStub + 8u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x500u; program.memsz = 0x500u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u, 0xAFB10014u,             // addiu sp, -0x20; save ra, s0, s1
+            0x3C040001u, 0x34840300u, jal(createThreadStub), 0x00000000u,   // CreateThread(waiter descriptor)
+            0x00408021u,                                                    // move s0, v0
+            0x3C040001u, 0x34840320u, jal(createThreadStub), 0x00000000u,   // CreateThread(waker descriptor)
+            0x00408821u,                                                    // move s1, v0
+            0x02002021u, 0x00002821u, jal(startThreadStub), 0x00000000u,    // StartThread(waiter, 0)
+            0x02202021u, 0x02002821u, jal(startThreadStub), 0x00000000u,    // StartThread(waker, waiter id)
+            0x8FB10014u, 0x8FB00018u, 0x8FBF001Cu,                          // restore s1, s0, ra
+            0x00001021u, 0x27BD0020u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t waiter[] = {
+            0x27BDFFC0u, 0xAFBF003Cu,                         // addiu sp, -0x40; sw ra, 0x3c(sp)
+            0x3C040001u, 0x34840200u,                         // a0 = client 0x10200
+            0x3C050000u | ((sid >> 16u) & 0xFFFFu), 0x34A50000u | (sid & 0xFFFFu),
+            0x00003021u, jal(bindStub), 0x00000000u,          // sceSifBindRpc(client, sid, 0)
+            0x3C040001u, 0x34840200u,                         // a0 = client
+            0x24050005u, 0x00003021u,                         // a1 = fno 5, a2 = mode 0 (WAIT)
+            0x3C070001u, 0x34E70380u,                         // a3 = send 0x10380
+            0x24080006u, 0xAFA80010u,                         // send size 6
+            0x3C080001u, 0x35080400u, 0xAFA80014u,            // receive 0x10400
+            0x24080004u, 0xAFA80018u,                         // receive size 4
+            0xAFA0001Cu, 0xAFA00020u,                         // no end function
+            jal(callStub), 0x00000000u,                       // sceSifCallRpc
+            0x3C080001u, 0x35080480u, 0x24090001u, 0xAD090000u, // *0x10480 = 1
+            0x8FBF003Cu, 0x27BD0040u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t waker[] = {
+            0x27BDFFE0u, 0xAFBF001Cu,                         // addiu sp, -0x20; sw ra
+            jal(wakeupThreadStub), 0x00000000u,               // WakeupThread(a0 = the waiter's id, its start argument)
+            0x3C080001u, 0x35080484u, 0x24090001u, 0xAD090000u, // *0x10484 = 1
+            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t thbaseImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x61626874u, 0x00006573u, // "thbase"
+            0x03E00008u, 0x24000004u, // CreateThread
+            0x03E00008u, 0x24000006u, // StartThread
+            0x03E00008u, 0x24000019u, // WakeupThread
+            0u, 0u,
+        };
+        const uint32_t sifcmdImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x63666973u, 0x0000646Du, // "sifcmd"
+            0x03E00008u, 0x2400000Fu, // sceSifBindRpc
+            0x03E00008u, 0x24000010u, // sceSifCallRpc
+            0u, 0u,
+        };
+        const uint32_t waiterDescriptor[] = {0u, 0u, waiterAddress, 0x400u, 20u};
+        const uint32_t wakerDescriptor[] = {0u, 0u, wakerAddress, 0x400u, 30u};
+        static_assert(sizeof(entry) <= 0x100u && sizeof(waiter) <= 0xA0u && sizeof(waker) <= 0x60u,
+                      "code overlaps the next block");
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        const auto put = [&](uint32_t offset, const void *data, size_t size)
+        {
+            std::memcpy(segment.data() + offset, data, size);
+        };
+        put(0u, entry, sizeof(entry));
+        put(0x100u, waiter, sizeof(waiter));
+        put(0x1A0u, waker, sizeof(waker));
+        put(0x200u, thbaseImports, sizeof(thbaseImports));
+        put(0x240u, sifcmdImports, sizeof(sifcmdImports));
+        put(0x300u, waiterDescriptor, sizeof(waiterDescriptor));
+        put(0x320u, wakerDescriptor, sizeof(wakerDescriptor));
+        put(0x380u, "IOPRPC", 6u);
+
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
     // IRX whose entry installs a SIF command handler: sceSifAddCmdHandler(cid, 0x10300, 0x10400).
@@ -1452,6 +1664,81 @@ int main()
         { return message.find("unhandled import cdvdman:7") != std::string::npos; });
     if (!expect(!emittedUnhandledSeek,
                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
+
+    // IOP -> EE RPC: an IRX binds a server the EE registered and calls it; the reply lands in its receive buffer.
+    {
+        constexpr uint32_t eeSid = 0x00010001u;
+        host.eeRpcSid = eeSid;
+        host.eeRpcServer = IopHost::EeRpcServer{0x0089DDB0u, 0x0089DE00u, 0x0089DF00u};
+        host.eeRpcCalls.clear();
+        iop.reset();
+        writeEeRpcClientIrx(host, 0x100u, eeSid);
+        const ModuleLoadResult client = iop.loadModuleBuffer(0x100u);
+        if (!expect(client.handled && client.startResult == 0, "Synthetic IOP -> EE RPC client IRX did not start")) return 1;
+        uint32_t bound[5]{};
+        if (!expect(iop.readMemory(0x00010214u, bound, sizeof(bound)), "Could not read the bound client")) return 1;
+        if (!expect(bound[0] == 0x0089DE00u && bound[1] == 0x0089DF00u && bound[4] == 0x0089DDB0u,
+                    "sceSifBindRpc did not fill the client's buf, cbuf and server from the EE server")) return 1;
+        if (!expect(host.eeRpcCalls.size() == 1u, "sceSifCallRpc did not hand the call to the EE")) return 1;
+        const IopHost::EeRpcCall &call = host.eeRpcCalls.front();
+        if (!expect(call.sid == eeSid && call.function == 5u, "The EE call lost its sid or RPC number")) return 1;
+        if (!expect(call.send.size() == 6u && std::memcmp(call.send.data(), "IOPRPC", 6u) == 0,
+                    "The EE call did not carry the send data")) return 1;
+        if (!expect(call.receiveSize == 16u, "The receive size was not rounded to a SIF DMA quadword")) return 1;
+
+        uint8_t reply[16];
+        for (uint32_t i = 0; i < sizeof(reply); ++i)
+            reply[i] = static_cast<uint8_t>(0xA0u + i);
+        iop.completeEeRpc(call.token, reply, sizeof(reply));
+        uint8_t received[16]{};
+        if (!expect(iop.readMemory(0x00010400u, received, sizeof(received)) &&
+                        std::memcmp(received, reply, sizeof(reply)) == 0,
+                    "The EE reply did not land in the IRX's receive buffer")) return 1;
+        iop.completeEeRpc(call.token, reply, sizeof(reply)); // a second reply for the same call is ignored
+        host.eeRpcSid = 0u;
+        iop.reset();
+    }
+
+    // IOP -> EE RPC with WAIT from a real IOP thread: the thread sleeps in sceSifCallRpc until the EE replies, then
+    // resumes with the reply in its receive buffer.
+    {
+        constexpr uint32_t eeSid = 0x00010001u;
+        host.eeRpcSid = eeSid;
+        host.eeRpcServer = IopHost::EeRpcServer{0x0089DDB0u, 0x0089DE00u, 0x0089DF00u};
+        host.eeRpcCalls.clear();
+        iop.reset();
+        writeEeRpcWaitIrx(host, 0x100u, eeSid);
+        const ModuleLoadResult waiter = iop.loadModuleBuffer(0x100u);
+        if (!expect(waiter.handled && waiter.startResult == 0, "Synthetic IOP -> EE WAIT client IRX did not start")) return 1;
+        for (int i = 0; i < 64 && host.eeRpcCalls.empty(); ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(host.eeRpcCalls.size() == 1u, "The IOP thread's sceSifCallRpc did not reach the EE")) return 1;
+        uint32_t marker = 0xFFFFFFFFu;
+        for (int i = 0; i < 8; ++i)
+            iop.runEeCycles(200000u);
+        uint32_t woken = 0u;
+        if (!expect(iop.readMemory(0x00010484u, &woken, sizeof(woken)) && woken == 1u,
+                    "The waker thread did not run its WakeupThread")) return 1;
+        if (!expect(iop.readMemory(0x00010480u, &marker, sizeof(marker)) && marker == 0u,
+                    "The WAIT caller went on before the EE replied (a WakeupThread ended the call)")) return 1;
+
+        uint8_t reply[16];
+        for (uint32_t i = 0; i < sizeof(reply); ++i)
+            reply[i] = static_cast<uint8_t>(0x50u + i);
+        iop.completeEeRpc(host.eeRpcCalls.front().token, reply, sizeof(reply));
+        for (int i = 0; i < 64 && marker != 1u; ++i)
+        {
+            iop.runEeCycles(200000u);
+            (void)iop.readMemory(0x00010480u, &marker, sizeof(marker));
+        }
+        if (!expect(marker == 1u, "The WAIT caller did not resume after the EE reply")) return 1;
+        uint8_t received[16]{};
+        if (!expect(iop.readMemory(0x00010400u, received, sizeof(received)) &&
+                        std::memcmp(received, reply, sizeof(reply)) == 0,
+                    "The WAIT caller's receive buffer does not hold the EE reply")) return 1;
+        host.eeRpcSid = 0u;
+        iop.reset();
+    }
 
     std::cout << "ps2xIOP emulator smoke tests passed\n";
     return 0;

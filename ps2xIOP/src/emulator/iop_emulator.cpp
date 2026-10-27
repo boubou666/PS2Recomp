@@ -1533,6 +1533,14 @@ namespace ps2x::iop::detail
         return m_impl->queueSifCommand(cid, packet, size);
     }
 
+    void IopEmulator::completeEeRpc(uint64_t token, const void *data, size_t size)
+    {
+        // The end function runs after the copy, at the IOP's next scheduling point, like a SIF DMA completion.
+        if (const auto end = m_impl->rpc.completeEeRpc(token, data, size))
+            m_impl->pendingGuestCallbacks.emplace(m_impl->totalCycles,
+                                                  Impl::ScheduledGuestCallback{end->function, end->gp, end->argument});
+    }
+
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
         return m_impl->stopModule(moduleId, result);

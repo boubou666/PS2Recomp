@@ -869,6 +869,12 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
     return m_iopSubsystem->handleRpc(request);
 }
 
+void PS2Runtime::completeIopEeRpc(uint64_t token, const std::vector<uint8_t> &reply)
+{
+    IopLock iop(m_iopMutex, m_iopWanted);
+    m_iopSubsystem->completeEeRpc(token, reply.data(), reply.size());
+}
+
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
     IopLock iop(m_iopMutex, m_iopWanted);

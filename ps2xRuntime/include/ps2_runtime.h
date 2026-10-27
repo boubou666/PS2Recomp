@@ -491,6 +491,8 @@ public:
     inline R5900Context &cpu() { return m_cpuContext; }
     inline const R5900Context &cpu() const { return m_cpuContext; }
 
+    // The EE server's reply to an IOP -> EE RPC (PS2IopHostAdapter::callEeRpc), delivered to the IRX under the IOP lock.
+    void completeIopEeRpc(uint64_t token, const std::vector<uint8_t> &reply);
     inline PS2Memory &memory() { return m_memory; }
     inline const PS2Memory &memory() const { return m_memory; }
 

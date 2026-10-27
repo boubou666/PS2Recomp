@@ -160,6 +160,11 @@ namespace ps2x::iop
         return m_impl->emulator.sendSifCommand(cid, packet, size);
     }
 
+    void IopSubsystem::completeEeRpc(uint64_t token, const void *data, size_t size)
+    {
+        m_impl->emulator.completeEeRpc(token, data, size);
+    }
+
     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
     {
         if (m_impl->moduleManager.stopHle(moduleId, result))

@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_iop_transport.h"
+#include "Kernel/Stubs/SIF.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
@@ -183,12 +184,110 @@ namespace
         std::memcpy(&value, rdram + addr, sizeof(value));
         return value;
     }
+
+    // IOP -> EE RPC, EE half: a thread registers a server and serves it from sceSifRpcLoop; a call handed over the way
+    // the IOP host does it must run the server function on that thread and send its reply back.
+    constexpr uint32_t K_IOPEE_MAIN = 0x00301400u;
+    constexpr uint32_t K_IOPEE_SERVER = 0x00301500u;
+    constexpr uint32_t K_IOPEE_QD = 0x00023000u;
+    constexpr uint32_t K_IOPEE_SD = 0x00023100u;
+    constexpr uint32_t K_IOPEE_BUF = 0x00023200u;
+    constexpr uint32_t K_IOPEE_SID = 0x00010001u;
+    int gIopEeServedOn = 0;
+    uint32_t gIopEeFunction = 0u;
+    uint32_t gIopEeSize = 0u;
+    uint32_t gIopEeFirstWord = 0u;
+    int gIopEeCalls = 0;
+    std::vector<uint8_t> gIopEeReply;
+    bool gIopEeReplied = false;
+
+    uint32_t iopEeRead32(const uint8_t *rdram, uint32_t addr)
+    {
+        uint32_t value = 0u;
+        std::memcpy(&value, rdram + addr, sizeof(value));
+        return value;
+    }
+
+    void iopEeServerMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SifInitRpc(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, K_IOPEE_QD);
+        setRegU32(*ctx, 5, static_cast<uint32_t>(runtime->eeScheduler().currentThreadId()));
+        SifSetRpcQueue(rdram, ctx, runtime);
+        setRegU32(*ctx, 29, K_STACK_ADDR);
+        writeGuestU32(rdram, K_STACK_ADDR + 0x10u, 0u);         // cfunc
+        writeGuestU32(rdram, K_STACK_ADDR + 0x14u, 0u);         // cbuf
+        writeGuestU32(rdram, K_STACK_ADDR + 0x18u, K_IOPEE_QD); // qd
+        setRegU32(*ctx, 4, K_IOPEE_SD);
+        setRegU32(*ctx, 5, K_IOPEE_SID);
+        setRegU32(*ctx, 6, K_IOPEE_SERVER);
+        setRegU32(*ctx, 7, K_IOPEE_BUF);
+        SifRegisterRpc(rdram, ctx, runtime);
+        // The IOP calls once its bind found the server, so after the registration: here, as the host would hand it over.
+        const std::vector<uint8_t> send{0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u};
+        (void)ps2_stubs::queueEeRpcFromIop(rdram, runtime, K_IOPEE_SID, 7u, send, 16u,
+                                           [runtime](const std::vector<uint8_t> &data)
+                                           {
+                                               gIopEeReply = data;
+                                               gIopEeReplied = true;
+                                               runtime->requestStop();
+                                           });
+        setRegU32(*ctx, 4, K_IOPEE_QD);
+        ps2_stubs::sceSifRpcLoop(rdram, ctx, runtime); // blocks: it never returns
+    }
+
+    // func(fno, buf, size): answers in its own buffer (returns 0).
+    void iopEeServer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gIopEeCalls;
+        gIopEeServedOn = runtime->eeScheduler().currentThreadId();
+        gIopEeFunction = getRegU32(ctx, 4);
+        gIopEeSize = getRegU32(ctx, 6);
+        gIopEeFirstWord = iopEeRead32(rdram, getRegU32(ctx, 5));
+        writeGuestU32(rdram, getRegU32(ctx, 5), 0xCAFEF00Du);
+        setRegU32(*ctx, 2, 0u);
+        ctx->pc = getRegU32(ctx, 31);
+    }
 }
 
 void register_ps2_sif_rpc_tests()
 {
     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
     {
+        tc.Run("an IOP -> EE call runs the server function on the sceSifRpcLoop thread and sends the reply back", [](TestCase &t)
+        {
+            TestEnv env;
+            gIopEeServedOn = 0;
+            gIopEeFunction = gIopEeSize = gIopEeFirstWord = 0u;
+            gIopEeCalls = 0;
+            env.runtime.registerFunction(K_IOPEE_MAIN, iopEeServerMain);
+            env.runtime.registerFunction(K_IOPEE_SERVER, iopEeServer);
+            env.ctx.pc = K_IOPEE_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+
+            gIopEeReply.clear();
+            gIopEeReplied = false;
+            ee.run();
+            const std::vector<uint8_t> &reply = gIopEeReply;
+            const bool replied = gIopEeReplied;
+
+            t.IsTrue(replied, "the IOP side should get a reply");
+            t.Equals(gIopEeCalls, 1, "the server function should run once");
+            t.Equals(gIopEeServedOn, EeScheduler::kMainThreadId, "it should run on the sceSifRpcLoop thread");
+            t.Equals(gIopEeFunction, 7u, "it should get the RPC number");
+            t.Equals(gIopEeSize, 6u, "it should get the send size");
+            t.Equals(gIopEeFirstWord, 0x44332211u, "the send data should be in the server buffer");
+            t.Equals(reply.size(), size_t{16u}, "the reply should have the size the IOP asked for");
+            t.Equals(reply.size() >= 4u ? reply[0] | (reply[1] << 8) | (reply[2] << 16) | (static_cast<uint32_t>(reply[3]) << 24) : 0u,
+                     0xCAFEF00Du, "the reply should be the server buffer, which it answered in");
+            const GuestThread *server = ee.thread(EeScheduler::kMainThreadId);
+            t.IsTrue(server && server->wait.reason == EeWaitReason::External,
+                     "the server thread should be back waiting in sceSifRpcLoop");
+            env.runtime.registerFunction(K_IOPEE_MAIN, nullptr);
+            env.runtime.registerFunction(K_IOPEE_SERVER, nullptr);
+        });
+
         tc.Run("SifInitRpc does not reset the running IOP", [](TestCase &t)
         {
             TestEnv env;

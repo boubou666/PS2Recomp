@@ -31,6 +31,9 @@ namespace ps2x::iop
         // EE -> IOP SIF command (EE sceSifSendCmd). The packet header is already filled; extra data
         // must already be in IOP RAM. Handlers run during the next IOP time slice.
         [[nodiscard]] bool sendSifCommand(uint32_t cid, const void *packet, uint32_t size);
+        // The EE server's reply to an IOP -> EE RPC (IopHost::callEeRpc): copied to the IRX's receive buffer, then its
+        // caller resumes and its end function runs. Takes the IOP's state: call it where the IOP is not running.
+        void completeEeRpc(uint64_t token, const void *data, size_t size);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
 

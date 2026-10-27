@@ -522,6 +522,22 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          packetSize);
 }
 
+bool PS2IopHostAdapter::findEeRpcServer(uint32_t sid, EeRpcServer &server) const
+{
+    uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+    return ps2_stubs::findEeRpcServerForIop(rdram, sid, server.serverData, server.buffer, server.callbackBuffer);
+}
+
+bool PS2IopHostAdapter::callEeRpc(EeRpcCall call)
+{
+    PS2Runtime *const runtime = &m_runtime;
+    uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+    const uint64_t token = call.token;
+    return ps2_stubs::queueEeRpcFromIop(rdram, runtime, call.sid, call.function, std::move(call.send), call.receiveSize,
+                                        [runtime, token](const std::vector<uint8_t> &reply)
+                                        { runtime->completeIopEeRpc(token, reply); });
+}
+
 bool PS2IopHostAdapter::readPadState(int port, uint8_t *state, size_t size)
 {
     // The IOP's emulated SIO2 DualShock 2 reads the same host input as the EE libpad HLE.

@@ -86,6 +86,17 @@ namespace ps2x::iop::detail
         static constexpr uint32_t kSifCmdSetSreg = 0x80000001u;
         void setSreg(uint32_t reg, uint32_t value) noexcept;
 
+        // IOP -> EE RPC: the reply to a call this bridge handed to the host (sceSifCallRpc on an EE server). Copies it
+        // to the IRX's receive buffer and wakes a waiting caller; returns the IRX's end function, to run after the copy.
+        struct EndFunction
+        {
+            uint32_t function = 0;
+            uint32_t gp = 0;
+            uint32_t argument = 0;
+        };
+        [[nodiscard]] std::optional<EndFunction> completeEeRpc(uint64_t token, const void *data, size_t size);
+        [[nodiscard]] size_t pendingEeRpcCount() const noexcept { return m_eeCalls.size(); }
+
     private:
         struct RpcServer
         {
@@ -105,6 +116,24 @@ namespace ps2x::iop::detail
         std::unordered_map<uint32_t, RpcServer> m_servers;
         std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers;
         std::unordered_map<uint32_t, int> m_queueThreads; // sceSifSetRpcQueue: queue -> server thread
+
+        // IOP -> EE RPC: clients bound to an EE sid, and the calls handed to the host until the EE replies.
+        struct EeCall
+        {
+            int thread = 0; // the IOP thread asleep in sceSifCallRpc; 0 for SIF_RPC_M_NOWAIT
+            uint32_t receive = 0;
+            uint32_t receiveSize = 0;
+            uint32_t endFunction = 0;
+            uint32_t endParam = 0;
+            uint32_t gp = 0;
+        };
+        std::unordered_map<uint32_t, uint32_t> m_eeClients; // client address -> EE sid
+        std::unordered_map<uint64_t, EeCall> m_eeCalls;     // token -> call
+        // The wake cycle of a caller waiting for the EE reply: a delay that never expires.
+        static constexpr uint64_t kEeRpcWaitCycle = ~uint64_t{0};
+        uint64_t m_nextEeCallToken = 1u; // never reset: a reply from before an IOP reset must not match a new call
+        bool bindEeRpc(IopCpuState &cpu);
+        bool callEeRpc(IopCpuState &cpu);
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
         std::array<uint32_t, 32> m_sregs{};
