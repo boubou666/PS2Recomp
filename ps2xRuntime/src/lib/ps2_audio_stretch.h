@@ -26,6 +26,9 @@ public:
     static constexpr size_t kCompareFrames = 256u;
     static constexpr double kMinRate = 0.5;
     static constexpr double kMaxRate = 2.0;
+    static constexpr double kLockRate = 0.03;
+    static constexpr double kLockFill = 0.125;
+    static constexpr double kUnlockFill = 0.4;
 
     AudioTimeStretcher()
         : m_ring(kCapacityFrames * 2u), m_tail(kHopFrames * 2u, 0.0f), m_window(kGrainFrames)
@@ -73,6 +76,7 @@ public:
 
     [[nodiscard]] size_t fill() const noexcept { return m_fill; }
     [[nodiscard]] double rate() const noexcept { return m_rate; }
+    [[nodiscard]] bool locked() const noexcept { return m_locked; }
     [[nodiscard]] uint64_t underruns() const noexcept { return m_underruns; }
     // Frames dropped because the buffer was full (the producer ran far ahead of real time).
     [[nodiscard]] uint64_t dropped() const noexcept { return m_dropped; }
@@ -145,15 +149,32 @@ private:
         const double wanted = std::clamp(static_cast<double>(m_fill) / kTargetFrames, kMinRate, kMaxRate);
         m_rate += (wanted - m_rate) * 0.05;
 
-        const size_t nominal = static_cast<size_t>(std::max(0.0, m_position));
+        const double offTarget = std::abs(static_cast<double>(m_fill) - kTargetFrames) / kTargetFrames;
+        if (m_locked && offTarget > kUnlockFill)
+        {
+            m_locked = false;
+            m_rate = wanted;
+        }
+        else if (!m_locked && m_previous >= 0 && offTarget < kLockFill && std::abs(m_rate - 1.0) < kLockRate)
+        {
+            m_locked = true;
+        }
+        if (m_locked)
+            m_rate = 1.0;
+
+        const size_t nominal = m_locked ? static_cast<size_t>(m_previous) + kHopFrames
+                                        : static_cast<size_t>(std::max(0.0, m_position));
         if (nominal + kGrainFrames > m_fill)
         {
             ++m_underruns;
             m_primed = false;
+            m_locked = false;
             emitTail();
             return;
         }
-        const size_t start = bestStart(nominal);
+        const size_t start = m_locked ? nominal : bestStart(nominal);
+        if (m_locked)
+            m_position = static_cast<double>(start);
 
         m_out.resize(kHopFrames * 2u);
         for (size_t i = 0; i < kHopFrames; ++i)
@@ -196,6 +217,7 @@ private:
     std::ptrdiff_t m_previous = -1;
     double m_rate = 1.0;
     bool m_primed = false;
+    bool m_locked = false;
     uint64_t m_underruns = 0;
     uint64_t m_dropped = 0;
 };
