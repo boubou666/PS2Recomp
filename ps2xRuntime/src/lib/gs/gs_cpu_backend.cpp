@@ -1196,6 +1196,8 @@ struct GSCpuBackend::PixelPipeline
 struct GSCpuBackend::TextureSampler
 {
     const GSDrawState *state = nullptr;
+    uint32_t tbp0 = 0;
+    uint32_t tbw = 0;
     int texW = 1;
     int texH = 1;
     uint8_t wrapU = 0;
@@ -1415,6 +1417,8 @@ GSCpuBackend::TextureSampler GSCpuBackend::MakeTextureSampler(const GSDrawState 
     const uint64_t clamp = state.context.clamp;
     TextureSampler s;
     s.state = &state;
+    s.tbp0 = state.context.tex0.tbp0;
+    s.tbw = state.context.tex0.tbw;
     s.texW = state.textureWidth;
     s.texH = state.textureHeight;
     s.wrapU = static_cast<uint8_t>(clamp & 0x3u);
@@ -2855,7 +2859,7 @@ uint32_t GSCpuBackend::FetchTexel(const TextureSampler &sampler, GSMem::TextureP
 {
     const GSDrawState &state = *sampler.state;
     const auto &tex = state.context.tex0;
-    u32 out = GSMem::ReadTexture(cache, m_vram, tex.psm, tex.tbp0, tex.tbw, u, v);
+    u32 out = GSMem::ReadTexture(cache, m_vram, tex.psm, sampler.tbp0, sampler.tbw, u, v);
 
     switch (tex.psm)
     {
@@ -2906,7 +2910,7 @@ GSCpuBackend::DecodedTexture *GSCpuBackend::FindDecodedTexture(DecodedTextureCac
     const bool indexed = isFourBitIndexedPsm(tex.psm) || isEightBitIndexedPsm(tex.psm);
     auto matches = [&](const DecodedTexture &t)
     {
-        return t.tbp0 == tex.tbp0 && t.tbw == tex.tbw && t.psm == tex.psm && t.width == sampler.texW &&
+        return t.tbp0 == sampler.tbp0 && t.tbw == sampler.tbw && t.psm == tex.psm && t.width == sampler.texW &&
                t.height == sampler.texH && t.texa.ta0 == state.texa.ta0 && t.texa.ta1 == state.texa.ta1 &&
                t.texa.aem == state.texa.aem &&
                (!indexed || (t.cpsm == tex.cpsm && t.csm == tex.csm && t.csa == tex.csa && t.clutSerial == sampler.clutSerial));
@@ -2942,8 +2946,8 @@ GSCpuBackend::DecodedTexture *GSCpuBackend::FindDecodedTexture(DecodedTextureCac
     }
     DecodedTexture &t = *slot;
     t.valid = true;
-    t.tbp0 = tex.tbp0;
-    t.tbw = tex.tbw;
+    t.tbp0 = sampler.tbp0;
+    t.tbw = sampler.tbw;
     t.psm = tex.psm;
     t.cpsm = tex.cpsm;
     t.csm = tex.csm;
