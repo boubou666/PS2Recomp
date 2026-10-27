@@ -1422,6 +1422,53 @@ int main()
         if (!expect(iop.stopModule(set.moduleId, &stopResult), "SREG IRX stop failed")) return 1;
     }
 
+    // A start routine runs in a thread, as in MODLOAD: DelayThread(1000) blocks it for 1 ms of IOP time, and
+    // GetThreadId names that thread. LIBSD's start waits for its first SPU2 transfers the same way.
+    {
+        const uint32_t code[] = {
+            0x27BDFFE0u, // addiu sp, sp, -0x20
+            0xAFBF001Cu, // sw    ra, 0x1c(sp)
+            0x3C040001u, // lui   a0, 1
+            0x0C004017u, // jal   0x1005C (GetSystemTime stub)
+            0x34840400u, // ori   a0, a0, 0x400 (delay slot)
+            0x0C004015u, // jal   0x10054 (DelayThread stub)
+            0x240403E8u, // addiu a0, zero, 1000 (delay slot)
+            0x3C040001u, // lui   a0, 1
+            0x0C004017u, // jal   0x1005C (GetSystemTime stub)
+            0x34840408u, // ori   a0, a0, 0x408 (delay slot)
+            0x0C004019u, // jal   0x10064 (GetThreadId stub)
+            0x00000000u, // nop
+            0x8FBF001Cu, // lw    ra, 0x1c(sp)
+            0x00000000u, // nop   (load delay slot)
+            0x03E00008u, // jr    ra
+            0x27BD0020u, // addiu sp, sp, 0x20 (delay slot)
+            0x41E00000u, // IRX import magic
+            0x00000000u,
+            0x00000101u,
+            0x61626874u, // "thba"
+            0x00006573u, // "se"
+            0x03E00008u, // jr ra
+            0x24000021u, // addiu zero, zero, 33 (DelayThread)
+            0x03E00008u, // jr ra
+            0x24000022u, // addiu zero, zero, 34 (GetSystemTime)
+            0x03E00008u, // jr ra
+            0x24000014u, // addiu zero, zero, 20 (GetThreadId)
+            0x00000000u,
+            0x00000000u,
+        };
+        writeCodeIrx(host, 0x100u, code, sizeof(code));
+        const ModuleLoadResult delayed = iop.loadModuleBuffer(0x100u);
+        uint32_t before = 0u;
+        uint32_t after = 0u;
+        if (!expect(delayed.handled, "DelayThread IRX must load")) return 1;
+        if (!expect(delayed.startResult > 0, "A start routine must run in a thread")) return 1;
+        if (!expect(iop.readMemory(0x00010400u, &before, sizeof(before)) &&
+                        iop.readMemory(0x00010408u, &after, sizeof(after)),
+                    "Start routine system times must be readable")) return 1;
+        if (!expect(after - before >= 36864u, "DelayThread in a start routine must wait 1 ms of IOP time")) return 1;
+        if (!expect(iop.stopModule(delayed.moduleId, &stopResult), "DelayThread IRX stop failed")) return 1;
+    }
+
     constexpr uint32_t rpcSid = 0xF00DCAFEu;
     writeRpcServerIrx(host, 0x100u);
     const ModuleLoadResult rpcModule = iop.loadModuleBuffer(0x100u);
