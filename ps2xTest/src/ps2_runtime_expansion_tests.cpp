@@ -211,6 +211,52 @@ namespace
     constexpr uint32_t kMpegNoDuplicateProducerPc = 0x00125050u;
     constexpr uint32_t kMpegNoDuplicateHandle = 0x00124000u;
     constexpr uint32_t kMpegNoDuplicateImage = 0x00131000u;
+    // sceMpegCbNodata: GetPicture with no picture calls the game's type-1 callback, which feeds the stream.
+    constexpr uint32_t kMpegNodataMainPc = 0x00125060u;
+    constexpr uint32_t kMpegNodataResumePc = 0x00125070u;
+    constexpr uint32_t kMpegNodataCallbackPc = 0x00125080u;
+    constexpr uint32_t kMpegNodataHandle = 0x00125800u;
+    constexpr uint32_t kMpegNodataImage = 0x00132000u;
+    constexpr uint32_t kMpegNodataData = 0x00001234u;
+    constexpr uint32_t kMpegNodataGp = 0x00055550u;
+    std::atomic<uint32_t> gMpegNodataCalls{0u};
+    std::atomic<uint32_t> gMpegNodataArgs[4]{};
+    std::atomic<bool> gMpegNodataResumed{false};
+
+    void testMpegNodataMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, 1u); // sceMpegCbNodata
+        setRegU32(*ctx, 6, kMpegNodataCallbackPc);
+        setRegU32(*ctx, 7, kMpegNodataData);
+        setRegU32(*ctx, 28, kMpegNodataGp);
+        ps2_stubs::sceMpegAddCallback(rdram, ctx, runtime);
+        setRegU32(*ctx, 28, 0u);
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, kMpegNodataImage);
+        ctx->pc = kMpegNodataResumePc;
+        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
+    }
+
+    void testMpegNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataCalls.fetch_add(1u, std::memory_order_acq_rel);
+        gMpegNodataArgs[0].store(::getRegU32(ctx, 4));
+        gMpegNodataArgs[1].store(Ps2FastRead32(rdram, ::getRegU32(ctx, 5))); // cbdata type
+        gMpegNodataArgs[2].store(::getRegU32(ctx, 6));
+        gMpegNodataArgs[3].store(::getRegU32(ctx, 28));
+        ps2_stubs::notifyMpegCdStreamEof(runtime); // the "game" has no more data: GetPicture may return
+        setRegU32(*ctx, 2, 0u);
+        ctx->pc = 0u;
+    }
+
+    void testMpegNodataResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataResumed.store(true, std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     constexpr uint32_t kIpuInitMainPc = 0x00125100u;
     constexpr uint32_t kIpuInitResumePc = 0x00125104u;
     constexpr uint32_t kIpuSetD4Pc = 0x00126428u; // one game's SetD4_CHCR helper, other code elsewhere
@@ -971,6 +1017,44 @@ void register_ps2_runtime_expansion_tests()
                      "resumed GetPicture should publish the configured width");
             t.Equals(Ps2FastRead32(rdram.data(), kMpegWaitHandle + 0x04u), 240u,
                      "resumed GetPicture should publish the configured height");
+        });
+
+        tc.Run("sceMpegGetPicture asks the game's sceMpegCbNodata callback for data", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kMpegNodataMainPc, testMpegNodataMain);
+            runtime.registerFunction(kMpegNodataCallbackPc, testMpegNodataCallback);
+            runtime.registerFunction(kMpegNodataResumePc, testMpegNodataResume);
+            gMpegNodataCalls.store(0u);
+            gMpegNodataResumed.store(false);
+
+            R5900Context mainContext{};
+            mainContext.pc = kMpegNodataMainPc;
+            runtime.eeScheduler().reset(rdram.data(), mainContext);
+            runtime.eeScheduler().run();
+
+            t.Equals(gMpegNodataCalls.load(), 1u, "GetPicture without a picture should call the Nodata callback once");
+            t.Equals(gMpegNodataArgs[0].load(), kMpegNodataHandle, "the callback gets the MPEG handle in a0");
+            t.Equals(gMpegNodataArgs[1].load(), 1u, "the callback's cbdata has type sceMpegCbNodata");
+            t.Equals(gMpegNodataArgs[2].load(), kMpegNodataData, "the callback gets its registered data in a2");
+            t.Equals(gMpegNodataArgs[3].load(), kMpegNodataGp, "the callback runs with the GP it was registered with");
+            t.IsTrue(gMpegNodataResumed.load(), "GetPicture should resume once the callback returns");
+        });
+
+        tc.Run("sceMpegAddBs feeds 16 bytes past the aligned size, as libmpeg does", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kMpegNodataHandle);
+            setRegU32(ctx, 5, 0x00140000u);
+            setRegU32(ctx, 6, 0xFB0u); // The Third Age: a 0xFC0-byte movie block passed as 0xFB0
+            ps2_stubs::sceMpegAddBs(rdram.data(), &ctx, &runtime);
+            t.Equals(getRegS32(ctx, 2), 0xFC0, "AddBs should take ((size + 19) >> 4) << 4 bytes");
         });
 
         tc.Run("sceMpegGetPicture waits for new decoder output instead of duplicating the last frame", [](TestCase &t)
