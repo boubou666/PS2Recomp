@@ -1106,6 +1106,34 @@ namespace
         return ((tex1 >> 2) & 7u) != 0u && mmin >= 2u && mmin <= 5u;
     }
 
+    struct MipLevelGeometry
+    {
+        uint32_t tbp = 0;
+        uint32_t tbw = 0;
+        int width = 1;
+        int height = 1;
+    };
+
+    MipLevelGeometry mipLevelGeometry(const GSContext &ctx, uint32_t n)
+    {
+        MipLevelGeometry level;
+        if (n == 0)
+        {
+            level.tbp = ctx.tex0.tbp0;
+            level.tbw = ctx.tex0.tbw;
+        }
+        else
+        {
+            const uint64_t miptbp = n <= 3u ? ctx.miptbp1 : ctx.miptbp2;
+            const uint32_t shift = ((n - 1u) % 3u) * 20u;
+            level.tbp = static_cast<uint32_t>((miptbp >> shift) & 0x3FFFu);
+            level.tbw = static_cast<uint32_t>((miptbp >> (shift + 14u)) & 0x3Fu);
+        }
+        level.width = 1 << std::max<int>(std::min<int>(ctx.tex0.tw, 10) - static_cast<int>(n), 0);
+        level.height = 1 << std::max<int>(std::min<int>(ctx.tex0.th, 10) - static_cast<int>(n), 0);
+        return level;
+    }
+
     PrimitiveBlocks primitiveBlocks(const GSPrimitiveBatch &batch)
     {
         const auto &ctx = batch.state.context;
@@ -1551,26 +1579,14 @@ GSCpuBackend::TextureSampler GSCpuBackend::MakeTextureSampler(const GSDrawState 
         s.lodPerPixel = true;
     if (s.mipmapped)
     {
-        const auto &tex0 = state.context.tex0;
-        const int tw = std::min<int>(tex0.tw, 10);
-        const int th = std::min<int>(tex0.th, 10);
         for (uint32_t n = 0; n <= s.maxLevel; ++n)
         {
             TextureSampler::Level &level = s.levels[n];
-            if (n == 0)
-            {
-                level.tbp = tex0.tbp0;
-                level.tbw = tex0.tbw;
-            }
-            else
-            {
-                const uint64_t miptbp = n <= 3u ? state.context.miptbp1 : state.context.miptbp2;
-                const uint32_t shift = ((n - 1u) % 3u) * 20u;
-                level.tbp = static_cast<uint32_t>((miptbp >> shift) & 0x3FFFu);
-                level.tbw = static_cast<uint32_t>((miptbp >> (shift + 14u)) & 0x3Fu);
-            }
-            level.width = 1 << std::max<int>(tw - static_cast<int>(n), 0);
-            level.height = 1 << std::max<int>(th - static_cast<int>(n), 0);
+            const MipLevelGeometry geometry = mipLevelGeometry(state.context, n);
+            level.tbp = geometry.tbp;
+            level.tbw = geometry.tbw;
+            level.width = geometry.width;
+            level.height = geometry.height;
             level.minU = static_cast<uint16_t>(s.minU >> n);
             level.maxU = static_cast<uint16_t>(s.maxU >> n);
             level.minV = static_cast<uint16_t>(s.minV >> n);
