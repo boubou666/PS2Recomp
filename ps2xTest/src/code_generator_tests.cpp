@@ -1060,6 +1060,31 @@ void register_code_generator_tests()
             t.IsTrue(mtc0Code.find("Unhandled COP0") == std::string::npos, "MTC0 should not hit unhandled COP0 path");
         });
 
+        tc.Run("COP0 Count and Perf go through the recomp ABI, not PS2Runtime members", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            const auto cop0 = [](uint32_t rs, uint32_t rt, uint32_t rd)
+            {
+                Instruction inst{};
+                inst.opcode = OPCODE_COP0;
+                inst.rs = rs;
+                inst.rt = rt;
+                inst.rd = rd;
+                inst.raw = (OPCODE_COP0 << 26) | (rs << 21) | (rt << 16) | (rd << 11);
+                return inst;
+            };
+
+            const std::string readCount = gen.translateInstruction(cop0(COP0_MF, 4, COP0_REG_COUNT));
+            t.IsTrue(readCount.find("ps2rReadCop0Count(runtime)") != std::string::npos, "MFC0 Count reads through ps2rReadCop0Count: " + readCount);
+            const std::string writeCount = gen.translateInstruction(cop0(COP0_MT, 4, COP0_REG_COUNT));
+            t.IsTrue(writeCount.find("ps2rWriteCop0Count(runtime, ") != std::string::npos, "MTC0 Count writes through ps2rWriteCop0Count: " + writeCount);
+            const std::string readPerf = gen.translateInstruction(cop0(COP0_MF, 4, COP0_REG_PERF));
+            t.IsTrue(readPerf.find("ps2rReadCop0Perf(runtime, ") != std::string::npos, "MFC0 Perf reads through ps2rReadCop0Perf: " + readPerf);
+            const std::string writePerf = gen.translateInstruction(cop0(COP0_MT, 4, COP0_REG_PERF));
+            t.IsTrue(writePerf.find("ps2rWriteCop0Perf(runtime, ") != std::string::npos, "MTC0 Perf writes through ps2rWriteCop0Perf: " + writePerf);
+            for (const std::string *code : {&readCount, &writeCount, &readPerf, &writePerf})
+                t.IsTrue(code->find("runtime->") == std::string::npos, "generated COP0 code must not call PS2Runtime members: " + *code);
+        });
+
         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {
             CodeGenerator gen({}, {});
 

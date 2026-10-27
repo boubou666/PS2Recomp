@@ -40,6 +40,10 @@ void ps2rHandleTLBWI(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx) { r
 void ps2rHandleTLBWR(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx) { runtime->handleTLBWR(rdram, ctx); }
 void ps2rHandleTLBP(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx) { runtime->handleTLBP(rdram, ctx); }
 void ps2rClearLLBit(PS2Runtime *runtime, R5900Context *ctx) { runtime->clearLLBit(ctx); }
+uint32_t ps2rReadCop0Count(PS2Runtime *runtime) { return runtime->readCop0Count(); }
+void ps2rWriteCop0Count(PS2Runtime *runtime, uint32_t value) { runtime->writeCop0Count(value); }
+uint32_t ps2rReadCop0Perf(PS2Runtime *runtime, uint32_t select) { return runtime->readCop0Perf(select); }
+void ps2rWriteCop0Perf(PS2Runtime *runtime, uint32_t select, uint32_t value) { runtime->writeCop0Perf(select, value); }
 
 void ps2rKickGifDmaChainFromMMIO(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t dPcrValue,
                                  uint32_t dStatValue, uint32_t tadr, uint32_t chcr)
