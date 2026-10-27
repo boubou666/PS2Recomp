@@ -92,6 +92,10 @@ namespace
         uint32_t eeRpcSid = 0u;
         EeRpcServer eeRpcServer{};
         std::vector<EeRpcCall> eeRpcCalls;
+
+        // EE -> IOP calls whose server was handed off to its thread: the tokens the IOP reported done.
+        void completeDeferredRpc(uint64_t token, const RpcResult &) override { deferredDone.push_back(token); }
+        std::vector<uint64_t> deferredDone;
         std::string cdRoot;
     };
 
@@ -482,6 +486,109 @@ namespace
         put(0x300u, waiterDescriptor, sizeof(waiterDescriptor));
         put(0x320u, wakerDescriptor, sizeof(wakerDescriptor));
         put(0x380u, "IOPRPC", 6u);
+
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
+    // IRX with a real RPC server thread (priority 30): it runs sceSifSetRpcQueue(0x10380, its id),
+    // sceSifRegisterRpc(0x103A0, sid, 0x10200, buffer 0x10400, -, -, 0x10380), then sceSifRpcLoop. The server function
+    // blocks in DelayThread(1000) for fno 1 (not for other numbers), then writes 0x5A5A to its buffer and returns it.
+    void writeQueueRpcServerIrx(TestHost &host, uint32_t address, uint32_t sid)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t threadAddress = loadAddress + 0x100u;
+        constexpr uint32_t thbaseTable = loadAddress + 0x480u;
+        constexpr uint32_t createThreadStub = thbaseTable + 20u;
+        constexpr uint32_t startThreadStub = createThreadStub + 8u;
+        constexpr uint32_t getThreadIdStub = startThreadStub + 8u;
+        constexpr uint32_t delayThreadStub = getThreadIdStub + 8u;
+        constexpr uint32_t sifcmdTable = loadAddress + 0x4C0u;
+        constexpr uint32_t registerRpcStub = sifcmdTable + 20u;
+        constexpr uint32_t setRpcQueueStub = registerRpcStub + 8u;
+        constexpr uint32_t rpcLoopStub = setRpcQueueStub + 8u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x500u; program.memsz = 0x500u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const auto jump = [](uint32_t target) { return 0x08000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFE0u, 0xAFBF001Cu,                                       // addiu sp, -0x20; sw ra
+            0x3C040001u, 0x34840300u, jal(createThreadStub), 0x00000000u,   // CreateThread(descriptor)
+            0x00402021u, 0x00002821u, jal(startThreadStub), 0x00000000u,    // StartThread(v0, 0)
+            0x8FBF001Cu, 0x00001021u, 0x27BD0020u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t loopAddress = threadAddress + 30u * 4u;
+        const uint32_t thread[] = {
+            0x27BDFFE0u, 0xAFBF001Cu,                         // addiu sp, -0x20; sw ra
+            jal(getThreadIdStub), 0x00000000u,                // v0 = GetThreadId()
+            0x3C040001u, 0x34840380u, 0x00402821u,            // a0 = qd 0x10380, a1 = v0
+            jal(setRpcQueueStub), 0x00000000u,                // sceSifSetRpcQueue(qd, id)
+            0x3C040001u, 0x348403A0u,                         // a0 = sd 0x103A0
+            0x3C050000u | ((sid >> 16u) & 0xFFFFu), 0x34A50000u | (sid & 0xFFFFu),
+            0x3C060001u, 0x34C60200u,                         // a2 = function 0x10200
+            0x3C070001u, 0x34E70400u,                         // a3 = buffer 0x10400
+            0xAFA00010u, 0xAFA00014u,                         // no callback function, no callback buffer
+            0x3C080001u, 0x35080380u, 0xAFA80018u,            // qd
+            jal(registerRpcStub), 0x00000000u,                // sceSifRegisterRpc
+            0x3C040001u, 0x34840380u,                         // a0 = qd
+            jal(rpcLoopStub), 0x00000000u,                    // sceSifRpcLoop(qd)
+            0x00000000u, 0x00000000u,
+            jump(loopAddress), 0x00000000u,                   // never returns
+        };
+        const uint32_t server[] = {
+            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u,            // addiu sp, -0x20; save ra, s0
+            0x00A08021u,                                      // s0 = buffer
+            0x24080001u, 0x14880004u, 0x00000000u,            // if (fno != 1) skip the delay
+            0x240403E8u, jal(delayThreadStub), 0x00000000u,   // DelayThread(1000): blocks
+            0x34095A5Au, 0xAE090000u,                         // *buffer = 0x5A5A
+            0x02001021u,                                      // return the buffer
+            0x8FB00018u, 0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t thbaseImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x61626874u, 0x00006573u, // "thbase"
+            0x03E00008u, 0x24000004u, // CreateThread
+            0x03E00008u, 0x24000006u, // StartThread
+            0x03E00008u, 0x24000014u, // GetThreadId
+            0x03E00008u, 0x24000021u, // DelayThread
+            0u, 0u,
+        };
+        const uint32_t sifcmdImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x63666973u, 0x0000646Du, // "sifcmd"
+            0x03E00008u, 0x24000011u, // sceSifRegisterRpc
+            0x03E00008u, 0x24000013u, // sceSifSetRpcQueue
+            0x03E00008u, 0x24000016u, // sceSifRpcLoop
+            0u, 0u,
+        };
+        const uint32_t threadDescriptor[] = {0u, 0u, threadAddress, 0x800u, 30u};
+        static_assert(sizeof(entry) <= 0x100u && sizeof(thread) <= 0x100u && sizeof(server) <= 0x100u,
+                      "code overlaps the next block");
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        const auto put = [&](uint32_t offset, const void *data, size_t size)
+        {
+            std::memcpy(segment.data() + offset, data, size);
+        };
+        put(0u, entry, sizeof(entry));
+        put(0x100u, thread, sizeof(thread));
+        put(0x200u, server, sizeof(server));
+        put(0x300u, threadDescriptor, sizeof(threadDescriptor));
+        put(0x480u, thbaseImports, sizeof(thbaseImports));
+        put(0x4C0u, sifcmdImports, sizeof(sifcmdImports));
 
         std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
         std::memcpy(host.guest.data() + address, &header, sizeof(header));
@@ -1737,6 +1844,64 @@ int main()
                         std::memcmp(received, reply, sizeof(reply)) == 0,
                     "The WAIT caller's receive buffer does not hold the EE reply")) return 1;
         host.eeRpcSid = 0u;
+        iop.reset();
+    }
+
+    // EE -> IOP handoff (RpcRequest::allowDeferred): a server that blocks goes on as its queue thread and the call
+    // completes later; one that does not block stays inline; without allowDeferred a blocking server runs inline.
+    {
+        constexpr uint32_t serverSid = 0x00020001u;
+        constexpr uint32_t receive = 0x00000C00u;
+        host.deferredDone.clear();
+        iop.reset();
+        writeQueueRpcServerIrx(host, 0x100u, serverSid);
+        const ModuleLoadResult serverModule = iop.loadModuleBuffer(0x100u);
+        if (!expect(serverModule.handled && serverModule.startResult == 0, "Queue RPC server IRX did not start")) return 1;
+        for (int i = 0; i < 64 && !iop.canBindRpc(serverSid); ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(iop.canBindRpc(serverSid), "The queue RPC server did not register")) return 1;
+        const auto receivedWord = [&]()
+        {
+            uint32_t word = 0u;
+            std::memcpy(&word, host.guest.data() + receive, sizeof(word));
+            return word;
+        };
+        const auto call = [&](uint32_t function, bool allowDeferred)
+        {
+            std::memset(host.guest.data() + receive, 0, 16u);
+            RpcRequest request{};
+            request.sid = serverSid;
+            request.function = function;
+            request.receive = {receive, 16u};
+            request.allowDeferred = allowDeferred;
+            return iop.handleRpc(request);
+        };
+
+        const RpcResult quick = call(2u, true);
+        if (!expect(quick.handled && !quick.deferred && receivedWord() == 0x5A5Au,
+                    "A server that does not block should complete inline even when it may be deferred")) return 1;
+
+        const RpcResult blocked = call(1u, true);
+        if (!expect(blocked.handled && blocked.deferred && blocked.deferredToken != 0u,
+                    "A server that blocks should be handed off (deferred)")) return 1;
+        if (!expect(host.deferredDone.empty() && receivedWord() == 0u,
+                    "A deferred call should not be complete before its server returns")) return 1;
+        for (int i = 0; i < 64 && host.deferredDone.empty(); ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(host.deferredDone.size() == 1u && host.deferredDone.front() == blocked.deferredToken,
+                    "The handed-off server should report its call done once, with its token")) return 1;
+        if (!expect(receivedWord() == 0x5A5Au, "The deferred reply should be in the EE receive buffer")) return 1;
+
+        const RpcResult again = call(1u, true);
+        if (!expect(again.deferred, "The server thread should be back in sceSifRpcLoop and serve a second deferral")) return 1;
+        for (int i = 0; i < 64 && host.deferredDone.size() < 2u; ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(host.deferredDone.size() == 2u && receivedWord() == 0x5A5Au,
+                    "The second deferred call should complete too")) return 1;
+
+        const RpcResult inlineBlocked = call(1u, false);
+        if (!expect(inlineBlocked.handled && !inlineBlocked.deferred && receivedWord() == 0x5A5Au,
+                    "Without allowDeferred a blocking server should still run inline to its reply")) return 1;
         iop.reset();
     }
 
