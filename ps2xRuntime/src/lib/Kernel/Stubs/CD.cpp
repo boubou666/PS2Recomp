@@ -261,6 +261,7 @@ namespace ps2_stubs
         // The thread belongs to the runtime that created it (tests create several).
         int g_cdCallbackThreadId = 0;
         const PS2Runtime *g_cdCallbackThreadRuntime = nullptr;
+        const PS2Runtime *g_cdThreadEndObserverRuntime = nullptr; // one observer per runtime
         std::deque<uint32_t> g_cdPendingCallbacks;
 
         // The callback thread of this runtime, if it still exists; forgets a stale one (a runtime at a reused
@@ -270,6 +271,15 @@ namespace ps2_stubs
             if (!runtime || runtime != g_cdCallbackThreadRuntime || g_cdCallbackThreadId == 0 ||
                 !runtime->eeScheduler().thread(g_cdCallbackThreadId))
             {
+                // A thread of this runtime that is gone (the callback ended with ExitDeleteThread): its callbacks go
+                // back to the interrupt path, where one that blocks can deadlock again.
+                static bool s_reported = false;
+                if (!s_reported && runtime && runtime == g_cdCallbackThreadRuntime && g_cdCallbackThreadId != 0)
+                {
+                    s_reported = true;
+                    std::cerr << "[cd] sceCdInitEeCB callback thread " << g_cdCallbackThreadId
+                              << " no longer exists; CD callbacks run as interrupts again" << std::endl;
+                }
                 g_cdCallbackThreadId = 0;
                 g_cdCallbackThreadRuntime = nullptr;
                 g_cdPendingCallbacks.clear();
@@ -585,13 +595,17 @@ namespace ps2_stubs
         g_cdCallbackThreadId = id;
         g_cdCallbackThreadRuntime = runtime;
         g_cdPendingCallbacks.clear();
-        runtime->eeScheduler().addThreadEndObserver([runtime](int ended)
+        if (g_cdThreadEndObserverRuntime != runtime)
         {
-            if (ended != 0 && ended == cdCallbackThread(runtime))
+            g_cdThreadEndObserverRuntime = runtime;
+            runtime->eeScheduler().addThreadEndObserver([runtime](int ended)
             {
-                runPendingCdCallbacks(runtime);
-            }
-        });
+                if (ended != 0 && ended == cdCallbackThread(runtime))
+                {
+                    runPendingCdCallbacks(runtime);
+                }
+            });
+        }
         setReturnS32(ctx, id);
     }
 
