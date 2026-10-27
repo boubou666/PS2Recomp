@@ -2005,6 +2005,9 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
+        // A stream fed as elementary stream may continue through DMA channel 4; a demuxed one is decoded from the
+        // demux, and its own channel 4 transfers repeat that video.
+        runtime->memory().setIpuInputEnabled(true);
 
         size_t copied = 0u;
         bool wakePictureWaiter = false;
@@ -2197,10 +2200,16 @@ namespace ps2_stubs
         (void)rdram;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        bool lastStream = false;
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
+            lastStream = g_mpeg_stub_state.playbackByMpeg.empty();
+        }
+        if (lastStream)
+        {
+            runtime->memory().setIpuInputEnabled(false);
         }
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
         setReturnU32(ctx, 0u);
@@ -2209,6 +2218,7 @@ namespace ps2_stubs
     void sceMpegDemuxPss(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         syncMpegFieldRate(runtime);
+        runtime->memory().setIpuInputEnabled(false);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
@@ -2281,6 +2291,7 @@ namespace ps2_stubs
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         syncMpegFieldRate(runtime);
+        runtime->memory().setIpuInputEnabled(false);
         static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
         const uint32_t entryIdx = s_demuxRingEntryCount.fetch_add(1u, std::memory_order_relaxed);
         if (entryIdx < 4u)
@@ -2431,10 +2442,40 @@ namespace ps2_stubs
         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
     }
 
+    // Feeds what the game queued on DMA channel 4 until a picture decodes (or the channel has nothing left).
+    static void pullIpuInputForPicture(PS2Runtime *runtime, uint32_t mpegAddr)
+    {
+        constexpr size_t kPullBytes = 64u * 1024u;
+        constexpr int kMaxPulls = 64;
+        for (int pull = 0; pull < kMaxPulls; ++pull)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                if (!playback.decodedFrames.empty() || playback.streamEnded || playback.decoderFailed)
+                {
+                    return;
+                }
+            }
+            const std::vector<uint8_t> data = runtime->memory().pullIpuInput(kPullBytes);
+            if (data.empty())
+            {
+                return;
+            }
+            const auto decodeStart = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                feedElementaryStream(getPlaybackState(mpegAddr), data.data(), data.size());
+            }
+            accountHostDecodeTime(runtime, decodeStart);
+        }
+    }
+
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         syncMpegFieldRate(runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        pullIpuInputForPicture(runtime, mpegAddr);
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;
         uint32_t height = kStubMovieHeight;
