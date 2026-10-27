@@ -1,6 +1,6 @@
 # GPU GS renderer: design and plan
 
-Status: design, no code yet. Branch `gs/gpu-renderer`.
+Status: phase 0 (groundwork) done, see 7.1; phase 1 next. Branch `gs/gpu-renderer`.
 
 Goal: a GPU implementation of the PS2 Graphics Synthesizer, written entirely in this repository, that replaces
 paraLLEl-GS (LGPL-3.0+, Arntzen Software) once it matches it on every port we ship, and that matches the CPU
@@ -162,13 +162,26 @@ copy is 1.3 MiB per frame (well under a millisecond). Zero-copy interop with ray
   A game override may request `gpu` the same way SC3 requests `parallel` today.
 - Interface additions (also implemented by the paraLLEl adapter where it can):
   - `uploadImage(bitbltbuf, trxpos, trxreg, trxdir, bytes)`: native uploads without repacking into an IMAGE
-    packet.
+    packet (the paraLLEl adapter now does the repacking the frontend used to), and `nativePackedGifTransfer` for
+    the frontend's validated PACKED packets (a plain `gifTransfer` unless the renderer has a fast path).
   - `loadState(const GSStateImage &)` / `saveState(GSStateImage &)`: a renderer-neutral image of the GS (raw
     64-bit register file for both contexts and the general registers, PRMODE/PRMODECONT, the vertex queue,
-    the 1 KiB CLUT buffer and its CBP cache, an in-progress transfer), used by traces and by
-    `setRasterBackend`-style renderer switches.
-  - `readVramPixel` / `writeVramPixel` / `clearFrame`: so `GS::ReadVram`, `WriteVram` and
-    `clearFramebufferContext` work on whichever renderer owns VRAM (through `runOnWorker`).
+    the 1 KiB CLUT buffer and its CBP cache), used by traces and by `setRasterBackend`-style renderer switches.
+    An in-progress transfer is not part of it: images are taken between packets with no transfer in progress
+    (the recorder's rule), which keeps every renderer's loader simple. A renderer that cannot see a part leaves
+    its flag clear: paraLLEl keeps its vertex queue and CLUT buffer private, so its images have neither (the CBP
+    cache is there), and PRIM holds PRMODE's attributes when PRMODECONT.AC is 0, as paraLLEl folds them. Loading
+    into paraLLEl writes the registers in an order that keeps their side effects out (TEX0 without CLD, MIPTBP
+    after TEX0, TRXDIR set without starting a transfer), rebuilds the queue with XYZ3 writes, and refills the
+    CLUT buffer by having paraLLEl load the image's CLUT as a CSM1 CT32 palette written to page 0, then puts
+    the page back.
+  - `writeVram` (all of VRAM, to seed a replay), `readVramPixel` / `writeVramPixel`: so `GS::ReadVram` and
+    `WriteVram` work on whichever renderer owns VRAM (through `runOnWorker`). `clearFrame` is not added in
+    phase 0 (see the gaps in section 2).
+- The CPU renderer is a `GSStreamRenderer` too (kind `cpu`: a synchronous `GS` with the CPU backend over its own
+  VRAM), so tools and tests drive every renderer the same way. The frontend never hands its stream to it: in
+  game the CPU path stays the frontend's own decoder and backend, untouched, and `PS2X_GS_RENDERER=cpu` keeps
+  meaning that.
 - Unchanged: SIGNAL / FINISH / LABEL are still posted EE-side at queue time by `postQueuedCpuEvents`; the
   renderer only reports FINISH in stream order through the `finish` callback that advances `m_finishesDrawn`,
   so the one-frame lag limit and the CSR timing model stay exactly as with paraLLEl. SIGNAL never forces a GPU
@@ -212,7 +225,12 @@ ps2xTest/src/ps2_gs_gpu_tests.cpp                     differential tests and fuz
 
 `gs_gif_decoder` is new shared code: the GPU renderer needs a GIF decoder, and having a second private one
 next to the frontend's would let them drift. The frontend keeps its decoder at first; a differential test
-feeds the same packets to both and compares the primitives and transfers they produce. Moving the CPU path
+feeds the same packets to both and compares the primitives and transfers they produce. Phase 0 built it as
+`GSGifDecoder`: its state is a `GSStateImage` (raw register values, TEX2 folded into TEX0), and a sink receives
+primitives (raw vertices, PRIM as drawn), every A+D / REGLIST register write after it took effect, and image
+data. The differential test (`PS2GSState` in `ps2xTest/src/ps2_gs_state_tests.cpp`) runs seeded random streams
+through both and compares every backend call (primitives with their full draw state, CLUT loads, transfer
+starts, image data, TEXFLUSH) and the final state. Moving the CPU path
 onto the shared decoder is a later, separate cleanup, not on the critical path.
 
 ### 5.3 VRAM model
@@ -454,6 +472,35 @@ one developer.
 
 Total: roughly 75 to 105 working days. Phases 1 and 2 can run in parallel (different files); everything after 2
 is sequential.
+
+### 7.1 Phase 0 results
+
+Layers on `gs/gpu-renderer`: the `GSStreamRenderer` rename, register decoders and encoders
+(`gs_registers.h`), `GSStateImage` with `GS::saveState` / `loadState`, `GSR2` traces and `--convert`, per-PSM
+pixel helpers, the interface additions with the paraLLEl and CPU implementations, recording and
+`ReadVram` / `WriteVram` under a stream renderer, `ps2_gs_replay --renderer / --compare / --every`,
+`GSGifDecoder`, one fix (below) and the `PS2GSState` tests.
+
+Acceptance:
+
+- Existing tests green at every layer: `ps2x_tests` (564 before, 572 with `PS2GSState`) and the 45 `gs_cache`
+  cases. The five SC3 `GSR1` traces in `~/Games/PS2/SoulcaliburIII/runs` give the same CPU VRAM hash before
+  phase 0, after each layer, replayed directly and after conversion to `GSR2` (`~/Games/PS2/gs-traces/sc3/`,
+  hashes in its `manifest.toml`).
+- paraLLEl unchanged in SC3: the phase 0 layers on top of `sc3/bringup` boot to the attract-mode fight on
+  paraLLEl the same way as `sc3/bringup` itself (same log apart from timing noise, frames correct). A 2-second
+  trace recorded under paraLLEl (`parallel_route.gsr2`, starting at a latch) replays on both renderers.
+- `--compare`: `cpu` against `cpu` matches on every trace. `parallel` against `cpu` differs early on every trace,
+  as expected before phase 1: on `fight`, `gallery` and `parallel_route` the first difference is the CT16 clear at
+  page 140 drawn with DTHE=1 (paraLLEl dithers, the CPU backend does not: section 6.2); on `t` it is command 31,
+  a 64x32 area of FRAME_1 where paraLLEl writes 0x80000000 and the CPU 0x7f131313, not triaged yet.
+
+Deviations from the plan above, each written into its section: the CPU renderer implements `GSStreamRenderer`
+(5.1); the state image has no in-progress transfer and a paraLLEl image has no vertex queue or CLUT buffer
+(5.1); recording under a stream renderer starts at a latch, and `clearFramebufferContext` stays skipped with a
+stream renderer (section 2); `--every` defaults to 64 and the bisect is automatic (6.4). One CPU path change was
+needed for images to round trip: after a reset ZBUF now decodes as a written zero (PSMZ32) instead of PSM 0,
+which no write can produce; no trace or test changed.
 
 ## 8. Things deliberately left out
 
