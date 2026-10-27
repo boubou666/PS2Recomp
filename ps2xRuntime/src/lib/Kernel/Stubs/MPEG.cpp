@@ -2715,13 +2715,14 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-        // PS2X_MPEG_SKIP=1 (testing): a movie ends once its first picture is shown.
-        static const bool skipMovies = []
+        // PS2X_MPEG_SKIP=<n> (testing): a movie ends once it has shown n pictures (1: the first one). Games that feed
+        // the decoder from their own CD loop may need a few pictures before the end is safe for them.
+        static const uint32_t skipAfterPictures = []
         {
             const char *value = std::getenv("PS2X_MPEG_SKIP");
-            return value && value[0] == '1';
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
         }();
-        if (skipMovies && playback.picturesServed > 0u)
+        if (skipAfterPictures != 0u && playback.picturesServed >= skipAfterPictures)
         {
             if (runtime)
                 runtime->memory().setIpuInputEnabled(false);
