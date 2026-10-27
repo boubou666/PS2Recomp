@@ -1141,6 +1141,38 @@ namespace ps2recomp
                 }
             }
 
+            // A function whose range covers a stub-bound start (an end taken from a symbol or the analyzer, or a
+            // wrapper that tail-jumps into the routine after it) would reach that address through a local label and
+            // run the guest body instead of the handler. End it there so the jump or fall-through dispatches.
+            {
+                std::vector<uint32_t> stubStarts;
+                for (const auto &function : m_functions)
+                {
+                    if (isStubFunction(function))
+                    {
+                        stubStarts.push_back(function.start);
+                    }
+                }
+                std::sort(stubStarts.begin(), stubStarts.end());
+                for (auto &function : m_functions)
+                {
+                    if (isStubFunction(function))
+                    {
+                        continue;
+                    }
+                    const auto inside = std::upper_bound(stubStarts.begin(), stubStarts.end(), function.start);
+                    if (inside == stubStarts.end() || *inside >= function.end)
+                    {
+                        continue;
+                    }
+                    std::ostringstream msg;
+                    msg << "Function 0x" << std::hex << function.start << " ends at stub-bound 0x" << *inside
+                        << " instead of 0x" << function.end;
+                    m_reporter.info("stub", msg.str());
+                    function.end = *inside;
+                }
+            }
+
             for (auto &function : m_functions)
             {
                 m_reporter.recordFunctionProcessed();
