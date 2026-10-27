@@ -121,14 +121,14 @@ namespace ps2recomp
             return "{ }";
         }
         const int lane = (destMask & 0x8) ? 0 : (destMask & 0x4) ? 1 : (destMask & 0x2) ? 2 : 3;
-        return fmt::format("{{ uint16_t value; std::memcpy(&value, runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4) + {}u, sizeof(value)); ctx->vi[{}] = value; }}",
+        return fmt::format("{{ uint16_t value; std::memcpy(&value, ps2rVu0Data(runtime) + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4) + {}u, sizeof(value)); ctx->vi[{}] = value; }}",
                            inst.rd, lane * 4, inst.rt);
     }
 
     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
     {
         const uint8_t destMask = inst.vectorInfo.vectorField;
-        std::string code = fmt::format("{{ uint8_t *vu0Mem = runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4); const uint32_t value = ctx->vi[{}]; ",
+        std::string code = fmt::format("{{ uint8_t *vu0Mem = ps2rVu0Data(runtime) + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4); const uint32_t value = ctx->vi[{}]; ",
                                        inst.rd, inst.rt);
         for (int lane = 0; lane < 4; ++lane)
         {
@@ -196,7 +196,7 @@ namespace ps2recomp
         return fmt::format(
             "{{ "
             "    ctx->vu0_tpc = 0x{:X}; " // Set target program counter
-            "    runtime->executeVU0Microprogram(rdram, ctx, 0x{:X}); "
+            "    ps2rExecuteVU0Microprogram(runtime, rdram, ctx, 0x{:X}); "
             "}}",
             target_byte_addr, target_byte_addr);
     }
@@ -211,7 +211,7 @@ namespace ps2recomp
             "    uint16_t instr_index = ctx->vu0_cmsar0 & 0x1FF; "         // Instruction index, 9 bits
             "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
             "    ctx->vu0_pc = target_byte_addr; "
-            "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+            "    ps2rVu0StartMicroProgram(runtime, rdram, ctx, target_byte_addr); "
             "}}");
     }
 
@@ -805,7 +805,7 @@ namespace ps2recomp
             }
             if (ft != 0)
             {
-                code += fmt::format("__m128 res; std::memcpy(&res, runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4), sizeof(res)); "
+                code += fmt::format("__m128 res; std::memcpy(&res, ps2rVu0Data(runtime) + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4), sizeof(res)); "
                                     "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, {}); ",
                                     is, ft, ft, codegen::vuMaskExpr(destMask));
             }
@@ -823,7 +823,7 @@ namespace ps2recomp
             {
                 code += fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1u); ", it, it);
             }
-            code += fmt::format("uint8_t *vu0Mem = runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4); "
+            code += fmt::format("uint8_t *vu0Mem = ps2rVu0Data(runtime) + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4); "
                                 "__m128 old; std::memcpy(&old, vu0Mem, sizeof(old)); "
                                 "const __m128 res = _mm_blendv_ps(old, ctx->vu0_vf[{}], {}); "
                                 "std::memcpy(vu0Mem, &res, sizeof(res)); ",

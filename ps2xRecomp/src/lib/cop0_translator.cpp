@@ -133,13 +133,13 @@ namespace ps2recomp
             switch (function)
             {
             case COP0_CO_TLBR:
-                return fmt::format("runtime->handleTLBR(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBR(runtime, rdram, ctx);");
             case COP0_CO_TLBWI:
-                return fmt::format("runtime->handleTLBWI(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBWI(runtime, rdram, ctx);");
             case COP0_CO_TLBWR:
-                return fmt::format("runtime->handleTLBWR(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBWR(runtime, rdram, ctx);");
             case COP0_CO_TLBP:
-                return fmt::format("runtime->handleTLBP(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBP(runtime, rdram, ctx);");
             case COP0_CO_ERET:
                 return fmt::format(
                     "if (ctx->cop0_status & 0x4) {{ \n" // Check ERL bit (bit 2)
@@ -149,7 +149,7 @@ namespace ps2recomp
                     "    ctx->pc = ctx->cop0_epc; \n"  // Note: If neither ERL/EXL set, behavior is undefined; using EPC is common.
                     "    ctx->cop0_status &= ~0x2; \n" // Clear EXL bit
                     "}} \n"
-                    "runtime->clearLLBit(ctx); \n" // Essential: Clear Load-Linked bit
+                    "ps2rClearLLBit(runtime, ctx); \n" // Essential: Clear Load-Linked bit
                     "return;"                      // Stop execution in this recompiled block
                 );
             case COP0_CO_EI:

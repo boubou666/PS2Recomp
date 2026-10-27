@@ -122,10 +122,8 @@ namespace ps2recomp
             output << "#include <stdexcept>\n";
             output << "#include <" << codeGenerator.functionsHeaderName() << ">\n\n";
             output << "#include \"ps2_runtime_macros.h\"\n";
-            output << "#include \"ps2_runtime.h\"\n";
             output << "#include <" << codeGenerator.stubsHeaderName() << ">\n";
-            output << "#include \"ps2_syscalls.h\"\n";
-            output << "#include \"ps2_stubs.h\"\n";
+            output << "#include \"ps2_recomp_calls.h\"\n";
             output << "#ifdef _DEBUG\n";
             output << "#include \"ps2_log.h\"\n";
             output << "#endif\n";
@@ -1468,9 +1466,7 @@ namespace ps2recomp
                         }
 
                         std::stringstream stubFile;
-                        stubFile << "#include \"ps2_runtime.h\"\n";
-                        stubFile << "#include \"ps2_syscalls.h\"\n";
-                        stubFile << "#include \"ps2_stubs.h\"\n";
+                        stubFile << "#include \"ps2_recomp_calls.h\"\n";
                         stubFile << "#ifdef _DEBUG\n";
                         stubFile << "#include \"ps2_log.h\"\n";
                         stubFile << "#endif\n";
@@ -1981,8 +1977,7 @@ namespace ps2recomp
 
             ss << "#pragma once\n\n";
             ss << "#include <cstdint>\n";
-            ss << "#include \"ps2_runtime.h\"\n";
-            ss << "#include \"ps2_syscalls.h\"\n\n";
+            ss << "#include \"ps2_recomp_calls.h\"\n\n";
             // ss << "namespace ps2recomp {\n";
             // ss << "namespace stubs {\n\n";
 
