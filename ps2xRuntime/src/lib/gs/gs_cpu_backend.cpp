@@ -602,6 +602,62 @@ namespace
 
 namespace
 {
+    constexpr int kAttributeShift = 16;
+    constexpr int kDepthShift = 12;
+
+    int64_t floorDiv(int64_t a, int64_t b)
+    {
+        const int64_t q = a / b;
+        return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    }
+
+    int64_t ceilDiv(int64_t a, int64_t b)
+    {
+        return -floorDiv(-a, b);
+    }
+
+    int64_t fixedRatio(int64_t n, int shift, int64_t d)
+    {
+        if (d < 0)
+        {
+            n = -n;
+            d = -d;
+        }
+        return floorDiv(n * (int64_t{1} << (shift + 1)) + d, 2 * d);
+    }
+
+    int32_t subpixel(float coordinate)
+    {
+        return static_cast<int32_t>(coordinate * 16.0f);
+    }
+
+    // Evaluated modulo 2^64: the gradient terms can overflow on their own for slivers, their sum at a covered sample
+    // cannot.
+    struct FixedPlane
+    {
+        uint64_t origin = 0;
+        uint64_t dx = 0;
+        uint64_t dy = 0;
+        int64_t x = 0;
+        int64_t y = 0;
+
+        uint64_t at(int64_t px, int64_t py) const
+        {
+            return origin + dx * static_cast<uint64_t>(px - x) + dy * static_cast<uint64_t>(py - y);
+        }
+    };
+
+    uint32_t depthFromPlane(uint64_t acc, uint32_t zmax)
+    {
+        const int64_t z = (static_cast<int64_t>(acc) + (int64_t{1} << (kDepthShift - 1))) >> kDepthShift;
+        return static_cast<uint32_t>(std::min<int64_t>(std::max<int64_t>(z, 0), zmax));
+    }
+
+    int32_t colourFromPlane(uint64_t acc)
+    {
+        return static_cast<int32_t>(std::min<int64_t>(std::max<int64_t>(static_cast<int64_t>(acc) >> kAttributeShift, 0), 255));
+    }
+
     // Worker spin before sleeping, about 50 us: primitives of a frame arrive back to back.
     // PS2X_GS_SPIN=<n> (measurements): spin iterations before sleeping.
     const uint32_t kWorkerSpinIterations = []
@@ -819,46 +875,41 @@ namespace
     // Texels a primitive can sample along one axis (U for columns, else V). Perspective-correct
     // S/Q and T/Q stay within the vertices' range while Q keeps one sign; wrapping or mixed signs
     // mean the whole texture.
-    // Texel coordinates (in texels, along one axis) a sprite samples at its first and last drawn
-    // pixel centers, as DrawSprite maps them. False when nothing is drawn.
+    // Texel coordinates (in texels, along one axis) a sprite samples at its first and last drawn pixels, as DrawSprite
+    // maps them. False when nothing is drawn.
     bool spriteTexelCoords(const GSPrimitiveBatch &batch, bool columns, float &low, float &high)
     {
         const GSDrawState &state = batch.state;
         const auto &ctx = state.context;
         const GSVertex &v0 = batch.vertices[0];
         const GSVertex &v1 = batch.vertices[1];
-        const int offset = (columns ? ctx.xyoffset.ofx : ctx.xyoffset.ofy) >> 4;
-        int p0 = static_cast<int>(columns ? v0.x : v0.y) - offset;
-        int p1 = static_cast<int>(columns ? v1.x : v1.y) - offset;
-        const bool flipped = p0 > p1; // the texture coordinates stay at their vertex's corner (DrawSprite)
-        if (flipped)
-            std::swap(p0, p1);
-        const int span = std::max(1, p1 - p0);
+        const int64_t offset = columns ? ctx.xyoffset.ofx : ctx.xyoffset.ofy;
+        const int64_t p0 = subpixel(columns ? v0.x : v0.y) - offset;
+        const int64_t p1 = subpixel(columns ? v1.x : v1.y) - offset;
         const int scissor0 = columns ? ctx.scissor.x0 : ctx.scissor.y0;
         const int scissor1 = columns ? ctx.scissor.x1 : ctx.scissor.y1;
-        const int draw0 = clampInt(p0, scissor0, scissor1);
-        const int draw1 = clampInt(p0 + span - 1, scissor0, scissor1);
-        if (p0 + span - 1 < scissor0 || p0 > scissor1)
+        const int64_t draw0 = std::max<int64_t>(ceilDiv(std::min(p0, p1), 16), scissor0);
+        const int64_t draw1 = std::min<int64_t>(ceilDiv(std::max(p0, p1), 16) - 1, scissor1);
+        if (draw0 > draw1)
             return false;
-        float c0 = 0.0f;
-        float c1 = 0.0f;
+        double c0 = 0.0;
+        double c1 = 0.0;
         if (state.prim.fst)
         {
-            c0 = static_cast<float>(columns ? v0.u : v0.v) / 16.0f;
-            c1 = static_cast<float>(columns ? v1.u : v1.v) / 16.0f;
+            c0 = static_cast<double>(columns ? v0.u : v0.v) / 16.0;
+            c1 = static_cast<double>(columns ? v1.u : v1.v) / 16.0;
         }
         else
         {
-            const float size = static_cast<float>(columns ? state.textureWidth : state.textureHeight);
-            c0 = ((columns ? v0.s : v0.t) / fabsQ(v0.q)) * size;
-            c1 = ((columns ? v1.s : v1.t) / fabsQ(v1.q)) * size;
+            const double size = static_cast<double>(columns ? state.textureWidth : state.textureHeight);
+            c0 = static_cast<double>(columns ? v0.s : v0.t) / fabsQ(v1.q) * size;
+            c1 = static_cast<double>(columns ? v1.s : v1.t) / fabsQ(v1.q) * size;
         }
-        if (flipped)
-            std::swap(c0, c1);
-        const float a = c0 + (c1 - c0) * ((static_cast<float>(draw0 - p0) + 0.5f) / static_cast<float>(span));
-        const float b = c0 + (c1 - c0) * ((static_cast<float>(draw1 - p0) + 0.5f) / static_cast<float>(span));
-        low = std::min(a, b);
-        high = std::max(a, b);
+        const double span = p1 != p0 ? static_cast<double>(p1 - p0) : 1.0;
+        const double a = c0 + (c1 - c0) * static_cast<double>(draw0 * 16 - p0) / span;
+        const double b = c0 + (c1 - c0) * static_cast<double>(draw1 * 16 - p0) / span;
+        low = static_cast<float>(std::min(a, b));
+        high = static_cast<float>(std::max(a, b));
         return true;
     }
 
@@ -1029,6 +1080,7 @@ namespace
     {
         return static_cast<uint32_t>(std::min(4294967295.0, std::max(0.0, z)));
     }
+
 
     // VRAM blocks a primitive can write (whole page rows of its frame and Z buffers) and sample.
     struct PrimitiveBlocks
@@ -2242,9 +2294,10 @@ void GSCpuBackend::DrawWith(const GSPrimitiveBatch &batch, const RasterContext &
     {
         const GSVertex &v = batch.vertices[0];
         const auto &ctx = state.context;
-        int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
-        int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        if (raster.owns(px, py))
+        const PixelPipeline &pixel = *raster.pixel;
+        const int px = static_cast<int>(floorDiv(subpixel(v.x) - static_cast<int64_t>(ctx.xyoffset.ofx) + 8, 16));
+        const int py = static_cast<int>(floorDiv(subpixel(v.y) - static_cast<int64_t>(ctx.xyoffset.ofy) + 8, 16));
+        if (px >= pixel.scissorX0 && px <= pixel.scissorX1 && py >= pixel.scissorY0 && py <= pixel.scissorY1 && raster.owns(px, py))
             WritePixel(*raster.pixel, px, py, std::min(gsDepthBits(v.z), raster.pixel->zmax), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
@@ -3293,224 +3346,139 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
-
-    float fx0 = v0.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
-    float fy0 = v0.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
-    float fx1 = v1.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
-    float fy1 = v1.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
-    u32 z1 = std::min(gsDepthBits(v1.z), raster.pixel->zmax);
-
-    // Each vertex keeps its texture coordinates at its own corner: a sprite given right to left or bottom to top
-    // is not mirrored (the texture coordinates are swapped with the edges below).
-    const bool flipX = fx0 > fx1;
-    const bool flipY = fy0 > fy1;
-    if (flipX)
-        std::swap(fx0, fx1);
-    if (flipY)
-        std::swap(fy0, fy1);
-
-    // The GS covers the pixels whose integer coordinates satisfy x0 <= x < x1 (and the same for
-    // y), so a sprite ending at 63.5 includes pixel 63.
-    const int unclippedX0 = static_cast<int>(std::ceil(fx0));
-    const int unclippedY0 = static_cast<int>(std::ceil(fy0));
-    const int unclippedX1 = std::max(unclippedX0, static_cast<int>(std::ceil(fx1)) - 1);
-    const int unclippedY1 = std::max(unclippedY0, static_cast<int>(std::ceil(fy1)) - 1);
-    const int spanX = unclippedX1 - unclippedX0 + 1;
-    const int spanY = unclippedY1 - unclippedY0 + 1;
-
-    // If the sprite rectangle is fully outside scissor, nothing should render.
-    if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
-        unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
-        return;
-
-    const int drawX0 = clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
-    const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
-    const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
-    const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
-    if (!raster.ownsAnyIn(drawX0, drawY0, drawX1, drawY1))
-        return;
-
-    const uint64_t alphaReg = ctx.alpha;
-    const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
-    const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
-
-    uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
-
-    // kLanes pixels at a time when their order cannot matter (needsPixelOrder), as DrawTriangle does: each lane comes
-    // out as the per-pixel code below would draw it. WritePixelBlock takes depth-tested lanes: the test runs first.
-    constexpr int N = kLanes;
     const PixelPipeline &pixel = *raster.pixel;
-    const bool blocks = !raster.pixelOrder;
-    const auto depthTestedLanes = [&](int xb, int y, uint32_t live)
+    if (pixel.ztst == 0u)
+        return;
+
+    const int64_t X0 = subpixel(v0.x) - static_cast<int64_t>(ctx.xyoffset.ofx);
+    const int64_t Y0 = subpixel(v0.y) - static_cast<int64_t>(ctx.xyoffset.ofy);
+    const int64_t X1 = subpixel(v1.x) - static_cast<int64_t>(ctx.xyoffset.ofx);
+    const int64_t Y1 = subpixel(v1.y) - static_cast<int64_t>(ctx.xyoffset.ofy);
+
+    // Samples at whole pixels in [min, max) on each axis, whichever corner comes first.
+    const int64_t unclippedX0 = ceilDiv(std::min(X0, X1), 16);
+    const int64_t unclippedX1 = ceilDiv(std::max(X0, X1), 16) - 1;
+    const int64_t unclippedY0 = ceilDiv(std::min(Y0, Y1), 16);
+    const int64_t unclippedY1 = ceilDiv(std::max(Y0, Y1), 16) - 1;
+    const int drawX0 = static_cast<int>(std::max<int64_t>(unclippedX0, ctx.scissor.x0));
+    const int drawX1 = static_cast<int>(std::min<int64_t>(unclippedX1, ctx.scissor.x1));
+    const int drawY0 = static_cast<int>(std::max<int64_t>(unclippedY0, ctx.scissor.y0));
+    const int drawY1 = static_cast<int>(std::min<int64_t>(unclippedY1, ctx.scissor.y1));
+    if (drawX0 > drawX1 || drawY0 > drawY1 || !raster.ownsAnyIn(drawX0, drawY0, drawX1, drawY1))
+        return;
+
+    const u32 z1 = std::min(gsDepthBits(v1.z), pixel.zmax);
+    const int32_t r = v1.r, g = v1.g, b = v1.b, a = v1.a, fogValue = v1.fog;
+
+    const bool textured = state.prim.tme;
+    const bool fst = state.prim.fst;
+    FixedPlane uLine, vLine;
+    float sBase = 0.0f, sStep = 0.0f, tBase = 0.0f, tStep = 0.0f;
+    if (textured && fst)
     {
-        if (pixel.ztst == 0u)
-            return 0u;
-        if (pixel.ztst >= 2u)
-        {
-            for (int i = 0; i < N; ++i)
-            {
-                if (!((live >> i) & 1u))
-                    continue;
-                const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, xb + i, y);
-                if (pixel.ztst == 2u ? z1 < storedZ : z1 <= storedZ)
-                    live &= ~(1u << i);
-            }
-        }
-        return live;
-    };
-
-    if (state.prim.tme)
+        uLine.origin = static_cast<uint64_t>(v0.u) << kAttributeShift;
+        uLine.dx = X1 != X0 ? static_cast<uint64_t>(fixedRatio(static_cast<int64_t>(v1.u) - v0.u, kAttributeShift, X1 - X0)) : 0u;
+        uLine.x = X0;
+        vLine.origin = static_cast<uint64_t>(v0.v) << kAttributeShift;
+        vLine.dx = Y1 != Y0 ? static_cast<uint64_t>(fixedRatio(static_cast<int64_t>(v1.v) - v0.v, kAttributeShift, Y1 - Y0)) : 0u;
+        vLine.x = Y0;
+    }
+    else if (textured)
     {
-        const auto &tex = ctx.tex0;
-        const int texW = state.textureWidth;
-        const int texH = state.textureHeight;
+        sBase = v0.s;
+        tBase = v0.t;
+        sStep = X1 != X0 ? static_cast<float>((static_cast<double>(v1.s) - static_cast<double>(v0.s)) / static_cast<double>(X1 - X0)) : 0.0f;
+        tStep = Y1 != Y0 ? static_cast<float>((static_cast<double>(v1.t) - static_cast<double>(v0.t)) / static_cast<double>(Y1 - Y0)) : 0.0f;
+    }
 
-        float u0f, v0f, u1f, v1f;
-        if (state.prim.fst)
+    constexpr int N = kLanes;
+    const int width = raster.pixelOrder ? 1 : N;
+    const auto &tex = ctx.tex0;
+    for (int y = drawY0; y <= drawY1; ++y)
+    {
+        const int64_t py = static_cast<int64_t>(y) * 16;
+        uint16_t rowV = 0;
+        float rowT = 0.0f;
+        if (textured && fst)
+            rowV = static_cast<uint16_t>(std::min<int64_t>(std::max<int64_t>(static_cast<int64_t>(vLine.at(py, 0)) >> kAttributeShift, 0), 0xFFFF));
+        else if (textured)
         {
-            // UV registers are 12.4 fixed point; keep the fraction (games use sub-texel offsets,
-            // e.g. per-field half-texel shifts when copying an interlaced frame with bilinear filtering).
-            u0f = static_cast<float>(v0.u) / 16.0f;
-            v0f = static_cast<float>(v0.v) / 16.0f;
-            u1f = static_cast<float>(v1.u) / 16.0f;
-            v1f = static_cast<float>(v1.v) / 16.0f;
+            const float ty = tStep * static_cast<float>(py - Y0);
+            rowT = tBase + ty;
         }
-        else
+        for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
         {
-            const float q0 = fabsQ(v0.q);
-            const float q1 = fabsQ(v1.q);
-            u0f = (v0.s / q0) * static_cast<float>(texW);
-            v0f = (v0.t / q0) * static_cast<float>(texH);
-            u1f = (v1.s / q1) * static_cast<float>(texW);
-            v1f = (v1.t / q1) * static_cast<float>(texH);
-        }
-        if (flipX)
-            std::swap(u0f, u1f);
-        if (flipY)
-            std::swap(v0f, v1f);
-
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
-
-        for (int y = drawY0; y <= drawY1; ++y)
-        {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
-            float texVf = v0f + (v1f - v0f) * ty;
-
-            for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
+            for (int xb = runStart; xb <= runEnd; xb += width)
             {
-            if (blocks)
-            {
-                for (int xb = runStart; xb <= runEnd; xb += N)
+                const int count = std::min(width, runEnd - xb + 1);
+                uint32_t live = (1u << count) - 1u;
+                if (pixel.ztst >= 2u)
                 {
-                    const uint32_t live = depthTestedLanes(xb, y, (1u << std::min(N, runEnd - xb + 1)) - 1u);
+                    for (int i = 0; i < count; ++i)
+                    {
+                        const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, xb + i, y);
+                        if (pixel.ztst == 2u ? z1 < storedZ : z1 <= storedZ)
+                            live &= ~(1u << i);
+                    }
                     if (live == 0u)
                         continue;
+                }
+                uint32_t zs[N];
+                int32_t cr[N], cg[N], cb[N], ca[N], fog[N];
+                for (int i = 0; i < N; ++i)
+                {
+                    cr[i] = r;
+                    cg[i] = g;
+                    cb[i] = b;
+                    ca[i] = a;
+                    zs[i] = z1;
+                    fog[i] = fogValue;
+                }
+                if (textured)
+                {
+                    const int64_t px = static_cast<int64_t>(xb) * 16;
                     float is[N], it[N], iq[N];
                     uint16_t iu[N], iv[N];
-                    for (int i = 0; i < N; ++i)
+                    if (fst)
                     {
-                        const float tx = (static_cast<float>(xb + i - unclippedX0) + 0.5f) / spriteW;
-                        const float texUf = u0f + (u1f - u0f) * tx;
-                        if (state.prim.fst)
+                        const uint64_t uAcc = uLine.at(px, 0);
+                        for (int i = 0; i < N; ++i)
                         {
-                            iu[i] = static_cast<uint16_t>(clampInt(static_cast<int>((texUf * 16.0f) + 0.5f), 0, 0xFFFF));
-                            iv[i] = static_cast<uint16_t>(clampInt(static_cast<int>((texVf * 16.0f) + 0.5f), 0, 0xFFFF));
+                            const int64_t u = static_cast<int64_t>(uAcc + uLine.dx * static_cast<uint64_t>(16 * i)) >> kAttributeShift;
+                            iu[i] = static_cast<uint16_t>(std::min<int64_t>(std::max<int64_t>(u, 0), 0xFFFF));
+                            iv[i] = rowV;
                             is[i] = 0.0f;
                             it[i] = 0.0f;
+                            iq[i] = 1.0f;
                         }
-                        else
+                    }
+                    else
+                    {
+                        for (int i = 0; i < N; ++i)
                         {
-                            iu[i] = 0u;
-                            iv[i] = 0u;
-                            is[i] = texUf / static_cast<float>(texW);
-                            it[i] = texVf / static_cast<float>(texH);
+                            const float sx = sStep * static_cast<float>(px + 16 * i - X0);
+                            is[i] = sBase + sx;
+                            it[i] = rowT;
+                            iq[i] = v1.q;
+                            iu[i] = 0;
+                            iv[i] = 0;
                         }
-                        iq[i] = 1.0f;
                     }
                     uint32_t texel[N];
                     SampleTextureBlock(*raster.texture, *raster.cache, is, it, iq, iu, iv, live, texel);
-                    uint32_t zs[N];
-                    int32_t cr[N], cg[N], cb[N], ca[N], fog[N];
                     for (int i = 0; i < N; ++i)
                     {
                         const TextureCombineResult color =
-                            combineTexture(tex, r, g, b, a, static_cast<uint8_t>(texel[i] & 0xFF), static_cast<uint8_t>((texel[i] >> 8) & 0xFF),
+                            combineTexture(tex, static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b), static_cast<uint8_t>(a),
+                                           static_cast<uint8_t>(texel[i] & 0xFF), static_cast<uint8_t>((texel[i] >> 8) & 0xFF),
                                            static_cast<uint8_t>((texel[i] >> 16) & 0xFF), static_cast<uint8_t>((texel[i] >> 24) & 0xFF));
                         cr[i] = color.r;
                         cg[i] = color.g;
                         cb[i] = color.b;
                         ca[i] = color.a;
-                        zs[i] = z1;
-                        fog[i] = v1.fog;
                     }
-                    WritePixelBlock(pixel, xb, y, live, zs, cr, cg, cb, ca, fog);
                 }
-                continue;
-            }
-            for (int x = runStart; x <= runEnd; ++x)
-            {
-                float tx =(static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
-                float texUf = u0f + (u1f - u0f) * tx;
-                uint32_t texel = 0xFFFF00FFu;
-                if (state.prim.fst)
-                {
-                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
-                    const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = SampleTexture(*raster.texture, *raster.cache, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
-                }
-                else
-                {
-                    texel = SampleTexture(*raster.texture, *raster.cache, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
-                }
-
-                uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
-                uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-                uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
-                uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
-
-                const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                WritePixel(*raster.pixel, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
-            }
-            }
-        }
-    }
-    else
-    {
-        for (int y = drawY0; y <= drawY1; ++y)
-        {
-            for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
-            {
-                if (blocks)
-                {
-                    for (int xb = runStart; xb <= runEnd; xb += N)
-                    {
-                        const uint32_t live = depthTestedLanes(xb, y, (1u << std::min(N, runEnd - xb + 1)) - 1u);
-                        if (live == 0u)
-                            continue;
-                        uint32_t zs[N];
-                        int32_t cr[N], cg[N], cb[N], ca[N], fog[N];
-                        for (int i = 0; i < N; ++i)
-                        {
-                            cr[i] = r;
-                            cg[i] = g;
-                            cb[i] = b;
-                            ca[i] = a;
-                            zs[i] = z1;
-                            fog[i] = v1.fog;
-                        }
-                        WritePixelBlock(pixel, xb, y, live, zs, cr, cg, cb, ca, fog);
-                    }
-                    continue;
-                }
-                for (int x = runStart; x <= runEnd; ++x)
-                    WritePixel(*raster.pixel, x, y, z1, r, g, b, a, v1.fog);
+                WritePixelBlock(pixel, xb, y, live, zs, cr, cg, cb, ca, fog);
             }
         }
     }
@@ -3523,117 +3491,140 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
     const GSVertex &v1 = batch.vertices[1];
     const GSVertex &v2 = batch.vertices[2];
     const auto &ctx = state.context;
-
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
-
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
-
-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
-    if (!raster.ownsAnyIn(minX, minY, maxX, maxY))
-        return;
-
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
-        return;
- (void)(uint64_t(maxX-minX+1)*uint64_t(maxY-minY+1));
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
-
-    // Each weight is linear in px: w = slope * (px - fx2) + rowTerm. Solving the three edge
-    // conditions gives the row's covered span; scanning only that span (padded, the
-    // per-pixel test below still decides) skips the empty part of the bounding box.
-    const float slope0 = ((fy1 - fy2) * winding) * invAbsDenom;
-    const float slope1 = ((fy2 - fy0) * winding) * invAbsDenom;
-
-    // Early depth test: WritePixel's Z comparison done before shading, so occluded pixels skip
-    // the texture sample. A pixel failing it writes nothing whatever its colour, and sampling
-    // has no visible side effect, so the result is the same.
     const PixelPipeline &pixel = *raster.pixel;
     if (pixel.ztst == 0u)
         return;
+
+    const int64_t X[3] = {subpixel(v0.x) - static_cast<int64_t>(ctx.xyoffset.ofx), subpixel(v1.x) - static_cast<int64_t>(ctx.xyoffset.ofx),
+                          subpixel(v2.x) - static_cast<int64_t>(ctx.xyoffset.ofx)};
+    const int64_t Y[3] = {subpixel(v0.y) - static_cast<int64_t>(ctx.xyoffset.ofy), subpixel(v1.y) - static_cast<int64_t>(ctx.xyoffset.ofy),
+                          subpixel(v2.y) - static_cast<int64_t>(ctx.xyoffset.ofy)};
+    const int64_t cross = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+    if (cross == 0)
+        return;
+    const int64_t sign = cross > 0 ? 1 : -1;
+    const int64_t area = cross * sign;
+
+    // A sample on an edge is covered only by a top or left edge.
+    int64_t A[3], B[3], C[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        const int a = (i + 1) % 3;
+        const int b = (i + 2) % 3;
+        A[i] = -sign * (Y[b] - Y[a]);
+        B[i] = sign * (X[b] - X[a]);
+        C[i] = -(A[i] * X[a] + B[i] * Y[a]) + ((A[i] > 0 || (A[i] == 0 && B[i] > 0)) ? 0 : -1);
+    }
+
+    int minX = static_cast<int>(ceilDiv(std::min({X[0], X[1], X[2]}), 16));
+    int maxX = static_cast<int>(floorDiv(std::max({X[0], X[1], X[2]}), 16));
+    int minY = static_cast<int>(ceilDiv(std::min({Y[0], Y[1], Y[2]}), 16));
+    int maxY = static_cast<int>(floorDiv(std::max({Y[0], Y[1], Y[2]}), 16));
+    minX = std::max<int>(minX, ctx.scissor.x0);
+    maxX = std::min<int>(maxX, ctx.scissor.x1);
+    minY = std::max<int>(minY, ctx.scissor.y0);
+    maxY = std::min<int>(maxY, ctx.scissor.y1);
+    if (minX > maxX || minY > maxY || !raster.ownsAnyIn(minX, minY, maxX, maxY))
+        return;
+
+    auto fixedPlane = [&](int64_t a0, int64_t a1, int64_t a2, int shift)
+    {
+        FixedPlane plane;
+        plane.origin = static_cast<uint64_t>(a2) << shift;
+        plane.dx = static_cast<uint64_t>(fixedRatio((a0 - a2) * A[0] + (a1 - a2) * A[1], shift, area));
+        plane.dy = static_cast<uint64_t>(fixedRatio((a0 - a2) * B[0] + (a1 - a2) * B[1], shift, area));
+        plane.x = X[2];
+        plane.y = Y[2];
+        return plane;
+    };
+    // The GS interpolates S, T and Q as floats.
+    struct FloatPlane
+    {
+        float base, dx, dy;
+    };
+    auto floatPlane = [&](float a0, float a1, float a2)
+    {
+        const double d0 = static_cast<double>(a0) - static_cast<double>(a2);
+        const double d1 = static_cast<double>(a1) - static_cast<double>(a2);
+        const double gx = (d0 * static_cast<double>(A[0]) + d1 * static_cast<double>(A[1])) / static_cast<double>(area);
+        const double gy = (d0 * static_cast<double>(B[0]) + d1 * static_cast<double>(B[1])) / static_cast<double>(area);
+        return FloatPlane{a2, static_cast<float>(gx), static_cast<float>(gy)};
+    };
+
+    const FixedPlane zPlane = fixedPlane(static_cast<int64_t>(gsDepthBits(v0.z)), static_cast<int64_t>(gsDepthBits(v1.z)),
+                                         static_cast<int64_t>(gsDepthBits(v2.z)), kDepthShift);
+    const FixedPlane fogPlane = fixedPlane(v0.fog, v1.fog, v2.fog, kAttributeShift);
+    const bool gouraud = state.prim.iip;
+    FixedPlane colourPlanes[4];
+    if (gouraud)
+    {
+        colourPlanes[0] = fixedPlane(v0.r, v1.r, v2.r, kAttributeShift);
+        colourPlanes[1] = fixedPlane(v0.g, v1.g, v2.g, kAttributeShift);
+        colourPlanes[2] = fixedPlane(v0.b, v1.b, v2.b, kAttributeShift);
+        colourPlanes[3] = fixedPlane(v0.a, v1.a, v2.a, kAttributeShift);
+    }
+    const bool textured = state.prim.tme;
+    const bool fst = state.prim.fst;
+    FixedPlane uPlane, vPlane;
+    FloatPlane sPlane{}, tPlane{}, qPlane{};
+    if (textured && fst)
+    {
+        uPlane = fixedPlane(v0.u, v1.u, v2.u, kAttributeShift);
+        vPlane = fixedPlane(v0.v, v1.v, v2.v, kAttributeShift);
+    }
+    else if (textured)
+    {
+        sPlane = floatPlane(v0.s, v1.s, v2.s);
+        tPlane = floatPlane(v0.t, v1.t, v2.t);
+        qPlane = floatPlane(v0.q, v1.q, v2.q);
+    }
+
+    // Early depth test: WritePixel's Z comparison done before shading, so occluded pixels skip the texture sample. A
+    // pixel failing it writes nothing whatever its colour, and sampling has no visible side effect.
     const bool earlyZ = pixel.ztst >= 2u;
+    constexpr int N = kLanes;
+    const int width = raster.pixelOrder ? 1 : N;
+    const auto &tex = ctx.tex0;
+    const bool tcc = tex.tcc != 0u;
 
     for (int y = minY; y <= maxY; ++y)
     {
-        float py = static_cast<float>(y) + 0.5f;
-
-        const float row0 = (((fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-        const float row1 = (((fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-        float lo = static_cast<float>(minX) - 2.0f - fx2;
-        float hi = static_cast<float>(maxX) + 2.0f - fx2;
+        const int64_t py = static_cast<int64_t>(y) * 16;
+        int64_t spanX0 = minX;
+        int64_t spanX1 = maxX;
         bool empty = false;
-        auto bound = [&](float slope, float rowTerm)
+        for (int i = 0; i < 3; ++i)
         {
-            // slope * d + rowTerm >= -kEdgeEpsilon
-            if (slope > 0.0f)
-                lo = std::max(lo, (-kEdgeEpsilon - rowTerm) / slope);
-            else if (slope < 0.0f)
-                hi = std::min(hi, (-kEdgeEpsilon - rowTerm) / slope);
-            else if (rowTerm < -kEdgeEpsilon)
+            const int64_t row = B[i] * py + C[i];
+            if (A[i] > 0)
+                spanX0 = std::max(spanX0, ceilDiv(-row, A[i] * 16));
+            else if (A[i] < 0)
+                spanX1 = std::min(spanX1, floorDiv(row, -A[i] * 16));
+            else if (row < 0)
                 empty = true;
-        };
-        bound(slope0, row0);
-        bound(slope1, row1);
-        bound(-(slope0 + slope1), 1.0f - row0 - row1);
-        if (empty || lo > hi + 1.0f)
+        }
+        if (empty || spanX0 > spanX1)
             continue;
-        const int spanX0 = std::max(minX, floorToInt(lo + fx2 - 0.5f) - 1);
-        const int spanX1 = std::min(maxX, floorToInt(hi + fx2 - 0.5f) + 2);
 
-        for (int runStart = spanX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, spanX1); runStart = runEnd + 1)
+        for (int runStart = static_cast<int>(spanX0), runEnd = 0; raster.ownedRun(y, runStart, runEnd, static_cast<int>(spanX1));
+             runStart = runEnd + 1)
         {
-        if (!raster.pixelOrder)
-        {
-            // kLanes pixels at a time: each stage below is the per-pixel code further down, as a loop over the
-            // lanes, so every lane comes out as that pixel would. Depth tests and texture samples of a block run
-            // before its stores, which needsPixelOrder made sure cannot matter.
-            constexpr int N = kLanes;
-            for (int xb = runStart; xb <= runEnd; xb += N)
+            for (int xb = runStart; xb <= runEnd; xb += width)
             {
-                const int count = std::min(N, runEnd - xb + 1);
-                float w0[N], w1[N], w2[N];
-                int32_t covered[N];
-                for (int i = 0; i < N; ++i)
-                {
-                    float px = static_cast<float>(xb + i) + 0.5f;
-                    w0[i] = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-                    w1[i] = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-                    w2[i] = 1.0f - w0[i] - w1[i];
-                    covered[i] = (i < count && !(w0[i] < -kEdgeEpsilon || w1[i] < -kEdgeEpsilon || w2[i] < -kEdgeEpsilon)) ? 1 : 0;
-                }
-                uint32_t live = 0u;
-                for (int i = 0; i < N; ++i)
-                    live |= static_cast<uint32_t>(covered[i]) << i;
-                if (live == 0u)
-                    continue;
+                const int count = std::min(width, runEnd - xb + 1);
+                uint32_t live = (1u << count) - 1u;
+                const int64_t px = static_cast<int64_t>(xb) * 16;
 
                 u32 zs[N];
-                for (int i = 0; i < N; ++i)
                 {
-                    const double z = v0.z * w0[i] + v1.z * w1[i] + v2.z * w2[i];
-                    zs[i] = std::min(gsDepthBits(z + 0.5), pixel.zmax);
+                    const uint64_t acc = zPlane.at(px, py);
+                    for (int i = 0; i < N; ++i)
+                        zs[i] = depthFromPlane(acc + zPlane.dx * static_cast<uint64_t>(16 * i), pixel.zmax);
                 }
                 if (earlyZ)
                 {
-                    for (int i = 0; i < N; ++i)
+                    for (int i = 0; i < count; ++i)
                     {
-                        if (!((live >> i) & 1u))
-                            continue;
                         const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, xb + i, y);
                         if (pixel.ztst == 2u ? zs[i] < storedZ : zs[i] <= storedZ)
                             live &= ~(1u << i);
@@ -3643,14 +3634,15 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                 }
 
                 int32_t r[N], g[N], b[N], a[N];
-                if (state.prim.iip)
+                if (gouraud)
                 {
-                    for (int i = 0; i < N; ++i)
+                    int32_t *const channels[4] = {r, g, b, a};
+                    for (int c = 0; c < 4; ++c)
                     {
-                        r[i] = clampU8(static_cast<int>(v0.r * w0[i] + v1.r * w1[i] + v2.r * w2[i]));
-                        g[i] = clampU8(static_cast<int>(v0.g * w0[i] + v1.g * w1[i] + v2.g * w2[i]));
-                        b[i] = clampU8(static_cast<int>(v0.b * w0[i] + v1.b * w1[i] + v2.b * w2[i]));
-                        a[i] = clampU8(static_cast<int>(v0.a * w0[i] + v1.a * w1[i] + v2.a * w2[i]));
+                        const uint64_t acc = colourPlanes[c].at(px, py);
+                        const uint64_t step = colourPlanes[c].dx * 16u;
+                        for (int i = 0; i < N; ++i)
+                            channels[c][i] = colourFromPlane(acc + step * static_cast<uint64_t>(i));
                     }
                 }
                 else
@@ -3664,16 +3656,20 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                     }
                 }
 
-                if (state.prim.tme)
+                if (textured)
                 {
                     float is[N], it[N], iq[N];
                     uint16_t iu[N], iv[N];
-                    if (state.prim.fst)
+                    if (fst)
                     {
+                        const uint64_t uAcc = uPlane.at(px, py);
+                        const uint64_t vAcc = vPlane.at(px, py);
                         for (int i = 0; i < N; ++i)
                         {
-                            iu[i] = static_cast<uint16_t>(v0.u * w0[i] + v1.u * w1[i] + v2.u * w2[i]);
-                            iv[i] = static_cast<uint16_t>(v0.v * w0[i] + v1.v * w1[i] + v2.v * w2[i]);
+                            const int64_t u = static_cast<int64_t>(uAcc + uPlane.dx * static_cast<uint64_t>(16 * i)) >> kAttributeShift;
+                            const int64_t v = static_cast<int64_t>(vAcc + vPlane.dx * static_cast<uint64_t>(16 * i)) >> kAttributeShift;
+                            iu[i] = static_cast<uint16_t>(std::min<int64_t>(std::max<int64_t>(u, 0), 0xFFFF));
+                            iv[i] = static_cast<uint16_t>(std::min<int64_t>(std::max<int64_t>(v, 0), 0xFFFF));
                             is[i] = 0.0f;
                             it[i] = 0.0f;
                             iq[i] = 1.0f;
@@ -3681,11 +3677,22 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                     }
                     else
                     {
+                        const float dy = static_cast<float>(py - Y[2]);
                         for (int i = 0; i < N; ++i)
                         {
-                            is[i] = v0.s * w0[i] + v1.s * w1[i] + v2.s * w2[i];
-                            it[i] = v0.t * w0[i] + v1.t * w1[i] + v2.t * w2[i];
-                            iq[i] = v0.q * w0[i] + v1.q * w1[i] + v2.q * w2[i];
+                            const float dx = static_cast<float>(px + 16 * i - X[2]);
+                            const float sx = sPlane.dx * dx;
+                            const float sy = sPlane.dy * dy;
+                            const float tx = tPlane.dx * dx;
+                            const float ty = tPlane.dy * dy;
+                            const float qx = qPlane.dx * dx;
+                            const float qy = qPlane.dy * dy;
+                            const float s = sPlane.base + sx;
+                            const float t = tPlane.base + tx;
+                            const float q = qPlane.base + qx;
+                            is[i] = s + sy;
+                            it[i] = t + ty;
+                            iq[i] = q + qy;
                             iu[i] = 0;
                             iv[i] = 0;
                         }
@@ -3693,9 +3700,6 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                     uint32_t texel[N];
                     SampleTextureBlock(*raster.texture, *raster.cache, is, it, iq, iu, iv, live, texel);
 
-                    // combineTexture.
-                    const auto &tex = ctx.tex0;
-                    const bool tcc = tex.tcc != 0u;
                     int32_t tr[N], tg[N], tb[N], ta[N];
                     for (int i = 0; i < N; ++i)
                     {
@@ -3750,95 +3754,14 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                 }
 
                 int32_t fog[N];
-                for (int i = 0; i < N; ++i)
-                    fog[i] = clampU8(static_cast<int>(v0.fog * w0[i] + v1.fog * w1[i] + v2.fog * w2[i]));
+                {
+                    const uint64_t acc = fogPlane.at(px, py);
+                    const uint64_t step = fogPlane.dx * 16u;
+                    for (int i = 0; i < N; ++i)
+                        fog[i] = colourFromPlane(acc + step * static_cast<uint64_t>(i));
+                }
                 WritePixelBlock(pixel, xb, y, live, zs, r, g, b, a, fog);
             }
-            continue;
-        }
-        for (int x = runStart; x <= runEnd; ++x)
-        {
-            float px = static_cast<float>(x) + 0.5f;
-
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
-                continue;
-
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
-            const u32 pixelZ = std::min(gsDepthBits(z + 0.5), pixel.zmax);
-            if (earlyZ)
-            {
-                const u32 storedZ = pixel.readZ(m_vram, pixel.zbp, pixel.fbw, x, y);
-                if (pixel.ztst == 2u ? pixelZ < storedZ : pixelZ <= storedZ)
-                    continue;
-            }
-
-            uint8_t r, g, b, a;
-            if (state.prim.iip)
-            {
-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
-            }
-            else
-            {
-                r = v2.r;
-                g = v2.g;
-                b = v2.b;
-                a = v2.a;
-            }
-
-            if (state.prim.tme)
-            {
-                float is, it, iq;
-                uint16_t iu, iv;
-                if (state.prim.fst)
-                {
-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
-                    is = 0.0f;
-                    it = 0.0f;
-                    iq = 1.0f;
-                }
-                else
-                {
-                    // The GS DDA interpolates the homogeneous S, T and Q
-                    // values. Texel coordinates are calculated from S/Q and
-                    // T/Q only after interpolation.
-                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
-                    iu = 0;
-                    iv = 0;
-                }
-
-                uint32_t texel = SampleTexture(*raster.texture, *raster.cache, is, it, iq, iu, iv);
-
-                uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
-                uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-                uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
-                uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
-
-                const auto &tex = ctx.tex0;
-                const uint8_t shadeR = r;
-                const uint8_t shadeG = g;
-                const uint8_t shadeB = b;
-                const uint8_t shadeA = a;
-                const TextureCombineResult color = combineTexture(tex, shadeR, shadeG, shadeB, shadeA, tr, tg, tb, ta);
-
-                r = color.r;
-                g = color.g;
-                b = color.b;
-                a = color.a;
-            }
-
-            const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(pixel, x, y, pixelZ, r, g, b, a, fog, true);
-        }
         }
     }
 }
@@ -3849,65 +3772,52 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch, const RasterContext &
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
+    const PixelPipeline &pixel = *raster.pixel;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    const int64_t X0 = subpixel(v0.x) - static_cast<int64_t>(ctx.xyoffset.ofx);
+    const int64_t Y0 = subpixel(v0.y) - static_cast<int64_t>(ctx.xyoffset.ofy);
+    const int64_t X1 = subpixel(v1.x) - static_cast<int64_t>(ctx.xyoffset.ofx);
+    const int64_t Y1 = subpixel(v1.y) - static_cast<int64_t>(ctx.xyoffset.ofy);
+    if (X0 == X1 && Y0 == Y1)
+        return;
 
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
-
-    int dx = std::abs(x1 - x0);
-    int dy = -std::abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-
-    int totalSteps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-    if (totalSteps == 0)
-        totalSteps = 1;
-    int step = 0;
-
-    for (;;)
+    // One pixel per whole step of the major axis in [min, max), the minor coordinate rounded with halves up.
+    const bool xMajor = std::abs(X1 - X0) >= std::abs(Y1 - Y0);
+    const int64_t M0 = xMajor ? X0 : Y0;
+    const int64_t M1 = xMajor ? X1 : Y1;
+    const int64_t first = ceilDiv(std::min(M0, M1), 16);
+    const int64_t last = ceilDiv(std::max(M0, M1), 16) - 1;
+    const int64_t span = M1 - M0;
+    auto linePlane = [&](int64_t a0, int64_t a1, int shift)
     {
-        float t = static_cast<float>(step) / static_cast<float>(totalSteps);
-        uint8_t r, g, b, a;
-        if (state.prim.iip)
-        {
-            r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * t));
-            g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * t));
-            b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * t));
-            a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * t));
-        }
-        else
-        {
-            r = v1.r;
-            g = v1.g;
-            b = v1.b;
-            a = v1.a;
-        }
+        FixedPlane plane;
+        plane.origin = static_cast<uint64_t>(a0) << shift;
+        plane.dx = static_cast<uint64_t>(fixedRatio(a1 - a0, shift, span));
+        plane.x = M0;
+        return plane;
+    };
+    const FixedPlane minor = linePlane(xMajor ? Y0 : X0, xMajor ? Y1 : X1, kAttributeShift);
+    const FixedPlane zLine = linePlane(gsDepthBits(v0.z), gsDepthBits(v1.z), kDepthShift);
+    const FixedPlane fogLine = linePlane(v0.fog, v1.fog, kAttributeShift);
+    const bool gouraud = state.prim.iip;
+    const FixedPlane colourLines[4] = {linePlane(v0.r, v1.r, kAttributeShift), linePlane(v0.g, v1.g, kAttributeShift),
+                                       linePlane(v0.b, v1.b, kAttributeShift), linePlane(v0.a, v1.a, kAttributeShift)};
 
-        double z = (v0.z + (v1.z - v0.z) * t);
-        const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        if (raster.owns(x0, y0))
-            WritePixel(*raster.pixel, x0, y0, std::min(gsDepthBits(z), raster.pixel->zmax), r, g, b, a, fog);
-
-        if (x0 == x1 && y0 == y1)
-            break;
-
-        int e2 = 2 * err;
-        if (e2 >= dy)
-        {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
-        }
-        ++step;
+    for (int64_t m = first; m <= last; ++m)
+    {
+        const int64_t p = m * 16;
+        const int64_t minorSubpixel = static_cast<int64_t>(minor.at(p, 0)) >> kAttributeShift;
+        const int64_t n = floorDiv(minorSubpixel + 8, 16);
+        const int x = static_cast<int>(xMajor ? m : n);
+        const int y = static_cast<int>(xMajor ? n : m);
+        if (x < pixel.scissorX0 || x > pixel.scissorX1 || y < pixel.scissorY0 || y > pixel.scissorY1 || !raster.owns(x, y))
+            continue;
+        uint8_t c[4] = {v1.r, v1.g, v1.b, v1.a};
+        if (gouraud)
+            for (int i = 0; i < 4; ++i)
+                c[i] = static_cast<uint8_t>(colourFromPlane(colourLines[i].at(p, 0)));
+        WritePixel(pixel, x, y, depthFromPlane(zLine.at(p, 0), pixel.zmax), c[0], c[1], c[2], c[3],
+                   static_cast<uint8_t>(colourFromPlane(fogLine.at(p, 0))));
     }
 }
 
