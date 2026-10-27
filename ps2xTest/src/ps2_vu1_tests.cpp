@@ -770,6 +770,25 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().q, 5.0f, "WAITQ should expose SQRT after its seven-cycle latency");
         });
 
+        tc.Run("an upper write to vf0 is discarded before the lower instruction of its pair reads vf0", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            constexpr uint32_t kSubVf0 = (0xFu << 21) | (2u << 16) | (1u << 11) | (0u << 6) | 0x2Cu; // SUB vf0, vf1, vf2
+            writeVuInstructionPair(fx.code, 0u, makeVuDiv(0u, 3u, 3u, 3u), kSubVf0);                // Q = vf0.w / vf3.w
+            writeVuInstructionPair(fx.code, 8u, makeVuLowerSpecial(0x3Bu, 0u), kVuUpperNop);          // WAITQ
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][3] = 4000.0f;
+            vu1.state().vf[2][3] = 1.0f;
+            vu1.state().vf[3][3] = 4.0f;
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 8u);
+            t.Equals(vu1.state().q, 0.25f, "DIV should read vf0.w as 1 after SUB vf0 in the same pair");
+            t.Equals(vu1.state().vf[0][3], 1.0f, "vf0 should stay (0, 0, 0, 1)");
+        });
+
         tc.Run("FDIV resource serializes back-to-back scalar operations", [](TestCase &t)
         {
             Vu1Fixture fx;

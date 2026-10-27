@@ -216,6 +216,7 @@ namespace
     }
 
     std::string vfName(uint32_t reg) { return "vf" + std::to_string(reg); }
+    std::string upperTarget(uint32_t reg) { return reg == 0u ? std::string("vfDiscard") : vfName(reg); }
     std::string viName(uint32_t reg) { return reg == 0u ? std::string("vi0") : "vi" + std::to_string(reg); }
 
     // One block as one function: VU registers in locals, each instruction a Vu1Jit call. Returns false when the
@@ -435,22 +436,22 @@ namespace
                 else
                     up << "J::fmac<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u>(vu, ";
                 up
-                   << (pi.upper.kind == J::Upper::FmacAcc ? std::string("acc") : vfName(pi.upper.target)) << ", " << fs
+                   << (pi.upper.kind == J::Upper::FmacAcc ? std::string("acc") : upperTarget(pi.upper.target)) << ", " << fs
                    << ", " << ft << ", acc" << (pi.stickyFlags ? ", stickySign, stickyZero" : "") << ");";
                 break;
             case J::Upper::Max:
             case J::Upper::Mini:
                 up << "J::maxMini<" << hex32(upper) << ", " << (pi.upper.kind == J::Upper::Max ? "true" : "false")
-                   << ">(vu, " << vfName(pi.upper.target) << ", " << fs << ", " << ft << ");";
+                   << ">(vu, " << upperTarget(pi.upper.target) << ", " << fs << ", " << ft << ");";
                 break;
             case J::Upper::Itof:
-                up << "J::itof<" << hex32(upper) << ">(" << vfName(pi.upper.target) << ", " << fs << ");";
+                up << "J::itof<" << hex32(upper) << ">(" << upperTarget(pi.upper.target) << ", " << fs << ");";
                 break;
             case J::Upper::Ftoi:
-                up << "J::ftoi<" << hex32(upper) << ", 0u>(" << vfName(pi.upper.target) << ", " << fs << ");";
+                up << "J::ftoi<" << hex32(upper) << ", 0u>(" << upperTarget(pi.upper.target) << ", " << fs << ");";
                 break;
             case J::Upper::Abs:
-                up << "J::abs<" << hex32(upper) << ">(" << vfName(pi.upper.target) << ", " << fs << ");";
+                up << "J::abs<" << hex32(upper) << ">(" << upperTarget(pi.upper.target) << ", " << fs << ");";
                 break;
             case J::Upper::Clip:
                 up << "J::clip(vu, " << fs << ", " << ft << ");";
@@ -582,9 +583,7 @@ namespace
                 if (!lo.str().empty())
                     body << "        " << lo.str() << "\n";
             }
-            const bool writesVf0 = (pi.upper.kind != J::Upper::Nop && pi.upper.kind != J::Upper::Clip &&
-                                    pi.upper.kind != J::Upper::FmacAcc && pi.upper.target == 0u) ||
-                                   (!pair.iBit && ps2_vu1_detail::FT(lower) == 0u &&
+            const bool writesVf0 = (!pair.iBit && ps2_vu1_detail::FT(lower) == 0u &&
                                     (pi.lower == J::Lower::Lq || pi.lower == J::Lower::Move || pi.lower == J::Lower::Mr32 ||
                                      pi.lower == J::Lower::Lqi || pi.lower == J::Lower::Lqd || pi.lower == J::Lower::Mfir ||
                                      pi.lower == J::Lower::Mfp || pi.lower == J::Lower::Rnext || pi.lower == J::Lower::Rget));
@@ -611,7 +610,7 @@ namespace
             << (fast ? ">(vu, context, base))\n" : ">(context, base))\n")
             << "            return pair" << id << "(vu, context);\n"
             << "        VU1State &s = J::state(vu);\n"
-            << "        [[maybe_unused]] __m128 vf0 = J::vf0();\n"
+            << "        [[maybe_unused]] __m128 vf0 = J::vf0(), vfDiscard = vf0;\n"
             << "        [[maybe_unused]] int32_t vi0 = 0, viDiscard = 0;\n"
             << "        [[maybe_unused]] bool taken = false;\n"
             << "        [[maybe_unused]] uint32_t target = 0u;\n";
