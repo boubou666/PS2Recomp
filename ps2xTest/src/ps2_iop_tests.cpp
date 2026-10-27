@@ -112,6 +112,34 @@ void register_ps2_iop_tests()
             t.IsTrue(std::memcmp(copied, kPayload, sizeof(kPayload)) == 0, "the IOP buffer should hold the EE payload");
         });
 
+        tc.Run("IOP time spent in a call run from the EE is not run again", [](TestCase &t)
+        {
+            constexpr uint32_t kLoops = 50000u;
+            iop_test::Host host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            iop_test::Irx image;
+            image.words(0u, {
+                0x3C080000u | (kLoops >> 16u), 0x35080000u | (kLoops & 0xFFFFu), // t0 = kLoops
+                0x2508FFFFu, 0x1500FFFEu, 0u,                                     // loop: addiu t0, -1; bnez t0, loop
+                0x03E00008u, 0x24020001u,                                         // return 1 (not resident)
+            });
+            image.install(host);
+
+            const ps2x::iop::ModuleLoadResult loaded = subsystem.loadModuleBuffer(0x1000u);
+            t.Equals(loaded.startResult, 1, "the start routine should run to its end");
+            const uint64_t afterCall = subsystem.debugSnapshot().emulatorCycles;
+            t.IsTrue(afterCall >= kLoops * 2u, "the start routine's loop should take IOP time");
+
+            subsystem.runEeCycles(afterCall / 2u * 8u);
+            t.Equals(subsystem.debugSnapshot().emulatorCycles, afterCall,
+                     "the IOP should wait while the EE has paid for less time than the call took");
+            subsystem.runEeCycles(afterCall * 8u);
+            const uint64_t paid = afterCall / 2u + afterCall;
+            t.IsTrue(subsystem.debugSnapshot().emulatorCycles >= paid &&
+                         subsystem.debugSnapshot().emulatorCycles < paid + afterCall / 4u,
+                     "then follow the EE clock, the call's time counted once");
+        });
+
         tc.Run("sceSifGetOtherData fails for an EE range outside guest memory", [](TestCase &t)
         {
             iop_test::Host host;
