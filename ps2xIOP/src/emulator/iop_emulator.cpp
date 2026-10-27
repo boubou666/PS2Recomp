@@ -1081,6 +1081,7 @@ namespace ps2x::iop::detail
             }
             owner->state = ownerState; // back to its sceSifRpcLoop wait
             kernel.setCurrentThread(previous);
+            lastThreadCallReturned = cpu.stopped;
 
             static const bool trace = []
             {
@@ -1391,9 +1392,17 @@ namespace ps2x::iop::detail
             const uint32_t argc = argvBlock ? static_cast<uint32_t>(argv.size()) : 0u;
             // Start routines run in MODLOAD's thread on the IOP and may block on what they started (LIBSD waiting
             // for its first SPU2 transfers); priority 1 keeps them running before any other thread, as before.
+            constexpr uint32_t kNoResidentEnd = 1u;
             (void)kernel.hostThread(IopKernel::kModuleLoaderThreadId, 1u);
-            const uint32_t startResult = executeGuestFunctionAsThread(module.entry, argc, argvBlock, 0u, 0u, module.gp,
-                                                                      IopKernel::kModuleLoaderThreadId);
+            lastThreadCallReturned = true;
+            uint32_t startResult = executeGuestFunctionAsThread(module.entry, argc, argvBlock, 0u, 0u, module.gp,
+                                                                IopKernel::kModuleLoaderThreadId);
+            if (!lastThreadCallReturned)
+            {
+                std::fprintf(stderr, "[IOP] %s: start routine abandoned before it returned, not resident\n",
+                             module.name.c_str());
+                startResult = kNoResidentEnd;
+            }
             module.resident = startResult == 0u || startResult == 2u;
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
@@ -1499,6 +1508,7 @@ namespace ps2x::iop::detail
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
+        bool lastThreadCallReturned = true;
         int maskedThreadId = 0;
         GuestCallback secrMcCommandHandler;
         GuestCallback secrMcDevIdHandler;

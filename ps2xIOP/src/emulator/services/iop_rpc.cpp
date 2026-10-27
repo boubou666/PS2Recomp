@@ -245,15 +245,17 @@ namespace ps2x::iop::detail
         call.receiveSize = transfer;
 
         IopThread *const caller = m_kernel.currentThread();
-        const bool wait = (mode & kRpcNowait) == 0u && caller != nullptr;
-        if ((mode & kRpcNowait) == 0u && caller == nullptr)
+        // A module start cannot wait either: the EE executor that would serve the reply is the one inside LoadModule.
+        const bool canWait = caller != nullptr && caller->id != IopKernel::kModuleLoaderThreadId;
+        const bool wait = (mode & kRpcNowait) == 0u && canWait;
+        if ((mode & kRpcNowait) == 0u && !canWait)
         {
-            // No IOP thread to put to sleep (a module start run inline): the call cannot wait, so the IRX goes on
-            // before the reply is in its receive buffer. Said every time, since the IRX reads that buffer early.
-            char message[160];
+            // The call cannot wait, so the IRX goes on before the reply is in its receive buffer. Said every time,
+            // since the IRX reads that buffer early.
+            char message[176];
             std::snprintf(message, sizeof(message),
-                          "[IOP sifcmd] sceSifCallRpc sid=0x%x fno=%u with WAIT outside any IOP thread (ra=0x%x): it "
-                          "returns before the EE reply",
+                          "[IOP sifcmd] sceSifCallRpc sid=0x%x fno=%u with WAIT outside an IOP thread or in a module "
+                          "start (ra=0x%x): it returns before the EE reply",
                           bound->second, function, cpu.gpr[31]);
             m_host.log(LogLevel::Warning, message);
         }
