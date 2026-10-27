@@ -350,6 +350,42 @@ namespace
                expect(flags('=') == 0x10u, "look_ctype_table: punctuation");
     }
 
+    // sprintf/vsprintf format their varargs (MIPS o32: a2, a3, then the stack from sp + 16; vsprintf reads
+    // the va_list). EA's AUDIOPF builds every disc path with sprintf("\\%s\\%s.%s;1", dir, name, ext).
+    bool testSysclibSprintf()
+    {
+        IopMemory memory;
+        IopSysclib sysclib(memory);
+        IopCpuState cpu{};
+        const auto put = [&](uint32_t address, const std::string &text)
+        { return memory.writeRam(address, text.c_str(), text.size() + 1u); };
+        const auto putWord = [&](uint32_t address, uint32_t value)
+        { return memory.writeRam(address, &value, sizeof(value)); };
+        if (!put(0x10000u, "\\%s\\%s.%s;1") || !put(0x10100u, "DATA\\GAME") || !put(0x10200u, "LOADONCE") ||
+            !put(0x10300u, "SCP") || !putWord(0x20010u, 0x10300u))
+            return expect(false, "test setup failed");
+
+        cpu.gpr[4] = 0x11000u;
+        cpu.gpr[5] = 0x10000u;
+        cpu.gpr[6] = 0x10100u;
+        cpu.gpr[7] = 0x10200u;
+        cpu.gpr[29] = 0x20000u;
+        if (!expect(sysclib.dispatchImport(19u, cpu), "sprintf was not handled") ||
+            !expect(memory.readString(0x11000u) == "\\DATA\\GAME\\LOADONCE.SCP;1", "sprintf did not format its varargs") ||
+            !expect(cpu.gpr[2] == 25u, "sprintf did not return the length"))
+            return false;
+
+        if (!put(0x10400u, "%d|%5x|%-3c|%08X|%%|%.2s") || !putWord(0x30000u, static_cast<uint32_t>(-12)) ||
+            !putWord(0x30004u, 0xABu) || !putWord(0x30008u, 'q') || !putWord(0x3000Cu, 0xBEEFu) ||
+            !putWord(0x30010u, 0x10300u))
+            return expect(false, "test setup failed");
+        cpu.gpr[4] = 0x12000u;
+        cpu.gpr[5] = 0x10400u;
+        cpu.gpr[6] = 0x30000u;
+        return expect(sysclib.dispatchImport(42u, cpu), "vsprintf was not handled") &&
+               expect(memory.readString(0x12000u) == "-12|   ab|q  |0000BEEF|%|SC", "vsprintf did not read its va_list");
+    }
+
     bool testVblankHandlers()
     {
         IopMemory memory;
@@ -403,7 +439,7 @@ namespace
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback() || !testVblankHandlers() || !testSysclibCtypeFlags())
+        !testTimrmanPeriodicCallback() || !testVblankHandlers() || !testSysclibCtypeFlags() || !testSysclibSprintf())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

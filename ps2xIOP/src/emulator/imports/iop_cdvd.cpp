@@ -17,6 +17,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -603,7 +604,19 @@ namespace ps2x::iop::detail
             const std::string guestPath = memory.readString(nameAddress, 1024u);
             IsoNode *node = findVirtualIsoNode(guestPath);
             if (!node)
+            {
+                // Once per name: a module that retries the search (EA's AUDIOPF, 256 times per file) shows up as
+                // one line, with the disc root it looked in.
+                if (missedSearches.insert(guestPath).second && missedSearches.size() <= 64u)
+                {
+                    char line[256];
+                    std::snprintf(line, sizeof(line), "[IOP cdvd] sceCdSearchFile \"%.120s\" not found (root \"%.80s\"%s)",
+                                  guestPath.c_str(), host.hostPath(HostPathKind::CdRoot).c_str(),
+                                  virtualIsoValid ? "" : ", no virtual disc");
+                    host.log(LogLevel::Info, line);
+                }
                 return false;
+            }
 
             // sceCdlFILE: lsn, size, name[16], date/flags[8].
             std::array<uint8_t, 32u> result{};
@@ -732,6 +745,7 @@ namespace ps2x::iop::detail
         uint32_t lastReadTimeout = 0u;
         int interruptEventFlagId = 0;
         uint64_t imageHandle = 0u;
+        std::unordered_set<std::string> missedSearches;
         bool virtualIsoBuilt = false;
         bool virtualIsoValid = false;
         uint32_t volumeSectors = 0u;

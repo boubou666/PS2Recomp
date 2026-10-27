@@ -4,13 +4,120 @@
 #include "../core/iop_memory.h"
 
 #include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        // printf-style formatting of a guest format string. nextWord yields the next 32-bit vararg slot and
+        // alignWord skips one slot when the next one is odd (MIPS o32 puts 64-bit arguments on an even slot).
+        std::string formatGuest(const IopMemory &memory, const std::string &format,
+                                const std::function<uint32_t()> &nextWord, const std::function<void()> &alignWord)
+        {
+            std::string out;
+            for (size_t i = 0; i < format.size(); ++i)
+            {
+                if (format[i] != '%')
+                {
+                    out += format[i];
+                    continue;
+                }
+                const size_t start = i++;
+                if (i < format.size() && format[i] == '%')
+                {
+                    out += '%';
+                    continue;
+                }
+                std::string spec = "%";
+                while (i < format.size() && std::strchr("-+ #0", format[i]))
+                    spec += format[i++];
+                if (i < format.size() && format[i] == '*')
+                {
+                    spec += std::to_string(static_cast<int32_t>(nextWord()));
+                    ++i;
+                }
+                while (i < format.size() && std::isdigit(static_cast<unsigned char>(format[i])))
+                    spec += format[i++];
+                if (i < format.size() && format[i] == '.')
+                {
+                    spec += format[i++];
+                    if (i < format.size() && format[i] == '*')
+                    {
+                        spec += std::to_string(static_cast<int32_t>(nextWord()));
+                        ++i;
+                    }
+                    while (i < format.size() && std::isdigit(static_cast<unsigned char>(format[i])))
+                        spec += format[i++];
+                }
+                int longs = 0;
+                while (i < format.size() && (format[i] == 'l' || format[i] == 'h' || format[i] == 'z'))
+                    longs += format[i++] == 'l' ? 1 : 0;
+                if (i >= format.size())
+                {
+                    out.append(format, start, std::string::npos);
+                    break;
+                }
+                const char conversion = format[i];
+                char buffer[512];
+                switch (conversion)
+                {
+                case 'd':
+                case 'i':
+                case 'u':
+                case 'x':
+                case 'X':
+                case 'o':
+                    if (longs >= 2)
+                    {
+                        alignWord();
+                        const uint64_t low = nextWord();
+                        const uint64_t value = low | (static_cast<uint64_t>(nextWord()) << 32);
+                        std::snprintf(buffer, sizeof(buffer), (spec + "ll" + conversion).c_str(),
+                                      static_cast<unsigned long long>(value));
+                    }
+                    else
+                    {
+                        const uint32_t value = nextWord();
+                        if (conversion == 'd' || conversion == 'i')
+                            std::snprintf(buffer, sizeof(buffer), (spec + conversion).c_str(), static_cast<int32_t>(value));
+                        else
+                            std::snprintf(buffer, sizeof(buffer), (spec + conversion).c_str(), value);
+                    }
+                    out += buffer;
+                    break;
+                case 'p':
+                    std::snprintf(buffer, sizeof(buffer), "0x%x", nextWord());
+                    out += buffer;
+                    break;
+                case 'c':
+                    std::snprintf(buffer, sizeof(buffer), (spec + 'c').c_str(), static_cast<int>(nextWord() & 0xFFu));
+                    out += buffer;
+                    break;
+                case 's':
+                {
+                    const uint32_t address = nextWord();
+                    const std::string text = address ? memory.readString(address, 4096u) : std::string("(null)");
+                    std::vector<char> wide(text.size() + 512u);
+                    std::snprintf(wide.data(), wide.size(), (spec + 's').c_str(), text.c_str());
+                    out += wide.data();
+                    break;
+                }
+                default:
+                    out.append(format, start, i - start + 1u); // unknown conversion: keep it as written
+                    break;
+                }
+            }
+            return out;
+        }
+    }
+
     IopSysclib::IopSysclib(IopMemory &memory) noexcept
         : m_memory(memory)
     {
@@ -149,15 +256,38 @@ namespace ps2x::iop::detail
         case 18: // prnt
             setV0(0);
             return true;
-        case 19: // sprintf: preserve useful literal formats even before full vararg formatting.
-        case 42: // vsprintf fallback: copy format literal.
+        case 19: // sprintf(buffer, format, ...): varargs in a2, a3, then the caller's stack from sp + 16 (MIPS o32)
+        case 42: // vsprintf(buffer, format, va_list): varargs read in order from the va_list pointer
         {
             const std::string format = m_memory.readString(a1, 4096u);
-            for (size_t i = 0; i <= format.size(); ++i)
+            uint32_t slot = 0u;
+            uint32_t list = a2;
+            const uint32_t stack = cpu.gpr[29];
+            const std::function<uint32_t()> nextWord = [&]() -> uint32_t
             {
-                m_memory.write8(a0 + static_cast<uint32_t>(i), i < format.size() ? static_cast<uint8_t>(format[i]) : 0u);
-            }
-            setV0(static_cast<uint32_t>(format.size()));
+                if (ordinal == 42u)
+                {
+                    const uint32_t value = m_memory.read32(list);
+                    list += 4u;
+                    return value;
+                }
+                const uint32_t index = slot++;
+                if (index == 0u)
+                    return cpu.gpr[6];
+                if (index == 1u)
+                    return cpu.gpr[7];
+                return m_memory.read32(stack + 16u + (index - 2u) * 4u);
+            };
+            const std::function<void()> alignWord = [&]()
+            {
+                if (ordinal == 42u)
+                    list = (list + 7u) & ~7u;
+                else if ((slot & 1u) != 0u) // slot 0 is argument 2: even slots are even arguments
+                    ++slot;
+            };
+            const std::string text = formatGuest(m_memory, format, nextWord, alignWord);
+            (void)m_memory.writeRam(a0, text.c_str(), text.size() + 1u);
+            setV0(static_cast<uint32_t>(text.size()));
             return true;
         }
         case 20:
