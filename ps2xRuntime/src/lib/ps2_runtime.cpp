@@ -3248,7 +3248,12 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    return ps2rCheckpointDue(this, cycles);
+}
+
+bool ps2rCheckpointDue(PS2Runtime *runtime, uint32_t cycles) noexcept
+{
+    return runtime->m_eeScheduler->checkpointDue(cycles);
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)

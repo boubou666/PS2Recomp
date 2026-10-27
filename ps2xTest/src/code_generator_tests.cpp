@@ -224,7 +224,7 @@ void register_code_generator_tests()
         CodeGenerator gen({}, {});
         const std::string generated = gen.generateFunction(func, {syscall, after}, false);
         const size_t continuation = generated.find("ctx->pc = 0x9004u;");
-        const size_t dispatch = generated.find("runtime->handleSyscall(rdram, ctx, 0x44u);");
+        const size_t dispatch = generated.find("ps2rHandleSyscall(runtime, rdram, ctx, 0x44u);");
 
         t.IsTrue(continuation != std::string::npos,
                  "generated syscall must publish the next guest PC");
@@ -363,7 +363,7 @@ void register_code_generator_tests()
         std::string generated = gen.generateFunction(func, instructions, false);
         printGeneratedCode("constant MMIO store emits direct runtime store", generated);
 
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u, GPR_U32(ctx, 2));") != std::string::npos,
+        t.IsTrue(generated.find("ps2rStore32(runtime, rdram, ctx, 0x1000E020u, GPR_U32(ctx, 2));") != std::string::npos,
                  "constant MMIO SW should emit a direct runtime Store32");
         t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant MMIO SW should not go through WRITE32 address classification");
@@ -378,7 +378,7 @@ void register_code_generator_tests()
         const std::string generated = gen.translateInstruction(store);
         printGeneratedCode("stale MMIO annotation does not replace the guest effective address", generated);
 
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 1), 0), GPR_U32(ctx, 2))") != std::string::npos,
+        t.IsTrue(generated.find("ps2rStore32(runtime, rdram, ctx, ADD32(GPR_U32(ctx, 1), 0), GPR_U32(ctx, 2))") != std::string::npos,
                  "MMIO annotations should select runtime access without hard-coding a possibly stale address");
         t.IsTrue(generated.find("0x10000000u") == std::string::npos,
                  "stale MMIO address should not replace the address calculated by guest registers");
@@ -439,11 +439,11 @@ void register_code_generator_tests()
 
         t.IsTrue(generated.find("uint32_t gifDmaKickValue_3024_2 = GPR_U32(ctx, 4);") != std::string::npos,
                  "dynamic GIF TADR source should be captured when the store is coalesced");
-        t.IsTrue(generated.find("runtime->kickGifDmaChainFromMMIO(rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_3024_2, 0x105u);") != std::string::npos,
+        t.IsTrue(generated.find("ps2rKickGifDmaChainFromMMIO(runtime, rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_3024_2, 0x105u);") != std::string::npos,
                  "known GIF DMA MMIO stores should coalesce into the native kick helper");
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u") == std::string::npos,
+        t.IsTrue(generated.find("ps2rStore32(runtime, rdram, ctx, 0x1000E020u") == std::string::npos,
                  "coalesced D_PCR store should not remain as an individual Store32");
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000A000u") == std::string::npos,
+        t.IsTrue(generated.find("ps2rStore32(runtime, rdram, ctx, 0x1000A000u") == std::string::npos,
                  "coalesced GIF CHCR store should not remain as an individual Store32");
     });
 
@@ -480,7 +480,7 @@ void register_code_generator_tests()
                  "TADR value should be captured before a0 is reused for CHCR");
         t.IsTrue(generated.find("ctx->in_delay_slot = true;") != std::string::npos,
                  "coalesced helper should still run as the return delay slot");
-        t.IsTrue(generated.find("runtime->kickGifDmaChainFromMMIO(rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_2e7cb4_2, 0x105u);") != std::string::npos,
+        t.IsTrue(generated.find("ps2rKickGifDmaChainFromMMIO(runtime, rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_2e7cb4_2, 0x105u);") != std::string::npos,
                  "loadImage-like GIF DMA stores should coalesce into the native kick helper");
         t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 3), 0), GPR_U32(ctx, 4));") == std::string::npos,
                  "coalesced delay-slot CHCR store should not remain as an individual WRITE32");
@@ -1060,6 +1060,31 @@ void register_code_generator_tests()
             t.IsTrue(mtc0Code.find("Unhandled COP0") == std::string::npos, "MTC0 should not hit unhandled COP0 path");
         });
 
+        tc.Run("COP0 Count and Perf go through the recomp ABI, not PS2Runtime members", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            const auto cop0 = [](uint32_t rs, uint32_t rt, uint32_t rd)
+            {
+                Instruction inst{};
+                inst.opcode = OPCODE_COP0;
+                inst.rs = rs;
+                inst.rt = rt;
+                inst.rd = rd;
+                inst.raw = (OPCODE_COP0 << 26) | (rs << 21) | (rt << 16) | (rd << 11);
+                return inst;
+            };
+
+            const std::string readCount = gen.translateInstruction(cop0(COP0_MF, 4, COP0_REG_COUNT));
+            t.IsTrue(readCount.find("ps2rReadCop0Count(runtime)") != std::string::npos, "MFC0 Count reads through ps2rReadCop0Count: " + readCount);
+            const std::string writeCount = gen.translateInstruction(cop0(COP0_MT, 4, COP0_REG_COUNT));
+            t.IsTrue(writeCount.find("ps2rWriteCop0Count(runtime, ") != std::string::npos, "MTC0 Count writes through ps2rWriteCop0Count: " + writeCount);
+            const std::string readPerf = gen.translateInstruction(cop0(COP0_MF, 4, COP0_REG_PERF));
+            t.IsTrue(readPerf.find("ps2rReadCop0Perf(runtime, ") != std::string::npos, "MFC0 Perf reads through ps2rReadCop0Perf: " + readPerf);
+            const std::string writePerf = gen.translateInstruction(cop0(COP0_MT, 4, COP0_REG_PERF));
+            t.IsTrue(writePerf.find("ps2rWriteCop0Perf(runtime, ") != std::string::npos, "MTC0 Perf writes through ps2rWriteCop0Perf: " + writePerf);
+            for (const std::string *code : {&readCount, &writeCount, &readPerf, &writePerf})
+                t.IsTrue(code->find("runtime->") == std::string::npos, "generated COP0 code must not call PS2Runtime members: " + *code);
+        });
+
         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
@@ -1548,7 +1573,7 @@ void register_code_generator_tests()
                      "VCALLMSR should take the address from CMSAR0");
             t.IsTrue(callCode.find("ctx->vi[") == std::string::npos,
                      "VCALLMSR must not index the integer registers with 27");
-            t.IsTrue(callCode.find("vu0StartMicroProgram") != std::string::npos,
+            t.IsTrue(callCode.find("ps2rVu0StartMicroProgram(runtime") != std::string::npos,
                      "VCALLMSR should start the microprogram");
         });
 
@@ -1675,7 +1700,7 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[14]") != std::string::npos, "S2 VLQI base VI should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[6]") != std::string::npos, "S2 VLQI destination VF should come from rt");
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
-            t.IsTrue(out.find("getVU0Data()") != std::string::npos, "S2 VLQI should address VU0 data memory");
+            t.IsTrue(out.find("ps2rVu0Data(runtime)") != std::string::npos, "S2 VLQI should address VU0 data memory");
             t.IsTrue(out.find("READ128") == std::string::npos, "S2 VLQI must not read EE memory");
         });
 
@@ -1696,7 +1721,7 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[10] = static_cast<uint16_t>(ctx->vi[10] + 1u)") != std::string::npos,
                      "S2 VSQI should post-increment the VI base from rt");
             t.IsTrue(out.find("ctx->vi[11]") == std::string::npos, "S2 VSQI must not use rd as VI base");
-            t.IsTrue(out.find("getVU0Data()") != std::string::npos, "S2 VSQI should address VU0 data memory");
+            t.IsTrue(out.find("ps2rVu0Data(runtime)") != std::string::npos, "S2 VSQI should address VU0 data memory");
         });
 
         tc.Run("VU0 S2 VDIV uses the PS2 divide (zero divisor gives +-max)", [](TestCase &t) {
@@ -1726,7 +1751,7 @@ void register_code_generator_tests()
             t.IsTrue(push.find("ctx->vi[15] = static_cast<uint16_t>(ctx->vi[15] + 1u)") != std::string::npos,
                      "VSQI must post-increment It (rt = vi15)");
             t.IsTrue(push.find("ctx->vi[1]") == std::string::npos, "VSQI must not address memory through vi1");
-            t.IsTrue(push.find("getVU0Data()") != std::string::npos, "VSQI must write VU0 data memory");
+            t.IsTrue(push.find("ps2rVu0Data(runtime)") != std::string::npos, "VSQI must write VU0 data memory");
             t.IsTrue(push.find("WRITE128") == std::string::npos && push.find("READ128") == std::string::npos,
                      "VSQI must not touch EE RAM");
 
@@ -1737,7 +1762,7 @@ void register_code_generator_tests()
                      "VLQD must pre-decrement Is (rd = vi15)");
             t.IsTrue(pop.find("ctx->vu0_vf[4] = _mm_blendv_ps(ctx->vu0_vf[4]") != std::string::npos,
                      "VLQD must load into Ft (rt = vf4)");
-            t.IsTrue(pop.find("getVU0Data()") != std::string::npos, "VLQD must read VU0 data memory");
+            t.IsTrue(pop.find("ps2rVu0Data(runtime)") != std::string::npos, "VLQD must read VU0 data memory");
             t.IsTrue(pop.find("READ128") == std::string::npos, "VLQD must not read EE RAM");
             t.IsTrue(pop.find("& 0xFFu) << 4") != std::string::npos, "VU0 data memory addresses wrap at 4 KB");
             t.IsTrue(pop.find("ctx->vi[15] - 1u); __m128 res") != std::string::npos, "VLQD must decrement before loading");
@@ -1783,7 +1808,7 @@ void register_code_generator_tests()
 
             inst.vectorInfo.vectorField = 0x5;
             const std::string iswr = gen.translateVU_VISWR(inst);
-            t.IsTrue(iswr.find("getVU0Data() + ((static_cast<uint32_t>(ctx->vi[7]) & 0xFFu) << 4)") != std::string::npos,
+            t.IsTrue(iswr.find("ps2rVu0Data(runtime) + ((static_cast<uint32_t>(ctx->vi[7]) & 0xFFu) << 4)") != std::string::npos,
                      "VISWR must address qword vi[is] of VU0 data memory");
             t.IsTrue(iswr.find("const uint32_t value = ctx->vi[9]") != std::string::npos, "VISWR must store vi[it]");
             t.IsTrue(iswr.find("vu0Mem + 4u") != std::string::npos && iswr.find("vu0Mem + 12u") != std::string::npos,
@@ -1910,9 +1935,9 @@ void register_code_generator_tests()
             // runtime->dispatchGuestBranch(..., DirectCall, "JAL")
 
             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xA008u);") != std::string::npos, "JAL should set RA");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB000u") != std::string::npos,
+            t.IsTrue(generated.find("ps2rDispatchGuestBranch(runtime, rdram, ctx, 0xB000u") != std::string::npos,
                      "JAL should dispatch through the runtime branch helper");
-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::DirectCall") != std::string::npos,
+            t.IsTrue(generated.find("Ps2GuestBranchKind::DirectCall") != std::string::npos,
                      "JAL should identify itself as a direct call");
             t.IsTrue(generated.find("0xA000u, 0xA008u") != std::string::npos,
                      "JAL should pass call-site and fallthrough PCs to the runtime helper");
@@ -1968,7 +1993,7 @@ void register_code_generator_tests()
 
             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xA108u);") != std::string::npos,
                      "truncated trailing JAL should still set RA");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB000u") != std::string::npos,
+            t.IsTrue(generated.find("ps2rDispatchGuestBranch(runtime, rdram, ctx, 0xB000u") != std::string::npos,
                      "truncated trailing JAL should still emit the call dispatch");
             t.IsTrue(generated.find("0xA100u, 0xA108u") != std::string::npos,
                      "truncated trailing JAL should still pass the fallthrough to runtime dispatch");
@@ -2043,8 +2068,8 @@ void register_code_generator_tests()
 
             t.IsTrue(generated.find("const uint32_t jumpTarget = GPR_U32(ctx, 4);") != std::string::npos, "JALR should read target from RS");
             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xD008u);") != std::string::npos, "JALR should set link register");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, jumpTarget") != std::string::npos, "JALR should dispatch through runtime branch helper");
-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::IndirectCall") != std::string::npos,
+            t.IsTrue(generated.find("ps2rDispatchGuestBranch(runtime, rdram, ctx, jumpTarget") != std::string::npos, "JALR should dispatch through runtime branch helper");
+            t.IsTrue(generated.find("Ps2GuestBranchKind::IndirectCall") != std::string::npos,
                      "JALR should identify itself as an indirect call");
             t.IsTrue(generated.find("0xD000u, 0xD008u") != std::string::npos,
                      "JALR should pass call-site and fallthrough PCs to the runtime helper");
@@ -2090,7 +2115,7 @@ void register_code_generator_tests()
                      "mid-function backward loop head should be re-enterable after returning to the dispatcher");
             t.IsTrue(generated.find("ctx->pc = 0x1104u;") != std::string::npos,
                      "backward internal branch should preserve the loop target in ctx->pc");
-            t.IsTrue(generated.find("if (runtime->eeCheckpointDue()) {") != std::string::npos,
+            t.IsTrue(generated.find("if (ps2rCheckpointDue(runtime)) {") != std::string::npos,
                      "backward internal branch should consult the EE event checkpoint before re-entering the loop");
             t.IsTrue(generated.find("return;") != std::string::npos,
                      "backward internal branch should return to the dispatcher when the runtime preemption policy requests it");
@@ -2210,7 +2235,7 @@ void register_code_generator_tests()
                      "internal JAL return address should still be emitted as a label");
             t.IsTrue(generated.find("        return;") != std::string::npos,
                      "JR $31 should return to the dispatcher/runtime after setting ctx->pc");
-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos,
+            t.IsTrue(generated.find("Ps2GuestBranchKind::Return") != std::string::npos,
                      "JR $31 should use the Return branch kind for precise diagnostics");
             t.IsTrue(generated.find("\"JR $ra\"") != std::string::npos,
                      "JR $31 should pass a return-specific debug name");
@@ -2242,7 +2267,7 @@ void register_code_generator_tests()
                      "truncated trailing JR should still include the internal return label");
             t.IsTrue(generated.find("// JR $31 - Handled by branch logic") == std::string::npos,
                      "truncated trailing JR must not degrade to comment-only output");
-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos,
+            t.IsTrue(generated.find("Ps2GuestBranchKind::Return") != std::string::npos,
                      "truncated JR $31 should still use return diagnostics");
         });
 
@@ -2279,7 +2304,7 @@ void register_code_generator_tests()
                      "owner resume switch should include internal fallback labels");
             t.IsTrue(generated.find("ctx->pc = jumpTarget;") != std::string::npos,
                      "unresolved JR should hand the dynamic target back through ctx->pc");
-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::IndirectJump") != std::string::npos,
+            t.IsTrue(generated.find("Ps2GuestBranchKind::IndirectJump") != std::string::npos,
                      "unresolved non-RA JR should use indirect-jump diagnostics");
         });
 
@@ -2394,9 +2419,9 @@ void register_code_generator_tests()
 
             t.IsFalse(generated.find("switch (jumpTarget)") != std::string::npos,
                       "unresolved JALR should not emit a broad local switch over every internal label");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, jumpTarget") != std::string::npos,
+            t.IsTrue(generated.find("ps2rDispatchGuestBranch(runtime, rdram, ctx, jumpTarget") != std::string::npos,
                      "unresolved JALR should dispatch through the runtime branch helper");
-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::IndirectCall") != std::string::npos,
+            t.IsTrue(generated.find("Ps2GuestBranchKind::IndirectCall") != std::string::npos,
                      "JALR should retain indirect-call dispatch kind");
             t.IsTrue(generated.find("0x1514u, 0x151Cu") != std::string::npos,
                      "JALR should pass call-site and fallthrough PCs to runtime dispatch");

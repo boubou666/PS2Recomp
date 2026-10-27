@@ -45,7 +45,7 @@ namespace ps2recomp
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_badvaddr);", rt);
             case COP0_REG_COUNT:
                 // Count runs with the EE clock; ctx->cop0_count keeps the last value read, for the debugger.
-                return fmt::format("ctx->cop0_count = runtime->readCop0Count(); SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_count);", rt);
+                return fmt::format("ctx->cop0_count = ps2rReadCop0Count(runtime); SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_count);", rt);
             case COP0_REG_ENTRYHI:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_entryhi);", rt);
             case COP0_REG_COMPARE:
@@ -65,7 +65,7 @@ namespace ps2recomp
             case COP0_REG_DEBUG:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_debug);", rt);
             case COP0_REG_PERF:
-                return fmt::format("ctx->cop0_perf = runtime->readCop0Perf({}u); SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_perf);", inst.raw & 0x3Fu, rt);
+                return fmt::format("ctx->cop0_perf = ps2rReadCop0Perf(runtime, {}u); SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_perf);", inst.raw & 0x3Fu, rt);
             case COP0_REG_TAGLO:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_taglo);", rt);
             case COP0_REG_TAGHI:
@@ -95,7 +95,7 @@ namespace ps2recomp
             case COP0_REG_BADVADDR:
                 return "// MTC0 to BADVADDR register ignored (read-only)";
             case COP0_REG_COUNT:
-                return fmt::format("ctx->cop0_count = GPR_U32(ctx, {}); runtime->writeCop0Count(ctx->cop0_count);", rt);
+                return fmt::format("ctx->cop0_count = GPR_U32(ctx, {}); ps2rWriteCop0Count(runtime, ctx->cop0_count);", rt);
             case COP0_REG_ENTRYHI:
                 return fmt::format("ctx->cop0_entryhi = GPR_U32(ctx, {}) & 0xC00000FF;", rt);
             case COP0_REG_COMPARE:
@@ -115,7 +115,7 @@ namespace ps2recomp
             case COP0_REG_DEBUG:
                 return fmt::format("ctx->cop0_debug = GPR_U32(ctx, {});", rt);
             case COP0_REG_PERF:
-                return fmt::format("ctx->cop0_perf = GPR_U32(ctx, {}); runtime->writeCop0Perf({}u, ctx->cop0_perf);", rt, inst.raw & 0x3Fu);
+                return fmt::format("ctx->cop0_perf = GPR_U32(ctx, {}); ps2rWriteCop0Perf(runtime, {}u, ctx->cop0_perf);", rt, inst.raw & 0x3Fu);
             case COP0_REG_TAGLO:
                 return fmt::format("ctx->cop0_taglo = GPR_U32(ctx, {});", rt);
             case COP0_REG_TAGHI:
@@ -133,13 +133,13 @@ namespace ps2recomp
             switch (function)
             {
             case COP0_CO_TLBR:
-                return fmt::format("runtime->handleTLBR(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBR(runtime, rdram, ctx);");
             case COP0_CO_TLBWI:
-                return fmt::format("runtime->handleTLBWI(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBWI(runtime, rdram, ctx);");
             case COP0_CO_TLBWR:
-                return fmt::format("runtime->handleTLBWR(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBWR(runtime, rdram, ctx);");
             case COP0_CO_TLBP:
-                return fmt::format("runtime->handleTLBP(rdram, ctx);");
+                return fmt::format("ps2rHandleTLBP(runtime, rdram, ctx);");
             case COP0_CO_ERET:
                 return fmt::format(
                     "if (ctx->cop0_status & 0x4) {{ \n" // Check ERL bit (bit 2)
@@ -149,7 +149,7 @@ namespace ps2recomp
                     "    ctx->pc = ctx->cop0_epc; \n"  // Note: If neither ERL/EXL set, behavior is undefined; using EPC is common.
                     "    ctx->cop0_status &= ~0x2; \n" // Clear EXL bit
                     "}} \n"
-                    "runtime->clearLLBit(ctx); \n" // Essential: Clear Load-Linked bit
+                    "ps2rClearLLBit(runtime, ctx); \n" // Essential: Clear Load-Linked bit
                     "return;"                      // Stop execution in this recompiled block
                 );
             case COP0_CO_EI:

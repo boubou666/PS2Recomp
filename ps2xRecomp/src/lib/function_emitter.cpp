@@ -231,11 +231,11 @@ namespace ps2recomp
         // thousands; the rest dispatch by address) rather than including the header that declares all of them.
         std::stringstream file;
         file << "#include <stdexcept>\n";
+        // Only the recomp ABI (ps2_recomp_abi.h, through the macros and the call declarations), not ps2_runtime.h:
+        // a runtime header change then recompiles the runtime but none of the generated code.
         file << "#include \"ps2_runtime_macros.h\"\n";
-        file << "#include \"ps2_runtime.h\"\n";
         file << "#include <" << cg.stubsHeaderName() << ">\n\n";
-        file << "#include \"ps2_syscalls.h\"\n";
-        file << "#include \"ps2_stubs.h\"\n\n";
+        file << "#include \"ps2_recomp_calls.h\"\n\n";
         file << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         file << "#include \"ps2_log.h\"\n";
         file << "#endif\n\n";
