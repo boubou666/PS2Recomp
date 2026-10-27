@@ -205,6 +205,9 @@ public:
     // stepPair() does and leaves the rest to the per-pair functions. Results, flags and cycle counts are the
     // interpreter's: the clock goes through the same cycles, and pairs still record when their results land.
     static constexpr uint32_t kMaxBlockPairs = 64u;
+    static constexpr uint32_t kAccForwardLatency = 1u;
+    // The longest a VF, VI or ACC write takes to land (LQ, ILW, FMAC); Q and P results are queued apart.
+    static constexpr uint32_t kMaxRegisterLatency = 4u;
     static constexpr uint8_t kKnownNormalFs = 0x1u;
     static constexpr uint8_t kKnownNormalFt = 0x2u;
     static constexpr uint8_t kKnownNormalAcc = 0x4u;
@@ -318,7 +321,6 @@ private:
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
-    static constexpr uint32_t kAccForwardLatency = 1u;
     static constexpr uint32_t kMaxFlagEntries = 8u;
     static constexpr uint32_t kMaxDecodedPairs = 0x4000u / 8u;
 

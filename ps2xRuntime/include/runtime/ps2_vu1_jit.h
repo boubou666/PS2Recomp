@@ -258,6 +258,36 @@ struct Vu1Jit
                 writes.writebackMax = std::max(writes.writebackMax, ready);
             }
         }
+        // As the block leaves, the clock is at its last pair's issue cycle + 1. A ready time at or before it is
+        // behind the clock for every later read, as is any one it replaces once the block outlasts the longest
+        // write latency (a write from before the block lands by base + kMaxRegisterLatency - 1): neither is stored.
+        const int32_t settled = kPlan.issue[kPlan.pairCount - 1u] + 1;
+        if (settled + 1 >= static_cast<int32_t>(Vu::kMaxRegisterLatency))
+        {
+            const auto drop = [settled](int32_t &ready)
+            {
+                if (ready <= settled)
+                    ready = -1;
+            };
+            for (uint32_t reg = 0; reg < 32u; ++reg)
+            {
+                writes.vfMax[reg] = -1;
+                for (int32_t &ready : writes.vfLane[reg])
+                {
+                    drop(ready);
+                    writes.vfMax[reg] = std::max(writes.vfMax[reg], ready);
+                }
+            }
+            for (int32_t &ready : writes.vi)
+                drop(ready);
+            writes.accMax = -1;
+            for (int32_t &ready : writes.accLane)
+            {
+                drop(ready);
+                writes.accMax = std::max(writes.accMax, ready);
+            }
+            drop(writes.writebackMax);
+        }
         return writes;
     }
     template <std::array<int32_t, 4> kLanes>
