@@ -307,6 +307,11 @@ public:
     };
     // Called on the executor thread after each idle wait (nullptr: off, nothing is collected).
     void setIdleObserver(std::function<void(const IdleRecord &)> observer) { m_idleObserver = std::move(observer); }
+    // Called on the executor thread with its id when a thread ends (returns from its entry or calls ExitThread), once
+    // it is dormant, so an HLE that owns a thread can start it again (libcdvd's callback thread). Nothing runs then
+    // (current thread 0): startThread on the ended id just makes it ready, and the dispatcher picks it up next. After
+    // ExitDeleteThread the record is already gone, so thread(id) is null there.
+    void addThreadEndObserver(std::function<void(int)> observer) { m_threadEndObservers.push_back(std::move(observer)); }
     // EE cycles skipped by wall-clock catch-up (see WallClockCatchUp).
     [[nodiscard]] uint64_t catchUpCycles() const noexcept { return m_catchUpCycles.load(std::memory_order_relaxed); }
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
@@ -542,6 +547,8 @@ private:
     std::deque<std::function<void()>> m_tasks; // guarded by m_eventMutex
     std::atomic<uint64_t> m_idleWaitNs{0};
     std::function<void(const IdleRecord &)> m_idleObserver;
+    std::vector<std::function<void(int)>> m_threadEndObservers;
+    void notifyThreadEnd(int id);
     [[nodiscard]] std::string describeBlockedThreads() const;
     void reportIdle(std::chrono::steady_clock::time_point start, std::string wokenBy, std::string blocked);
     std::atomic<uint64_t> m_catchUpCycles{0};

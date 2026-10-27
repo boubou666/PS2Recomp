@@ -255,8 +255,9 @@ namespace ps2_stubs
         // sceCdInitEeCB(priority, stack, stackSize) gives libcdvd a callback thread: the sceCdCallback function then
         // runs on that thread, not in the drive interrupt, so it may block. Jade Cocoon 2's callback takes the mutex
         // its loader thread holds while it issues sceCdRead; as an interrupt on top of that thread it deadlocked.
-        // Completions are run one at a time: the next one starts once the callback has returned (the thread is
-        // dormant again), checked on each completion and on sceCdSync.
+        // Completions are run one at a time: the next one starts when the callback thread ends (a thread-end
+        // observer), so a completion that arrives while the callback runs, such as the next read of a stream issued
+        // from the callback itself, runs right after it, as libcdvd's thread loop would.
         // The thread belongs to the runtime that created it (tests create several).
         int g_cdCallbackThreadId = 0;
         const PS2Runtime *g_cdCallbackThreadRuntime = nullptr;
@@ -584,6 +585,13 @@ namespace ps2_stubs
         g_cdCallbackThreadId = id;
         g_cdCallbackThreadRuntime = runtime;
         g_cdPendingCallbacks.clear();
+        runtime->eeScheduler().addThreadEndObserver([runtime](int ended)
+        {
+            if (ended != 0 && ended == cdCallbackThread(runtime))
+            {
+                runPendingCdCallbacks(runtime);
+            }
+        });
         setReturnS32(ctx, id);
     }
 
