@@ -5,8 +5,13 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_inline.h"
+#include "runtime/ps2_vu1_jit.h"
+#include "runtime/ps2_vu1_lifted.h"
 #include "runtime/ps2_vu_clip.h"
 
+#include <algorithm>
+#include <bit>
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -76,7 +81,7 @@ namespace
                static_cast<uint32_t>(funct & 0x3Fu);
     }
 
-    uint32_t makeVuUpper(uint8_t op, uint8_t dest, uint8_t ft, uint8_t fs, uint8_t fd)
+    constexpr uint32_t makeVuUpper(uint8_t op, uint8_t dest, uint8_t ft, uint8_t fs, uint8_t fd)
     {
         return (static_cast<uint32_t>(dest & 0xFu) << 21) |
                (static_cast<uint32_t>(ft & 0x1Fu) << 16) |
@@ -85,7 +90,7 @@ namespace
                static_cast<uint32_t>(op & 0x3Fu);
     }
 
-    uint32_t makeVuUpperSpecial(uint8_t specialOp, uint8_t dest, uint8_t ft, uint8_t fs)
+    constexpr uint32_t makeVuUpperSpecial(uint8_t specialOp, uint8_t dest, uint8_t ft, uint8_t fs)
     {
         return (static_cast<uint32_t>(dest & 0xFu) << 21) |
                (static_cast<uint32_t>(ft & 0x1Fu) << 16) |
@@ -220,6 +225,77 @@ namespace
     {
         std::memcpy(values, data + qwordIndex * 16u, sizeof(float) * 4u);
     }
+
+#if PS2X_VU1_JIT
+    // Zeros, denormals, exponent 1, 254 and 255, products and sums that leave the normal range or cancel.
+    constexpr uint32_t kFmacOperandBits[] = {0x00000000u, 0x00000001u, 0x007FFFFFu, 0x00800000u, 0x00800001u,
+                                             0x01000000u, 0x1F800000u, 0x20000000u, 0x3F800000u, 0x3F800001u,
+                                             0x3FFFFFFFu, 0x40000000u, 0x5F800000u, 0x60000000u, 0x7F000000u,
+                                             0x7F7FFFFFu, 0x7F800000u, 0x7FC00000u, 0x7FFFFFFFu, 0x3F000000u};
+
+    // Vu1Jit::fmacSticky against the exact flags of the same instruction (fmacLive on a dead write): same result,
+    // same sticky status bits once they land.
+    template <uint32_t kUpper>
+    void checkStickyFmac(TestCase &t, const char *name)
+    {
+        static_assert(ps2_vu1_detail::decodeFmacOperation(kUpper).kind != ps2_vu1_detail::FmacKind::None);
+        uint64_t seed = 0x9E3779B97F4A7C15ull ^ kUpper;
+        const auto next = [&]()
+        {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            return seed;
+        };
+        const auto pick = [&]() -> uint32_t
+        {
+            const uint64_t random = next();
+            if (random % 4u == 0u)
+                return static_cast<uint32_t>(random >> 32);
+            const uint32_t bits = kFmacOperandBits[(random >> 8) % std::size(kFmacOperandBits)] +
+                                  static_cast<uint32_t>((random >> 16) % 3u);
+            return ((random >> 40) & 1u) != 0u ? bits ^ 0x80000000u : bits;
+        };
+        const auto vector = [&]()
+        {
+            return _mm_castsi128_ps(_mm_setr_epi32(static_cast<int>(pick()), static_cast<int>(pick()),
+                                                   static_cast<int>(pick()), static_cast<int>(pick())));
+        };
+        const int previousRounding = std::fegetround();
+        std::fesetround(FE_TOWARDZERO);
+        VU1Interpreter vu;
+        int mismatches = 0;
+        for (int iteration = 0; iteration < 20000; ++iteration)
+        {
+            const __m128 vs = vector(), vt = vector(), acc = vector(), before = vector();
+            vu.state().q = std::bit_cast<float>(pick());
+            vu.state().i = std::bit_cast<float>(pick());
+            const auto run = [&](bool sticky, __m128 &result)
+            {
+                vu.state().status = 0u;
+                result = before;
+                if (sticky)
+                {
+                    __m128i sign = _mm_setzero_si128(), zero = _mm_setzero_si128();
+                    Vu1Jit::fmacSticky<kUpper, 0u>(vu, result, vs, vt, acc, sign, zero);
+                    Vu1Jit::foldSticky(vu, sign, zero);
+                }
+                else
+                    Vu1Jit::fmacLive<kUpper, 0u, true>(vu, result, vs, vt, acc);
+                Vu1Lifted::landQueued(vu);
+                return vu.state().status;
+            };
+            __m128 expected, actual;
+            const uint32_t expectedStatus = run(false, expected);
+            const uint32_t actualStatus = run(true, actual);
+            if (expectedStatus != actualStatus ||
+                _mm_movemask_epi8(_mm_cmpeq_epi32(_mm_castps_si128(expected), _mm_castps_si128(actual))) != 0xFFFF)
+                ++mismatches;
+        }
+        std::fesetround(previousRounding);
+        t.Equals(mismatches, 0, name);
+    }
+#endif
 }
 
 void register_ps2_vu1_tests()
@@ -1424,6 +1500,46 @@ void register_ps2_vu1_tests()
                      "XGKICK resource stalls should consume VU cycles");
         });
 
+        tc.Run("a time slice leaves PATH1 having read VU memory up to the cycle it stopped at", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t sizeBytes)
+                                     { captured.emplace_back(packet, packet + sizeBytes); });
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            uint8_t *code = mem.getVU1Code();
+            uint8_t *data = mem.getVU1Data();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            std::memset(data, 0, PS2_VU1_DATA_SIZE);
+
+            const uint64_t imageTag = makeGifTag(2u, GIF_FMT_IMAGE, 0u, true);
+            std::memcpy(data, &imageTag, sizeof(imageTag));
+            std::memset(data + 16u, 0x11, 16u);
+            std::memset(data + 32u, 0x22, 16u);
+            writeVuInstructionPair(code, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop); // XGKICK vi1
+            for (uint32_t pc = 8u; pc < 48u; pc += 8u)
+                writeVuInstructionPair(code, pc, 0u, pc == 32u ? 0x400002FFu : kVuUpperNop); // E bit at 32
+
+            VU1Interpreter vu1;
+            vu1.execute(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &mem, 0u, 0u, 0u, 3u);
+            // By cycle 3 PATH1 has read the tag and the first data qword, not the second.
+            std::memset(data + 16u, 0x33, 16u);
+            std::memset(data + 32u, 0x44, 16u);
+            vu1.resume(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &mem, 0u, 0u, 64u);
+
+            t.Equals(captured.size(), static_cast<size_t>(1u), "the transfer completes");
+            if (!captured.empty())
+            {
+                t.IsTrue(captured[0].size() >= 48u && captured[0][16u] == 0x11u,
+                         "the qword read before the slice ended keeps its value");
+                t.IsTrue(captured[0].size() >= 48u && captured[0][32u] == 0x44u,
+                         "the qword read after the resume sees the new data");
+            }
+        });
+
         tc.Run("synthetic Code Veronica text packet preserves black-frame PATH1 data", [](TestCase &t)
         {
             PS2Memory mem;
@@ -1886,6 +2002,132 @@ void register_ps2_vu1_tests()
             other.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
             t.Equals(liftedRuns, 1, "not for code it was not written for");
             t.Equals(other.state().vi[1], 9, "the interpreter runs that code");
+        });
+
+#if PS2X_VU1_JIT
+        tc.Run("a recompiled FMAC that keeps only its sticky bits matches the exact flags", [](TestCase &t)
+        {
+            checkStickyFmac<makeVuUpper(0x28, 0xF, 2, 1, 3)>(t, "ADD");
+            checkStickyFmac<makeVuUpper(0x2C, 0x9, 2, 1, 3)>(t, "SUB.xw");
+            checkStickyFmac<makeVuUpper(0x2A, 0xF, 2, 1, 3)>(t, "MUL");
+            checkStickyFmac<makeVuUpper(0x2A, 0x2, 2, 1, 3)>(t, "MUL.z");
+            checkStickyFmac<makeVuUpper(0x29, 0xF, 2, 1, 3)>(t, "MADD");
+            checkStickyFmac<makeVuUpper(0x2D, 0xF, 2, 1, 3)>(t, "MSUB");
+            checkStickyFmac<makeVuUpper(0x01, 0xF, 2, 1, 3)>(t, "ADDy");
+            checkStickyFmac<makeVuUpper(0x1B, 0xF, 2, 1, 3)>(t, "MULw");
+            checkStickyFmac<makeVuUpper(0x08, 0xE, 2, 1, 3)>(t, "MADDx.xyz");
+            checkStickyFmac<makeVuUpper(0x0E, 0xF, 2, 1, 3)>(t, "MSUBz");
+            checkStickyFmac<makeVuUpper(0x1C, 0xF, 2, 1, 3)>(t, "MULq");
+            checkStickyFmac<makeVuUpper(0x22, 0xF, 2, 1, 3)>(t, "ADDi");
+            checkStickyFmac<makeVuUpper(0x21, 0xF, 2, 1, 3)>(t, "MADDq");
+            checkStickyFmac<makeVuUpper(0x27, 0xF, 2, 1, 3)>(t, "MSUBi");
+            checkStickyFmac<makeVuUpper(0x2E, 0xE, 2, 1, 3)>(t, "OPMSUB.xyz");
+            checkStickyFmac<makeVuUpper(0x2E, 0xF, 2, 1, 3)>(t, "OPMSUB.xyzw");
+            checkStickyFmac<makeVuUpperSpecial(0x2E, 0xE, 2, 1)>(t, "OPMULA.xyz");
+            checkStickyFmac<makeVuUpperSpecial(0x29, 0xF, 2, 1)>(t, "MADDA");
+            checkStickyFmac<makeVuUpperSpecial(0x19, 0xF, 2, 1)>(t, "MULAy");
+            checkStickyFmac<makeVuUpperSpecial(0x0D, 0xF, 2, 1)>(t, "MSUBAy");
+        });
+
+        tc.Run("FSSET replaces the sticky bits of dead flag writes issued before it", [](TestCase &t)
+        {
+            VU1Interpreter vu;
+            __m128 target = _mm_setzero_ps();
+            __m128i sign = _mm_setzero_si128(), zero = _mm_setzero_si128();
+            Vu1Jit::fmacSticky<makeVuUpper(0x2A, 0xF, 2, 1, 3), 0u>(vu, target, _mm_set1_ps(-2.0f), _mm_set1_ps(3.0f),
+                                                                    _mm_setzero_ps(), sign, zero);
+            Vu1Jit::foldSticky(vu, sign, zero);
+            Vu1Jit::fsset<(0x15u << 25)>(vu); // FSSET 0
+            Vu1Lifted::landQueued(vu);
+            t.Equals(vu.state().status, 0u, "the sign sticky bit of the earlier MUL is gone");
+
+            Vu1Jit::fsset<(0x15u << 25)>(vu);
+            Vu1Jit::fmacSticky<makeVuUpper(0x2A, 0xF, 2, 1, 3), 0u>(vu, target, _mm_set1_ps(-2.0f), _mm_set1_ps(3.0f),
+                                                                    _mm_setzero_ps(), sign, zero);
+            Vu1Jit::foldSticky(vu, sign, zero);
+            Vu1Lifted::landQueued(vu);
+            t.Equals(vu.state().status, 0x80u, "a MUL after it adds its sign sticky bit");
+        });
+#endif
+
+        tc.Run("no VF, VI or ACC write takes longer than kMaxRegisterLatency", [](TestCase &t)
+        {
+            using Vu = VU1Interpreter;
+            uint32_t longest = 0u;
+            const auto check = [&](const Vu::InstructionUsage &usage)
+            {
+                if (usage.vfWrite.reg != 0u)
+                    longest = std::max<uint32_t>(longest, usage.vfLatency != 0u ? usage.vfLatency : usage.latency);
+                if ((usage.viWrite & 0xFFFEu) != 0u)
+                    longest = std::max<uint32_t>(longest, usage.viLatency != 0u ? usage.viLatency : usage.latency);
+                if (usage.accWrite != 0u)
+                    longest = std::max<uint32_t>(longest, Vu::kAccForwardLatency);
+            };
+            for (uint32_t op = 0; op < 0x80u; ++op)
+                for (uint32_t low = 0; low < 0x800u; ++low)
+                {
+                    // Registers 1 and 2 in every field, every DEST.
+                    const uint32_t lower = (op << 25) | (0xFu << 21) | (1u << 16) | (2u << 11) | low;
+                    check(Vu::decodeLowerUsage(Vu::Unit::VU1, lower));
+                    check(Vu::decodeLowerUsage(Vu::Unit::VU0, lower));
+                }
+            for (uint32_t low = 0; low < 0x800u; ++low)
+                check(Vu::decodeUpperUsage((0xFu << 21) | (1u << 16) | (2u << 11) | low));
+            t.Equals(longest, Vu::kMaxRegisterLatency, "the longest register write latency");
+        });
+
+        tc.Run("compiled entries follow the code memory back to an image seen before", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            const auto writeProgram = [&](int16_t value)
+            {
+                writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(2u, 0u, value), kVuUpperNop); // IADDIU vi2, vi0, value
+                writeVuInstructionPair(fx.code, 8u, 0x8000033cu, 0x400002ffu);                // NOP, end
+                writeVuInstructionPair(fx.code, 16u, 0x8000033cu, kVuUpperNop);
+            };
+            static int compiledRuns = 0, liftedRuns = 0;
+            static VU1Interpreter::CompiledEntry replaced = nullptr;
+            static constexpr VU1Interpreter::DecodedInstructionPair kPair0 =
+                VU1Interpreter::decodePair(VU1Interpreter::Unit::VU1, (0x08u << 25) | (2u << 16) | 5u, kVuUpperNop);
+            static const VU1Interpreter::CompiledEntry kEntries[3] = {
+                [](VU1Interpreter &vu, const VU1Interpreter::RunContext &context)
+                {
+                    ++compiledRuns;
+                    return vu.stepPairInterpreted(kPair0, context);
+                },
+                nullptr, nullptr};
+            writeProgram(5);
+            const uint64_t hash = VU1Interpreter::codeHash(fx.code, 24u);
+            VU1Interpreter::registerCompiledFragment({0u, 3u, hash, kEntries, VU1Interpreter::Unit::VU1});
+
+            VU1Interpreter vu1;
+            const auto run = [&]()
+            {
+                vu1.invalidateDecodedCode();
+                vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, nullptr, 0u, 0u, 0u, 64u);
+                return vu1.state().vi[2];
+            };
+            t.Equals(run(), 5, "the compiled program's result");
+            t.Equals(compiledRuns, 1, "its compiled entry runs");
+            writeProgram(6);
+            t.Equals(run(), 6, "other code runs in the interpreter");
+            t.Equals(compiledRuns, 1, "without the compiled entry");
+            writeProgram(5);
+            t.Equals(run(), 5, "the first image again");
+            t.Equals(compiledRuns, 2, "takes its compiled entry again");
+
+            VU1Interpreter::registerLiftedEntry(
+                {0u, 3u, hash, 0u,
+                 [](VU1Interpreter &vu, const VU1Interpreter::RunContext &context)
+                 {
+                     ++liftedRuns;
+                     return replaced(vu, context);
+                 },
+                 &replaced, VU1Interpreter::Unit::VU1});
+            t.Equals(run(), 5, "an entry registered since");
+            t.Equals(liftedRuns, 1, "applies to an image seen before it");
+            t.Equals(compiledRuns, 3, "and gets the compiled entry it replaces");
         });
     });
 }
