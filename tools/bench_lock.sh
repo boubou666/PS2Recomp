@@ -41,7 +41,7 @@ bench_lock_announce()
 bench_lock_is_free()
 {
     local content until now
-    content=$(tr -d '\r' < "$(bench_lock_file)" 2> /dev/null)
+    content=$(tr -d '\r' 2> /dev/null < "$(bench_lock_file)")
     [ -z "$(echo "$content" | tr -d '[:space:]')" ] && return 0
     until=$(echo "$content" | grep -o 'until [0-9]*:[0-9]*' | head -1 | cut -d' ' -f2 | tr -d ':')
     now=$(date +%H%M)
@@ -100,6 +100,8 @@ bench_lock_take()
 bench_lock_release()
 {
     local file minutes
+    # Nothing taken by this shell (a release without a take, e.g. from a cleanup trap): nothing to release.
+    [ -n "${BENCH_LOCK_PORT:-}" ] || return 0
     file=$(bench_lock_file)
     # Only our own lock: a stale one may have been taken over meanwhile.
     if grep -q "^$BENCH_LOCK_PORT until" "$file" 2> /dev/null; then
