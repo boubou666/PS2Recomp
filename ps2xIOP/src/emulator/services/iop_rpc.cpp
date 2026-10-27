@@ -27,7 +27,8 @@ namespace ps2x::iop::detail
         m_queueThreads.clear();
         m_eeClients.clear();
         m_eeCalls.clear();
-        m_nextEeCallToken = 1u;
+        // m_nextEeCallToken keeps counting: an EE server may still answer a call made before the reset (SC3 reboots
+        // the IOP at boot), and that reply must miss rather than match the first new call.
         m_nextDmaId = 1u;
         m_sifInitialized = false;
         m_sregs.fill(0u);
