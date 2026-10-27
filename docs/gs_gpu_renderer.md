@@ -693,6 +693,50 @@ the ones that make `fight` match paraLLEl. Mipmapping costs `free` about 10% on 
 take the per-pixel LOD path, without the decoded-texture fast path for levels above 0); traces without mipmaps are
 unaffected. The perf layer (32-bit plane stepping, no divisions for constant attributes) changes no output.
 
+The table above timed the synchronous replay only, and missed a regression of the asynchronous raster workers
+(`PS2X_GS_ASYNC_RASTER=1`) that TMB measured in game under `PS2X_GS_RENDERER=cpu`: 37% fewer fps, the GSFrontend
+thread's CPU per frame up from 13 to 29 ms while the four GSRaster threads dropped from 59 to 41 ms. The
+mipmapping layer counted all of VRAM as sampled by a mipmapped primitive. Its texture then always overlapped its
+own frame buffer, so `readsOwnWrites` sent every mipmapped primitive down the serial path: drain the workers,
+then draw on the frontend thread. Every later primitive also queued behind a barrier. A follow-up layer
+(`perf(gs): mipmapped primitives sample their levels, not all of VRAM`) gives such a primitive its real footprint:
+level 0's rows as before, plus levels 1 to MXL from MIPTBP1/2 as whole levels, widened when a region clamp or
+repeat reaches past a level's size. The serial path's decoded-texture check also stops failing on these
+primitives, which gives back part of mipmapping's synchronous cost on `free`. No trace hash changes. The final
+VRAM is byte-identical to the previous tip on all six traces, asynchronous and synchronous, and the workers
+match the synchronous replay every 16 commands (`PS2X_GS_REPLAY_CHECK=16`).
+
+Bisected on `free`, the one trace with mipmaps (asynchronous replay, 4 workers, one pass, two runs each under
+`benchlock -m bench`): phase 0 2395 / 2401 ms, fixed-point raster 2309 / 2270 ms, mipmapping 3407 / 3435 ms, the
+tip 3303 / 3268 ms, the tip with the fix 2235 / 2241 ms. Before the fix, `PS2X_GS_LOG_SERIAL=1` hits its cap of
+200 serial primitives on `free`; with it, it logs none. Replay before and after the fix (best of two asynchronous
+passes, best of three synchronous ones):
+
+| Trace | async, tip | async, fix | sync, tip | sync, fix |
+| --- | --- | --- | --- | --- |
+| t | 258 ms | 256 ms | 935 ms | 923 ms |
+| fight | 1021 ms | 1013 ms | 3875 ms | 3832 ms |
+| attack | 2907 ms | 2835 ms | 9916 ms | 9940 ms |
+| gallery | 984 ms | 976 ms | 3137 ms | 3126 ms |
+| free | 3125 ms | 2214 ms | 6695 ms | 6130 ms |
+| parallel_route | 1910 ms | 1873 ms | 6090 ms | 6003 ms |
+
+In game, SC3's scripted Free Training route (`scripts/regress.sh`, a 60 s fight) under `PS2X_GS_RENDERER=cpu
+PS2X_GS_ASYNC_RASTER=1`, with per-thread CPU over 30 s of the fight. The runners: main at 2e155453 (the game
+repo's pin, 75 commits past the branch base), main with this branch merged, and that merge with the fix. Two
+interleaved rounds:
+
+| Runner | fps (fight) | GSFrontend ms/frame | GSRaster ms/frame (4 threads) |
+| --- | --- | --- | --- |
+| main | 28.05 / 28.29 | 32.8 / 32.7 | 134.2 / 133.8 |
+| main + phase 1 | 21.67 / 21.75 | 45.2 / 45.3 | 128.9 / 128.5 |
+| main + phase 1 + fix | 28.15 / 28.29 | 32.6 / 32.4 | 134.1 / 133.8 |
+
+The fix brings SC3 back to main's frame rate. Synchronous rasterization (no `PS2X_GS_ASYNC_RASTER`) was hit
+less, by 7% (main 9.25 fps, phase 1 8.60, with the fix 9.05; one run each). TMB has no trace in the corpus, so its
+37% was not reproduced here. Its symptom (work moving from the raster threads to the frontend) is what the
+mipmapping layer does to any scene drawn with MXL > 0.
+
 Not done in phase 1: the plan's TMB traces (the corpus has none yet, so only SC3 was re-hashed), a review of
 frames by eye (the paraLLEl comparison stands in for it: `fight` and `t` now match it exactly), textured
 lines, and the candidates above (fog rounding, S/T/Q precision), which need hardware results or a better
