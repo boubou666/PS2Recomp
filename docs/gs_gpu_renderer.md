@@ -1,6 +1,7 @@
 # GPU GS renderer: design and plan
 
-Status: phase 0 (groundwork) done, see 7.1; phase 1 next. Branch `gs/gpu-renderer`.
+Status: phases 0 (groundwork) and 1 (CPU reference fixes) done, see 7.1 and 7.2; phase 2 next. Branch
+`gs/gpu-renderer`.
 
 Goal: a GPU implementation of the PS2 Graphics Synthesizer, written entirely in this repository, that replaces
 paraLLEl-GS (LGPL-3.0+, Arntzen Software) once it matches it on every port we ship, and that matches the CPU
@@ -310,9 +311,9 @@ In order, per covered pixel, mirroring `GSCpuBackend::WritePixel` after the sect
   destination alpha, on 16-bit formats behaves as FB_ONLY).
 - Destination alpha test (DATE, DATM) on CT32 / CT16 / CT16S.
 - Depth test (ZTE, ZTST) against Z32 / Z24 / Z16 / Z16S, Z write unless ZMSK or AFAIL forbids it, with the
-  format's range handling pinned by a test (open question 9.6).
+  Z saturated to the format's range first (section 6.2).
 - Blend (ABE, PABE, ALPHA A/B/C/D, FIX) with the 24-bit destination alpha of 0x80, then dither (DTHE, DIMX 4x4
-  matrix) and COLCLAMP (clamp or wrap to 8 bits).
+  matrix, 16-bit frames only) and COLCLAMP (clamp or wrap to 8 bits), as section 6.2 specifies.
 - FBA, FBMSK, pack to CT32 / CT24 / CT16 / CT16S, write.
 - AA1 is ignored (as the CPU backend does); PRMODE / PRMODECONT are resolved by the decoder before the record.
 
@@ -365,17 +366,51 @@ shows it, and applied only to the bytes concerned (never "within N per channel" 
 
 ### 6.2 Fix the reference first
 
-Reading `gs_cpu_backend.cpp` shows places where it is not yet the GS. Each is fixed in the CPU backend first, as
-its own layer with a unit test, and only then implemented on the GPU, so the two never agree on a known bug:
+Reading `gs_cpu_backend.cpp` showed places where it was not yet the GS. Each was fixed in the CPU backend first, as
+its own layer with a unit test (phase 1, section 7.2), and only then is implemented on the GPU, so the two never
+agree on a known bug. What the CPU backend does now, and the GPU must do byte for byte:
 
-- DTHE / DIMX dithering is not applied.
-- COLCLAMP is not read: blending always clamps, the GS wraps when CLAMP=0.
-- Mipmapping is absent (TEX1 only selects bilinear; MXL, LCM, L, K, MIPTBP1/2 unused).
-- Positions are floats and Z a double; the GS is 12.4 fixed point with integer edge functions. The raster rules
-  get a written spec (fill convention, sprite and line rules, Z and attribute interpolation precision) and the
-  CPU moves to it.
-- Fog uses two `>> 8` products; the GS formula and rounding need checking against hardware results.
-- Z range behaviour for Z24 / Z16 (clamp or truncate) needs a pinning test.
+- Rasterization (the written spec). A vertex's window position is its 12.4 XYZ value minus XYOFFSET, kept in
+  1/16 pixel units (subpixels). Pixel (x, y) is sampled at subpixel (16x, 16y): whole pixel positions, not centres
+  at +0.5.
+  - Triangles: edge functions in 64-bit integers over subpixels, oriented so the inside is positive. A sample on an
+    edge is covered only by a top edge (horizontal, inside below) or a left edge (inside to the right); a
+    zero-area triangle draws nothing. Each row's covered span is solved exactly from the three edges.
+  - Attributes of triangles are planes in fixed point anchored at the last vertex: gradient per subpixel =
+    round-half-up(sum of (a_i - a_2) * edge coefficient * 2^F / twice the area), value at a sample =
+    (a_2 << F) + gx * (X - X2) + gy * (Y - Y2) evaluated modulo 2^64 (only the sum at a covered sample has to fit).
+    Colours, fog and UV: F = 16, value truncated, clamped to the attribute's range. Z: F = 12, value rounded half
+    up, clamped to 0..2^32-1 then to the Z format (below). Flat shading takes the last vertex's colour. S, T and Q
+    are floats, as the GS interpolates them: gradients computed in double and rounded to float once, value =
+    (base + gx * dX) + gy * dY with each operation rounded to float (no fused multiply-add).
+  - Sprites: covered pixels are [ceil(min / 16), ceil(max / 16)) on each axis, whichever vertex comes first, so a
+    zero-width sprite draws nothing. Colour, Z and fog are v1's. UV run from v0's value at v0's position to v1's at
+    v1's along each axis, as 16-fraction-bit fixed point (truncated); S and T the same way as floats; Q is v1's.
+  - Lines: one pixel per whole step of the major axis (x when |dx| >= |dy|) in [ceil(min / 16), ceil(max / 16)),
+    the minor coordinate interpolated in 16 fraction bits and rounded half up; attributes interpolated along the
+    major axis the same way. Lines stay untextured, as before (a known gap, section 7.2).
+  - Points: the position rounded half up, ((X + 8) >> 4, (Y + 8) >> 4), as paraLLEl-GS's notes report from
+    TJnotJT's hardware tests.
+- Fog: C = (F * C + (256 - F) * FOGCOL) >> 8, one lerp truncated. It keeps F = 255, FOGCOL = 128, C = 128 at 128
+  (paraLLEl's reported hardware observation, which the manual's 255 - F form misses) and gives FOGCOL exactly at
+  F = 0. Whether the GS rounds this lerp (paraLLEl adds one half) or truncates it (PCSX2's software and hardware
+  renderers) has no hardware result yet; the truncated form is kept until one exists.
+- Blend, dither, COLCLAMP: ((A - B) * C >> 7) + D unclamped, then the dither, then COLCLAMP.CLAMP = 1 clamps to
+  0..255 and CLAMP = 0 keeps the low 8 bits (also for unblended pixels when dithering moved them). Dithering adds
+  DIMX[y & 3][x & 3] (3-bit two's complement, x and y in frame pixels) to R, G and B, only when DTHE = 1 and FRAME
+  is PSMCT16 or PSMCT16S, as PCSX2 does in both its renderers: the dither exists to hide the 16-bit pack's lost
+  bits. paraLLEl also dithers 32-bit frames, which changes their low bits; SC3's traces never dither a 32-bit
+  frame, so they cannot tell the two apart, and a hardware result should settle it.
+- Z range: Z is saturated to the Z buffer format's maximum (0xFFFFFF for Z24, 0xFFFF for Z16 and Z16S) before the
+  depth test and the write, as PCSX2's software renderer and paraLLEl do; it was compared at 32 bits and stored
+  truncated.
+- Mipmapping and the LOD. LOD = (log2(1 / |Q|) << L) + K in sixteenths of a level, K alone when LCM = 1 or FST = 1,
+  log2 |Q| taken as (exponent - 127) + (top four mantissa bits) / 16. LOD <= 0 filters with MMAG, LOD > 0 with
+  MMIN (nearest for 0, 2, 3; bilinear for 1, 4, 5). With MXL > 0 and MMIN 2..5, level n (n <= MXL, at most 6) reads
+  TBPn / TBWn from MIPTBP1 (1..3) and MIPTBP2 (4..6), is 2^max(TW - n, 0) by 2^max(TH - n, 0), with UV and the CLAMP
+  region shifted right by n; MMIN 2 and 4 take round-half-up(LOD) (clamped to MXL), 3 and 5 blend levels floor(LOD)
+  and floor(LOD) + 1 by the LOD's sixteenths, c0 + ((c1 - c0) * fraction >> 4). MTBA (automatic MIPTBP1 on TEX0
+  writes) is not implemented: no trace uses it.
 
 ### 6.3 Floating point
 
@@ -426,6 +461,22 @@ shadow buffers, Tales of Souls text, a stage transition (copy + clear frames). T
 (TMB menus with both circuits, VP2 overlay screens, Drakengard boot frame copies, TLOTR, FFOP, SCTPT2, JC2).
 `PS2X_PAD_SCRIPT` makes reaching the scene repeatable; the trace itself is deterministic regardless of game
 timing.
+
+Intentional hash changes. A trace's `cpu_vram_hash` is what the CPU reference must produce at the tip of the
+branch; any other value is a regression until explained. A commit that changes CPU output on purpose is a
+`fix(gs)` (or `feat(gs)`) layer whose message names the behaviour it changes; the session that lands it replays
+the whole corpus after that layer alone, and for each scene whose hash moved it writes the new `cpu_vram_hash` and
+appends the old one to the scene's history with the commit subject:
+
+```toml
+[[scene.history]]
+cpu_vram_hash = "<hash before the layer>"
+changed_by = "<commit subject of the layer that changed it>"
+```
+
+A layer that should not change output (refactors, tests, docs) must leave every hash as it is. The section of
+this document for the phase lists the per-layer hash table and the `--compare` results, so a reviewer can check
+that each fix moved only the scenes that use its feature.
 
 ### 6.5 Unit and differential tests
 
@@ -502,6 +553,103 @@ stream renderer (section 2); `--every` defaults to 64 and the bisect is automati
 needed for images to round trip: after a reset ZBUF now decodes as a written zero (PSMZ32) instead of PSM 0,
 which no write can produce; no trace or test changed.
 
+### 7.2 Phase 1 results
+
+The `t` discrepancy of phase 0 (command 31, a 64x32 area of FRAME_1 where paraLLEl wrote 0x80000000 and the CPU
+0x7f131313) is a CPU bug, and paraLLEl is right. Command 31 is one 238 KB packet: a texture upload, then 48
+Gouraud, alpha-blended triangle strips (ALPHA = Cd + (Cs - Cd) * As) drawing a glow outline of thin slivers, about
+4 pixels wide and 90 tall, from colour 0xc3 at one side to 0 at the other. Split into one command per GIF tag, the
+first difference is the first strip's first triangle: at (223, 175) the CPU covers the pixel and paraLLEl does
+not, at (224, 175) the CPU writes 0x4b and paraLLEl 0x32. The CPU sampled coverage and attributes at the pixel
+centre plus one half (x + 0.5, with a 1e-4 tolerance on the edges); the GS samples at whole pixel positions, which
+is also the rule the CPU's own sprite path already followed (a sprite covers x0 <= x < x1 at whole x) and the one
+both PCSX2 and paraLLEl implement. At y = 175 the triangle spans x = 223.02 to 224.81: only pixel 224 has its
+sample inside, and its colour, a quarter of the way from the 0 edge, is about 0x33 before blending (paraLLEl:
+0x32). Sampling half a pixel to the right, the CPU lit column 223 down the whole sliver and every pixel came out
+half a pixel brighter; 48 strips of such slivers left 3954 words different. With the fixed-point rasterizer of
+section 6.2, command 31 matches paraLLEl word for word, and so does the whole `t` trace at its end.
+
+Layers on `gs/gpu-renderer`, each with the trace hashes it produced (CPU, synchronous replay):
+
+| Layer | t | fight | attack | gallery | free | parallel_route |
+| --- | --- | --- | --- | --- | --- | --- |
+| phase 0 | 9f57179650881733 | d24e92a9bc2a7981 | 13bd6761ae261dba | 537460974613ade1 | 09b626f92089d47e | c5e927fa19e7dfca |
+| sampler refactor | = | = | = | = | = | = |
+| fog | = | = | 035a351706548124 | = | = | = |
+| COLCLAMP wrap | = | = | = | = | e235c6aae93e8dee | = |
+| DTHE dither | 9e7143ca8f9a29f8 | 0fc7a14ecb4f044f | 0cc7bb788ed6edd9 | 6ea52a97d18cfde1 | 860b4c4fdfb6fa6a | 68d6a358027dea95 |
+| Z range | = | = | = | = | = | = |
+| fixed-point raster | efdde1828bcc158e | 1785ba1af3c1f13a | bd4efda565124016 | ebc5d38aafe7150a | 2e11ae1dac1e6273 | e91ef9bdb13337e6 |
+| mipmapping | = | = | = | = | 833fdafa00cde365 | = |
+| perf (plane stepping) | = | = | = | = | = | = |
+| tests | = | = | = | = | = | = |
+
+Each moved only where its feature is used: fog only `attack` (the one scene with a non-zero FOGCOL; the others fog
+toward black, where both formulas agree), COLCLAMP only `free` (the one scene that writes COLCLAMP = 0), dithering
+every scene (each clears a CT16 buffer with DTHE = 1), Z saturation none (no scene sends a Z past its format),
+mipmapping only `free` (the one scene with MXL > 0). At the tip, the asynchronous raster workers match the
+synchronous replay on all six traces (`PS2X_GS_REPLAY_CHECK=128`).
+
+`ps2_gs_replay --renderer parallel --compare cpu` (every 64 commands), first difference and words differing at the
+end of the trace (paraLLEl's final VRAM against the CPU's):
+
+| Layer | t | fight | attack | gallery | free | parallel_route |
+| --- | --- | --- | --- | --- | --- | --- |
+| phase 0 | 31 / 36142 | 0 / 48579 | 0 / 357193 | 0 / 216416 | 0 / 588649 | 1 / 405467 |
+| fog | 31 / 36142 | 0 / 48579 | 0 / 315383 | 0 / 216416 | 0 / 588649 | 1 / 405467 |
+| COLCLAMP wrap | 31 / 36142 | 0 / 48579 | 0 / 315383 | 0 / 216416 | 0 / 574185 | 1 / 405467 |
+| DTHE dither | 31 / 528 | 0 / 15335 | 0 / 280547 | 1 / 180576 | 0 / 558656 | 605 / 402222 |
+| Z range | 31 / 528 | 0 / 15335 | 0 / 280547 | 1 / 180576 | 0 / 558656 | 605 / 402222 |
+| fixed-point raster | 32 / 0 | none / 0 | 33 / 182146 | 15 / 124786 | 22 / 210057 | 605 / 218547 |
+| mipmapping | 32 / 0 | none / 0 | 33 / 182146 | 15 / 124786 | 22 / 178209 | 605 / 218547 |
+
+`fight` now matches paraLLEl at every comparison and `t` at its end (the transient difference at command 32 is
+overwritten later). The differences left are small: off by one in a channel on textured, bilinear-filtered
+primitives (`attack` command 33, `gallery` command 15, `free` command 22) and an alpha difference (0x10 against 0x16) in
+`parallel_route` command 605. They point at the precision of the bilinear weights (the CPU uses 8 fraction bits; the GS's
+precision is unknown), the fog rounding (section 6.2) and the S, T, Q interpolation, the candidates for the next
+reference fixes; none is in the phase 1 list. Lines are still untextured in the CPU backend, also a gap to close
+before the GPU copies it.
+
+Tests: `ps2xTest/src/ps2_gs_reference_tests.cpp` (`PS2GSReference`) pins each fix against values computed by hand
+from the rules above: fog (F = 255 over FOGCOL = 128, F = 128, F = 0, F = 1), COLCLAMP clamp and wrap of 300 and
+-100, the dither of every pixel of an 8x8 CT16 sprite, no dither on CT32 or with DTHE = 0, dither then clamp or
+wrap at both ends, Z24 and Z16 saturation in the write and in GREATER / GEQUAL tests, the top-left rule on a quad
+split along its diagonal (each pixel exactly once, right and bottom edges out), whole-pixel coverage and truncated
+Gouraud values, sprite coverage and texture coordinates (bilinear halfway at pixel 1), point and line rounding,
+MMAG / MMIN selection by the LOD's sign, nearest and blended mip levels from MIPTBP1 and the LOD from Q. Existing
+tests that drew zero-size sprites to reach one pixel now draw 1x1 sprites (a zero-size sprite draws nothing on the
+GS), the fan quad test reads its frame through the CT32 swizzle (it read linear memory), and the STQ and bilinear
+triangle tests sample pixels that still separate their cases at whole-pixel sample points; the fog test's F = 0
+case now expects FOGCOL exactly, as its own message said.
+
+Performance (`ps2_gs_replay <trace> 3`, synchronous CPU replay, best of 3, under `benchlock -m bench`), phase 0
+against the tip of phase 1:
+
+| Trace | phase 0 | phase 1 | change |
+| --- | --- | --- | --- |
+| t | 919 ms | 937 ms | +2.0% |
+| fight | 3732 ms | 3862 ms | +3.5% |
+| gallery | 3013 ms | 3163 ms | +5.0% |
+| free | 6355 ms | 6697 ms | +5.4% |
+| attack | 9735 ms | 10020 ms | +2.9% |
+| fight, `PS2X_GS_ASYNC_RASTER=1` | 964 ms | 1010 ms | +4.8% |
+
+Dithering costs nothing measurable (the dither layer alone: -1.7% to +1.9% across the traces, within noise; the
+no-dither path is one branch per block of 8 pixels). The fixed-point rasterizer accounts for most of the rest, and
+it is work the GS does, not overhead: counting bilinear samples on `fight`, the CPU now blends 91.9 M four-tap
+samples against 83.2 M before (`gallery`: 62.8 M against 57.1 M), because SC3's full-screen copy passes sample
+whole-pixel positions that fall between texels, where the old half-pixel centres fell on texel centres and took
+the one-tap shortcut; restoring the old sprite code alone brings the time back, and the extra blends are exactly
+the ones that make `fight` match paraLLEl. Mipmapping costs `free` about 10% on its own (its mipmapped primitives
+take the per-pixel LOD path, without the decoded-texture fast path for levels above 0); traces without mipmaps are
+unaffected. The perf layer (32-bit plane stepping, no divisions for constant attributes) changes no output.
+
+Not done in phase 1: the plan's TMB traces (the corpus has none yet, so only SC3 was re-hashed), a review of
+frames by eye (the paraLLEl comparison stands in for it: `fight` and `t` now match it exactly), MTBA, textured
+lines, and the candidates above (bilinear weight precision, fog rounding, S/T/Q precision), which need hardware
+results or a better paraLLEl-independent argument before they change the reference.
+
 ## 8. Things deliberately left out
 
 - Upscaling, supersampling, texture filtering beyond the GS's own, widescreen hacks.
@@ -531,8 +679,9 @@ which no write can produce; no trace or test changed.
    frame; the frontend currently also scans every packet at queue time. If needed, setup moves fully to the GPU
    (already planned) and the decoder gets the same fast paths as the frontend (native packed packets).
 6. Undefined or unclear GS behaviour that tests must pin: overlapping local-to-local copies, sampling a texel
-   written by the same primitive, CLUT loads during a transfer, Z overflow for Z24 / Z16, AA1, dithering with
-   COLCLAMP=0, interlaced field selection at odd `vsyncTick`.
+   written by the same primitive, CLUT loads during a transfer, AA1, interlaced field selection at odd
+   `vsyncTick`, fog rounding (section 6.2). Phase 1 pinned Z overflow for Z24 / Z16 (saturates) and dithering with
+   COLCLAMP=0 (dither, then wrap), both with PCSX2 and paraLLEl agreeing.
 7. Device loss or missing features at run time. Startup failure falls back to the CPU backend (as with paraLLEl
    today). Device loss mid-game is not recoverable without a VRAM copy; first version reports and exits.
 8. Shader toolchain drift between the committed SPIR-V and the GLSL. Mitigated by the CI regeneration check.
