@@ -1,6 +1,9 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -92,18 +95,101 @@ namespace
         return down;
     }
 
+    // PS2X_PAD_INPUT=<file>: each line appended while the game runs presses its words in turn, 0.35 s apart,
+    // as PS2X_PAD_SCRIPT entries without a time ("CROSS", "circle/100", "SQUARE+TRIANGLE" presses both).
+    void appendLivePresses(const std::string &added, double now, std::vector<ScriptedPress> &presses)
+    {
+        double at = now;
+        for (const ScriptedPress &press : presses)
+            at = std::max(at, press.time + 0.35);
+        size_t start = 0;
+        while (start < added.size())
+        {
+            size_t end = added.find_first_of(" ,\n", start);
+            if (end == std::string::npos)
+                end = added.size();
+            std::string word = added.substr(start, end - start);
+            start = end + 1;
+            double hold = 0.25;
+            if (const size_t slash = word.find('/'); slash != std::string::npos)
+            {
+                hold = std::atof(word.substr(slash + 1).c_str()) / 1000.0;
+                word.resize(slash);
+            }
+            uint16_t mask = 0;
+            size_t partStart = 0;
+            while (partStart < word.size())
+            {
+                size_t plus = word.find('+', partStart);
+                if (plus == std::string::npos)
+                    plus = word.size();
+                std::string part = word.substr(partStart, plus - partStart);
+                for (char &c : part)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                mask |= scriptButton(part);
+                partStart = plus + 1;
+            }
+            if (mask == 0)
+                continue;
+            presses.push_back({at, hold, mask});
+            at += 0.35;
+        }
+    }
+
+    void appendLiveInput(const char *path, double now, std::vector<ScriptedPress> &presses)
+    {
+        static double nextPoll = 0.0;
+        static long offset = 0;
+        if (now < nextPoll)
+            return;
+        nextPoll = now + 0.1;
+        FILE *file = std::fopen(path, "rb");
+        if (!file)
+            return;
+        std::fseek(file, 0, SEEK_END);
+        const long size = std::ftell(file);
+        if (size < offset)
+            offset = 0;
+        std::string added(static_cast<size_t>(size - offset), '\0');
+        std::fseek(file, offset, SEEK_SET);
+        added.resize(std::fread(added.data(), 1, added.size(), file));
+        std::fclose(file);
+        const size_t lastLine = added.rfind('\n');
+        if (lastLine == std::string::npos)
+            return;
+        offset += static_cast<long>(lastLine + 1);
+        added.resize(lastLine);
+        appendLivePresses(added, now, presses);
+    }
+
     uint16_t scriptedButtonsDown()
     {
         static const std::vector<ScriptedPress> script = parsePadScript(std::getenv("PS2X_PAD_SCRIPT"));
-        if (script.empty())
+        static const char *const liveInput = std::getenv("PS2X_PAD_INPUT");
+        if (script.empty() && !liveInput)
             return 0;
-        return buttonsDownAt(script, std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count());
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+        uint16_t down = buttonsDownAt(script, now);
+        if (liveInput)
+        {
+            static std::vector<ScriptedPress> livePresses;
+            appendLiveInput(liveInput, now, livePresses);
+            down |= buttonsDownAt(livePresses, now);
+        }
+        return down;
     }
 }
 
 uint16_t ps2PadScriptButtonsAt(const char *script, double seconds)
 {
     return buttonsDownAt(parsePadScript(script), seconds);
+}
+
+uint16_t ps2PadLiveInputButtonsAt(const char *lines, double addedAt, double seconds)
+{
+    std::vector<ScriptedPress> presses;
+    appendLivePresses(lines, addedAt, presses);
+    return buttonsDownAt(presses, seconds);
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)

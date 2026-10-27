@@ -16,5 +16,7 @@ public:
 // Buttons a PS2X_PAD_SCRIPT string holds down at a time (seconds since process start), as a mask of
 // pad button bits (1 = pressed).
 uint16_t ps2PadScriptButtonsAt(const char *script, double seconds);
+// Buttons that PS2X_PAD_INPUT lines, read at addedAt, hold down at a time (same clock).
+uint16_t ps2PadLiveInputButtonsAt(const char *lines, double addedAt, double seconds);
 
 #endif
