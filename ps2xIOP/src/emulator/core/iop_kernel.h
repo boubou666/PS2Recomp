@@ -48,6 +48,9 @@ namespace ps2x::iop::detail
     class IopKernel
     {
     public:
+        // The host thread module start routines run on (hostThread), as MODLOAD's thread on the IOP.
+        static constexpr int kModuleLoaderThreadId = 0x7FFF0000;
+
         explicit IopKernel(IopMemory &memory) noexcept;
 
         void reset();

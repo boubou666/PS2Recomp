@@ -1391,10 +1391,9 @@ namespace ps2x::iop::detail
             const uint32_t argc = argvBlock ? static_cast<uint32_t>(argv.size()) : 0u;
             // Start routines run in MODLOAD's thread on the IOP and may block on what they started (LIBSD waiting
             // for its first SPU2 transfers); priority 1 keeps them running before any other thread, as before.
-            constexpr int kModuleLoaderThreadId = 0x7FFF0000;
-            (void)kernel.hostThread(kModuleLoaderThreadId, 1u);
-            const uint32_t startResult =
-                executeGuestFunctionAsThread(module.entry, argc, argvBlock, 0u, 0u, module.gp, kModuleLoaderThreadId);
+            (void)kernel.hostThread(IopKernel::kModuleLoaderThreadId, 1u);
+            const uint32_t startResult = executeGuestFunctionAsThread(module.entry, argc, argvBlock, 0u, 0u, module.gp,
+                                                                      IopKernel::kModuleLoaderThreadId);
             module.resident = startResult == 0u || startResult == 2u;
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
