@@ -497,6 +497,8 @@ void VU1Interpreter::stallUntilReady(const DecodedInstructionPair &decoded, uint
             break;
         }
         advanceTo(readyCycle);
+        if (decoded.lowerUsage.pipeline == PipelineXgkick)
+            catchUpXgkick();
         readyCycle = calculatePairReadyCycle(decoded);
     }
 }
@@ -875,6 +877,7 @@ void VU1Interpreter::flushPipelines()
     // Nothing executes, so the clock jumps from one completion to the next (advanceTo applies everything ready),
     // ending on the same cycle as ticking would: PATH1 to the end of the current GIFtag's data, else to the
     // last pending result.
+    catchUpXgkick();
     while (pipelinesPending())
     {
         uint64_t target = m_cycle + 1u;
@@ -899,6 +902,7 @@ void VU1Interpreter::flushPipelines()
                 target = std::max(target, m_flagPipeline[(m_flagHead + m_flagCount - 1u) % kMaxFlagEntries].readyCycle);
         }
         advanceTo(target);
+        catchUpXgkick();
     }
 }
 
@@ -1230,6 +1234,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         programEnded = result == StepResult::Ended;
         break;
     }
+    catchUpXgkick();
 
     if (!programEnded)
         hideInFlightWrites();

@@ -316,6 +316,7 @@ private:
         uint32_t currentTagEnd = 0;
         uint32_t cycleCredit = 0;
         uint64_t issueCycle = 0;
+        uint64_t syncCycle = 0; // the clock its progress was applied up to (catchUpXgkick)
         bool active = false;
         bool currentTagEop = false;
     };
@@ -520,7 +521,17 @@ private:
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
-    void progressXgkick(uint64_t cycles);
+    // PATH1 reads VU memory as the clock moves, but only stores, the next XGKICK and the end of a run can tell
+    // when: the transfer catches up to the clock there instead of on every clock move.
+    void catchUpXgkick()
+    {
+        if (m_xgkick.active && m_cycle > m_xgkick.syncCycle)
+        {
+            const uint64_t elapsed = m_cycle - m_xgkick.syncCycle;
+            m_xgkick.syncCycle = m_cycle;
+            progressXgkickActive(elapsed);
+        }
+    }
     void progressXgkickActive(uint64_t cycles);
     void resetXgkick();
     void finishXgkick();

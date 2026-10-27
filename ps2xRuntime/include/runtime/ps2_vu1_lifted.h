@@ -43,7 +43,11 @@ struct Vu1Lifted
     }
 
     // The clock to `cycle`: PATH1 transfers progress (reading VU memory as it is now), ready results land.
-    static void advanceTo(Vu &vu, uint64_t cycle) { vu.advanceTo(cycle); }
+    static void advanceTo(Vu &vu, uint64_t cycle)
+    {
+        vu.advanceTo(cycle);
+        vu.catchUpXgkick();
+    }
 
     static float normalizeOperand(const Vu &vu, float value) { return vu.normalizeOperand(value); }
     static float normalizeResult(const Vu &vu, float value)

@@ -845,7 +845,10 @@ struct Vu1Jit
                                           __m128i words)
     {
         if (vu.m_xgkick.active)
+        {
             vu.advanceTo(cycle);
+            vu.catchUpXgkick();
+        }
         if (!inData(context, address) || !vu.m_activeVuData || address + 16u > vu.m_activeVuDataSize)
             return;
         if (cycle + 1u > vu.m_lastWritebackCycle)

@@ -1343,6 +1343,7 @@ PS2X_VU_INLINE void VU1Interpreter::queueStore(uint32_t address, const uint32_t 
     // reads VU memory, so writing it now is indistinguishable.
     if (!m_activeVuData || address + 16u > m_activeVuDataSize)
         return;
+    catchUpXgkick();
     if (m_cycle + 1u > m_lastWritebackCycle)
         m_lastWritebackCycle = m_cycle + 1u;
     uint32_t *target = reinterpret_cast<uint32_t *>(m_activeVuData + address);
@@ -1370,6 +1371,7 @@ PS2X_VU_INLINE void VU1Interpreter::resetXgkick()
     m_xgkick.currentTagEnd = 0u;
     m_xgkick.cycleCredit = 0u;
     m_xgkick.issueCycle = 0u;
+    m_xgkick.syncCycle = 0u;
     m_xgkick.active = false;
     m_xgkick.currentTagEop = false;
 }
@@ -1385,6 +1387,7 @@ PS2X_VU_INLINE void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
     m_xgkick.issueCycle = m_cycle;
+    m_xgkick.syncCycle = m_cycle;
 }
 
 PS2X_VU_INLINE void VU1Interpreter::advanceOneCycle()
@@ -1396,12 +1399,11 @@ PS2X_VU_INLINE void VU1Interpreter::advanceTo(uint64_t targetCycle)
 {
     if (targetCycle <= m_cycle)
         return;
-    // Nothing executes while the clock jumps, so pending results and PATH1 progress can be applied in one step.
-    const uint64_t elapsed = targetCycle - m_cycle;
+    // Nothing executes while the clock jumps, so pending results can be applied in one step (PATH1 catches up
+    // where it can be observed: catchUpXgkick).
     m_cycle = targetCycle;
     m_state.cycles = m_cycle;
     commitReadyPipelines();
-    progressXgkick(elapsed);
 }
 
 PS2X_VU_INLINE uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
@@ -1531,12 +1533,6 @@ PS2X_VU_INLINE void VU1Interpreter::logInFlightWrite(InFlightWrite::Kind kind, u
     entry.readyCycle = readyCycle;
     std::memcpy(entry.oldValue, oldValue, sizeof(entry.oldValue));
     std::memcpy(entry.newValue, newValue, sizeof(entry.newValue));
-}
-
-PS2X_VU_INLINE void VU1Interpreter::progressXgkick(uint64_t cycles)
-{
-    if (m_xgkick.active)
-        progressXgkickActive(cycles);
 }
 
 // ============================================================================
@@ -2758,6 +2754,8 @@ PS2X_VU_INLINE VU1Interpreter::StepResult VU1Interpreter::stepPairImpl(const Dec
     }
 
     const uint64_t budgetEnd = context.budgetEnd;
+    if (decoded.lowerUsage.pipeline == PipelineXgkick)
+        catchUpXgkick();
     // The caller checked m_cycle < budgetEnd (canIssue): only a stall can reach the budget.
     const uint64_t readyCycle = calculatePairReadyCycle(decoded);
     if (readyCycle > m_cycle)
