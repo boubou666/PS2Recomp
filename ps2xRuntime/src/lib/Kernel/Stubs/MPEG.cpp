@@ -2431,10 +2431,40 @@ namespace ps2_stubs
         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
     }
 
+    // Feeds what the game queued on DMA channel 4 until a picture decodes (or the channel has nothing left).
+    static void pullIpuInputForPicture(PS2Runtime *runtime, uint32_t mpegAddr)
+    {
+        constexpr size_t kPullBytes = 64u * 1024u;
+        constexpr int kMaxPulls = 64;
+        for (int pull = 0; pull < kMaxPulls; ++pull)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                if (!playback.decodedFrames.empty() || playback.streamEnded || playback.decoderFailed)
+                {
+                    return;
+                }
+            }
+            const std::vector<uint8_t> data = runtime->memory().pullIpuInput(kPullBytes);
+            if (data.empty())
+            {
+                return;
+            }
+            const auto decodeStart = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                feedElementaryStream(getPlaybackState(mpegAddr), data.data(), data.size());
+            }
+            accountHostDecodeTime(runtime, decodeStart);
+        }
+    }
+
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         syncMpegFieldRate(runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        pullIpuInputForPicture(runtime, mpegAddr);
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;
         uint32_t height = kStubMovieHeight;
@@ -2583,6 +2613,10 @@ namespace ps2_stubs
     void sceMpegInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
+        if (runtime)
+        {
+            runtime->memory().setIpuInputEnabled(true);
+        }
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
         const uint64_t cdStreamBytesProduced = g_mpeg_stub_state.cdStreamBytesProduced;
