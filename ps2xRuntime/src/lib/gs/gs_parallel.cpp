@@ -1,5 +1,5 @@
-// paraLLEl-GS behind the GS frontend (gs_parallel.h). Compiled only with PS2X_ENABLE_PARALLEL_GS.
-#include "runtime/gs/gs_parallel.h"
+// paraLLEl-GS as a GS stream renderer (gs_stream_renderer.h). Compiled only with PS2X_ENABLE_PARALLEL_GS.
+#include "runtime/gs/gs_stream_renderer.h"
 
 #include "context.hpp"
 #include "device.hpp"
@@ -10,7 +10,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string_view>
 
 using namespace Vulkan;
 using namespace ParallelGS;
@@ -26,7 +25,7 @@ namespace
     class Signals final : public SignalInterface
     {
     public:
-        explicit Signals(const GSParallelRenderer::Callbacks &callbacks) : m_callbacks(callbacks) {}
+        explicit Signals(const GSStreamRenderer::Callbacks &callbacks) : m_callbacks(callbacks) {}
 
         bool on_signal(uint64_t payload) override
         {
@@ -49,10 +48,10 @@ namespace
         }
 
     private:
-        GSParallelRenderer::Callbacks m_callbacks;
+        GSStreamRenderer::Callbacks m_callbacks;
     };
 
-    class ParallelRenderer final : public GSParallelRenderer
+    class ParallelRenderer final : public GSStreamRenderer
     {
     public:
         ParallelRenderer(uint32_t vramSize, const Callbacks &callbacks) : m_vramSize(vramSize), m_signals(callbacks) {}
@@ -235,13 +234,7 @@ namespace
     };
 }
 
-bool GSParallelRenderer::requested()
-{
-    const char *renderer = std::getenv("PS2X_GS_RENDERER");
-    return renderer && std::string_view(renderer) == "parallel";
-}
-
-std::unique_ptr<GSParallelRenderer> GSParallelRenderer::create(uint32_t vramSize, const Callbacks &callbacks)
+std::unique_ptr<GSStreamRenderer> createParallelGsRenderer(uint32_t vramSize, const GSStreamRenderer::Callbacks &callbacks)
 {
     auto renderer = std::make_unique<ParallelRenderer>(vramSize, callbacks);
     if (!renderer->init())

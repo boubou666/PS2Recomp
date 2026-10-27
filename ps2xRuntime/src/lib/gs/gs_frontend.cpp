@@ -1,7 +1,7 @@
 #include "ThreadNaming.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
-#include "runtime/gs/gs_parallel.h"
+#include "runtime/gs/gs_stream_renderer.h"
 #include "runtime/gs/gs_trace.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
@@ -419,26 +419,27 @@ void GS::workerLoop()
 {
     ThreadNaming::SetCurrentThreadName("GSFrontend");
     t_onGsWorker = true;
-#if defined(PS2X_HAVE_PARALLEL_GS)
-    if (m_parallelRequested && !m_parallel)
+    if (m_streamRendererRequested && !m_streamRenderer)
     {
-        GSParallelRenderer::Callbacks callbacks;
+        GSStreamRenderer::Callbacks callbacks;
         callbacks.finish = [this]()
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             ++m_finishesDrawn;
         };
-        m_parallel = GSParallelRenderer::create(m_localMemorySize, callbacks);
-        if (!m_parallel)
-            std::fprintf(stderr, "[gs-parallel] unavailable, drawing on the CPU\n");
+        m_streamRenderer = GSStreamRenderer::create(m_streamRendererKind, m_localMemorySize, callbacks);
+        if (!m_streamRenderer)
+            std::fprintf(stderr, "[gs-%s] unavailable, drawing on the CPU\n", GSStreamRenderer::name(m_streamRendererKind));
     }
-    // PS2X_GS_PARALLEL_FLUSH=0: only submit to the GPU at FINISH and presentation, not whenever the queue runs dry.
+    // PS2X_GS_STREAM_FLUSH=0 (or the older PS2X_GS_PARALLEL_FLUSH=0): only submit to the GPU at FINISH and
+    // presentation, not whenever the queue runs dry.
     static const bool s_flushWhenDrained = []
     {
-        const char *value = std::getenv("PS2X_GS_PARALLEL_FLUSH");
+        const char *value = std::getenv("PS2X_GS_STREAM_FLUSH");
+        if (!value)
+            value = std::getenv("PS2X_GS_PARALLEL_FLUSH");
         return !(value && *value == '0');
     }();
-#endif
     for (;;)
     {
         QueuedCommand command;
@@ -454,7 +455,7 @@ void GS::workerLoop()
             if (m_queue.empty())
             {
                 lock.unlock();
-                m_parallel.reset(); // its Vulkan objects go with the thread that made them
+                m_streamRenderer.reset(); // its Vulkan objects go with the thread that made them
                 return;
             }
             command = std::move(m_queue.front());
@@ -465,7 +466,7 @@ void GS::workerLoop()
 
         const uint8_t *data = command.bytes.data();
         const uint32_t size = static_cast<uint32_t>(command.bytes.size());
-        if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow && !m_parallel)
+        if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow && !m_streamRenderer)
         {
             const double now = GsRecorder::sinceProcessStart();
             if (!recorder.started && now >= recorder.startAt && m_backend)
@@ -494,8 +495,8 @@ void GS::workerLoop()
                     writeGsTraceCommand(recorder.out, static_cast<uint8_t>(command.kind), command.registers, data, size);
             }
         }
-        if (m_parallel)
-            processWithParallel(command);
+        if (m_streamRenderer)
+            processWithStreamRenderer(command);
         else
         for (GS *target : {this, m_shadow.get()})
         {
@@ -520,7 +521,7 @@ void GS::workerLoop()
                     m_queuedLatchesDone.fetch_add(1u, std::memory_order_release);
                 }
                 break;
-            // Queued for paraLLEl-GS before it failed to start.
+            // Queued for a stream renderer before it failed to start.
             case QueuedCommand::Kind::Register:
                 if (target == this)
                     writeRegister(static_cast<uint8_t>(command.registers[0]), command.registers[1]);
@@ -540,12 +541,10 @@ void GS::workerLoop()
         }
         // Batched primitives are finished once the EE has nothing more queued, before anyone waiting for
         // idle can observe VRAM.
-        if (drained && m_backend && !m_parallel)
+        if (drained && m_backend && !m_streamRenderer)
             m_backend->Flush();
-#if defined(PS2X_HAVE_PARALLEL_GS)
-        if (drained && m_parallel && s_flushWhenDrained)
-            m_parallel->flush();
-#endif
+        if (drained && m_streamRenderer && s_flushWhenDrained)
+            m_streamRenderer->flush();
         if (drained && m_shadow)
             compareShadowVram();
         {
@@ -573,7 +572,7 @@ void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     enqueue(std::move(command));
 }
 
-void GS::processWithParallel(const QueuedCommand &command)
+void GS::processWithStreamRenderer(const QueuedCommand &command)
 {
     const uint8_t *data = command.bytes.data();
     const uint32_t size = static_cast<uint32_t>(command.bytes.size());
@@ -581,14 +580,14 @@ void GS::processWithParallel(const QueuedCommand &command)
     {
     case QueuedCommand::Kind::GifPacket:
     case QueuedCommand::Kind::NativePackedGifPacket:
-        m_parallel->gifTransfer(data, size);
+        m_streamRenderer->gifTransfer(data, size);
         break;
     case QueuedCommand::Kind::NativeImageUpload:
     {
         if (!data || size == 0u)
             break;
         for (uint32_t i = 0; i < 4u; ++i) // BITBLTBUF, TRXPOS, TRXREG, TRXDIR
-            m_parallel->writeRegister(static_cast<uint8_t>(GS_REG_BITBLTBUF + i), command.registers[i]);
+            m_streamRenderer->writeRegister(static_cast<uint8_t>(GS_REG_BITBLTBUF + i), command.registers[i]);
         // The image data behind an IMAGE tag, padded to whole quadwords.
         thread_local std::vector<uint8_t> packet;
         const uint32_t qwords = (size + 15u) / 16u;
@@ -596,16 +595,16 @@ void GS::processWithParallel(const QueuedCommand &command)
         const uint64_t tag = qwords | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58);
         std::memcpy(packet.data(), &tag, sizeof(tag));
         std::memcpy(packet.data() + 16u, data, size);
-        m_parallel->gifTransfer(packet.data(), static_cast<uint32_t>(packet.size()));
+        m_streamRenderer->gifTransfer(packet.data(), static_cast<uint32_t>(packet.size()));
         ++m_nativeImageUploadCount;
         break;
     }
     case QueuedCommand::Kind::PresentationLatch:
-        storePresentationFrame(m_parallel->present(command.displayRegisters));
+        storePresentationFrame(m_streamRenderer->present(command.displayRegisters));
         m_queuedLatchesDone.fetch_add(1u, std::memory_order_release);
         break;
     case QueuedCommand::Kind::Register:
-        m_parallel->writeRegister(static_cast<uint8_t>(command.registers[0]), command.registers[1]);
+        m_streamRenderer->writeRegister(static_cast<uint8_t>(command.registers[0]), command.registers[1]);
         break;
     case QueuedCommand::Kind::Call:
         command.call();
@@ -659,15 +658,14 @@ void GS::enableAsync()
 {
     // Called by the runtime after init(). Library users (tests, tools) keep the synchronous GS, whose
     // VRAM is current as soon as a packet call returns.
-#if defined(PS2X_HAVE_PARALLEL_GS)
-    // paraLLEl-GS needs the GS thread (its Vulkan objects stay on one thread), and has no CPU reference to compare.
-    if (!m_isShadow && GSParallelRenderer::requested())
+    // A stream renderer needs the GS thread (its Vulkan objects stay on one thread), and has no CPU reference to
+    // compare.
+    if (!m_isShadow && GSStreamRenderer::requested(m_streamRendererKind))
     {
-        m_parallelRequested = true;
+        m_streamRendererRequested = true;
         m_asyncEnabled = true;
         return;
     }
-#endif
     const char *sync = std::getenv("PS2X_GS_SYNC");
     if (m_isShadow || (sync && *sync == '1'))
         return;
@@ -688,21 +686,25 @@ void GS::enableAsync()
     }
 }
 
-bool GS::requestParallelRenderer()
+bool GS::requestStreamRenderer(GSStreamRendererKind kind)
 {
-#if defined(PS2X_HAVE_PARALLEL_GS)
+    if (!GSStreamRenderer::available(kind))
+        return false;
     std::lock_guard<std::mutex> lock(m_queueMutex);
-    if (m_parallelRequested)
+    if (m_streamRendererRequested)
         return true;
     const char *renderer = std::getenv("PS2X_GS_RENDERER");
     if (m_isShadow || m_shadow || m_worker.joinable() || (renderer && *renderer))
         return false;
-    m_parallelRequested = true;
+    m_streamRendererKind = kind;
+    m_streamRendererRequested = true;
     m_asyncEnabled = true;
     return true;
-#else
-    return false;
-#endif
+}
+
+bool GS::requestParallelRenderer()
+{
+    return requestStreamRenderer(GSStreamRendererKind::Parallel);
 }
 
 void GS::waitForIdle()
@@ -814,10 +816,10 @@ void GS::snapshotVRAM()
     // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
     // feeding the GS while a backend performs host-side conversion. Keep the
     // selected backend alive and unswappable for the duration of the call.
-    if (m_parallelRequested)
+    if (m_streamRendererRequested)
     {
         std::vector<uint8_t> snapshot;
-        runOnWorker([&]() { if (m_parallel) m_parallel->readVram(snapshot); });
+        runOnWorker([&]() { if (m_streamRenderer) m_streamRenderer->readVram(snapshot); });
         if (!snapshot.empty())
         {
             std::lock_guard<std::mutex> lock(m_snapshotMutex);
@@ -1152,8 +1154,8 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
-    // paraLLEl-GS presents on the GS thread, after what is queued before it.
-    if (m_parallelRequested && shouldQueue())
+    // A stream renderer presents on the GS thread, after what is queued before it.
+    if (m_streamRendererRequested && shouldQueue())
     {
         queueHostPresentationLatch();
         return;
@@ -1821,8 +1823,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
-    // paraLLEl-GS: in queue order, without waiting (0x59-0x5f mirror display registers, no drawing state).
-    if (m_parallelRequested && shouldQueue() && (regAddr < 0x59u || regAddr > 0x5fu) && regAddr != GS_REG_SIGNAL &&
+    // Stream renderer: in queue order, without waiting (0x59-0x5f mirror display registers, no drawing state).
+    if (m_streamRendererRequested && shouldQueue() && (regAddr < 0x59u || regAddr > 0x5fu) && regAddr != GS_REG_SIGNAL &&
         regAddr != GS_REG_FINISH && regAddr != GS_REG_LABEL)
     {
         QueuedCommand command;
@@ -2383,7 +2385,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     // The clear packet the caller sends next draws it (sceGsSwapDBuffDc).
-    if (m_parallelRequested)
+    if (m_streamRendererRequested)
         return true;
     waitForIdle(); // the EE needs every earlier packet applied first
     if (m_shadow)
@@ -2394,7 +2396,7 @@ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
-    if (m_parallelRequested)
+    if (m_streamRendererRequested)
         return true;
     waitForIdle(); // the EE needs every earlier packet applied first
     if (m_shadow)
@@ -2405,19 +2407,19 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    if (m_parallelRequested)
+    if (m_streamRendererRequested)
     {
         uint32_t copied = 0u;
         runOnWorker([&]()
                     {
-            if (!m_parallel)
+            if (!m_streamRenderer)
             {
                 std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
                 copied = m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
                 return;
             }
             std::vector<uint8_t> words((maxBytes + 15u) & ~15u);
-            m_parallel->readTransferFifo(words.data(), static_cast<uint32_t>(words.size() / 16u));
+            m_streamRenderer->readTransferFifo(words.data(), static_cast<uint32_t>(words.size() / 16u));
             if (dst)
                 std::memcpy(dst, words.data(), maxBytes);
             copied = maxBytes; });

@@ -16,7 +16,8 @@
 #include "runtime/gs/gs_draw_estimate.h"
 #include "runtime/gs/gs_backend.h"
 
-class GSParallelRenderer;
+class GSStreamRenderer;
+enum class GSStreamRendererKind : uint8_t;
 enum class GsCpuEvent : uint8_t;
 
 struct GSDebugSnapshot
@@ -128,8 +129,9 @@ public:
     // Moves packet processing to a GS thread (unless PS2X_GS_SYNC=1). The runtime calls it after init();
     // without it the GS is synchronous.
     void enableAsync();
-    // Lets a game prefer paraLLEl-GS while the GS thread has not started yet (game overrides run after
+    // Lets a game prefer a stream renderer while the GS thread has not started yet (game overrides run after
     // enableAsync). PS2X_GS_RENDERER set to anything else keeps the user's choice. Returns whether it is in use.
+    bool requestStreamRenderer(GSStreamRendererKind kind);
     bool requestParallelRenderer();
     // A game's drawing speed for the GS event latency (GsDrawEstimate); PS2X_GS_PIXEL_CYCLES and
     // PS2X_GS_PRIM_CYCLES still override each rate.
@@ -206,7 +208,7 @@ private:
             NativePackedGifPacket,
             NativeImageUpload,
             PresentationLatch, // displayRegisters (queueHostPresentationLatch)
-            Register,          // registers[0] address, registers[1] value (writeRegister with paraLLEl-GS)
+            Register,          // registers[0] address, registers[1] value (writeRegister with a stream renderer)
             Call,              // call() on the GS thread (runOnWorker)
         };
         Kind kind = Kind::GifPacket;
@@ -218,11 +220,12 @@ private:
     bool shouldQueue() const;
     // Runs work on the GS thread, in queue order, and waits for it (directly without a GS thread).
     void runOnWorker(std::function<void()> work);
-    // PS2X_GS_RENDERER=parallel: the GS thread hands packets to paraLLEl-GS (created there when it starts) instead
-    // of decoding them for the CPU backend. Falls back to the CPU backend when it cannot be created.
-    bool m_parallelRequested = false;
-    std::unique_ptr<GSParallelRenderer> m_parallel;
-    void processWithParallel(const QueuedCommand &command);
+    // PS2X_GS_RENDERER=parallel: the GS thread hands packets to a stream renderer (created there when it starts)
+    // instead of decoding them for the CPU backend. Falls back to the CPU backend when it cannot be created.
+    bool m_streamRendererRequested = false;
+    GSStreamRendererKind m_streamRendererKind{};
+    std::unique_ptr<GSStreamRenderer> m_streamRenderer;
+    void processWithStreamRenderer(const QueuedCommand &command);
     void storePresentationFrame(PresentationFrame &&frame);
     void postCpuEvent(GsCpuEvent event, uint64_t value, uint64_t delayCycles);
     void postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes);
