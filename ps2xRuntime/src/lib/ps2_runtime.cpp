@@ -1732,6 +1732,13 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
+    // PS2X_CD_IMAGE=<disc image>: sectors no file under cdRoot covers are read from it, for games that read data by
+    // LSN outside the ISO 9660 file system.
+    if (const char *image = std::getenv("PS2X_CD_IMAGE"); image && *image)
+    {
+        paths.cdImage = normalizeAbsolutePath(std::filesystem::path(image));
+    }
+
     setIoPaths(paths);
 }
 

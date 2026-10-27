@@ -133,6 +133,19 @@ namespace
         }
     };
 
+    // setenv/unsetenv are POSIX; Windows (MSVC, MinGW) has _putenv_s, where an empty value removes the variable.
+    void setTestEnv(const char *name, const char *value)
+    {
+#if defined(_WIN32)
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+#endif
+    }
+
     TempPaths makeTempPaths()
     {
         TempPaths paths;
@@ -169,6 +182,23 @@ void register_ps2_runtime_io_tests()
 {
     MiniTest::Case("PS2RuntimeIO", [](TestCase &tc)
     {
+        tc.Run("PS2X_CD_IMAGE sets the CD image when IO paths come from the ELF", [](TestCase &t)
+        {
+            TestContext test;
+            const std::filesystem::path elf = test.paths.cdRoot / "SLUS_000.00";
+            const std::filesystem::path image = test.paths.base / "disc.iso";
+
+            setTestEnv("PS2X_CD_IMAGE", image.string().c_str());
+            PS2Runtime::configureIoPathsFromElf(elf.string());
+            setTestEnv("PS2X_CD_IMAGE", nullptr);
+
+            const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+            t.IsTrue(paths.cdImage == std::filesystem::absolute(image).lexically_normal(),
+                     "cdImage should be the absolute PS2X_CD_IMAGE path");
+            t.IsTrue(paths.cdRoot == std::filesystem::absolute(test.paths.cdRoot).lexically_normal(),
+                     "cdRoot should still be the ELF directory");
+        });
+
         tc.Run("ROM0 ROMVER is exposed as the 14-byte firmware pseudo-file", [](TestCase &t)
         {
             TestContext test;
