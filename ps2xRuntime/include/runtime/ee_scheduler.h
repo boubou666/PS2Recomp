@@ -422,6 +422,17 @@ public:
     void setVBlankHold(bool held) noexcept { m_vblankHold.store(held, std::memory_order_relaxed); }
     void setVBlankHoldLimit(std::chrono::microseconds limit) noexcept { m_vblankHoldLimit = limit; }
     [[nodiscard]] uint64_t vblanksHeld() const noexcept { return m_vblanksHeld.load(std::memory_order_relaxed); }
+    // A game that waits for its vblank by spinning on a counter instead of blocking (sceGsSyncV, WaitVSync): thread
+    // `threadId` is in that wait loop while its pc is in [begin, end). Its frame counts as complete there, so vblanks
+    // latch the picture as they do for blocked waiters (otherwise only every third vblank does). With holdVBlank, a
+    // due VBlankStart also waits (up to the hold limit) while the thread runs outside the loop. end == 0 turns it off.
+    void setGuestFrameWait(int threadId, uint32_t begin, uint32_t end, bool holdVBlank) noexcept
+    {
+        m_frameWaitThread = threadId;
+        m_frameWaitPcBegin = begin;
+        m_frameWaitPcEnd = end;
+        m_frameWaitHoldsVBlank = holdVBlank;
+    }
     // Whether a thread of equal priority takes over at the end of a time slice (default yes; PS2X_EE_SLICE_EQUAL=0
     // no). The real EE kernel never round-robins equal priorities: a thread runs until it blocks or a higher
     // priority one becomes ready.
@@ -550,6 +561,12 @@ private:
     std::chrono::steady_clock::time_point m_vblankHeldSince{}; // the held vblank's own time (zero: none held)
     uint64_t m_vblankHeldCycle = 0;
     std::atomic<uint64_t> m_vblanksHeld{0};
+    int m_frameWaitThread = 0;
+    uint32_t m_frameWaitPcBegin = 0;
+    uint32_t m_frameWaitPcEnd = 0;
+    bool m_frameWaitHoldsVBlank = false;
+    // The setGuestFrameWait thread, when it is running or ready: whether it sits in its wait loop.
+    [[nodiscard]] std::optional<bool> guestFrameWaiting();
     std::atomic<bool> m_equalPrioritySlicing{[]
     {
         const char *value = std::getenv("PS2X_EE_SLICE_EQUAL");
