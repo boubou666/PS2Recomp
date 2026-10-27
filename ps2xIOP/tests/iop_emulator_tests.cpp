@@ -75,6 +75,23 @@ namespace
 
         std::vector<uint8_t> guest;
         std::vector<std::string> logs;
+
+        // IOP -> EE RPC: one EE server (eeRpcSid), and the calls the IOP handed over.
+        bool findEeRpcServer(uint32_t sid, EeRpcServer &server) const override
+        {
+            if (sid != eeRpcSid)
+                return false;
+            server = eeRpcServer;
+            return true;
+        }
+        bool callEeRpc(EeRpcCall call) override
+        {
+            eeRpcCalls.push_back(std::move(call));
+            return true;
+        }
+        uint32_t eeRpcSid = 0u;
+        EeRpcServer eeRpcServer{};
+        std::vector<EeRpcCall> eeRpcCalls;
         std::string cdRoot;
     };
 
@@ -275,6 +292,99 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
         std::memcpy(host.guest.data() + address + codeOffset + importTableOffset,
                     importTable, sizeof(importTable));
+    }
+
+    // IRX whose entry binds the EE server `sid` with client 0x10200 and calls it SIF_RPC_M_NOWAIT: fno 5, 6 bytes from
+    // 0x10300 ("IOPRPC"), 4 bytes back to 0x10400 (a whole quadword moves, so 16).
+    void writeEeRpcClientIrx(TestHost &host, uint32_t address, uint32_t sid)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t importTableOffset = 0x80u;
+        constexpr uint32_t bindStub = loadAddress + importTableOffset + 20u;
+        constexpr uint32_t callStub = bindStub + 8u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        const uint32_t code[] = {
+            0x27BDFFC0u, // addiu sp, sp, -0x40
+            0xAFBF003Cu, // sw    ra, 0x3c(sp)
+            0x3C040001u, // lui   a0, 1
+            0x34840200u, // ori   a0, a0, 0x200 (client)
+            0x3C050000u | ((sid >> 16u) & 0xFFFFu), // lui a1, SID upper
+            0x34A50000u | (sid & 0xFFFFu),          // ori a1, a1, SID lower
+            0x00003021u, // addu  a2, zero, zero (mode)
+            0x0C000000u | ((bindStub >> 2u) & 0x03FFFFFFu), // jal sceSifBindRpc
+            0x00000000u, // nop
+            0x3C040001u, // lui   a0, 1
+            0x34840200u, // ori   a0, a0, 0x200 (client)
+            0x24050005u, // addiu a1, zero, 5 (fno)
+            0x24060001u, // addiu a2, zero, 1 (SIF_RPC_M_NOWAIT)
+            0x3C070001u, // lui   a3, 1
+            0x34E70300u, // ori   a3, a3, 0x300 (send)
+            0x24080006u, // addiu t0, zero, 6
+            0xAFA80010u, // sw    t0, 0x10(sp) (send size)
+            0x3C080001u, // lui   t0, 1
+            0x35080400u, // ori   t0, t0, 0x400
+            0xAFA80014u, // sw    t0, 0x14(sp) (receive)
+            0x24080004u, // addiu t0, zero, 4
+            0xAFA80018u, // sw    t0, 0x18(sp) (receive size)
+            0xAFA0001Cu, // sw    zero, 0x1c(sp) (end function)
+            0xAFA00020u, // sw    zero, 0x20(sp) (end parameter)
+            0x0C000000u | ((callStub >> 2u) & 0x03FFFFFFu), // jal sceSifCallRpc
+            0x00000000u, // nop
+            0x8FBF003Cu, // lw    ra, 0x3c(sp)
+            0x00001021u, // addu  v0, zero, zero
+            0x27BD0040u, // addiu sp, sp, 0x40
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        const uint32_t importTable[] = {
+            0x41E00000u, // IRX import magic
+            0x00000000u,
+            0x00000101u,
+            0x63666973u, // "sifc"
+            0x0000646Du, // "md"
+            0x03E00008u, // jr ra
+            0x2400000Fu, // addiu zero, zero, 15 (sceSifBindRpc)
+            0x03E00008u, // jr ra
+            0x24000010u, // addiu zero, zero, 16 (sceSifCallRpc)
+            0x00000000u,
+            0x00000000u,
+        };
+        const char send[] = "IOPRPC";
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = 0x310u;
+        program.memsz = 0x500u;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::fill(host.guest.begin() + address, host.guest.end(), 0u);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
+        std::memcpy(host.guest.data() + address + codeOffset + importTableOffset, importTable, sizeof(importTable));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x300u, send, 6u);
     }
 
     // IRX whose entry installs a SIF command handler: sceSifAddCmdHandler(cid, 0x10300, 0x10400).
@@ -1452,6 +1562,40 @@ int main()
         { return message.find("unhandled import cdvdman:7") != std::string::npos; });
     if (!expect(!emittedUnhandledSeek,
                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
+
+    // IOP -> EE RPC: an IRX binds a server the EE registered and calls it; the reply lands in its receive buffer.
+    {
+        constexpr uint32_t eeSid = 0x00010001u;
+        host.eeRpcSid = eeSid;
+        host.eeRpcServer = IopHost::EeRpcServer{0x0089DDB0u, 0x0089DE00u, 0x0089DF00u};
+        host.eeRpcCalls.clear();
+        iop.reset();
+        writeEeRpcClientIrx(host, 0x100u, eeSid);
+        const ModuleLoadResult client = iop.loadModuleBuffer(0x100u);
+        if (!expect(client.handled && client.startResult == 0, "Synthetic IOP -> EE RPC client IRX did not start")) return 1;
+        uint32_t bound[5]{};
+        if (!expect(iop.readMemory(0x00010214u, bound, sizeof(bound)), "Could not read the bound client")) return 1;
+        if (!expect(bound[0] == 0x0089DE00u && bound[1] == 0x0089DF00u && bound[4] == 0x0089DDB0u,
+                    "sceSifBindRpc did not fill the client's buf, cbuf and server from the EE server")) return 1;
+        if (!expect(host.eeRpcCalls.size() == 1u, "sceSifCallRpc did not hand the call to the EE")) return 1;
+        const IopHost::EeRpcCall &call = host.eeRpcCalls.front();
+        if (!expect(call.sid == eeSid && call.function == 5u, "The EE call lost its sid or RPC number")) return 1;
+        if (!expect(call.send.size() == 6u && std::memcmp(call.send.data(), "IOPRPC", 6u) == 0,
+                    "The EE call did not carry the send data")) return 1;
+        if (!expect(call.receiveSize == 16u, "The receive size was not rounded to a SIF DMA quadword")) return 1;
+
+        uint8_t reply[16];
+        for (uint32_t i = 0; i < sizeof(reply); ++i)
+            reply[i] = static_cast<uint8_t>(0xA0u + i);
+        iop.completeEeRpc(call.token, reply, sizeof(reply));
+        uint8_t received[16]{};
+        if (!expect(iop.readMemory(0x00010400u, received, sizeof(received)) &&
+                        std::memcmp(received, reply, sizeof(reply)) == 0,
+                    "The EE reply did not land in the IRX's receive buffer")) return 1;
+        iop.completeEeRpc(call.token, reply, sizeof(reply)); // a second reply for the same call is ignored
+        host.eeRpcSid = 0u;
+        iop.reset();
+    }
 
     std::cout << "ps2xIOP emulator smoke tests passed\n";
     return 0;
