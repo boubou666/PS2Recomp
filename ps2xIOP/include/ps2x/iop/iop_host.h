@@ -162,6 +162,14 @@ namespace ps2x::iop
             return false;
         }
 
+        // A deferred EE -> IOP RPC (RpcResult::deferred) is done and its reply is in the EE receive buffer. Called from
+        // the IOP's run, under its lock: the host completes the EE caller later, on the EE side.
+        virtual void completeDeferredRpc(uint64_t token, const RpcResult &result)
+        {
+            (void)token;
+            (void)result;
+        }
+
         // 32-byte pad state of a controller port in libpad's layout ([2..3] buttons, active low;
         // [4..7] right and left sticks). The default reports no input.
         virtual bool readPadState(int port, uint8_t *state, size_t size)

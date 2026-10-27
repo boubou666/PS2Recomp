@@ -11,6 +11,8 @@ namespace ps2_syscalls
     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    // A deferred EE -> IOP call (RpcResult::deferred) is done: completes its EE caller. On the executor.
+    void completeDeferredIopRpc(PS2Runtime *runtime, uint64_t token);
     void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

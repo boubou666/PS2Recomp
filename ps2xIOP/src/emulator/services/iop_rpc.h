@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <unordered_map>
 
@@ -53,6 +54,23 @@ namespace ps2x::iop::detail
         {
             (void)threadId;
             return executeGuestFunction(address, a0, a1, a2, a3, gp);
+        }
+        // executeGuestFunctionAsThread that may hand the call off: when the function blocks, it goes on as thread
+        // `threadId` in IOP time, `deferred` is set, and onReturn(v0) runs once it has returned. A call that does not
+        // block completes inline as before.
+        [[nodiscard]] virtual uint32_t executeGuestFunctionAsThreadDeferrable(uint32_t address,
+                                                                              uint32_t a0,
+                                                                              uint32_t a1,
+                                                                              uint32_t a2,
+                                                                              uint32_t a3,
+                                                                              uint32_t gp,
+                                                                              int threadId,
+                                                                              std::function<void(uint32_t)> onReturn,
+                                                                              bool &deferred)
+        {
+            (void)onReturn;
+            deferred = false;
+            return executeGuestFunctionAsThread(address, a0, a1, a2, a3, gp, threadId);
         }
     };
 
@@ -132,6 +150,7 @@ namespace ps2x::iop::detail
         // The wake cycle of a caller waiting for the EE reply: a delay that never expires.
         static constexpr uint64_t kEeRpcWaitCycle = ~uint64_t{0};
         uint64_t m_nextEeCallToken = 1u; // never reset: a reply from before an IOP reset must not match a new call
+        uint64_t m_nextDeferredToken = 1u; // EE -> IOP calls handed off to their thread; never reset either
         bool bindEeRpc(IopCpuState &cpu);
         bool callEeRpc(IopCpuState &cpu);
         uint32_t m_nextDmaId = 1u;

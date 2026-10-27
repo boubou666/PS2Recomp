@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
+#include "Kernel/Syscalls/RPC.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
@@ -536,6 +537,13 @@ bool PS2IopHostAdapter::callEeRpc(EeRpcCall call)
     return ps2_stubs::queueEeRpcFromIop(rdram, runtime, call.sid, call.function, std::move(call.send), call.receiveSize,
                                         [runtime, token](const std::vector<uint8_t> &reply)
                                         { runtime->completeIopEeRpc(token, reply); });
+}
+
+void PS2IopHostAdapter::completeDeferredRpc(uint64_t token, const ps2x::iop::RpcResult &result)
+{
+    (void)result; // the reply is already in the EE receive buffer
+    PS2Runtime *const runtime = &m_runtime;
+    m_runtime.eeScheduler().postTask([runtime, token]() { ps2_syscalls::completeDeferredIopRpc(runtime, token); });
 }
 
 bool PS2IopHostAdapter::readPadState(int port, uint8_t *state, size_t size)
