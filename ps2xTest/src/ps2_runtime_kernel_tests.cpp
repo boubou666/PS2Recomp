@@ -962,6 +962,21 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(trace == expected, "higher priority should run before the starter continues");
         });
 
+        tc.Run("EE SignalSema counts past max_count instead of refusing the signal", [](TestCase &t)
+        {
+            TestEnv env;
+            env.ctx.pc = K_SCHED_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            // Jade Cocoon 2's loader mutex: init 1, max 1, released once before it is ever taken.
+            const int mutex = ee.createSemaphore(1, 1, 0, 0);
+            t.Equals(ee.signalSemaphore(mutex, false), mutex, "a signal at max_count should still succeed");
+            t.Equals(ee.semaphore(mutex)->count, 2, "the count should go past max_count");
+            t.Equals(ee.pollSemaphore(mutex), mutex, "the first taker should get a token");
+            t.Equals(ee.pollSemaphore(mutex), mutex, "the extra release should leave a second token");
+            t.Equals(ee.pollSemaphore(mutex), KE_SEMA_ZERO, "then the semaphore is empty");
+        });
+
         tc.Run("semaphore waiters are FIFO and signal transfers one token directly", [](TestCase &t)
         {
             TestEnv env;

@@ -11,6 +11,7 @@
 #include <map>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -1045,8 +1046,8 @@ int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uin
 {
     assertExecutor();
     // The EE kernel stores max_count without validating it, and games rely on that:
-    // Valkyrie Profile 2 creates its sound worker semaphore with max_count 0. Such a
-    // semaphore has no upper bound (see signalSemaphore).
+    // Valkyrie Profile 2 creates its sound worker semaphore with max_count 0. No semaphore has an
+    // upper bound (see signalSemaphore).
     if (initCount < 0 || (maxCount > 0 && initCount > maxCount))
     {
         return KE_ERROR;
@@ -1107,9 +1108,20 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
         publishSnapshot();
         return id;
     }
+    // No KE_SEMA_OVF: the count goes past max_count. Jade Cocoon 2's loader releases its mutex (init 1, max 1)
+    // before it takes it, then holds the one token while its CD callback must take another: refusing the extra
+    // release deadlocks it, and the retail game runs, so the EE kernel does not cap the count. That is a
+    // behavioural conclusion, not one read from a BIOS disassembly; Play!'s HLE kernel (sc_SignalSema) does not
+    // check the maximum either. Each semaphore that goes past its maximum is logged once, so a game that does
+    // depend on the cap shows up here.
     if (object->maxCount > 0 && object->count >= object->maxCount)
     {
-        return KE_SEMA_OVF;
+        static std::set<int> s_reported;
+        if (s_reported.insert(id).second)
+        {
+            std::cerr << "[ee-sema] semaphore " << id << " signalled past max_count " << object->maxCount
+                      << " (count " << object->count + 1 << "): no KE_SEMA_OVF on the EE" << std::endl;
+        }
     }
     ++object->count;
     publishSnapshot();
