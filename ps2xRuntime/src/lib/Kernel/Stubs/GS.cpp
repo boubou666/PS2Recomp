@@ -109,7 +109,7 @@ namespace ps2_stubs
         {
             const uint32_t stateAddr = getRegU32(ctx, 4);
             const uint32_t baseAddr = getRegU32(ctx, 5);
-            const uint32_t words[4] = {baseAddr, baseAddr, 0u, 0u};
+            const uint32_t words[3] = {baseAddr, baseAddr, 0u};
             writeGuestBytes(rdram,
                             runtime,
                             stateAddr,
@@ -162,12 +162,8 @@ namespace ps2_stubs
                 return;
             }
 
-            const uint32_t words[4] = {baseAddr, baseAddr, 0u, 0u};
-            writeGuestBytes(rdram,
-                            runtime,
-                            stateAddr,
-                            reinterpret_cast<const uint8_t *>(words),
-                            sizeof(words));
+            writeGuestU32(rdram, runtime, stateAddr, baseAddr);
+            writeGuestU32(rdram, runtime, stateAddr + 8u, 0u);
             setReturnU32(ctx, baseAddr);
         }
 
@@ -1573,7 +1569,6 @@ namespace ps2_stubs
     void sceVif1PkInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         initPacketBuilderState(rdram, ctx, runtime);
-        writeGuestU32(rdram, runtime, getRegU32(ctx, 4) + 20u, 0u);
     }
 
     void sceVif1PkOpenDirectCode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1601,7 +1596,6 @@ namespace ps2_stubs
     void sceVif1PkReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         resetPacketBuilderState(rdram, ctx, runtime);
-        writeGuestU32(rdram, runtime, getRegU32(ctx, 4) + 20u, 0u);
     }
 
     void sceVif1PkReserve(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

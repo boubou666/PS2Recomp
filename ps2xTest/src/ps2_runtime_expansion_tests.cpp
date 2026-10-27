@@ -1715,7 +1715,7 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(getRegS32(ctx, 2), 0, "sceVu0TransposeMatrix should report success");
         });
 
-        tc.Run("sceVif1PkReset preserves the packet base pointer and clears open tag state", [](TestCase &t)
+        tc.Run("sceVif1PkReset rewinds pCurrent and drops pDmaTag, leaving the open codes alone", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             R5900Context ctx{};
@@ -1754,8 +1754,8 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(current, kBaseAddr, "sceVif1PkReset should restore current pointer to the packet base");
             t.Equals(base, kBaseAddr, "sceVif1PkReset should preserve the packet base pointer");
             t.Equals(pending, 0u, "sceVif1PkReset should clear pending count tracking");
-            t.Equals(directOpen, 0u, "sceVif1PkReset should clear direct-code open state");
-            t.Equals(gifOpen, 0u, "sceVif1PkReset should clear GIF-tag open state");
+            t.Equals(directOpen, dirtyDirectOpen, "sceVif1PkReset should leave pVifCode as libvif does");
+            t.Equals(gifOpen, dirtyGifOpen, "sceVif1PkReset should leave pGifTag as libvif does");
             t.Equals(::getRegU32(&ctx, 2), kBaseAddr, "sceVif1PkReset should return the packet base pointer");
         });
 
