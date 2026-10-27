@@ -1250,6 +1250,8 @@ PS2X_VU_INLINE void VU1Interpreter::queueFsset(uint16_t immediate)
 {
     // FSSET overrides the status flags an upper instruction of the same pair would write.
     forEachFlagEntryIssuedThisCycle([](FlagPipelineEntry &entry) { entry.writesStatus = false; });
+    // Dead flag writes issued before it land before it: it replaces their sticky bits too.
+    m_deadSticky = 0u;
     if (FlagPipelineEntry *entry = pushFlagEntry(false, 0xFFFFFFFEu))
     {
         entry->status = static_cast<uint32_t>(immediate) & 0xFC0u;
