@@ -79,6 +79,17 @@ void register_pad_input_tests()
             t.Equals(static_cast<int>(ps2PadScriptButtonsAt(script, 5.9)), 0x4000, "START released after its 300 ms hold");
         });
 
+        tc.Run("PS2X_PAD_INPUT presses each word in turn, 0.35 s apart, in any case", [](TestCase &t)
+        {
+            const char *lines = "cross SQUARE+triangle\nstart/100";
+            t.Equals(static_cast<int>(ps2PadLiveInputButtonsAt(lines, 10.0, 10.1)), 0x4000, "the first word at once");
+            t.Equals(static_cast<int>(ps2PadLiveInputButtonsAt(lines, 10.0, 10.3)), 0, "released after 250 ms");
+            t.Equals(static_cast<int>(ps2PadLiveInputButtonsAt(lines, 10.0, 10.4)), 0x9000, "SQUARE+triangle together");
+            t.Equals(static_cast<int>(ps2PadLiveInputButtonsAt(lines, 10.0, 10.75)), 0x0008, "the next line's word");
+            t.Equals(static_cast<int>(ps2PadLiveInputButtonsAt(lines, 10.0, 10.85)), 0, "START held 100 ms");
+            t.Equals(static_cast<int>(ps2PadLiveInputButtonsAt("jump", 0.0, 0.1)), 0, "unknown words press nothing");
+        });
+
         tc.Run("scePadRead uses override state", [](TestCase &t)
                {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
