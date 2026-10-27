@@ -1049,6 +1049,13 @@ namespace
 
 namespace
 {
+    // Bumped by every registration: images resolved before it are resolved again.
+    std::atomic<uint64_t> &registryGeneration()
+    {
+        static std::atomic<uint64_t> generation{1u};
+        return generation;
+    }
+
     std::vector<VU1Interpreter::LiftedEntry> &liftedEntryRegistry()
     {
         static std::vector<VU1Interpreter::LiftedEntry> registry;
@@ -1070,6 +1077,7 @@ namespace
 void VU1Interpreter::registerLiftedEntry(const LiftedEntry &lifted)
 {
     liftedEntryRegistry().push_back(lifted);
+    registryGeneration().fetch_add(1u, std::memory_order_relaxed);
 }
 
 void VU1Interpreter::registerCompiledFragment(const CompiledFragment &fragment)
@@ -1081,6 +1089,7 @@ void VU1Interpreter::registerCompiledFragment(const CompiledFragment &fragment)
                                      [](const CompiledFragment &left, const CompiledFragment &right)
                                      { return left.pairCount < right.pairCount; }),
                     fragment);
+    registryGeneration().fetch_add(1u, std::memory_order_relaxed);
 }
 
 void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp)
@@ -1088,8 +1097,40 @@ void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t co
     m_compiledChecked = true;
     m_compiledStamp = stamp;
     m_compiledCode = vuCode;
-    m_compiledByPair.clear();
-    const uint32_t pairCount = codeSize / 8u;
+    const uint64_t generation = registryGeneration().load(std::memory_order_relaxed);
+    CompiledImage *image = nullptr;
+    for (CompiledImage &cached : m_compiledImages)
+        if (cached.registryGeneration == generation && cached.code.size() == codeSize &&
+            std::memcmp(cached.code.data(), vuCode, codeSize) == 0)
+        {
+            image = &cached;
+            break;
+        }
+    if (image)
+    {
+        for (const auto &[replaced, entry] : image->replaced)
+            *replaced = entry;
+    }
+    else
+    {
+        image = &*std::min_element(m_compiledImages.begin(), m_compiledImages.end(),
+                                   [](const CompiledImage &left, const CompiledImage &right)
+                                   { return left.lastUse < right.lastUse; });
+        image->code.assign(vuCode, vuCode + codeSize);
+        image->registryGeneration = generation;
+        image->byPair.clear();
+        image->replaced.clear();
+        resolveCompiledImage(*image);
+    }
+    image->lastUse = ++m_compiledImageUses;
+    m_compiledImage = image;
+}
+
+void VU1Interpreter::resolveCompiledImage(CompiledImage &image) const
+{
+    const uint8_t *vuCode = image.code.data();
+    const uint32_t pairCount = static_cast<uint32_t>(image.code.size() / 8u);
+    std::vector<CompiledEntry> &byPair = image.byPair;
     // Versions of one program share their ranges: hash each range once per refresh (games upload microcode often).
     struct RangeHash
     {
@@ -1110,11 +1151,11 @@ void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t co
                                         codeHash(vuCode + fragment.firstPair * 8u, fragment.pairCount * 8u)});
         if (range->hash != fragment.codeHash)
             continue;
-        if (m_compiledByPair.empty())
-            m_compiledByPair.assign(pairCount, nullptr);
-        std::copy_n(fragment.pairs, fragment.pairCount, m_compiledByPair.begin() + fragment.firstPair);
+        if (byPair.empty())
+            byPair.assign(pairCount, nullptr);
+        std::copy_n(fragment.pairs, fragment.pairCount, byPair.begin() + fragment.firstPair);
     }
-    if (m_compiledByPair.empty() || !liftedEntriesEnabled())
+    if (byPair.empty() || !liftedEntriesEnabled())
         return;
     for (const LiftedEntry &lifted : liftedEntryRegistry())
     {
@@ -1122,10 +1163,11 @@ void VU1Interpreter::refreshCompiledFragments(const uint8_t *vuCode, uint32_t co
             continue;
         const auto range = std::find_if(rangeHashes.begin(), rangeHashes.end(), [&](const RangeHash &entry)
                                         { return entry.firstPair == lifted.firstPair && entry.pairCount == lifted.pairCount; });
-        if (range == rangeHashes.end() || range->hash != lifted.codeHash || !m_compiledByPair[lifted.pair])
+        if (range == rangeHashes.end() || range->hash != lifted.codeHash || !byPair[lifted.pair])
             continue;
-        *lifted.replaced = m_compiledByPair[lifted.pair];
-        m_compiledByPair[lifted.pair] = lifted.entry;
+        *lifted.replaced = byPair[lifted.pair];
+        image.replaced.push_back({lifted.replaced, byPair[lifted.pair]});
+        byPair[lifted.pair] = lifted.entry;
     }
 }
 
@@ -1172,8 +1214,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                                  : (vu1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration()) + 1u;
         if (!m_compiledChecked || stamp != m_compiledStamp || vuCode != m_compiledCode)
             refreshCompiledFragments(vuCode, codeSize, stamp);
-        if (!m_compiledByPair.empty())
-            compiled = m_compiledByPair.data();
+        if (!m_compiledImage->byPair.empty())
+            compiled = m_compiledImage->byPair.data();
     }
 
     while (canIssue(context))

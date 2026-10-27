@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <utility>
 #include <vector>
 
 class GS;
@@ -419,13 +420,27 @@ private:
     PacketObserver m_packetObserver;
     uint64_t m_externalCodeGeneration = 0;
 
-    // Compiled fragments matching the current code memory, by pair index (empty: none apply).
-    std::vector<CompiledEntry> m_compiledByPair;
+    // The compiled entries of the last few code memory contents seen, by pair index (empty: none apply). Games
+    // switch between a few microcode images: a new upload of one of them costs a comparison instead of hashing the
+    // fragments' ranges again.
+    struct CompiledImage
+    {
+        std::vector<uint8_t> code;
+        std::vector<CompiledEntry> byPair;
+        std::vector<std::pair<CompiledEntry *, CompiledEntry>> replaced; // LiftedEntry::replaced, as it was set
+        uint64_t registryGeneration = 0;
+        uint64_t lastUse = 0;
+    };
+    static constexpr uint32_t kCompiledImages = 4u;
+    std::array<CompiledImage, kCompiledImages> m_compiledImages{};
+    const CompiledImage *m_compiledImage = nullptr;
+    uint64_t m_compiledImageUses = 0;
     const uint8_t *m_compiledCode = nullptr;
     uint64_t m_compiledStamp = 0;
     bool m_compiledChecked = false;
     bool m_compiledCodeDisabled = false;
     void refreshCompiledFragments(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp);
+    void resolveCompiledImage(CompiledImage &image) const;
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
