@@ -811,6 +811,7 @@ void GS::reset()
         m_ctx[i].frame.fbw = 10;
         m_ctx[i].scissor = {0, 639, 0, 447};
         m_ctx[i].xyoffset = {0, 0};
+        m_ctx[i].zbuf = GSReg::decodeZbuf(0u);
     }
 }
 
