@@ -87,6 +87,46 @@ void register_audio_stretch_tests()
             t.IsTrue(crossings > 850u && crossings < 910u, "a 440 Hz tone keeps its pitch");
         });
 
+        tc.Run("bursty real-time input plays through unchanged", [](TestCase &t)
+               {
+            AudioTimeStretcher stretcher;
+            std::vector<int16_t> input;
+            uint32_t seed = 1u;
+            for (size_t i = 0; i < 48000u * 12u; ++i)
+            {
+                seed = seed * 1664525u + 1013904223u;
+                input.push_back(static_cast<int16_t>(static_cast<int32_t>(seed >> 16) - 32768) / 4);
+            }
+            std::vector<int16_t> pulled;
+            std::vector<int16_t> chunk;
+            std::vector<int16_t> out(512u * 2u);
+            size_t pushed = 0;
+            for (size_t p = 0; pushed + 2048u < input.size(); ++p)
+            {
+                const size_t frames = p % 4u == 0u ? 1280u : (p % 4u == 2u ? 768u : 0u);
+                chunk.resize(frames * 2u);
+                for (size_t i = 0; i < frames; ++i)
+                    chunk[i * 2u] = chunk[i * 2u + 1u] = input[pushed + i];
+                stretcher.push(chunk.data(), frames);
+                pushed += frames;
+                stretcher.pull(out.data(), 512u);
+                for (size_t i = 0; i < 512u; ++i)
+                    pulled.push_back(out[i * 2u]);
+            }
+            t.Equals(stretcher.underruns(), static_cast<uint64_t>(0), "no underrun at real-time pace");
+            t.IsTrue(stretcher.locked(), "the stretcher plays the input through");
+            const size_t at = pulled.size() - 48000u * 4u;
+            size_t lag = 0;
+            while (lag < at && !std::equal(pulled.begin() + static_cast<std::ptrdiff_t>(at), pulled.begin() + static_cast<std::ptrdiff_t>(at + 64u),
+                                           input.begin() + static_cast<std::ptrdiff_t>(at - lag),
+                                           [](int16_t a, int16_t b) { return std::abs(a - b) <= 1; }))
+                ++lag;
+            size_t differ = 0;
+            for (size_t i = at; i < pulled.size(); ++i)
+                differ += std::abs(pulled[i] - input[i - lag]) > 1 ? 1u : 0u;
+            t.Equals(differ, size_t{0}, "the last 4 s are the input, delayed, without a splice");
+        });
+
         tc.Run("an empty buffer fades to silence", [](TestCase &t)
                {
             AudioTimeStretcher stretcher;
