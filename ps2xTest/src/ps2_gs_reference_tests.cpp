@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_state_image.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/ps2_memory.h"
 
@@ -53,7 +54,7 @@ namespace
         std::vector<uint8_t> vram;
         GS gs;
 
-        explicit Target(uint32_t framePsm = GS_PSM_CT32, uint32_t zPsm = 0u, bool zMask = true)
+        explicit Target(uint32_t framePsm = GS_PSM_CT32, uint32_t zPsm = 0u, bool zMask = true, bool writeColclamp = true)
             : vram(PS2_GS_VRAM_SIZE, 0u)
         {
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
@@ -62,7 +63,8 @@ namespace
             gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
-            gs.writeRegister(GS_REG_COLCLAMP, 1ull);
+            if (writeColclamp)
+                gs.writeRegister(GS_REG_COLCLAMP, 1ull);
             gs.writeRegister(GS_REG_PRMODECONT, 1ull);
         }
 
@@ -144,16 +146,21 @@ void register_ps2_gs_reference_tests()
             t.Equals(blended(0ull, add), 0x802C2C2Cu, "300 wraps to 44");
             t.Equals(blended(1ull, subtract), 0x80000000u, "-100 clamps to 0");
             t.Equals(blended(0ull, subtract), 0x809C9C9Cu, "-100 wraps to 156");
+
+            Target unset(GS_PSM_CT32, 0u, true, false);
+            unset.gs.WriteVram(GS_PSM_CT32, 0u, 1u, 0u, 0u, 0x80646464u);
+            unset.gs.writeRegister(GS_REG_ALPHA_1, add);
+            unset.gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 6));
+            unset.gs.writeRegister(GS_REG_RGBAQ, rgbaq(200u, 200u, 200u, 0x80u));
+            unset.sprite(0u, 0u, 16u, 16u);
+            t.Equals(unset.frame32(0u, 0u), 0x80FFFFFFu, "COLCLAMP never written: the reset value 1 clamps 300 to 255");
         });
 
         tc.Run("DTHE adds the DIMX entry of the pixel's window position to colours written to 16-bit frames", [](TestCase &t)
         {
-            // DIMX rows: (-4, -1, 0, 1), (2, 3, -2, -3), (0, 1, 2, 3), (-1, -2, -3, -4) as 3-bit two's complement.
+            // GS manual layout: DMxy (x the row, y the column) is 3-bit two's complement at bit 16x + 4y.
             const int dimx[4][4] = {{-4, -1, 0, 1}, {2, 3, -2, -3}, {0, 1, 2, 3}, {-1, -2, -3, -4}};
-            uint64_t dimxReg = 0u;
-            for (int row = 0; row < 4; ++row)
-                for (int column = 0; column < 4; ++column)
-                    dimxReg |= static_cast<uint64_t>(dimx[row][column] & 7) << (row * 16 + column * 4);
+            constexpr uint64_t dimxReg = 0x4567321056321074ull;
 
             auto draw = [&](uint32_t framePsm, uint64_t dthe, uint64_t colclamp, uint32_t colour)
             {
@@ -275,7 +282,7 @@ void register_ps2_gs_reference_tests()
             textured.gs.writeRegister(GS_REG_XYZ2, vertex(0u, 0u));
             textured.gs.writeRegister(GS_REG_UV, uv(64u, 16u));
             textured.gs.writeRegister(GS_REG_XYZ2, vertex(64u, 16u));
-            t.Equals(textured.frame32(1u, 0u), 0x80808080u, "pixel 1 samples U = 1.0: half of texel 0, half of texel 1");
+            t.Equals(textured.frame32(1u, 0u), 0x80808080u, "pixel 1 samples U = 1.0: weight 8/16, (255 * 8 * 16 + 128) >> 8 = 128");
 
             textured.gs.writeRegister(GS_REG_TEX1_1, 0ull);
             textured.gs.writeRegister(GS_REG_UV, uv(0u, 0u));
@@ -329,7 +336,7 @@ void register_ps2_gs_reference_tests()
             };
             t.Equals(drawWithK(0u), 0x80FFFFFFu, "LOD 0 magnifies: nearest texel 1");
             t.Equals(drawWithK(0xFF0u), 0x80FFFFFFu, "LOD -1 magnifies: nearest texel 1");
-            t.Equals(drawWithK(1u), 0x80808080u, "LOD 1/16 minifies: bilinear between texels 0 and 1");
+            t.Equals(drawWithK(1u), 0x80808080u, "LOD 1/16 minifies: bilinear between texels 0 and 1, weight 8/16 rounds to 128");
         });
 
         tc.Run("mipmap levels come from MIPTBP1, nearest or blended by the LOD's fraction", [](TestCase &t)
@@ -365,6 +372,78 @@ void register_ps2_gs_reference_tests()
             t.Equals(draw(2u, 0u, true, 0.5f), kGreen, "Q = 0.5: LOD = log2(1 / Q) = 1");
             t.Equals(draw(2u, 0u, true, 1.0f), kRed, "Q = 1: LOD 0, level 0");
             t.Equals(draw(2u, 0u, true, 2.0f), kRed, "Q = 2: LOD -1, level 0");
+        });
+
+        tc.Run("bilinear weights are the low 4 bits of U * 16 - 8, the blend rounded once", [](TestCase &t)
+        {
+            auto draw = [](float s)
+            {
+                Target target;
+                for (uint32_t x = 0; x < 4u; ++x)
+                    target.gs.WriteVram(GS_PSM_CT32, kTextureBlock, 1u, x, 0u, (x & 1u) ? 0x80FFFFFFu : 0x80000000u);
+                target.texture(2u, 0u);
+                target.gs.writeRegister(GS_REG_TEX1_1, 1ull << 5);
+                target.gs.writeRegister(GS_REG_CLAMP_1, 1ull | (1ull << 2));
+                target.gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4));
+                target.gs.writeRegister(GS_REG_RGBAQ, rgbaq(128u, 128u, 128u, 0x80u));
+                target.gs.writeRegister(GS_REG_ST, st(s, 0.5f));
+                target.gs.writeRegister(GS_REG_XYZ2, vertex(0u, 0u));
+                target.gs.writeRegister(GS_REG_XYZ2, vertex(16u, 16u));
+                return target.frame32(0u, 0u);
+            };
+            t.Equals(draw(0.1953125f), 0x80404040u, "U * 16 = 12.5: weight 4, (255 * 4 * 16 + 128) >> 8 = 64");
+            t.Equals(draw(0.25f), 0x80808080u, "U * 16 = 16: weight 8, 127.5 rounds to 128");
+            t.Equals(draw(0.2021484375f), 0x80404040u, "U * 16 = 12.9375 drops its fraction: weight 4 again");
+        });
+
+        tc.Run("TEX0 with TEX1.MTBA = 1 places mip levels 1 to 3 behind level 0 in MIPTBP1", [](TestCase &t)
+        {
+            auto miptbp1After = [](uint64_t tex1, uint64_t tex0)
+            {
+                Target target;
+                target.gs.writeRegister(GS_REG_MIPTBP1_1, 0x123ull);
+                target.gs.writeRegister(GS_REG_TEX1_1, tex1);
+                target.gs.writeRegister(GS_REG_TEX0_1, tex0);
+                GSStateImage image;
+                target.gs.saveState(image);
+                return image.reg(GS_REG_MIPTBP1_1);
+            };
+            auto level = [](uint64_t tbp, uint64_t tbw, int n)
+            {
+                return (tbp | (tbw << 14)) << (20 * n);
+            };
+            // 32x8 CT16 at block 100, TBW 4: the height counts as 32.
+            const uint64_t tex0 = 100ull | (4ull << 14) | (static_cast<uint64_t>(GS_PSM_CT16) << 20) | (5ull << 26) | (3ull << 30);
+            t.Equals(miptbp1After(1ull << 9, tex0), level(108u, 2u, 0) | level(110u, 1u, 1) | level(111u, 1u, 2),
+                     "32x32x16 bits = 8 blocks, 16x16 = 2 blocks, 8x8 = half a block counts as 1; TBW 4 -> 2 -> 1 -> 1");
+            t.Equals(miptbp1After(0ull, tex0), 0x123ull, "MTBA = 0 keeps the written MIPTBP1");
+
+            auto draw = [](bool mtba)
+            {
+                Target target;
+                for (uint32_t y = 0; y < 8u; ++y)
+                    for (uint32_t x = 0; x < 8u; ++x)
+                        target.gs.WriteVram(GS_PSM_CT32, kTextureBlock, 1u, x, y, 0x800000FFu);
+                for (uint32_t y = 0; y < 4u; ++y)
+                    for (uint32_t x = 0; x < 4u; ++x)
+                    {
+                        target.gs.WriteVram(GS_PSM_CT32, kTextureBlock + 1u, 1u, x, y, 0x8000FF00u);
+                        target.gs.WriteVram(GS_PSM_CT32, kMipBlock, 1u, x, y, 0x80FF0000u);
+                    }
+                target.gs.writeRegister(GS_REG_MIPTBP1_1, static_cast<uint64_t>(kMipBlock) | (1ull << 14));
+                // LCM, MXL 1, MMIN nearest mipmap, LOD 1.
+                target.gs.writeRegister(GS_REG_TEX1_1, 1ull | (1ull << 2) | (2ull << 6) | (mtba ? (1ull << 9) : 0ull) | (16ull << 32));
+                target.texture(3u, 3u);
+                target.gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4));
+                target.gs.writeRegister(GS_REG_RGBAQ, rgbaq(128u, 128u, 128u, 0x80u));
+                target.gs.writeRegister(GS_REG_ST, st(0.0f, 0.0f));
+                target.gs.writeRegister(GS_REG_XYZ2, vertex(0u, 0u));
+                target.gs.writeRegister(GS_REG_ST, st(0.25f, 0.25f));
+                target.gs.writeRegister(GS_REG_XYZ2, vertex(32u, 32u));
+                return target.frame32(1u, 1u);
+            };
+            t.Equals(draw(true), 0x8000FF00u, "8x8 CT32 at block 64 is one block: level 1 reads block 65");
+            t.Equals(draw(false), 0x80FF0000u, "without MTBA level 1 reads MIPTBP1's block");
         });
     });
 }
