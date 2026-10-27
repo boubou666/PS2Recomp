@@ -1,6 +1,7 @@
 #include "ThreadNaming.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_registers.h"
 #include "runtime/gs/gs_stream_renderer.h"
 #include "runtime/gs/gs_trace.h"
 #include "runtime/gs/ps2_gs_memory.h"
@@ -25,21 +26,6 @@
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
-
-    GSPrimReg decodePrimRegister(uint64_t value)
-    {
-        GSPrimReg prim{};
-        prim.type = static_cast<GSPrimType>(value & 0x7u);
-        prim.iip = ((value >> 3) & 1u) != 0u;
-        prim.tme = ((value >> 4) & 1u) != 0u;
-        prim.fge = ((value >> 5) & 1u) != 0u;
-        prim.abe = ((value >> 6) & 1u) != 0u;
-        prim.aa1 = ((value >> 7) & 1u) != 0u;
-        prim.fst = ((value >> 8) & 1u) != 0u;
-        prim.ctxt = ((value >> 9) & 1u) != 0u;
-        prim.fix = ((value >> 10) & 1u) != 0u;
-        return prim;
-    }
 
     static inline uint64_t loadLE64(const uint8_t *p)
     {
@@ -1921,7 +1907,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
     case GS_REG_PRIM:
     {
-        m_primRegister = decodePrimRegister(value);
+        m_primRegister = GSReg::decodePrim(value);
         if (m_prmodecont)
         {
             m_prim = m_primRegister;
@@ -2007,18 +1993,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_TEX0_2) ? 1 : 0;
         auto &t = m_ctx[ci].tex0;
-        t.tbp0 = static_cast<uint32_t>(value & 0x3FFF);
-        t.tbw = static_cast<uint8_t>((value >> 14) & 0x3F);
-        t.psm = static_cast<uint8_t>((value >> 20) & 0x3F);
-        t.tw = static_cast<uint8_t>((value >> 26) & 0xF);
-        t.th = static_cast<uint8_t>((value >> 30) & 0xF);
-        t.tcc = static_cast<uint8_t>((value >> 34) & 0x1);
-        t.tfx = static_cast<uint8_t>((value >> 35) & 0x3);
-        t.cbp = static_cast<uint32_t>((value >> 37) & 0x3FFF);
-        t.cpsm = static_cast<uint8_t>((value >> 51) & 0xF);
-        t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
-        t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
-        t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        t = GSReg::decodeTex0(value);
         m_backend->LoadClut(t, m_texclut);
         break;
     }
@@ -2044,12 +2019,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_TEX2_2) ? 1 : 0;
         auto &t = m_ctx[ci].tex0;
-        t.psm = static_cast<uint8_t>((value >> 20) & 0x3F);
-        t.cbp = static_cast<uint32_t>((value >> 37) & 0x3FFF);
-        t.cpsm = static_cast<uint8_t>((value >> 51) & 0xF);
-        t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
-        t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
-        t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        GSReg::applyTex2(t, value);
         m_backend->LoadClut(t, m_texclut);
         break;
     }
@@ -2057,8 +2027,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_XYOFFSET_2:
     {
         int ci = (regAddr == GS_REG_XYOFFSET_2) ? 1 : 0;
-        m_ctx[ci].xyoffset.ofx = static_cast<uint16_t>(value & 0xFFFF);
-        m_ctx[ci].xyoffset.ofy = static_cast<uint16_t>((value >> 32) & 0xFFFF);
+        m_ctx[ci].xyoffset = GSReg::decodeXyoffset(value);
         break;
     }
     case GS_REG_PRMODECONT:
@@ -2071,7 +2040,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_PRMODE:
     {
-        m_prmodeRegister = decodePrimRegister(value);
+        m_prmodeRegister = GSReg::decodePrim(value);
         if (!m_prmodecont)
         {
             const GSPrimType type = m_primRegister.type;
@@ -2081,18 +2050,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_TEXCLUT:
-        m_texclut.cbw = static_cast<uint8_t>(value & 0x3Fu);
-        m_texclut.cou = static_cast<uint8_t>((value >> 6) & 0x3Fu);
-        m_texclut.cov = static_cast<uint16_t>((value >> 12) & 0x3FFu);
+        m_texclut = GSReg::decodeTexclut(value);
         break;
     case GS_REG_SCISSOR_1:
     case GS_REG_SCISSOR_2:
     {
         int ci = (regAddr == GS_REG_SCISSOR_2) ? 1 : 0;
-        m_ctx[ci].scissor.x0 = static_cast<uint16_t>(value & 0x7FF);
-        m_ctx[ci].scissor.x1 = static_cast<uint16_t>((value >> 16) & 0x7FF);
-        m_ctx[ci].scissor.y0 = static_cast<uint16_t>((value >> 32) & 0x7FF);
-        m_ctx[ci].scissor.y1 = static_cast<uint16_t>((value >> 48) & 0x7FF);
+        m_ctx[ci].scissor = GSReg::decodeScissor(value);
         break;
     }
     case GS_REG_ALPHA_1:
@@ -2113,19 +2077,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_FRAME_2:
     {
         int ci = (regAddr == GS_REG_FRAME_2) ? 1 : 0;
-        m_ctx[ci].frame.fbp = static_cast<uint32_t>(value & 0x1FF);
-        m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
-        m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
-        m_ctx[ci].frame.fbmsk = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
+        m_ctx[ci].frame = GSReg::decodeFrame(value);
         break;
     }
     case GS_REG_ZBUF_1:
     case GS_REG_ZBUF_2:
     {
         int ci = (regAddr == GS_REG_ZBUF_2) ? 1 : 0;
-        m_ctx[ci].zbuf.zbp = value & 0x1FF;
-        m_ctx[ci].zbuf.psm = ((value >> 24) & 0xF) | 0x30;
-        m_ctx[ci].zbuf.zmask = (value >> 32) & 1;
+        m_ctx[ci].zbuf = GSReg::decodeZbuf(value);
         break;
     }
     case GS_REG_FBA_1:
@@ -2137,27 +2096,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_BITBLTBUF:
     {
-        m_bitbltbuf.sbp = static_cast<uint32_t>(value & 0x3FFF);
-        m_bitbltbuf.sbw = static_cast<uint8_t>((value >> 16) & 0x3F);
-        m_bitbltbuf.spsm = static_cast<uint8_t>((value >> 24) & 0x3F);
-        m_bitbltbuf.dbp = static_cast<uint32_t>((value >> 32) & 0x3FFF);
-        m_bitbltbuf.dbw = static_cast<uint8_t>((value >> 48) & 0x3F);
-        m_bitbltbuf.dpsm = static_cast<uint8_t>((value >> 56) & 0x3F);
+        m_bitbltbuf = GSReg::decodeBitbltbuf(value);
         break;
     }
     case GS_REG_TRXPOS:
     {
-        m_trxpos.ssax = static_cast<uint16_t>(value & 0x7FF);
-        m_trxpos.ssay = static_cast<uint16_t>((value >> 16) & 0x7FF);
-        m_trxpos.dsax = static_cast<uint16_t>((value >> 32) & 0x7FF);
-        m_trxpos.dsay = static_cast<uint16_t>((value >> 48) & 0x7FF);
-        m_trxpos.dir = static_cast<uint8_t>((value >> 59) & 0x3);
+        m_trxpos = GSReg::decodeTrxpos(value);
         break;
     }
     case GS_REG_TRXREG:
     {
-        m_trxreg.rrw = static_cast<uint16_t>(value & 0xFFF);
-        m_trxreg.rrh = static_cast<uint16_t>((value >> 32) & 0xFFF);
+        m_trxreg = GSReg::decodeTrxreg(value);
         break;
     }
     case GS_REG_TRXDIR:
@@ -2223,9 +2172,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_TEXA:
     {
-        m_texa.ta0 = static_cast<uint8_t>(value & 0xFFu);
-        m_texa.aem = ((value >> 15) & 0x1u) != 0u;
-        m_texa.ta1 = static_cast<uint8_t>((value >> 32) & 0xFFu);
+        m_texa = GSReg::decodeTexa(value);
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t texaIndex = s_debugTexaWriteCount.fetch_add(1u, std::memory_order_relaxed);
             if (texaIndex < 24u)
