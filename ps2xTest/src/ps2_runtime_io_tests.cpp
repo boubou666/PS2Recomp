@@ -176,6 +176,64 @@ namespace
             PS2Runtime::setIoPaths(ioPaths);
         }
     };
+
+    // sceCdInitEeCB callback thread: the main thread holds a mutex while it issues sceCdRead, and the sceCdCallback
+    // function takes the same mutex (Jade Cocoon 2's loader does this). The callback must run on the thread
+    // sceCdInitEeCB created and wait there, not as an interrupt on top of the thread that holds the mutex.
+    constexpr uint32_t K_CDCB_MAIN = 0x00301000u;
+    constexpr uint32_t K_CDCB_MAIN_RESUME = 0x00301004u;
+    constexpr uint32_t K_CDCB_CALLBACK = 0x00301100u;
+    constexpr uint32_t K_CDCB_CALLBACK_RESUME = 0x00301104u;
+    constexpr uint32_t K_CDCB_STACK = 0x00023000u;
+    constexpr uint32_t K_CDCB_BUFFER = 0x00024000u;
+    std::vector<int> gCdCbTrace;
+    int gCdCbMutex = 0;
+    int gCdCbThreadId = 0;
+    int gCdCbRanOn = 0;
+    uint32_t gCdCbCommand = 0u;
+
+    void cdCallbackThreadMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_CDCB_MAIN)
+        {
+            gCdCbMutex = runtime->eeScheduler().createSemaphore(0, 1, 0, 0);
+            setRegU32(*ctx, 4, 5u);
+            setRegU32(*ctx, 5, K_CDCB_STACK);
+            setRegU32(*ctx, 6, 0x800u);
+            ps2_stubs::sceCdInitEeCB(rdram, ctx, runtime);
+            gCdCbThreadId = getRegS32(ctx, 2);
+            setRegU32(*ctx, 4, K_CDCB_CALLBACK);
+            ps2_stubs::sceCdCallback(rdram, ctx, runtime);
+            setRegU32(*ctx, 4, 0u);
+            setRegU32(*ctx, 5, 1u);
+            setRegU32(*ctx, 6, K_CDCB_BUFFER);
+            ps2_stubs::sceCdRead(rdram, ctx, runtime);
+            gCdCbTrace.push_back(getRegS32(ctx, 2) == 1 ? 1 : -1);
+            ctx->pc = K_CDCB_MAIN_RESUME;
+            setRegU32(*ctx, 4, static_cast<uint32_t>(gCdCbMutex));
+            SignalSema(rdram, ctx, runtime);
+            return;
+        }
+        gCdCbTrace.push_back(4);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void cdCallbackThreadCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_CDCB_CALLBACK)
+        {
+            gCdCbRanOn = runtime->eeScheduler().currentThreadId();
+            gCdCbCommand = getRegU32(ctx, 4);
+            gCdCbTrace.push_back(2);
+            ctx->pc = K_CDCB_CALLBACK_RESUME;
+            setRegU32(*ctx, 4, static_cast<uint32_t>(gCdCbMutex));
+            WaitSema(rdram, ctx, runtime);
+            return;
+        }
+        gCdCbTrace.push_back(3);
+        ctx->pc = 0u;
+    }
 }
 
 void register_ps2_runtime_io_tests()
@@ -785,6 +843,53 @@ void register_ps2_runtime_io_tests()
             t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed when cdImage is configured");
             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image", 8), 0,
                      "sceCdRead should copy sector data from the configured image");
+        });
+
+        tc.Run("sceCdInitEeCB runs the sceCdCallback function on its own thread, which may block", [](TestCase &t)
+        {
+            TestContext test;
+            const std::filesystem::path imagePath = test.paths.base / "disc.iso";
+            {
+                std::vector<uint8_t> sector(2048u, 0x5Au);
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(sector.data()), static_cast<std::streamsize>(sector.size()));
+            }
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            gCdCbTrace.clear();
+            gCdCbThreadId = gCdCbRanOn = 0;
+            gCdCbCommand = 0u;
+            test.runtime.registerFunction(K_CDCB_MAIN, cdCallbackThreadMain);
+            test.runtime.registerFunction(K_CDCB_MAIN_RESUME, cdCallbackThreadMain);
+            test.runtime.registerFunction(K_CDCB_CALLBACK, cdCallbackThreadCallback);
+            test.runtime.registerFunction(K_CDCB_CALLBACK_RESUME, cdCallbackThreadCallback);
+            std::memset(&test.ctx, 0, sizeof(test.ctx));
+            test.ctx.pc = K_CDCB_MAIN;
+            setRegU32(test.ctx, 29, 0x00022000u);
+            EeScheduler &ee = test.runtime.eeScheduler();
+            ee.reset(test.rdram.data(), test.ctx);
+            // Main runs below the callback thread (priority 5), like JC2's loader (4) under its callback thread.
+            ee.thread(EeScheduler::kMainThreadId)->currentPriority = 10;
+            ee.thread(EeScheduler::kMainThreadId)->initialPriority = 10;
+            ee.run();
+
+            t.IsTrue(gCdCbThreadId > EeScheduler::kMainThreadId, "sceCdInitEeCB should return the callback thread id");
+            t.Equals(gCdCbRanOn, gCdCbThreadId, "the callback should run on the sceCdInitEeCB thread");
+            t.Equals(gCdCbCommand, 1u, "the callback should receive the finished command (read)");
+            const std::vector<int> expected{1, 2, 3, 4};
+            t.IsTrue(gCdCbTrace == expected,
+                     "the callback should wait for the mutex its caller holds, then finish once it is released");
+
+            setRegU32(test.ctx, 4, 0u);
+            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &test.runtime);
+            for (uint32_t address : {K_CDCB_MAIN, K_CDCB_MAIN_RESUME, K_CDCB_CALLBACK, K_CDCB_CALLBACK_RESUME})
+                test.runtime.registerFunction(address, nullptr);
         });
 
         tc.Run("sceCdCallback is reported as an interrupt after a completed sceCdRead", [](TestCase &t)
