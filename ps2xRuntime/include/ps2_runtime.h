@@ -423,6 +423,10 @@ public:
     static constexpr uint32_t kReservedPoolBytes = 0x40000u;
     void configureReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit);
     static uint32_t reservedMemoryBase();
+    // SetupThread's main stack [stackBase, stackTop). Unless configureReservedMemory placed the region, a stack that
+    // overlaps it moves the region to the spare kernel RAM below the ELF, or below the stack when the ELF is there,
+    // and the guest heap ends at the stack or the region.
+    void reserveMainThreadStack(uint32_t stackBase, uint32_t stackTop);
 
     // Host-rendered frames shown instead of the GS output while the callback returns true
     // (e.g. a game override playing a movie on the host). Called on the render thread.
@@ -538,6 +542,7 @@ private:
     uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
+    void placeReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit);
     void HandleIntegerOverflow(R5900Context *ctx);
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
@@ -591,6 +596,8 @@ private:
     bool m_guestHeapPinned = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    uint32_t m_reservedMemoryTop = PS2_RAM_SIZE;
+    bool m_reservedMemoryExplicit = false;
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};

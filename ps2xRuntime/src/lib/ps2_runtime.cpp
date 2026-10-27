@@ -722,6 +722,8 @@ PS2Runtime::PS2Runtime()
     reservedMemoryBaseStorage() = kDefaultReservedMemoryBase;
     m_asyncCallbackStackFloor = std::min(m_guestHeapHardLimit, PS2_RAM_SIZE);
     m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_reservedMemoryTop = PS2_RAM_SIZE;
+    m_reservedMemoryExplicit = false;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -2839,11 +2841,65 @@ uint32_t PS2Runtime::guestHeapHardLimit() const
 
 void PS2Runtime::configureReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit)
 {
+    placeReservedMemory(base, top, guestHeapHardLimit);
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    m_reservedMemoryExplicit = true;
+}
+
+void PS2Runtime::reserveMainThreadStack(uint32_t stackBase, uint32_t stackTop)
+{
+    constexpr uint32_t kKernelSpareBase = 0x00080000u;
+    constexpr uint32_t kKernelSpareTop = 0x00100000u;
+    constexpr uint32_t kRegionBytes = kKernelSpareTop - kKernelSpareBase;
+
+    stackTop = std::min(stackTop, PS2_RAM_SIZE);
+    if (stackBase >= stackTop)
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+        if (m_reservedMemoryExplicit || stackTop <= reservedMemoryBaseStorage() || stackBase >= m_reservedMemoryTop)
+        {
+            return;
+        }
+    }
+
+    const auto overlaps = [](uint32_t base, uint32_t end, uint32_t otherBase, uint32_t otherEnd)
+    {
+        return base < otherEnd && otherBase < end;
+    };
+    bool kernelSpareFree = !overlaps(stackBase, stackTop, kKernelSpareBase, kKernelSpareTop);
+    for (const LoadedModule &module : m_loadedModules)
+    {
+        const uint64_t moduleEnd = static_cast<uint64_t>(module.baseAddress) + module.size;
+        if (module.baseAddress < kKernelSpareTop && moduleEnd > kKernelSpareBase)
+        {
+            kernelSpareFree = false;
+        }
+    }
+
+    if (kernelSpareFree)
+    {
+        placeReservedMemory(kKernelSpareBase, kKernelSpareTop, stackBase);
+        return;
+    }
+    const uint32_t top = stackBase & ~0xFFFu;
+    if (top < kRegionBytes)
+    {
+        return;
+    }
+    placeReservedMemory(top - kRegionBytes, top, top - kRegionBytes);
+}
+
+void PS2Runtime::placeReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit)
+{
     reservedMemoryBaseStorage() = base;
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         m_asyncCallbackStackFloor = std::min(base + kReservedPoolBytes, PS2_RAM_SIZE);
         m_asyncCallbackStackTop = std::min(top, PS2_RAM_SIZE);
+        m_reservedMemoryTop = m_asyncCallbackStackTop;
     }
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
     m_guestHeapHardLimit = std::min(guestHeapHardLimit, PS2_RAM_SIZE);
