@@ -1036,6 +1036,40 @@ void register_ps2_runtime_kernel_tests()
             env.runtime.configureReservedMemory(0x01F00000u, PS2_RAM_SIZE, 0x01F00000u);
         });
 
+        tc.Run("COP0 Count runs with the EE cycles and MTC0 Count sets its origin", [](TestCase &t)
+        {
+            TestEnv env;
+            const uint32_t start = env.runtime.readCop0Count();
+            env.runtime.eeScheduler().accountCycles(1000u);
+            t.IsTrue(env.runtime.readCop0Count() - start >= 1000u, "Count should advance with accounted EE cycles");
+
+            env.runtime.writeCop0Count(0xFFFFFF00u);
+            t.Equals(env.runtime.readCop0Count(), 0xFFFFFF00u, "MTC0 Count should set the value read back");
+            env.runtime.eeScheduler().accountCycles(0x200u);
+            t.IsTrue(env.runtime.readCop0Count() >= 0x100u && env.runtime.readCop0Count() < 0x1000u,
+                     "Count should wrap at 32 bits like the hardware register");
+        });
+
+        tc.Run("COP0 performance counters count EE cycles while PCCR.CTE is set", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kPccr = 0u, kPcr0 = 1u, kPcr1 = 3u;
+            env.runtime.writeCop0Perf(kPcr0, 5u);
+            env.runtime.eeScheduler().accountCycles(1000u);
+            t.Equals(env.runtime.readCop0Perf(kPcr0), 5u, "a stopped counter keeps its value");
+
+            env.runtime.writeCop0Perf(kPccr, 0x80008002u);
+            t.Equals(env.runtime.readCop0Perf(kPccr), 0x80008002u, "PCCR reads back");
+            env.runtime.eeScheduler().accountCycles(1000u);
+            t.IsTrue(env.runtime.readCop0Perf(kPcr0) >= 1005u, "PCR0 should count while CTE is set");
+            t.IsTrue(env.runtime.readCop0Perf(kPcr1) >= 1000u, "PCR1 should count while CTE is set");
+
+            env.runtime.writeCop0Perf(kPccr, 0u);
+            const uint32_t stopped = env.runtime.readCop0Perf(kPcr0);
+            env.runtime.eeScheduler().accountCycles(1000u);
+            t.Equals(env.runtime.readCop0Perf(kPcr0), stopped, "clearing CTE should stop the counters");
+        });
+
         tc.Run("a pinned runtime heap keeps HLE allocations out of the game's sbrk span", [](TestCase &t)
         {
             TestEnv env;

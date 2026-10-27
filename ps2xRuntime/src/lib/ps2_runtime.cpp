@@ -3091,6 +3091,46 @@ bool PS2Runtime::isStopRequested() const
     return m_stopRequested.load(std::memory_order_relaxed);
 }
 
+uint32_t PS2Runtime::readCop0Count() const noexcept
+{
+    return static_cast<uint32_t>(m_eeScheduler->currentCycle() - m_cop0CountBase);
+}
+
+void PS2Runtime::writeCop0Count(uint32_t value) noexcept
+{
+    m_cop0CountBase = m_eeScheduler->currentCycle() - value;
+}
+
+uint32_t PS2Runtime::readCop0Perf(uint32_t select) const noexcept
+{
+    if ((select & 1u) == 0u)
+        return m_cop0Pccr;
+    const uint32_t counter = (select >> 1) & 1u;
+    if ((m_cop0Pccr & 0x80000000u) == 0u)
+        return m_cop0PcrValue[counter];
+    return static_cast<uint32_t>(m_eeScheduler->currentCycle() - m_cop0PcrBase[counter]);
+}
+
+void PS2Runtime::writeCop0Perf(uint32_t select, uint32_t value) noexcept
+{
+    const uint64_t now = m_eeScheduler->currentCycle();
+    if ((select & 1u) == 0u)
+    {
+        // Starting or stopping the counters keeps their current values.
+        for (uint32_t counter = 0; counter < 2u; ++counter)
+        {
+            const uint32_t current = readCop0Perf(1u | (counter << 1));
+            m_cop0PcrValue[counter] = current;
+            m_cop0PcrBase[counter] = now - current;
+        }
+        m_cop0Pccr = value;
+        return;
+    }
+    const uint32_t counter = (select >> 1) & 1u;
+    m_cop0PcrValue[counter] = value;
+    m_cop0PcrBase[counter] = now - value;
+}
+
 EeScheduler &PS2Runtime::eeScheduler()
 {
     return *m_eeScheduler;

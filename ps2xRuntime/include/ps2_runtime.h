@@ -386,6 +386,13 @@ public:
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
+    // COP0 Count (MFC0/MTC0 $9): the EE clock, one tick per EE cycle the scheduler has accounted.
+    uint32_t readCop0Count() const noexcept;
+    void writeCop0Count(uint32_t value) noexcept;
+    // COP0 $25 (MFPS/MFPC, MTPS/MTPC): select is the instruction's low bits, bit 0 clear for PCCR, set for a
+    // counter (bit 1: PCR0 or PCR1). While PCCR.CTE (bit 31) is set the counters count EE cycles.
+    uint32_t readCop0Perf(uint32_t select) const noexcept;
+    void writeCop0Perf(uint32_t select, uint32_t value) noexcept;
 
 public:
     void handleSyscall(uint8_t *rdram, R5900Context *ctx);
@@ -589,6 +596,10 @@ private:
     uint32_t m_guestHeapHardLimit = 0x01F00000u;
     bool m_guestHeapConfigured = false;
     bool m_guestHeapPinned = false;
+    uint64_t m_cop0CountBase = 0; // EE cycle at which Count read 0 (MTC0 Count moves it)
+    uint32_t m_cop0Pccr = 0;
+    uint64_t m_cop0PcrBase[2] = {}; // EE cycle at which the counter read 0, while counting
+    uint32_t m_cop0PcrValue[2] = {}; // the counter while stopped
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 
