@@ -197,6 +197,7 @@ namespace
         Vu1Jit::Lower lower = Vu1Jit::Lower::Nop;
         bool fallback = false;  // through the interpreter's pair body
         bool liveFlags = false; // an FMAC whose flags a reader can see (Vu1Jit::fmacLive)
+        bool stickyFlags = false; // an FMAC whose sticky status bits are all a reader can see (Vu1Jit::fmacSticky)
     };
 
     // PS2X_VU_AOT_RELAXED=1: FMAC instructions of recompiled blocks as plain SSE (Vu1Jit::fmacRelaxed).
@@ -221,7 +222,8 @@ namespace
     // block keeps the per-pair path (a branch or E bit anywhere but at its end, a delay slot it cannot recompile).
     bool writeJitBlock(std::ostream &out, const std::vector<VU1Interpreter::DecodedInstructionPair> &decoded,
                        uint32_t first, uint32_t end, uint32_t firstPair, const std::vector<bool> &unobserved,
-                       const VU1Interpreter::BlockPlan &plan, uint32_t pcMask, bool fast = false)
+                       const std::vector<bool> &stickyOnly, const VU1Interpreter::BlockPlan &plan, uint32_t pcMask,
+                       bool fast = false)
     {
         using Vu = VU1Interpreter;
         using J = Vu1Jit;
@@ -255,7 +257,10 @@ namespace
                 pi.upper = {J::Upper::Nop, 0}; // no lane written, no flag either
             pi.lower = pair.iBit ? J::Lower::Nop : J::lowerKind(pair.lower);
             const bool fmac = pi.upper.kind == J::Upper::Fmac || pi.upper.kind == J::Upper::FmacAcc;
-            pi.liveFlags = fmac && ((pair.upper >> 21) & 0xFu) != 0u && !unobserved[first + k];
+            const bool relaxed = relaxedFloat() || fast;
+            pi.liveFlags = fmac && ((pair.upper >> 21) & 0xFu) != 0u && !unobserved[first + k] &&
+                           (relaxed || !stickyOnly[first + k]);
+            pi.stickyFlags = fmac && !relaxed && stickyOnly[first + k];
             pi.fallback = pi.upper.kind == J::Upper::Unsupported || pi.lower == J::Lower::Unsupported;
         }
         // The last two pairs end the block: the interpreter cannot run them in the middle of it.
@@ -368,6 +373,15 @@ namespace
                         lastViReg = static_cast<int>(reg);
         }
 
+        bool usesSticky = false;
+        for (uint32_t k = 0; k < count; ++k)
+            usesSticky = usesSticky || info[k].stickyFlags;
+        const auto foldSticky = [&](const char *indent)
+        {
+            if (usesSticky)
+                body << indent << "J::foldSticky(vu, stickySign, stickyZero);\n";
+        };
+
         bool needsBodies = false;
         for (uint32_t k = 0; k < count; ++k)
         {
@@ -385,6 +399,7 @@ namespace
             {
                 needsBodies = true;
                 body << "        {\n";
+                foldSticky("            ");
                 storeAll("            ");
                 body << "            J::advance(vu, " << cycle(k) << ");\n"
                      << "            jitBody" << (firstPair + first + k) << "(vu, context);\n";
@@ -402,6 +417,8 @@ namespace
                                     pi.lower == J::Lower::Efu;
             if (needsClock)
                 body << "        J::advance(vu, " << cycle(k) << ");\n";
+            if ((pi.liveFlags && !relaxedFloat() && !fast) || pi.lower == J::Lower::Fsset)
+                foldSticky("        ");
 
             std::ostringstream up;
             switch (pi.upper.kind)
@@ -413,11 +430,13 @@ namespace
                 else if (pi.liveFlags)
                     up << "J::fmacLive<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u, "
                        << (plan.deadFlags[k] ? "true" : "false") << ">(vu, ";
+                else if (pi.stickyFlags)
+                    up << "J::fmacSticky<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u>(vu, ";
                 else
                     up << "J::fmac<" << hex32(upper) << ", " << static_cast<unsigned>(hints) << "u>(vu, ";
                 up
                    << (pi.upper.kind == J::Upper::FmacAcc ? std::string("acc") : vfName(pi.upper.target)) << ", " << fs
-                   << ", " << ft << ", acc);";
+                   << ", " << ft << ", acc" << (pi.stickyFlags ? ", stickySign, stickyZero" : "") << ");";
                 break;
             case J::Upper::Max:
             case J::Upper::Mini:
@@ -596,6 +615,8 @@ namespace
             << "        [[maybe_unused]] int32_t vi0 = 0, viDiscard = 0;\n"
             << "        [[maybe_unused]] bool taken = false;\n"
             << "        [[maybe_unused]] uint32_t target = 0u;\n";
+        if (usesSticky)
+            out << "        __m128i stickySign = _mm_setzero_si128(), stickyZero = _mm_setzero_si128();\n";
         for (uint32_t reg = 1; reg < 32u; ++reg)
             if (vfUsed[reg])
                 out << "        __m128 " << vfName(reg) << " = J::load(s.vf[" << reg << "]);\n";
@@ -605,6 +626,7 @@ namespace
                 out << "        int32_t " << viName(reg) << " = s.vi[" << reg << "];\n";
         out << body.str();
         body.str("");
+        foldSticky("        ");
         storeAll("        ");
         out << body.str();
         const uint32_t lastPc = (firstPair + end - 1u) * 8u;
@@ -705,18 +727,20 @@ namespace
         }
         const auto blocks = findBlocks(decoded, fragment.firstPair, entryPairs);
         // Flags no reader sees are skipped only if nothing in the program can read the sticky bits they add to.
-        std::vector<bool> unobserved(fragment.pairCount, false);
-        if (stickyUnobserved)
+        // Otherwise the recompiled blocks keep only their sticky bits (Vu1Jit::fmacSticky).
+        std::vector<bool> unobserved = findUnobservedFlagWrites(decoded, fragment.firstPair);
+        for (const auto &[first, end] : blocks) // writes a later write in the block hides (BlockPlan::deadFlags)
         {
-            unobserved = findUnobservedFlagWrites(decoded, fragment.firstPair);
-            for (const auto &[first, end] : blocks) // writes a later write in the block hides (BlockPlan::deadFlags)
-            {
-                const Vu::BlockPlan plan = Vu::planBlock(decoded.data() + first, end - first);
-                for (uint32_t pair = first; pair < end; ++pair)
-                    if (plan.deadFlags[pair - first])
-                        unobserved[pair] = true;
-            }
+            const Vu::BlockPlan plan = Vu::planBlock(decoded.data() + first, end - first);
+            for (uint32_t pair = first; pair < end; ++pair)
+                if (plan.deadFlags[pair - first])
+                    unobserved[pair] = true;
         }
+        std::vector<bool> stickyOnly(fragment.pairCount, false);
+        if (vu0)
+            unobserved.assign(fragment.pairCount, false);
+        else if (!stickyUnobserved)
+            stickyOnly.swap(unobserved);
         const auto hints = [&](uint32_t pair) { return unobserved[pair] ? std::string(" | Vu::kHintFlagsUnobserved") : std::string(); };
 
         const auto decodeCall = [&](uint32_t pair)
@@ -734,7 +758,7 @@ namespace
             {
                 std::ostringstream jit;
                 const Vu::BlockPlan plan = Vu::planBlock(decoded.data() + first, end - first);
-                if (!writeJitBlock(jit, decoded, first, end, fragment.firstPair, unobserved, plan, pcMask, fast))
+                if (!writeJitBlock(jit, decoded, first, end, fragment.firstPair, unobserved, stickyOnly, plan, pcMask, fast))
                     continue;
                 jitText[first] = jit.str();
                 jitStart[first] = true;

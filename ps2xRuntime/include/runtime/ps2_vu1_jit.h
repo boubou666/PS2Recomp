@@ -422,6 +422,100 @@ struct Vu1Jit
         target = blend<kDest>(target, value);
     }
 
+    // An FMAC instruction whose MAC and status writes no reader sees, in microcode where something may read the sticky
+    // status bits: only what it adds to them (fmacFlags' status | sticky) is kept, gathered per lane in sign and
+    // zero until foldSticky() hands it to m_deadSticky. Results and operands in the normal range need no exact
+    // classification; anything else takes fmacFlagsWith out of line.
+    template <uint32_t kUpper, uint8_t kHints>
+    static PS2X_VU_INLINE void fmacSticky(Vu &vu, __m128 &target, __m128 vs, __m128 vt, __m128 acc, __m128i &sign,
+                                          __m128i &zero)
+    {
+        constexpr FmacOperation kOperation = ps2_vu1_detail::decodeFmacOperation(kUpper);
+        constexpr uint8_t kDest = (kUpper >> 21) & 0xFu;
+        if constexpr (kDest == 0u)
+            return;
+        constexpr bool kProductSum = kOperation.kind == FmacKind::Madd || kOperation.kind == FmacKind::Msub ||
+                                     kOperation.kind == FmacKind::CrossMsub;
+        constexpr bool kCross = kOperation.kind == FmacKind::CrossMsub || kOperation.kind == FmacKind::CrossMul;
+        constexpr uint32_t kActive = ((kDest >> 3) & 1u) | (((kDest >> 2) & 1u) << 1) | (((kDest >> 1) & 1u) << 2) |
+                                     ((kDest & 1u) << 3);
+        const __m128i activeLanes = _mm_setr_epi32((kActive & 1u) ? -1 : 0, (kActive & 2u) ? -1 : 0,
+                                                   (kActive & 4u) ? -1 : 0, (kActive & 8u) ? -1 : 0);
+        __m128 left, right, a;
+        __m128 value = fmacResult<kUpper, kHints>(vu, vs, vt, acc, left, right, a);
+        const __m128i bits = _mm_castps_si128(value);
+        const __m128i exponentMask = _mm_set1_epi32(0xFF);
+        const __m128i exponent = _mm_and_si128(_mm_srli_epi32(bits, 23), exponentMask);
+        const __m128i inRange = _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
+                                              _mm_cmpgt_epi32(_mm_set1_epi32(254), exponent));
+        // A zero result is exact (its sign that of the exact result) for a sum, which only cancels exactly, and
+        // for a product with a zero operand; the cross products' w lane is a constant zero.
+        const __m128i zeroResult =
+            _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128());
+        __m128i zeroExact = _mm_set1_epi32(-1);
+        __m128i negative = bits;
+        __m128i zeroProduct = _mm_setzero_si128();
+        __m128i oddProduct = _mm_setzero_si128();
+        if constexpr (kOperation.kind != FmacKind::Add && kOperation.kind != FmacKind::Sub)
+        {
+            __m128 productLeft = left, productRight = right;
+            if constexpr (kCross)
+            {
+                productLeft = _mm_shuffle_ps(productLeft, productLeft, _MM_SHUFFLE(3, 0, 2, 1));
+                productRight = _mm_shuffle_ps(productRight, productRight, _MM_SHUFFLE(3, 1, 0, 2));
+            }
+            const __m128i leftBits = _mm_castps_si128(productLeft), rightBits = _mm_castps_si128(productRight);
+            const __m128i leftExponent = _mm_and_si128(_mm_srli_epi32(leftBits, 23), exponentMask);
+            const __m128i rightExponent = _mm_and_si128(_mm_srli_epi32(rightBits, 23), exponentMask);
+            zeroProduct = _mm_or_si128(_mm_cmpeq_epi32(leftExponent, _mm_setzero_si128()),
+                                       _mm_cmpeq_epi32(rightExponent, _mm_setzero_si128()));
+            zeroExact = kCross ? _mm_or_si128(zeroProduct, _mm_setr_epi32(0, 0, 0, -1)) : zeroProduct;
+            if constexpr (kProductSum)
+            {
+                const __m128i productExponent =
+                    _mm_sub_epi32(_mm_add_epi32(leftExponent, rightExponent), _mm_set1_epi32(127));
+                const __m128i normalProduct = _mm_and_si128(_mm_cmpgt_epi32(productExponent, _mm_set1_epi32(1)),
+                                                            _mm_cmpgt_epi32(_mm_set1_epi32(253), productExponent));
+                oddProduct = _mm_andnot_si128(_mm_or_si128(zeroProduct, normalProduct), activeLanes);
+                negative = _mm_or_si128(negative, _mm_xor_si128(leftBits, rightBits));
+            }
+        }
+        const __m128i exact =
+            _mm_or_si128(_mm_andnot_si128(_mm_or_si128(inRange, _mm_and_si128(zeroResult, zeroExact)), activeLanes),
+                         oddProduct);
+        if (_mm_movemask_ps(_mm_castsi128_ps(exact)) != 0) [[unlikely]]
+            value = stickyExact(vu, value, kDest, kOperation, left, right, a);
+        else
+        {
+            sign = _mm_or_si128(sign, _mm_and_si128(negative, activeLanes));
+            zero = _mm_or_si128(zero, _mm_and_si128(kProductSum ? _mm_or_si128(zeroResult, zeroProduct) : zeroResult,
+                                                    activeLanes));
+        }
+        target = blend<kDest>(target, value);
+    }
+    // fmacSticky's rare case: fmacFlagsWith's exact path on the whole result.
+    PS2X_VU_COLD static __m128 stickyExact(Vu &vu, __m128 value, uint8_t dest, FmacOperation operation, __m128 left,
+                                           __m128 right, __m128 acc)
+    {
+        alignas(16) float result[4];
+        _mm_store_ps(result, value);
+        uint32_t mac = 0u, status = 0u, sticky = 0u;
+        if (vu.fmacFlagsWith(
+                result, dest, operation, [&]() { return left; }, [&]() { return right; }, [&]() { return acc; }, mac,
+                status, sticky))
+            vu.m_deadSticky |= status | sticky;
+        return _mm_load_ps(result);
+    }
+    // What fmacSticky gathered, to m_deadSticky: before anything takes or drops it (a flag write a reader sees,
+    // FSSET, a pair the interpreter runs) and as the block leaves.
+    static PS2X_VU_INLINE void foldSticky(Vu &vu, __m128i &sign, __m128i &zero)
+    {
+        vu.m_deadSticky |= (_mm_movemask_ps(_mm_castsi128_ps(sign)) != 0 ? 0x2u : 0u) |
+                           (_mm_movemask_ps(_mm_castsi128_ps(zero)) != 0 ? 0x1u : 0u);
+        sign = _mm_setzero_si128();
+        zero = _mm_setzero_si128();
+    }
+
     // An FMAC instruction whose flags a reader can see: fmacFlags() on the operands, the entry queued at its issue
     // cycle (the caller advanced the clock to it). kDead: BlockPlan::deadFlags (only the sticky bits go on).
     template <uint32_t kUpper, uint8_t kHints, bool kDead>
