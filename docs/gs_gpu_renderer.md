@@ -391,12 +391,17 @@ agree on a known bug. What the CPU backend does now, and the GPU must do byte fo
     major axis the same way. Lines stay untextured, as before (a known gap, section 7.2).
   - Points: the position rounded half up, ((X + 8) >> 4, (Y + 8) >> 4), as paraLLEl-GS's notes report from
     TJnotJT's hardware tests.
+  - Neither the point rounding nor the line's [first, last) rule has a hardware dump of our own behind it: both rest
+    on paraLLEl's notes and agree with paraLLEl on the traces. A hardware result should confirm them.
 - Fog: C = (F * C + (256 - F) * FOGCOL) >> 8, one lerp truncated. It keeps F = 255, FOGCOL = 128, C = 128 at 128
   (paraLLEl's reported hardware observation, which the manual's 255 - F form misses) and gives FOGCOL exactly at
   F = 0. Whether the GS rounds this lerp (paraLLEl adds one half) or truncates it (PCSX2's software and hardware
   renderers) has no hardware result yet; the truncated form is kept until one exists.
 - Blend, dither, COLCLAMP: ((A - B) * C >> 7) + D unclamped, then the dither, then COLCLAMP.CLAMP = 1 clamps to
-  0..255 and CLAMP = 0 keeps the low 8 bits (also for unblended pixels when dithering moved them). Dithering adds
+  0..255 and CLAMP = 0 keeps the low 8 bits (also for unblended pixels when dithering moved them). A GS reset sets
+  CLAMP = 1 (frontend, GIF decoder state, paraLLEl adapter), the value the HLE sceGsSetDefDrawEnv writes and the
+  only behaviour the CPU backend had before it honoured CLAMP = 0, so code that never writes COLCLAMP keeps
+  clamping. PCSX2's GSState reset zeroes COLCLAMP (wrap); no hardware result says which the GS powers up with. Dithering adds
   DIMX[y & 3][x & 3] (3-bit two's complement, x and y in frame pixels) to R, G and B, only when DTHE = 1 and FRAME
   is PSMCT16 or PSMCT16S, as PCSX2 does in both its renderers: the dither exists to hide the 16-bit pack's lost
   bits. paraLLEl also dithers 32-bit frames, which changes their low bits; SC3's traces never dither a 32-bit
@@ -409,18 +414,38 @@ agree on a known bug. What the CPU backend does now, and the GPU must do byte fo
   MMIN (nearest for 0, 2, 3; bilinear for 1, 4, 5). With MXL > 0 and MMIN 2..5, level n (n <= MXL, at most 6) reads
   TBPn / TBWn from MIPTBP1 (1..3) and MIPTBP2 (4..6), is 2^max(TW - n, 0) by 2^max(TH - n, 0), with UV and the CLAMP
   region shifted right by n; MMIN 2 and 4 take round-half-up(LOD) (clamped to MXL), 3 and 5 blend levels floor(LOD)
-  and floor(LOD) + 1 by the LOD's sixteenths, c0 + ((c1 - c0) * fraction >> 4). MTBA (automatic MIPTBP1 on TEX0
-  writes) is not implemented: no trace uses it.
+  and floor(LOD) + 1 by the LOD's sixteenths, c0 + ((c1 - c0) * fraction >> 4), truncated (rounding it changes
+  no SC3 trace, so nothing decides it yet).
+- MTBA. A TEX0 write while TEX1.MTBA = 1 rewrites MIPTBP1 (the frontend's context and the GIF decoder's state
+  image), as paraLLEl does and as `gs_parallel.cpp` assumes when it restores TEX0 before MIPTBP. Level 1 starts
+  behind level 0, level 2 behind level 1, level 3 behind level 2; a level takes width x height texels, the height
+  raised to the width when it is smaller, at the format's stored bits per texel (16 for the CT16 and Z16
+  formats, 8 for T8, 4 for T4, 32 otherwise, T8H, T4HL and T4HH included), rounded down to 256-byte blocks with a
+  minimum of one. Width, height and TBW (starting from TEX0's) halve per level with a minimum of 1. paraLLEl
+  differs in two corners: it counts width x height without raising the height, and lets a halved TBW reach 0.
+  PCSX2 also skips MTBA for textures narrower than 32 or Z formats; neither is modelled.
+- Bilinear filtering. The sample point is P = floor(U * 16) - 8 in sixteenths of a texel (U the texel
+  coordinate: UV / 16 with FST, S / Q times the width otherwise), the first tap P >> 4 and the weight P & 15; the
+  same for V. The four taps blend as ((c00 * 16 + (c10 - c00) * wx) * 16 + (bottom - top) * wy + 128) >> 8: 4-bit
+  weights, one rounding at the end (a 50/50 blend of 0 and 255 is 128). Section 7.2 has the comparison that
+  chose the rounding over truncation.
 
 ### 6.3 Floating point
 
 STQ division, bilinear weights and LOD are the only float paths. Vulkan does not require correctly rounded
 division (OpFDiv may be 2.5 ULP) and may fuse multiply-adds unless told not to, so naive GLSL can differ from
 the CPU in the last bit and change a texel choice. Mitigations, in order of preference: compute in the GS's
-own fixed-point formats where the GS does (UV are 14.4, bilinear weights are 4-bit); for S/Q and T/Q use an
-integer or correctly rounded reciprocal (Newton step with an exactness check) shared verbatim by the CPU
-reference; mark the rest `precise` (SPIR-V `NoContraction`) and disable FMA contraction in the CPU build for
-those functions. The differential fuzzer (6.5) exercises these paths specifically.
+own fixed-point formats where the GS does (UV are 14.4, bilinear weights are 4-bit: floor(U * 16) - 8, its low
+four bits the weight, the blend rounded once, section 6.2); for S/Q and T/Q use an integer or correctly rounded
+reciprocal (Newton step with an exactness check) shared verbatim by the CPU reference; mark the rest `precise`
+(SPIR-V `NoContraction`). The differential fuzzer (6.5) exercises these paths specifically.
+
+The CPU reference itself must not fuse multiply-adds either: with `-march=x86-64-v3` GCC contracts by default
+(`-ffp-contract=fast`) and Clang within an expression, and a fused S, T or Q plane step rounds differently.
+`gs_cpu_backend.cpp`, `gs_cpu_stream_renderer.cpp` and `gs_frontend.cpp` are compiled with `-ffp-contract=off` on
+GCC and Clang (runtime and gs_cache test library). MSVC needs no flag: since Visual Studio 2022 its default
+`/fp:precise` does not contract unless `/fp:contract` is also given. `/fp:fast` or `/fp:contract` would lose byte
+parity and must not be used for the reference.
 
 ### 6.4 Trace replay
 
@@ -583,6 +608,11 @@ Layers on `gs/gpu-renderer`, each with the trace hashes it produced (CPU, synchr
 | mipmapping | = | = | = | = | 833fdafa00cde365 | = |
 | perf (plane stepping) | = | = | = | = | = | = |
 | tests | = | = | = | = | = | = |
+| review: COLCLAMP reset | = | = | = | = | = | = |
+| review: -ffp-contract=off | = | = | = | = | = | = |
+| review: MTBA | = | = | = | = | = | = |
+| review: 4-bit bilinear | = | = | 1ac6cf6b53ddffb9 | 9b11a00431885d50 | 43d09bb7776b4a31 | 1b78796d02904ed4 |
+| review: tests | = | = | = | = | = | = |
 
 Each moved only where its feature is used: fog only `attack` (the one scene with a non-zero FOGCOL; the others fog
 toward black, where both formulas agree), COLCLAMP only `free` (the one scene that writes COLCLAMP = 0), dithering
@@ -602,13 +632,27 @@ end of the trace (paraLLEl's final VRAM against the CPU's):
 | Z range | 31 / 528 | 0 / 15335 | 0 / 280547 | 1 / 180576 | 0 / 558656 | 605 / 402222 |
 | fixed-point raster | 32 / 0 | none / 0 | 33 / 182146 | 15 / 124786 | 22 / 210057 | 605 / 218547 |
 | mipmapping | 32 / 0 | none / 0 | 33 / 182146 | 15 / 124786 | 22 / 178209 | 605 / 218547 |
+| 4-bit bilinear, truncated (rejected) | 32 / 22 | 0 / 4292 | 0 / 237275 | 15 / 186057 | 0 / 245849 | 605 / 304598 |
+| 4-bit bilinear, rounded | 32 / 0 | none / 0 | 33 / 127978 | 15 / 3936 | 22 / 86665 | 1238 / 76443 |
 
 `fight` now matches paraLLEl at every comparison and `t` at its end (the transient difference at command 32 is
 overwritten later). The differences left are small: off by one in a channel on textured, bilinear-filtered
 primitives (`attack` command 33, `gallery` command 15, `free` command 22) and an alpha difference (0x10 against 0x16) in
-`parallel_route` command 605. They point at the precision of the bilinear weights (the CPU uses 8 fraction bits; the GS's
-precision is unknown), the fog rounding (section 6.2) and the S, T, Q interpolation, the candidates for the next
-reference fixes; none is in the phase 1 list. Lines are still untextured in the CPU backend, also a gap to close
+`parallel_route` command 605. They pointed at the precision of the bilinear weights (the CPU used 8 fraction bits),
+the fog rounding (section 6.2) and the S, T, Q interpolation.
+
+Review round (FFOP-Recomp). COLCLAMP resets to CLAMP = 1, the reference is compiled without FMA contraction,
+MTBA is implemented, and the bilinear weights follow the GS's 1/16-texel addressing (section 6.2), all with the
+trace hashes above (MSVC/GCC builds were not re-hashed; Clang on this machine with and without
+`-ffp-contract=off` gives the same six hashes). Two 4-bit forms were compared against paraLLEl (the last two rows
+of the comparison table): truncating the blend (a 50/50 blend of 0 and 255 gives 127) moves every trace away
+from paraLLEl, `fight` included; rounding it once (128) keeps `t` and `fight` exact and cuts the final
+difference by 30% on `attack`, 97% on `gallery`, 51% on `free` and 65% on `parallel_route`, whose first
+difference moves from command 605 to 1238. paraLLEl snaps U and V to sixteenths and lets the GPU's filter and a
+round-to-even produce the colour, which is the rounded form except at exact halves; the rounded form is kept. The
+two 50/50 tests expect 128 (weight 8/16 rounded), while the trilinear test's 127 is the mip-level blend, a separate
+lerp by the LOD's sixteenths that stays truncated (rounding it changes no trace). What is left against paraLLEl
+is the fog rounding and the S, T, Q interpolation, the candidates for the next reference fixes. Lines are still untextured in the CPU backend, also a gap to close
 before the GPU copies it.
 
 Tests: `ps2xTest/src/ps2_gs_reference_tests.cpp` (`PS2GSReference`) pins each fix against values computed by hand
@@ -617,7 +661,11 @@ from the rules above: fog (F = 255 over FOGCOL = 128, F = 128, F = 0, F = 1), CO
 wrap at both ends, Z24 and Z16 saturation in the write and in GREATER / GEQUAL tests, the top-left rule on a quad
 split along its diagonal (each pixel exactly once, right and bottom edges out), whole-pixel coverage and truncated
 Gouraud values, sprite coverage and texture coordinates (bilinear halfway at pixel 1), point and line rounding,
-MMAG / MMIN selection by the LOD's sign, nearest and blended mip levels from MIPTBP1 and the LOD from Q. Existing
+MMAG / MMIN selection by the LOD's sign, nearest and blended mip levels from MIPTBP1 and the LOD from Q. The
+review round added: the COLCLAMP reset value (no COLCLAMP write clamps 300 to 255), MTBA (MIPTBP1 regenerated
+for a non-square CT16 texture, kept when MTBA = 0, and a draw that reads level 1 behind level 0), the 4-bit
+bilinear weights (U * 16 = 12.5 and 12.9375 both blend with weight 4) and a DIMX register written as a literal
+from the GS manual's DMxy fields, so a wrong unpacking in the backend would fail the dither test. Existing
 tests that drew zero-size sprites to reach one pixel now draw 1x1 sprites (a zero-size sprite draws nothing on the
 GS), the fan quad test reads its frame through the CT32 swizzle (it read linear memory), and the STQ and bilinear
 triangle tests sample pixels that still separate their cases at whole-pixel sample points; the fog test's F = 0
@@ -646,9 +694,9 @@ take the per-pixel LOD path, without the decoded-texture fast path for levels ab
 unaffected. The perf layer (32-bit plane stepping, no divisions for constant attributes) changes no output.
 
 Not done in phase 1: the plan's TMB traces (the corpus has none yet, so only SC3 was re-hashed), a review of
-frames by eye (the paraLLEl comparison stands in for it: `fight` and `t` now match it exactly), MTBA, textured
-lines, and the candidates above (bilinear weight precision, fog rounding, S/T/Q precision), which need hardware
-results or a better paraLLEl-independent argument before they change the reference.
+frames by eye (the paraLLEl comparison stands in for it: `fight` and `t` now match it exactly), textured
+lines, and the candidates above (fog rounding, S/T/Q precision), which need hardware results or a better
+paraLLEl-independent argument before they change the reference.
 
 ## 8. Things deliberately left out
 
