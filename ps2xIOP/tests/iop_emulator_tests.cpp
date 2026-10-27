@@ -294,9 +294,9 @@ namespace
                     importTable, sizeof(importTable));
     }
 
-    // IRX whose entry binds the EE server `sid` with client 0x10200 and calls it SIF_RPC_M_NOWAIT: fno 5, 6 bytes from
-    // 0x10300 ("IOPRPC"), 4 bytes back to 0x10400 (a whole quadword moves, so 16).
-    void writeEeRpcClientIrx(TestHost &host, uint32_t address, uint32_t sid)
+    // IRX whose entry binds the EE server `sid` with client 0x10200 and calls it in `mode` (default SIF_RPC_M_NOWAIT):
+    // fno 5, 6 bytes from 0x10300 ("IOPRPC"), 4 bytes back to 0x10400 (a whole quadword moves, so 16).
+    void writeEeRpcClientIrx(TestHost &host, uint32_t address, uint32_t sid, uint32_t mode = 1u)
     {
         constexpr uint32_t codeOffset = 0x100u;
         constexpr uint32_t loadAddress = 0x00010000u;
@@ -334,7 +334,7 @@ namespace
             0x3C040001u, // lui   a0, 1
             0x34840200u, // ori   a0, a0, 0x200 (client)
             0x24050005u, // addiu a1, zero, 5 (fno)
-            0x24060001u, // addiu a2, zero, 1 (SIF_RPC_M_NOWAIT)
+            0x24060000u | mode, // addiu a2, zero, mode
             0x3C070001u, // lui   a3, 1
             0x34E70300u, // ori   a3, a3, 0x300 (send)
             0x24080006u, // addiu t0, zero, 6
@@ -1742,6 +1742,27 @@ int main()
                         std::memcmp(received, reply, sizeof(reply)) == 0,
                     "The EE reply did not land in the IRX's receive buffer")) return 1;
         iop.completeEeRpc(call.token, reply, sizeof(reply)); // a second reply for the same call is ignored
+        host.eeRpcSid = 0u;
+        iop.reset();
+    }
+
+    // IOP -> EE RPC with WAIT from a module start: the EE serves the reply only after LoadModule returns, so the call
+    // does not wait (it says so) and the start routine runs to its end.
+    {
+        constexpr uint32_t eeSid = 0x00010001u;
+        host.eeRpcSid = eeSid;
+        host.eeRpcServer = IopHost::EeRpcServer{0x0089DDB0u, 0x0089DE00u, 0x0089DF00u};
+        host.eeRpcCalls.clear();
+        host.logs.clear();
+        iop.reset();
+        writeEeRpcClientIrx(host, 0x100u, eeSid, 0u);
+        const ModuleLoadResult client = iop.loadModuleBuffer(0x100u);
+        if (!expect(client.handled && client.startResult == 0,
+                    "A module start calling the EE with WAIT must run to its end")) return 1;
+        if (!expect(host.eeRpcCalls.size() == 1u, "The WAIT call from a module start did not reach the EE")) return 1;
+        const bool warned = std::any_of(host.logs.begin(), host.logs.end(), [](const std::string &message)
+                                        { return message.find("in a module start") != std::string::npos; });
+        if (!expect(warned, "A WAIT call from a module start must say it does not wait")) return 1;
         host.eeRpcSid = 0u;
         iop.reset();
     }
