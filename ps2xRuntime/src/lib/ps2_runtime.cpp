@@ -2838,6 +2838,11 @@ uint32_t PS2Runtime::guestHeapHardLimit() const
 
 void PS2Runtime::configureReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit)
 {
+    placeReservedMemory(base, top, guestHeapHardLimit);
+}
+
+void PS2Runtime::placeReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit)
+{
     reservedMemoryBaseStorage() = base;
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
