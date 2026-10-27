@@ -1,5 +1,6 @@
 #include "ps2_overlay_modules.h"
 
+#include <atomic>
 #include <cstring>
 #include <iostream>
 
@@ -13,6 +14,13 @@ namespace ps2_overlays
         {
             static std::vector<Module> modules;
             return modules;
+        }
+
+        // Bumped when the registry changes, so a cached Module pointer is never used past it.
+        std::atomic<uint32_t> &registryGeneration()
+        {
+            static std::atomic<uint32_t> generation{0};
+            return generation;
         }
 
         ResidentResolver &resolverSlot()
@@ -30,20 +38,6 @@ namespace ps2_overlays
             slot = (address - module.tableBase) >> 2;
             return slot < module.slotCount;
         }
-
-        std::vector<const Module *> candidatesFor(uint32_t address)
-        {
-            std::vector<const Module *> candidates;
-            for (const Module &module : registry())
-            {
-                uint32_t slot = 0u;
-                if (tableSlot(module, address, slot))
-                {
-                    candidates.push_back(&module);
-                }
-            }
-            return candidates;
-        }
     }
 
     void registerModule(const Module &module)
@@ -57,12 +51,14 @@ namespace ps2_overlays
             }
         }
         registry().push_back(module);
+        registryGeneration().fetch_add(1u, std::memory_order_relaxed);
     }
 
     void clearModules()
     {
         registry().clear();
         resolverSlot() = nullptr;
+        registryGeneration().fetch_add(1u, std::memory_order_relaxed);
     }
 
     const std::vector<Module> &modules()
@@ -126,13 +122,49 @@ namespace ps2_overlays
 
     const Module *residentModuleFor(const uint8_t *rdram, uint32_t address)
     {
-        const std::vector<const Module *> candidates = candidatesFor(address);
-        if (candidates.empty())
+        // Every guest dispatch into an overlay range comes here. The module found last is checked first: its guard
+        // still in memory means it is still the resident one (the guards, module headers, differ between modules).
+        thread_local const Module *t_lastResident = nullptr;
+        thread_local uint32_t t_lastGeneration = 0u;
+        thread_local std::vector<const Module *> t_candidates;
+        const bool guardResolution = resolverSlot() == nullptr;
+        const uint32_t generation = registryGeneration().load(std::memory_order_relaxed);
+        if (t_lastGeneration != generation)
+        {
+            t_lastResident = nullptr;
+            t_lastGeneration = generation;
+        }
+        if (guardResolution && t_lastResident != nullptr && rdram != nullptr)
+        {
+            uint32_t slot = 0u;
+            const Module &last = *t_lastResident;
+            const uint32_t offset = last.loadAddress & PS2_RAM_MASK;
+            if (tableSlot(last, address, slot) && last.guard != nullptr && last.guardSize != 0u &&
+                offset + last.guardSize <= PS2_RAM_SIZE && std::memcmp(rdram + offset, last.guard, last.guardSize) == 0)
+            {
+                return t_lastResident;
+            }
+        }
+        t_candidates.clear();
+        for (const Module &module : registry())
+        {
+            uint32_t slot = 0u;
+            if (tableSlot(module, address, slot))
+            {
+                t_candidates.push_back(&module);
+            }
+        }
+        if (t_candidates.empty())
         {
             return nullptr;
         }
-        const ResidentResolver resolver = resolverSlot() ? resolverSlot() : &guardResolver;
-        return resolver(rdram, address, candidates);
+        const ResidentResolver resolver = guardResolution ? &guardResolver : resolverSlot();
+        const Module *module = resolver(rdram, address, t_candidates);
+        if (guardResolution && module != nullptr)
+        {
+            t_lastResident = module;
+        }
+        return module;
     }
 
     PS2Runtime::RecompiledFunction *residentEntry(const uint8_t *rdram, uint32_t address)
