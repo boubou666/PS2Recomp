@@ -12,8 +12,8 @@ class GsDrawEstimate
 public:
     struct Rates
     {
-        // EE cycles per 1024 pixels: the GS fills about 4 textured, blended pixels per GS cycle (2 EE cycles).
-        uint64_t cyclesPer1024Pixels = 512u;
+        // EE cycles per 1024 pixels: the GS fills 8 textured pixels per GS cycle (2 EE cycles).
+        uint64_t cyclesPer1024Pixels = 256u;
         uint64_t cyclesPerPrimitive = 32u;
     };
 
