@@ -383,7 +383,7 @@ namespace ps2_stubs
         const uint32_t extraValue = getRegU32(ctx, 6);
         const uint32_t tagWord = getRegU32(ctx, 7) | 0x70000000u;
         const uint32_t packetAddr = terminatePacketBuilderState(rdram, ctx, runtime);
-        const uint32_t words[4] = {tagWord, countValue, extraValue, 0u};
+        const uint32_t words[4] = {tagWord, 0u, countValue, extraValue};
         const uint32_t nextAddr = packetAddr + 16u;
 
         writeGuestU32(rdram, runtime, stateAddr + 8u, packetAddr);
