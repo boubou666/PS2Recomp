@@ -1093,6 +1093,13 @@ namespace
         bool samples = false;
     };
 
+    bool mipmapped(const GSDrawState &state)
+    {
+        const uint64_t tex1 = state.context.tex1;
+        const uint64_t mmin = (tex1 >> 6) & 7u;
+        return ((tex1 >> 2) & 7u) != 0u && mmin >= 2u && mmin <= 5u;
+    }
+
     PrimitiveBlocks primitiveBlocks(const GSPrimitiveBatch &batch)
     {
         const auto &ctx = batch.state.context;
@@ -1106,7 +1113,11 @@ namespace
         if (blocks.writesZ || blocks.readsZ)
             blocks.z = rowBlocks(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, firstRow, lastRow);
         blocks.samples = batch.state.prim.tme;
-        if (blocks.samples)
+        if (blocks.samples && mipmapped(batch.state))
+        {
+            blocks.texture = {0u, kVramBlocks};
+        }
+        else if (blocks.samples)
         {
             textureRows(batch, firstRow, lastRow);
             blocks.texture = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, std::min(lastRow, 2047));
@@ -1140,7 +1151,7 @@ namespace
         if (!((frameConflicts && blocksOverlap(blocks.texture, blocks.frame)) ||
               (zConflicts && blocksOverlap(blocks.texture, blocks.z))))
             return false;
-        if ((ctx.tex0.tbp0 % 32u) != 0u)
+        if ((ctx.tex0.tbp0 % 32u) != 0u || mipmapped(batch.state))
             return true; // not page aligned: its texels do not map to whole pages
         int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
         primitiveColumns(batch, x0, x1);
@@ -1264,6 +1275,27 @@ struct GSCpuBackend::TextureSampler
     uint16_t maxV = 0;
     bool fst = false;
     bool linear = false;
+    bool lodPerPixel = false;
+    bool magLinear = false;
+    bool minLinear = false;
+    bool mipmapped = false;
+    bool mipLinear = false;
+    bool lodFromK = false;
+    uint8_t maxLevel = 0;
+    uint8_t lodShift = 0;
+    int lodK = 0;
+    struct Level
+    {
+        uint32_t tbp = 0;
+        uint32_t tbw = 0;
+        int width = 1;
+        int height = 1;
+        uint16_t minU = 0;
+        uint16_t maxU = 0;
+        uint16_t minV = 0;
+        uint16_t maxV = 0;
+    };
+    std::array<Level, 7> levels{};
     const std::array<uint16_t, 512> *clut = nullptr;
     uint64_t clutSerial = 0;                // identifies the CLUT contents
     DecodedTexture *decoded = nullptr;      // decoded copy (FindDecodedTexture), if any
@@ -1493,7 +1525,52 @@ GSCpuBackend::TextureSampler GSCpuBackend::MakeTextureSampler(const GSDrawState 
     s.minV = static_cast<uint16_t>((clamp >> 24) & 0x3FFu);
     s.maxV = static_cast<uint16_t>((clamp >> 34) & 0x3FFu);
     s.fst = state.prim.fst;
-    s.linear = state.linearFilter;
+    const uint64_t tex1 = state.context.tex1;
+    const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6) & 7u);
+    const uint8_t mxl = static_cast<uint8_t>((tex1 >> 2) & 7u);
+    s.magLinear = ((tex1 >> 5) & 1u) != 0u;
+    s.minLinear = mmin == 1u || (mmin & 4u) != 0u;
+    s.mipmapped = mxl != 0u && mmin >= 2u && mmin <= 5u;
+    s.mipLinear = mmin == 3u || mmin == 5u;
+    s.lodFromK = (tex1 & 1u) != 0u || s.fst;
+    s.maxLevel = std::min<uint8_t>(mxl, 6u);
+    s.lodShift = static_cast<uint8_t>((tex1 >> 19) & 3u);
+    const int k = static_cast<int>((tex1 >> 32) & 0xFFFu);
+    s.lodK = k >= 0x800 ? k - 0x1000 : k;
+    if (!s.mipmapped && s.magLinear == s.minLinear)
+        s.linear = s.magLinear;
+    else if (!s.mipmapped && s.lodFromK)
+        s.linear = s.lodK > 0 ? s.minLinear : s.magLinear;
+    else
+        s.lodPerPixel = true;
+    if (s.mipmapped)
+    {
+        const auto &tex0 = state.context.tex0;
+        const int tw = std::min<int>(tex0.tw, 10);
+        const int th = std::min<int>(tex0.th, 10);
+        for (uint32_t n = 0; n <= s.maxLevel; ++n)
+        {
+            TextureSampler::Level &level = s.levels[n];
+            if (n == 0)
+            {
+                level.tbp = tex0.tbp0;
+                level.tbw = tex0.tbw;
+            }
+            else
+            {
+                const uint64_t miptbp = n <= 3u ? state.context.miptbp1 : state.context.miptbp2;
+                const uint32_t shift = ((n - 1u) % 3u) * 20u;
+                level.tbp = static_cast<uint32_t>((miptbp >> shift) & 0x3FFFu);
+                level.tbw = static_cast<uint32_t>((miptbp >> (shift + 14u)) & 0x3Fu);
+            }
+            level.width = 1 << std::max<int>(tw - static_cast<int>(n), 0);
+            level.height = 1 << std::max<int>(th - static_cast<int>(n), 0);
+            level.minU = static_cast<uint16_t>(s.minU >> n);
+            level.maxU = static_cast<uint16_t>(s.maxU >> n);
+            level.minV = static_cast<uint16_t>(s.minV >> n);
+            level.maxV = static_cast<uint16_t>(s.maxV >> n);
+        }
+    }
     s.clut = &m_clut;
     s.clutSerial = m_clutSerial;
     return s;
@@ -3080,8 +3157,61 @@ GSCpuBackend::DecodedTexture *GSCpuBackend::FindDecodedTexture(DecodedTextureCac
     return &t;
 }
 
+uint32_t GSCpuBackend::SampleTextureLod(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q,
+                                        uint16_t u, uint16_t v)
+{
+    // LOD = (log2(1/|Q|) << L) + K in sixteenths, log2 taken from Q's exponent and the top four mantissa bits.
+    int lod = sampler.lodK;
+    if (!sampler.lodFromK)
+    {
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &q, sizeof(bits));
+        const int log2q = (static_cast<int>((bits >> 23) & 0xFFu) - 127) * 16 + static_cast<int>((bits >> 19) & 0xFu);
+        lod = -log2q * (1 << sampler.lodShift) + sampler.lodK;
+    }
+    TextureSampler level = sampler;
+    level.lodPerPixel = false;
+    level.linear = lod > 0 ? sampler.minLinear : sampler.magLinear;
+    if (!sampler.mipmapped || lod <= 0)
+        return SampleTexture(level, cache, s, t, q, u, v);
+
+    const int clamped = std::min(lod, static_cast<int>(sampler.maxLevel) * 16);
+    auto sampleLevel = [&](int n)
+    {
+        const TextureSampler::Level &mip = sampler.levels[static_cast<size_t>(n)];
+        level.tbp0 = mip.tbp;
+        level.tbw = mip.tbw;
+        level.texW = mip.width;
+        level.texH = mip.height;
+        level.minU = mip.minU;
+        level.maxU = mip.maxU;
+        level.minV = mip.minV;
+        level.maxV = mip.maxV;
+        level.decoded = n == 0 ? sampler.decoded : nullptr;
+        return SampleTexture(level, cache, s, t, q, static_cast<uint16_t>(u >> n), static_cast<uint16_t>(v >> n));
+    };
+    if (!sampler.mipLinear)
+        return sampleLevel(std::min((clamped + 8) >> 4, static_cast<int>(sampler.maxLevel)));
+    const int n = clamped >> 4;
+    const int fraction = clamped & 15;
+    const uint32_t near = sampleLevel(n);
+    if (fraction == 0 || n >= sampler.maxLevel)
+        return near;
+    const uint32_t far = sampleLevel(n + 1);
+    uint32_t out = 0u;
+    for (int shift = 0; shift < 32; shift += 8)
+    {
+        const int c0 = static_cast<int>((near >> shift) & 0xFFu);
+        const int c1 = static_cast<int>((far >> shift) & 0xFFu);
+        out |= static_cast<uint32_t>(c0 + (((c1 - c0) * fraction) >> 4)) << shift;
+    }
+    return out;
+}
+
 uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v)
 {
+    if (sampler.lodPerPixel)
+        return SampleTextureLod(sampler, cache, s, t, q, u, v);
     const GSDrawState &state = *sampler.state;
     const auto &ctx = state.context;
     const auto &tex = ctx.tex0;
@@ -3225,7 +3355,7 @@ void GSCpuBackend::SampleTextureBlock(const TextureSampler &sampler, GSMem::Text
 {
     constexpr int N = kLanes;
     DecodedTexture *const decoded = sampler.decoded;
-    if (!decoded || sampler.wrapU > 1u || sampler.wrapV > 1u)
+    if (!decoded || sampler.wrapU > 1u || sampler.wrapV > 1u || sampler.lodPerPixel)
     {
         for (int i = 0; i < N; ++i)
             if ((live >> i) & 1u)

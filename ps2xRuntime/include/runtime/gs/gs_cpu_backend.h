@@ -90,6 +90,8 @@ private:
     void WritePixelBlock(const PixelPipeline &pipeline, int x0, int y, uint32_t live, const uint32_t *z, int32_t *r, int32_t *g,
                          int32_t *b, int32_t *a, const int32_t *fog);
     uint32_t SampleTexture(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v);
+    uint32_t SampleTextureLod(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u,
+                              uint16_t v);
     // SampleTexture for the lanes of a block of eight pixels set in live (s, t, q or u, v per lane); out[i] of the other
     // lanes is left unspecified.
     void SampleTextureBlock(const TextureSampler &sampler, GSMem::TexturePageCache &cache, const float *s, const float *t,
