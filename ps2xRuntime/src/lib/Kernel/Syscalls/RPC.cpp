@@ -665,7 +665,9 @@ namespace ps2_syscalls
             request.receive = {receiveBuffer, receiveSize};
             request.endFunction = endFunction;
             request.endParameter = endParameter;
-            request.allowDeferred = !server;
+            // An IOP server: the EE keeps a placeholder record (no function) for each IOP sid it binds; only a real EE
+            // server, run on the EE below, cannot be deferred.
+            request.allowDeferred = !(server && server->func != 0u);
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
 
