@@ -2132,6 +2132,10 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             getPlaybackState(param_1) = makeFreshPlaybackState();
         }
+        if (runtime)
+        {
+            runtime->memory().setIpuInputEnabled(true);
+        }
 
         const uint32_t puVar4 = uVar3 + 0x108u;
         const uint32_t innerSize = static_cast<uint32_t>(iVar2_signed) - 0x118u;
@@ -2197,10 +2201,16 @@ namespace ps2_stubs
         (void)rdram;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        bool lastStream = false;
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
+            lastStream = g_mpeg_stub_state.playbackByMpeg.empty();
+        }
+        if (lastStream)
+        {
+            runtime->memory().setIpuInputEnabled(false);
         }
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
         setReturnU32(ctx, 0u);
@@ -2613,10 +2623,6 @@ namespace ps2_stubs
     void sceMpegInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        if (runtime)
-        {
-            runtime->memory().setIpuInputEnabled(true);
-        }
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
         const uint64_t cdStreamBytesProduced = g_mpeg_stub_state.cdStreamBytesProduced;
