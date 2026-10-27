@@ -1459,6 +1459,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10002000 && address <= 0x10002030)
     {
+        releaseIpuInput();
         if (address == 0x10002010)
         {
             m_ioRegisters[address] = value & ~(1u << 31);
@@ -1724,7 +1725,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 void PS2Memory::setIpuInputEnabled(bool enabled)
 {
     m_ipuInputEnabled = enabled;
-    if (!enabled && m_ipuInputDma.active)
+    if (!enabled)
+    {
+        releaseIpuInput();
+    }
+}
+
+void PS2Memory::releaseIpuInput()
+{
+    if (m_ipuInputDma.active)
     {
         m_ipuInputDma.active = false;
         completeDmacChannel(kToIpuChannel, 4u);
@@ -3185,6 +3194,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (address >= 0x10002000 && address <= 0x10002030)
     {
+        releaseIpuInput();
         uint32_t val = 0;
         switch (address)
         {

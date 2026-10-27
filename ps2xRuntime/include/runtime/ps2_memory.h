@@ -372,6 +372,8 @@ public:
     // held in memory with a chain that never ends. A guest that polls CHCR while nothing pulls (it drives the IPU
     // itself) sees the transfer complete, as with the channel disabled.
     void setIpuInputEnabled(bool enabled);
+    // Code that drives the IPU itself (its registers) gets the transfer completed instead of parked.
+    void releaseIpuInput();
     std::vector<uint8_t> pullIpuInput(size_t minBytes);
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
