@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -416,6 +417,11 @@ public:
     void setVBlankHold(bool held) noexcept { m_vblankHold.store(held, std::memory_order_relaxed); }
     void setVBlankHoldLimit(std::chrono::microseconds limit) noexcept { m_vblankHoldLimit = limit; }
     [[nodiscard]] uint64_t vblanksHeld() const noexcept { return m_vblanksHeld.load(std::memory_order_relaxed); }
+    // Whether a thread of equal priority takes over at the end of a time slice (default yes; PS2X_EE_SLICE_EQUAL=0
+    // no). The real EE kernel never round-robins equal priorities: a thread runs until it blocks or a higher
+    // priority one becomes ready.
+    void setEqualPrioritySlicing(bool enabled) noexcept { m_equalPrioritySlicing.store(enabled, std::memory_order_relaxed); }
+    [[nodiscard]] bool equalPrioritySlicing() const noexcept { return m_equalPrioritySlicing.load(std::memory_order_relaxed); }
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
     void completeVSync(uint64_t tick);
@@ -537,6 +543,11 @@ private:
     std::chrono::steady_clock::time_point m_vblankHeldSince{}; // the held vblank's own time (zero: none held)
     uint64_t m_vblankHeldCycle = 0;
     std::atomic<uint64_t> m_vblanksHeld{0};
+    std::atomic<bool> m_equalPrioritySlicing{[]
+    {
+        const char *value = std::getenv("PS2X_EE_SLICE_EQUAL");
+        return !(value && *value == '0');
+    }()};
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::deque<std::function<void()>> m_tasks; // guarded by m_eventMutex

@@ -80,6 +80,8 @@ namespace
     constexpr uint32_t kSliceAPc = 0x001605B0u;
     constexpr uint32_t kSliceASpinPc = 0x001605C0u;
     constexpr uint32_t kSliceBPc = 0x001605D0u;
+    constexpr uint32_t kSliceOpenMainPc = 0x00160A00u;
+    constexpr uint32_t kSliceOpenAPc = 0x00160A10u;
     constexpr uint32_t kHandlerWakeMainPc = 0x001605E0u;
     constexpr uint32_t kHandlerWakeWaiterPc = 0x001605F0u;
     constexpr uint32_t kHandlerWakeWaiterResumePc = 0x00160800u;
@@ -516,6 +518,29 @@ namespace
         g_sliceSpinsWhenBRan = g_sliceSpins;
         ctx->pc = 0u;
         runtime->requestStop();
+    }
+
+    // The same two threads, A with interrupts enabled: only the equal-priority slicing decides when B runs.
+    void schedulerSliceOpenMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        EeThreadCreateParams params{};
+        params.stackSize = 0x1000u;
+        params.priority = 10;
+        params.entry = kSliceOpenAPc;
+        params.stack = 0x1C000u;
+        scheduler.startThread(scheduler.createThread(params), 0u, *ctx, false);
+        params.entry = kSliceBPc;
+        params.stack = 0x1D000u;
+        scheduler.startThread(scheduler.createThread(params), 0u, *ctx, false);
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        ctx->pc = kSliceOpenMainPc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerSliceOpenA(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = kSliceASpinPc;
     }
 
     // A low-priority thread takes an interrupt whose handler wakes a higher-priority waiter, then goes
@@ -1034,6 +1059,30 @@ void register_ps2_runtime_interrupt_tests()
             env.runtime.eeScheduler().run();
 
             t.Equals(g_sliceSpinsWhenBRan, 3u, "the equal-priority thread should run only once the other executes EI");
+        });
+
+        tc.Run("equal-priority slicing hands the CPU over at a slice end only while it is on", [](TestCase &t)
+        {
+            for (const bool slicing : {true, false})
+            {
+                TestEnv env;
+                env.runtime.registerFunction(kSliceOpenMainPc, schedulerSliceOpenMain);
+                env.runtime.registerFunction(kSliceOpenAPc, schedulerSliceOpenA);
+                env.runtime.registerFunction(kSliceASpinPc, schedulerSliceASpin);
+                env.runtime.registerFunction(kSliceBPc, schedulerSliceB);
+                g_sliceSpins = 0u;
+                g_sliceSpinsWhenBRan = 0u;
+                env.runtime.eeScheduler().setEqualPrioritySlicing(slicing);
+
+                R5900Context mainContext{};
+                mainContext.pc = kSliceOpenMainPc;
+                env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                env.runtime.eeScheduler().run();
+
+                t.Equals(g_sliceSpinsWhenBRan, slicing ? 1u : 3u,
+                         slicing ? "with slicing, the equal-priority thread runs after the first slice"
+                                 : "without it, only once the running thread is done (as the real kernel)");
+            }
         });
 
         tc.Run("a handler that wakes a higher-priority thread finishes before the switch", [](TestCase &t)

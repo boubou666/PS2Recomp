@@ -522,13 +522,9 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
-    // PS2X_EE_SLICE_EQUAL=0 (diagnostic): only a strictly higher-priority ready thread preempts
-    // at the end of a time slice, never one of equal priority.
-    static const bool sliceEqual = []
-    {
-        const char *value = std::getenv("PS2X_EE_SLICE_EQUAL");
-        return !(value && *value == '0');
-    }();
+    // setEqualPrioritySlicing(false) / PS2X_EE_SLICE_EQUAL=0: only a strictly higher-priority ready thread
+    // preempts at the end of a time slice, never one of equal priority.
+    const bool sliceEqual = m_equalPrioritySlicing.load(std::memory_order_relaxed);
     const GuestThread *running = currentThread();
     if (running != nullptr && (sliceEqual || running->currentPriority > 0) &&
         hasReadyAtOrAbovePriority(running->currentPriority - (sliceEqual ? 0 : 1)))
