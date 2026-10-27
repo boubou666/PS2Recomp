@@ -166,6 +166,9 @@ To execute the recompiled code.
 
 See [IOP emulation](ps2xIOP/README.md) for module execution and the service boundary.
 
+CD reads go to the files under the ELF's directory (`cdrom0:`). Games that read data by sector number outside the
+ISO 9660 file system also need the disc image: `PS2X_CD_IMAGE=<image.iso>` serves every sector no file covers.
+
 ### Game Override Hooks
 
 Game overrides are runtime-side, build-scoped patch modules.
