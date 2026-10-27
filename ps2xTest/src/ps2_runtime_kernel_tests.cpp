@@ -1036,6 +1036,100 @@ void register_ps2_runtime_kernel_tests()
             env.runtime.configureReservedMemory(0x01F00000u, PS2_RAM_SIZE, 0x01F00000u);
         });
 
+        const auto setupThread = [](TestEnv &env, uint32_t stack, uint32_t stackSize)
+        {
+            setRegU32(env.ctx, 4, 0x0036A7F0u);
+            setRegU32(env.ctx, 5, stack);
+            setRegU32(env.ctx, 6, stackSize);
+            setRegU32(env.ctx, 29, PS2_RAM_SIZE - 0x10u);
+            const bool dispatched = callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime);
+            return dispatched ? ::getRegU32(&env.ctx, 2) : 0u;
+        };
+        const auto restOfRamHeapEnd = [](TestEnv &env)
+        {
+            setRegU32(env.ctx, 4, 0x00549100u);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime);
+            callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime);
+            return ::getRegU32(&env.ctx, 2);
+        };
+
+        const auto checkTopOfRamMainStack = [setupThread, restOfRamHeapEnd](TestCase &t, uint32_t stack, uint32_t stackSize)
+        {
+            TestEnv env;
+            t.Equals(setupThread(env, stack, stackSize), stack + stackSize,
+                     "SetupThread should return the top of [stack, stack + size)");
+            t.IsTrue(PS2Runtime::reservedMemoryBase() + PS2Runtime::kReservedPoolBytes <= 0x00100000u,
+                     "HLE pools should leave the main stack for the kernel RAM below the ELF");
+
+            const uint32_t heapEnd = restOfRamHeapEnd(env);
+            t.Equals(heapEnd, stack, "a rest-of-RAM heap should end at the main stack, as EndOfHeap does");
+
+            const uint32_t invocationTop = env.runtime.eeScheduler().invocationStackTop();
+            t.IsTrue(invocationTop + 0x10u <= 0x00100000u,
+                     "the main thread's interrupt and callback stack must sit below the ELF, away from its stack and heap");
+
+            uint32_t stacks = 0u;
+            for (uint32_t top = env.runtime.reserveAsyncCallbackStack(0x4000u); top != 0u;
+                 top = env.runtime.reserveAsyncCallbackStack(0x4000u))
+            {
+                ++stacks;
+                const uint32_t base = top + 0x10u - 0x4000u;
+                t.IsTrue(top + 0x10u <= stack || base >= stack + stackSize,
+                         "an invocation stack must not overlap the main stack");
+                t.IsTrue(top + 0x10u <= 0x00549100u || base >= heapEnd,
+                         "an invocation stack must not overlap the guest heap");
+                t.IsTrue(base >= PS2Runtime::reservedMemoryBase() + PS2Runtime::kReservedPoolBytes,
+                         "an invocation stack must not overlap the HLE pools");
+            }
+            t.Equals(stacks + 1u, (0x00100000u - (PS2Runtime::reservedMemoryBase() + PS2Runtime::kReservedPoolBytes)) / 0x4000u,
+                     "the moved region should hold as many invocation stacks as fit above the HLE pools");
+
+            env.runtime.configureReservedMemory(0x01F00000u, PS2_RAM_SIZE, 0x01F00000u);
+        };
+
+        tc.Run("SetupThread moves the reserved region out of a main stack ending at the top of RAM", [checkTopOfRamMainStack](TestCase &t)
+               { checkTopOfRamMainStack(t, 0x01F80000u, 0x00080000u); });
+
+        tc.Run("SetupThread moves the reserved region out of a main stack just below the top of RAM", [checkTopOfRamMainStack](TestCase &t)
+               { checkTopOfRamMainStack(t, 0x01FDFF00u, 0x00020000u); });
+
+        tc.Run("SetupThread leaves the reserved region alone for a main stack below it", [setupThread](TestCase &t)
+        {
+            TestEnv env;
+            t.Equals(setupThread(env, 0x01000000u, 0x00010000u), 0x01010000u,
+                     "SetupThread should return the top of [stack, stack + size)");
+            t.Equals(PS2Runtime::reservedMemoryBase(), 0x01F00000u, "HLE pools should stay at the default base");
+            t.Equals(env.runtime.guestHeapHardLimit(), 0x01F00000u, "the heap hard limit should stay at the default");
+            t.Equals(env.runtime.reserveAsyncCallbackStack(0x4000u), PS2_RAM_SIZE - 0x10u,
+                     "invocation stacks should still grow down from the top of RAM");
+        });
+
+        tc.Run("SetupThread with an automatic stack keeps the default reserved region", [setupThread](TestCase &t)
+        {
+            TestEnv env;
+            t.Equals(setupThread(env, 0xFFFFFFFFu, 0x00020000u), PS2_RAM_SIZE - 0x00020000u,
+                     "the automatic main stack placement should not change");
+            t.Equals(PS2Runtime::reservedMemoryBase(), 0x01F00000u, "HLE pools should stay at the default base");
+            t.Equals(env.runtime.guestHeapHardLimit(), 0x01F00000u, "the heap hard limit should stay at the default");
+            t.Equals(env.runtime.reserveAsyncCallbackStack(0x4000u), PS2_RAM_SIZE - 0x10u,
+                     "invocation stacks should still grow down from the top of RAM");
+        });
+
+        tc.Run("SetupThread keeps a reserved region placed by configureReservedMemory", [setupThread, restOfRamHeapEnd](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.configureReservedMemory(0x01C00000u, 0x01D00000u, 0x01C00000u);
+            t.Equals(setupThread(env, 0x01F80000u, 0x00080000u), PS2_RAM_SIZE,
+                     "SetupThread should return the top of [stack, stack + size)");
+            t.Equals(PS2Runtime::reservedMemoryBase(), 0x01C00000u, "HLE pools should stay where the override put them");
+            t.Equals(restOfRamHeapEnd(env), 0x01C00000u, "the heap should keep the override's hard limit");
+            t.Equals(env.runtime.reserveAsyncCallbackStack(0x4000u), 0x01D00000u - 0x10u,
+                     "invocation stacks should grow down from the override's top");
+
+            env.runtime.configureReservedMemory(0x01F00000u, PS2_RAM_SIZE, 0x01F00000u);
+        });
+
         tc.Run("a pinned runtime heap keeps HLE allocations out of the game's sbrk span", [](TestCase &t)
         {
             TestEnv env;
