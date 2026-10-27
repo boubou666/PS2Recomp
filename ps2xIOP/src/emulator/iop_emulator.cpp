@@ -239,6 +239,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            paidCycles = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -1288,7 +1289,10 @@ namespace ps2x::iop::detail
         {
             try
             {
-                const uint64_t target = totalCycles + cycles;
+                paidCycles += cycles;
+                if (totalCycles > paidCycles + kMaxLeadCycles)
+                    paidCycles = totalCycles - kMaxLeadCycles;
+                const uint64_t target = paidCycles;
                 while (totalCycles < target)
                 {
                     IopThread *next = resumeMaskedThread();
@@ -1503,6 +1507,8 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        uint64_t paidCycles = 0;
+        static constexpr uint64_t kMaxLeadCycles = 36'864'000ull / 25u;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
