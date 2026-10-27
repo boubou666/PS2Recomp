@@ -195,6 +195,61 @@ void register_ps2_memory_tests()
 {
     MiniTest::Case("PS2Memory", [](TestCase &tc)
     {
+        tc.Run("toIPU DMA hands a looping source chain to the decoder as it pulls", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setIpuInputEnabled(true);
+
+            uint8_t *rdram = mem.getRDRAM();
+            for (uint32_t i = 0; i < 32u; ++i)
+            {
+                rdram[0x20000u + i] = static_cast<uint8_t>(i);
+            }
+            const uint64_t refTag = (uint64_t{0x20000u} << 32) | (3ull << 28) | 2u;
+            const uint64_t nextTag = (uint64_t{0x30000u} << 32) | (2ull << 28);
+            std::memcpy(rdram + 0x30000u, &refTag, sizeof(refTag));
+            std::memcpy(rdram + 0x30010u, &nextTag, sizeof(nextTag));
+
+            mem.writeIORegister(0x1000B430u, 0x30010u);
+            mem.writeIORegister(0x1000B420u, 0u);
+            mem.writeIORegister(0x1000B400u, 0x105u);
+            t.IsTrue((mem.read32(0x1000B400u) & 0x100u) != 0u, "the channel stays busy until the decoder pulls");
+
+            const std::vector<uint8_t> data = mem.pullIpuInput(80u);
+            t.Equals(data.size(), size_t{80}, "a pull takes whole quadwords up to the requested size");
+            bool looped = true;
+            for (size_t i = 0; i < data.size(); ++i)
+            {
+                looped = looped && data[i] == static_cast<uint8_t>(i % 32u);
+            }
+            t.IsTrue(looped, "the next tag loops back to the ref tag's 32 bytes");
+            t.IsTrue((mem.read32(0x1000B400u) & 0x100u) != 0u, "a chain that never ends keeps the channel busy");
+
+            mem.writeIORegister(0x1000B400u, 0x005u);
+            t.IsTrue(mem.pullIpuInput(16u).empty(), "clearing STR stops the transfer");
+        });
+
+        tc.Run("toIPU DMA completes the channel after an end tag", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setIpuInputEnabled(true);
+
+            uint8_t *rdram = mem.getRDRAM();
+            const uint64_t endTag = (7ull << 28) | 1u;
+            std::memcpy(rdram + 0x30000u, &endTag, sizeof(endTag));
+            std::memset(rdram + 0x30010u, 0xAB, 16u);
+
+            mem.writeIORegister(0x1000B430u, 0x30000u);
+            mem.writeIORegister(0x1000B400u, 0x105u);
+            const std::vector<uint8_t> data = mem.pullIpuInput(1024u);
+            t.Equals(data.size(), size_t{16}, "an end tag sends its own quadword and stops");
+            t.Equals(static_cast<uint32_t>(data[0]), 0xABu, "the end tag's data follows the tag");
+            t.IsTrue((mem.read32(0x1000B400u) & 0x100u) == 0u, "the channel completes after the end tag");
+            t.IsTrue(mem.pullIpuInput(16u).empty(), "nothing is left once the channel completed");
+        });
+
         tc.Run("uncached aliases map to same RDRAM bytes", [](TestCase &t)
         {
             PS2Memory mem;
