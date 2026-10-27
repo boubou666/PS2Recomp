@@ -3,6 +3,8 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+#include <deque>
+
 namespace ps2_stubs
 {
     namespace
@@ -250,10 +252,63 @@ namespace ps2_stubs
         uint32_t g_cdCallbackGp = 0u;
         constexpr uint32_t kCdFuncRead = 1u;
 
+        // sceCdInitEeCB(priority, stack, stackSize) gives libcdvd a callback thread: the sceCdCallback function then
+        // runs on that thread, not in the drive interrupt, so it may block. Jade Cocoon 2's callback takes the mutex
+        // its loader thread holds while it issues sceCdRead; as an interrupt on top of that thread it deadlocked.
+        // Completions are run one at a time: the next one starts when the callback thread ends (a thread-end
+        // observer), so a completion that arrives while the callback runs, such as the next read of a stream issued
+        // from the callback itself, runs right after it, as libcdvd's thread loop would.
+        // The thread belongs to the runtime that created it (tests create several).
+        int g_cdCallbackThreadId = 0;
+        const PS2Runtime *g_cdCallbackThreadRuntime = nullptr;
+        std::deque<uint32_t> g_cdPendingCallbacks;
+
+        // The callback thread of this runtime, if it still exists; forgets a stale one (a runtime at a reused
+        // address, a deleted thread), so callbacks fall back to the interrupt path rather than going unrun.
+        int cdCallbackThread(PS2Runtime *runtime)
+        {
+            if (!runtime || runtime != g_cdCallbackThreadRuntime || g_cdCallbackThreadId == 0 ||
+                !runtime->eeScheduler().thread(g_cdCallbackThreadId))
+            {
+                g_cdCallbackThreadId = 0;
+                g_cdCallbackThreadRuntime = nullptr;
+                g_cdPendingCallbacks.clear();
+                return 0;
+            }
+            return g_cdCallbackThreadId;
+        }
+
+        void runPendingCdCallbacks(PS2Runtime *runtime)
+        {
+            if (cdCallbackThread(runtime) == 0 || g_cdPendingCallbacks.empty())
+            {
+                return;
+            }
+            EeScheduler &ee = runtime->eeScheduler();
+            GuestThread *thread = ee.thread(g_cdCallbackThreadId);
+            if (thread->status != EeThreadStatus::Dormant)
+            {
+                return;
+            }
+            const uint32_t command = g_cdPendingCallbacks.front();
+            g_cdPendingCallbacks.pop_front();
+            thread->entry = g_cdCallbackFunction;
+            thread->gp = g_cdCallbackGp;
+            R5900Context caller{};
+            SET_GPR_U32(&caller, 28, g_cdCallbackGp);
+            ee.startThread(g_cdCallbackThreadId, command, caller, true);
+        }
+
         void queueCdCallback(PS2Runtime *runtime, uint32_t command)
         {
             if (!runtime || g_cdCallbackFunction == 0u || !runtime->hasFunction(g_cdCallbackFunction))
             {
+                return;
+            }
+            if (cdCallbackThread(runtime) != 0)
+            {
+                g_cdPendingCallbacks.push_back(command);
+                runPendingCdCallbacks(runtime);
                 return;
             }
             GuestInvocation invocation{};
@@ -414,6 +469,7 @@ namespace ps2_stubs
 
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        runPendingCdCallbacks(runtime);
         // Mode 0 waits for the read to end. A wait of a field or more blocks the calling thread across those
         // vblanks, so other threads and interrupts keep running in order meanwhile; the rest is spent waiting.
         if (getRegU32(ctx, 4) == 0u && cdBusy(runtime))
@@ -509,7 +565,34 @@ namespace ps2_stubs
 
     void sceCdInitEeCB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 1);
+        // Returns the callback thread's id, like libcdvd; 1 when there is no scheduler to create it on.
+        if (const int existing = cdCallbackThread(runtime); !runtime || existing != 0)
+        {
+            setReturnS32(ctx, existing != 0 ? existing : 1);
+            return;
+        }
+        EeThreadCreateParams params{};
+        params.priority = static_cast<int>(getRegU32(ctx, 4));
+        params.stack = getRegU32(ctx, 5);
+        params.stackSize = getRegU32(ctx, 6);
+        params.gp = getRegU32(ctx, 28);
+        const int id = runtime->eeScheduler().createThread(params);
+        if (id <= 0)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        g_cdCallbackThreadId = id;
+        g_cdCallbackThreadRuntime = runtime;
+        g_cdPendingCallbacks.clear();
+        runtime->eeScheduler().addThreadEndObserver([runtime](int ended)
+        {
+            if (ended != 0 && ended == cdCallbackThread(runtime))
+            {
+                runPendingCdCallbacks(runtime);
+            }
+        });
+        setReturnS32(ctx, id);
     }
 
     void sceCdIntToPos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

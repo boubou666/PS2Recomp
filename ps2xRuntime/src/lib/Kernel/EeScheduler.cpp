@@ -306,9 +306,11 @@ void EeScheduler::run()
                 }
                 continue;
             }
+            const int endedId = running->id;
             makeDormant(*running);
             m_currentThreadId = 0;
             copyMainContextToRuntime();
+            notifyThreadEnd(endedId);
             publishIdleDebugContext();
             publishSnapshot();
             continue;
@@ -736,8 +738,17 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     {
         m_runtime.guestFree(ownedStack);
     }
+    notifyThreadEnd(id);
     publishSnapshot();
     throw EeDispatcherTransfer{};
+}
+
+void EeScheduler::notifyThreadEnd(int id)
+{
+    for (const auto &observer : m_threadEndObservers)
+    {
+        observer(id);
+    }
 }
 
 int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSafe)
