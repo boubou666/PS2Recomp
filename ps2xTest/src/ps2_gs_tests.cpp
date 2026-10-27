@@ -5572,14 +5572,14 @@ void register_ps2_gs_tests()
             estimate.writeRegister(GS_REG_PRIM, 6u);
             estimate.writeRegister(GS_REG_XYZ2, xyz2(100, 200));
             estimate.writeRegister(GS_REG_XYZ2, xyz2(164, 232));
-            t.Equals(estimate.takeCycles(), 32ull + 64ull * 32ull / 2ull, "a 64x32 sprite fills 2048 pixels at half an EE cycle each");
+            t.Equals(estimate.takeCycles(), 32ull + 64ull * 32ull / 4ull, "a 64x32 sprite fills 2048 pixels at a quarter of an EE cycle each (8 per GS cycle)");
             t.Equals(estimate.takeCycles(), 0ull, "taking the estimate restarts it");
 
             estimate.writeRegister(GS_REG_SCISSOR_1, (15ull << 16) | (15ull << 48));
             estimate.writeRegister(GS_REG_PRIM, 6u);
             estimate.writeRegister(GS_REG_XYZ2, xyz2(100, 200));
             estimate.writeRegister(GS_REG_XYZ2, xyz2(164, 264));
-            t.Equals(estimate.takeCycles(), 32ull + 16ull * 16ull / 2ull, "only the scissored 16x16 pixels are filled");
+            t.Equals(estimate.takeCycles(), 32ull + 16ull * 16ull / 4ull, "only the scissored 16x16 pixels are filled");
 
             estimate.writeRegister(GS_REG_SCISSOR_1, (2047ull << 16) | (2047ull << 48));
             estimate.writeRegister(GS_REG_PRIM, 4u);
@@ -5587,7 +5587,7 @@ void register_ps2_gs_tests()
             estimate.writeRegister(GS_REG_XYZ2, xyz2(132, 200));
             estimate.writeRegister(GS_REG_XYZ2, xyz2(100, 232));
             estimate.writeRegister(GS_REG_XYZ2, xyz2(132, 232));
-            t.Equals(estimate.takeCycles(), 2ull * (32ull + 512ull / 2ull), "a 32x32 triangle strip quad is two 512-pixel triangles");
+            t.Equals(estimate.takeCycles(), 2ull * (32ull + 512ull / 4ull), "a 32x32 triangle strip quad is two 512-pixel triangles");
 
             estimate.writeRegister(GS_REG_PRIM, 6u);
             estimate.writeRegister(GS_REG_XYZ3, xyz2(100, 200));
