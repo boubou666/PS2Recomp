@@ -2005,6 +2005,9 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
+        // A stream fed as elementary stream may continue through DMA channel 4; a demuxed one is decoded from the
+        // demux, and its own channel 4 transfers repeat that video.
+        runtime->memory().setIpuInputEnabled(true);
 
         size_t copied = 0u;
         bool wakePictureWaiter = false;
@@ -2132,10 +2135,6 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             getPlaybackState(param_1) = makeFreshPlaybackState();
         }
-        if (runtime)
-        {
-            runtime->memory().setIpuInputEnabled(true);
-        }
 
         const uint32_t puVar4 = uVar3 + 0x108u;
         const uint32_t innerSize = static_cast<uint32_t>(iVar2_signed) - 0x118u;
@@ -2219,6 +2218,7 @@ namespace ps2_stubs
     void sceMpegDemuxPss(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         syncMpegFieldRate(runtime);
+        runtime->memory().setIpuInputEnabled(false);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
@@ -2291,6 +2291,7 @@ namespace ps2_stubs
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         syncMpegFieldRate(runtime);
+        runtime->memory().setIpuInputEnabled(false);
         static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
         const uint32_t entryIdx = s_demuxRingEntryCount.fetch_add(1u, std::memory_order_relaxed);
         if (entryIdx < 4u)

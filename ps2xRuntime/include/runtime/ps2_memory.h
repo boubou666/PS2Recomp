@@ -367,7 +367,7 @@ public:
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
 
-    // DMA channel 4 (toIPU) for the HLE MPEG decoder, enabled while an HLE stream exists. A start then leaves the
+    // DMA channel 4 (toIPU) for the HLE MPEG decoder, enabled while an HLE stream is fed as elementary stream. A start leaves the
     // channel busy and the decoder pulls the source data as it needs it, as the IPU does; a game may loop a whole movie
     // held in memory with a chain that never ends. A guest that polls CHCR while nothing pulls (it drives the IPU
     // itself) sees the transfer complete, as with the channel disabled.
