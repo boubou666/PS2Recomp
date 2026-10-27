@@ -2448,10 +2448,10 @@ void GSCpuBackend::WritePixel(const PixelPipeline &p, int x, int y, uint32_t z, 
 
     if (p.fge)
     {
-        const uint32_t inverseFog = 255u - fog;
+        const uint32_t inverseFog = 256u - fog;
         auto applyFog = [&](uint8_t input, uint8_t fogColor) -> uint8_t
         {
-            return static_cast<uint8_t>(((static_cast<uint32_t>(fog) * input) >> 8) + ((inverseFog * fogColor) >> 8));
+            return static_cast<uint8_t>((static_cast<uint32_t>(fog) * input + inverseFog * fogColor) >> 8);
         };
 
         r = applyFog(r, p.fogR);
@@ -2589,10 +2589,10 @@ void GSCpuBackend::WritePixelBlock(const PixelPipeline &p, int x0, int y, uint32
         const int fogR = p.fogR, fogG = p.fogG, fogB = p.fogB;
         for (int i = 0; i < N; ++i)
         {
-            const int inverseFog = 255 - fog[i];
-            r[i] = (((fog[i] * r[i]) >> 8) + ((inverseFog * fogR) >> 8)) & 0xFF;
-            g[i] = (((fog[i] * g[i]) >> 8) + ((inverseFog * fogG) >> 8)) & 0xFF;
-            b[i] = (((fog[i] * b[i]) >> 8) + ((inverseFog * fogB) >> 8)) & 0xFF;
+            const int inverseFog = 256 - fog[i];
+            r[i] = (fog[i] * r[i] + inverseFog * fogR) >> 8;
+            g[i] = (fog[i] * g[i] + inverseFog * fogG) >> 8;
+            b[i] = (fog[i] * b[i] + inverseFog * fogB) >> 8;
         }
     }
 
