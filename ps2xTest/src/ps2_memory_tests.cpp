@@ -230,6 +230,44 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.pullIpuInput(16u).empty(), "clearing STR stops the transfer");
         });
 
+        tc.Run("toIPU DMA completes for a guest that polls CHCR while nothing pulls", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setIpuInputEnabled(true);
+
+            uint8_t *rdram = mem.getRDRAM();
+            const uint64_t nextTag = (uint64_t{0x30000u} << 32) | (2ull << 28) | 1u;
+            std::memcpy(rdram + 0x30000u, &nextTag, sizeof(nextTag));
+            mem.writeIORegister(0x1000B430u, 0x30000u);
+            mem.writeIORegister(0x1000B400u, 0x105u);
+
+            uint32_t polls = 0;
+            while ((mem.read32(0x1000B400u) & 0x100u) != 0u && polls < 100000u)
+            {
+                ++polls;
+            }
+            t.IsTrue(polls > 0u && polls < 100000u, "a polling guest sees the transfer end after a bounded wait");
+            t.IsTrue(mem.pullIpuInput(16u).empty(), "the released transfer has nothing left to pull");
+        });
+
+        tc.Run("toIPU DMA disabled while parked completes the transfer", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setIpuInputEnabled(true);
+
+            uint8_t *rdram = mem.getRDRAM();
+            const uint64_t nextTag = (uint64_t{0x30000u} << 32) | (2ull << 28) | 1u;
+            std::memcpy(rdram + 0x30000u, &nextTag, sizeof(nextTag));
+            mem.writeIORegister(0x1000B430u, 0x30000u);
+            mem.writeIORegister(0x1000B400u, 0x105u);
+
+            mem.setIpuInputEnabled(false);
+            t.IsTrue((mem.read32(0x1000B400u) & 0x100u) == 0u, "the last HLE stream going away ends the transfer");
+            t.IsTrue(mem.pullIpuInput(16u).empty(), "nothing is pulled after the channel is disabled");
+        });
+
         tc.Run("toIPU DMA completes the channel after an end tag", [](TestCase &t)
         {
             PS2Memory mem;
