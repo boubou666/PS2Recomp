@@ -658,6 +658,13 @@ namespace
         return static_cast<int32_t>(std::min<int64_t>(std::max<int64_t>(static_cast<int64_t>(acc) >> kAttributeShift, 0), 255));
     }
 
+    // Colours, fog and UV at a covered sample stay below 2^30 in kAttributeShift fixed point: their planes can be
+    // stepped modulo 2^32.
+    int32_t colourFromLane(uint32_t acc)
+    {
+        return std::min(std::max(static_cast<int32_t>(acc) >> kAttributeShift, 0), 255);
+    }
+
     // Worker spin before sleeping, about 50 us: primitives of a frame arrive back to back.
     // PS2X_GS_SPIN=<n> (measurements): spin iterations before sleeping.
     const uint32_t kWorkerSpinIterations = []
@@ -3571,11 +3578,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
                     uint16_t iu[N], iv[N];
                     if (fst)
                     {
-                        const uint64_t uAcc = uLine.at(px, 0);
+                        const uint32_t uAcc = static_cast<uint32_t>(uLine.at(px, 0));
+                        const uint32_t uStep = static_cast<uint32_t>(uLine.dx) * 16u;
                         for (int i = 0; i < N; ++i)
                         {
-                            const int64_t u = static_cast<int64_t>(uAcc + uLine.dx * static_cast<uint64_t>(16 * i)) >> kAttributeShift;
-                            iu[i] = static_cast<uint16_t>(std::min<int64_t>(std::max<int64_t>(u, 0), 0xFFFF));
+                            const int32_t u = static_cast<int32_t>(uAcc + uStep * static_cast<uint32_t>(i)) >> kAttributeShift;
+                            iu[i] = static_cast<uint16_t>(std::min(std::max(u, 0), 0xFFFF));
                             iv[i] = rowV;
                             is[i] = 0.0f;
                             it[i] = 0.0f;
@@ -3661,8 +3669,11 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
     {
         FixedPlane plane;
         plane.origin = static_cast<uint64_t>(a2) << shift;
-        plane.dx = static_cast<uint64_t>(fixedRatio((a0 - a2) * A[0] + (a1 - a2) * A[1], shift, area));
-        plane.dy = static_cast<uint64_t>(fixedRatio((a0 - a2) * B[0] + (a1 - a2) * B[1], shift, area));
+        if (a0 != a2 || a1 != a2)
+        {
+            plane.dx = static_cast<uint64_t>(fixedRatio((a0 - a2) * A[0] + (a1 - a2) * A[1], shift, area));
+            plane.dy = static_cast<uint64_t>(fixedRatio((a0 - a2) * B[0] + (a1 - a2) * B[1], shift, area));
+        }
         plane.x = X[2];
         plane.y = Y[2];
         return plane;
@@ -3676,6 +3687,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
     {
         const double d0 = static_cast<double>(a0) - static_cast<double>(a2);
         const double d1 = static_cast<double>(a1) - static_cast<double>(a2);
+        if (d0 == 0.0 && d1 == 0.0)
+            return FloatPlane{a2, 0.0f, 0.0f};
         const double gx = (d0 * static_cast<double>(A[0]) + d1 * static_cast<double>(A[1])) / static_cast<double>(area);
         const double gy = (d0 * static_cast<double>(B[0]) + d1 * static_cast<double>(B[1])) / static_cast<double>(area);
         return FloatPlane{a2, static_cast<float>(gx), static_cast<float>(gy)};
@@ -3683,7 +3696,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
 
     const FixedPlane zPlane = fixedPlane(static_cast<int64_t>(gsDepthBits(v0.z)), static_cast<int64_t>(gsDepthBits(v1.z)),
                                          static_cast<int64_t>(gsDepthBits(v2.z)), kDepthShift);
-    const FixedPlane fogPlane = fixedPlane(v0.fog, v1.fog, v2.fog, kAttributeShift);
+    const FixedPlane fogPlane = pixel.fge ? fixedPlane(v0.fog, v1.fog, v2.fog, kAttributeShift) : FixedPlane{};
     const bool gouraud = state.prim.iip;
     FixedPlane colourPlanes[4];
     if (gouraud)
@@ -3716,6 +3729,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
     const int width = raster.pixelOrder ? 1 : N;
     const auto &tex = ctx.tex0;
     const bool tcc = tex.tcc != 0u;
+    uint64_t zLane[N];
+    for (int i = 0; i < N; ++i)
+        zLane[i] = zPlane.dx * static_cast<uint64_t>(16 * i);
 
     for (int y = minY; y <= maxY; ++y)
     {
@@ -3749,7 +3765,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                 {
                     const uint64_t acc = zPlane.at(px, py);
                     for (int i = 0; i < N; ++i)
-                        zs[i] = depthFromPlane(acc + zPlane.dx * static_cast<uint64_t>(16 * i), pixel.zmax);
+                        zs[i] = depthFromPlane(acc + zLane[i], pixel.zmax);
                 }
                 if (earlyZ)
                 {
@@ -3769,10 +3785,10 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                     int32_t *const channels[4] = {r, g, b, a};
                     for (int c = 0; c < 4; ++c)
                     {
-                        const uint64_t acc = colourPlanes[c].at(px, py);
-                        const uint64_t step = colourPlanes[c].dx * 16u;
+                        const uint32_t acc = static_cast<uint32_t>(colourPlanes[c].at(px, py));
+                        const uint32_t step = static_cast<uint32_t>(colourPlanes[c].dx) * 16u;
                         for (int i = 0; i < N; ++i)
-                            channels[c][i] = colourFromPlane(acc + step * static_cast<uint64_t>(i));
+                            channels[c][i] = colourFromLane(acc + step * static_cast<uint32_t>(i));
                     }
                 }
                 else
@@ -3792,14 +3808,16 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                     uint16_t iu[N], iv[N];
                     if (fst)
                     {
-                        const uint64_t uAcc = uPlane.at(px, py);
-                        const uint64_t vAcc = vPlane.at(px, py);
+                        const uint32_t uAcc = static_cast<uint32_t>(uPlane.at(px, py));
+                        const uint32_t vAcc = static_cast<uint32_t>(vPlane.at(px, py));
+                        const uint32_t uStep = static_cast<uint32_t>(uPlane.dx) * 16u;
+                        const uint32_t vStep = static_cast<uint32_t>(vPlane.dx) * 16u;
                         for (int i = 0; i < N; ++i)
                         {
-                            const int64_t u = static_cast<int64_t>(uAcc + uPlane.dx * static_cast<uint64_t>(16 * i)) >> kAttributeShift;
-                            const int64_t v = static_cast<int64_t>(vAcc + vPlane.dx * static_cast<uint64_t>(16 * i)) >> kAttributeShift;
-                            iu[i] = static_cast<uint16_t>(std::min<int64_t>(std::max<int64_t>(u, 0), 0xFFFF));
-                            iv[i] = static_cast<uint16_t>(std::min<int64_t>(std::max<int64_t>(v, 0), 0xFFFF));
+                            const int32_t u = static_cast<int32_t>(uAcc + uStep * static_cast<uint32_t>(i)) >> kAttributeShift;
+                            const int32_t v = static_cast<int32_t>(vAcc + vStep * static_cast<uint32_t>(i)) >> kAttributeShift;
+                            iu[i] = static_cast<uint16_t>(std::min(std::max(u, 0), 0xFFFF));
+                            iv[i] = static_cast<uint16_t>(std::min(std::max(v, 0), 0xFFFF));
                             is[i] = 0.0f;
                             it[i] = 0.0f;
                             iq[i] = 1.0f;
@@ -3883,12 +3901,13 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
                     }
                 }
 
-                int32_t fog[N];
+                int32_t fog[N] = {};
+                if (pixel.fge)
                 {
-                    const uint64_t acc = fogPlane.at(px, py);
-                    const uint64_t step = fogPlane.dx * 16u;
+                    const uint32_t acc = static_cast<uint32_t>(fogPlane.at(px, py));
+                    const uint32_t step = static_cast<uint32_t>(fogPlane.dx) * 16u;
                     for (int i = 0; i < N; ++i)
-                        fog[i] = colourFromPlane(acc + step * static_cast<uint64_t>(i));
+                        fog[i] = colourFromLane(acc + step * static_cast<uint32_t>(i));
                 }
                 WritePixelBlock(pixel, xb, y, live, zs, r, g, b, a, fog);
             }
