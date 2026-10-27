@@ -1188,6 +1188,8 @@ struct GSCpuBackend::PixelPipeline
     bool frame16 = false;
     bool frame24 = false;
     bool colclamp = true;
+    bool dither = false;
+    int8_t dimx[4][4]{};
     ReadVramFunc readFrame = nullptr;
     ReadVramFunc readZ = nullptr;
     WriteVramFunc writeFrame = nullptr;
@@ -1407,6 +1409,13 @@ GSCpuBackend::PixelPipeline GSCpuBackend::MakePixelPipeline(const GSDrawState &s
     p.frame16 = bitsPerPixel(p.fpsm) == 16;
     p.frame24 = p.fpsm == GS_PSM_CT24;
     p.colclamp = (state.colclamp & 1u) != 0u;
+    p.dither = (state.dthe & 1u) != 0u && p.frame16;
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column)
+        {
+            const int entry = static_cast<int>((state.dimx >> (row * 16 + column * 4)) & 7u);
+            p.dimx[row][column] = static_cast<int8_t>(entry >= 4 ? entry - 8 : entry);
+        }
     p.readFrame = m_readVramFuncs[p.fpsm & 0x3Fu];
     p.readZ = m_readVramFuncs[p.zpsm & 0x3Fu];
     p.writeFrame = m_writeVramFuncs[p.fpsm & 0x3Fu];
@@ -2536,12 +2545,26 @@ void GSCpuBackend::WritePixel(const PixelPipeline &p, int x, int y, uint32_t z, 
             const int cAlpha = (p.csel == 0) ? a : (p.csel == 1) ? da
                                                                  : p.fix;
 
-            const int br = ((pickRGB(p.asel, r, dr) - pickRGB(p.bsel, r, dr)) * cAlpha >> 7) + pickRGB(p.dsel, r, dr);
-            const int bg = ((pickRGB(p.asel, g, dg) - pickRGB(p.bsel, g, dg)) * cAlpha >> 7) + pickRGB(p.dsel, g, dg);
-            const int bb = ((pickRGB(p.asel, b, db) - pickRGB(p.bsel, b, db)) * cAlpha >> 7) + pickRGB(p.dsel, b, db);
+            int br = ((pickRGB(p.asel, r, dr) - pickRGB(p.bsel, r, dr)) * cAlpha >> 7) + pickRGB(p.dsel, r, dr);
+            int bg = ((pickRGB(p.asel, g, dg) - pickRGB(p.bsel, g, dg)) * cAlpha >> 7) + pickRGB(p.dsel, g, dg);
+            int bb = ((pickRGB(p.asel, b, db) - pickRGB(p.bsel, b, db)) * cAlpha >> 7) + pickRGB(p.dsel, b, db);
+            if (p.dither)
+            {
+                const int d = p.dimx[y & 3][x & 3];
+                br += d;
+                bg += d;
+                bb += d;
+            }
             r = p.colclamp ? clampU8(br) : static_cast<uint8_t>(br & 0xFF);
             g = p.colclamp ? clampU8(bg) : static_cast<uint8_t>(bg & 0xFF);
             b = p.colclamp ? clampU8(bb) : static_cast<uint8_t>(bb & 0xFF);
+        }
+        else if (p.dither)
+        {
+            const int d = p.dimx[y & 3][x & 3];
+            r = p.colclamp ? clampU8(r + d) : static_cast<uint8_t>((r + d) & 0xFF);
+            g = p.colclamp ? clampU8(g + d) : static_cast<uint8_t>((g + d) & 0xFF);
+            b = p.colclamp ? clampU8(b + d) : static_cast<uint8_t>((b + d) & 0xFF);
         }
 
         if (writeMask.writeAlpha && p.fba)
@@ -2734,6 +2757,20 @@ void GSCpuBackend::WritePixelBlock(const PixelPipeline &p, int x0, int y, uint32
             g[i] = (bg & blend) | (g[i] & ~blend);
             b[i] = (bb & blend) | (b[i] & ~blend);
         }
+    }
+    if (p.dither)
+    {
+        const int8_t *const row = p.dimx[y & 3];
+        for (int i = 0; i < N; ++i)
+        {
+            const int d = row[(x0 + i) & 3];
+            r[i] += d;
+            g[i] += d;
+            b[i] += d;
+        }
+    }
+    if (p.abe || p.dither)
+    {
         if (p.colclamp)
             for (int i = 0; i < N; ++i)
             {
