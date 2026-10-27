@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 
 bool latchPresentationOnVBlank()
@@ -1386,6 +1388,11 @@ uint32_t EeScheduler::invocationStackTop()
     const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
     if (top == 0u)
     {
+        std::ostringstream stacks;
+        for (const auto &[stackKey, stackTop] : m_invocationStackTops)
+            stacks << " t" << (stackKey >> 32u) << "/d" << static_cast<uint32_t>(stackKey);
+        std::cerr << "[EeScheduler] invocation stack exhausted: thread " << owner->id << " depth " << depth << ", "
+                  << m_invocationStackTops.size() << " stacks reserved:" << stacks.str() << std::endl;
         throw std::runtime_error("EE invocation stack space exhausted");
     }
     m_invocationStackTops.emplace(key, top);
