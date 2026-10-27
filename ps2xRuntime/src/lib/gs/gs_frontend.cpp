@@ -458,18 +458,33 @@ void GS::workerLoop()
                       static_cast<uint8_t>(QueuedCommand::Kind::Register) == GsTraceCommand::Register);
         const uint8_t *data = command.bytes.data();
         const uint32_t size = static_cast<uint32_t>(command.bytes.size());
-        if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow && !m_streamRenderer)
+        if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow)
         {
             const double now = GsRecorder::sinceProcessStart();
-            if (!recorder.started && now >= recorder.startAt && m_backend)
+            if (!recorder.started && now >= recorder.startAt && (m_backend || m_streamRenderer))
             {
-                const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
-                if (transfer.direction == 3u || transfer.totalPixels == 0u)
+                // A stream renderer cannot tell whether an image transfer is in progress: start at a presentation
+                // latch, where games have none.
+                bool between = command.kind == QueuedCommand::Kind::PresentationLatch;
+                if (!m_streamRenderer)
+                {
+                    const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
+                    between = transfer.direction == 3u || transfer.totalPixels == 0u;
+                }
+                if (between)
                 {
                     std::vector<uint8_t> vram;
                     GSStateImage image;
-                    m_backend->SnapshotVram(vram);
-                    saveState(image);
+                    if (m_streamRenderer)
+                    {
+                        m_streamRenderer->readVram(vram);
+                        m_streamRenderer->saveState(image);
+                    }
+                    else
+                    {
+                        m_backend->SnapshotVram(vram);
+                        saveState(image);
+                    }
                     writeGsTraceHeader(recorder.out, vram, image);
                     recorder.started = true;
                     recorder.began = std::chrono::steady_clock::now();
@@ -2420,12 +2435,37 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
+    if (m_streamRendererRequested)
+    {
+        bool done = false;
+        uint32_t value = 0u;
+        const_cast<GS *>(this)->runOnWorker([&]()
+                                            {
+            if (!m_streamRenderer)
+                return;
+            value = m_streamRenderer->readVramPixel(psm, base, bw, x, y);
+            done = true; });
+        if (done)
+            return value;
+    }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 
 void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
+    if (m_streamRendererRequested)
+    {
+        bool done = false;
+        runOnWorker([&]()
+                    {
+            if (!m_streamRenderer)
+                return;
+            m_streamRenderer->writeVramPixel(psm, base, bw, x, y, value);
+            done = true; });
+        if (done)
+            return;
+    }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);

@@ -49,14 +49,21 @@ rasterizer (`gs_cpu_backend.cpp`) byte for byte in VRAM.
   compares VRAM in game. `PS2X_GS_DUMP*` dumps primitives and textures. `ps2xTest/src/ps2_gs_tests.cpp` has
   ~60 GS cases (transfers, swizzle, CLUT, tests, presentation, async ordering).
 
-Gaps of today's paraLLEl integration that the new renderer must close, not copy:
+Gaps of the paraLLEl integration as it was before phase 0, which the new renderer must close, not copy (phase 0
+closed the first, the second for `ReadVram` / `WriteVram`, and the third):
 
-- Recording is disabled when paraLLEl is active (`!m_parallel` in `workerLoop`), so no trace can be taken from
-  the fast path.
-- `GS::ReadVram` / `WriteVram` / `clearFramebufferContext` still go to the CPU backend (or are skipped) when
-  paraLLEl owns VRAM, so any HLE path using them sees stale memory.
-- The trace's drawing state is the frontend's and the CPU backend's private serialization, so a trace cannot
-  seed a renderer that decodes GIF itself.
+- Recording was disabled when paraLLEl is active (`!m_parallel` in `workerLoop`), so no trace could be taken
+  from the fast path. Now a stream renderer records too: VRAM from `readVram`, state from its `saveState`,
+  starting at the first presentation latch after `PS2X_GS_RECORD_AT` (it cannot tell whether an image transfer is
+  in progress, and games have none across a latch).
+- `GS::ReadVram` / `WriteVram` / `clearFramebufferContext` went to the CPU backend (or were skipped) when
+  paraLLEl owns VRAM, so any HLE path using them saw stale memory. `ReadVram` / `WriteVram` now go to the stream
+  renderer on the GS thread (`readVramPixel` / `writeVramPixel` through `runOnWorker`). `clearFramebufferContext`
+  stays skipped with a stream renderer: its only caller (`sceGsSwapDBuffDc`) sends the clear packet right after,
+  which draws the same clear, and clearing from the host would add a GPU round trip per frame to SC3 for nothing.
+  Phase 6 revisits it if another caller appears.
+- The trace's drawing state was the frontend's and the CPU backend's private serialization, so a trace could
+  not seed a renderer that decodes GIF itself. `GSR2` traces carry a `GSStateImage`.
 
 ## 3. Approach: compute over exact VRAM
 
