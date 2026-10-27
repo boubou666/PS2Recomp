@@ -407,6 +407,12 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+# The CPU GS reference must round each float operation on its own so every compiler gives the same VRAM.
+if(NOT MSVC)
+    set_property(SOURCE src/lib/gs/gs_cpu_backend.cpp src/lib/gs/gs_cpu_stream_renderer.cpp src/lib/gs/gs_frontend.cpp
+        APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+endif()
+
 # The runtime (ps2_runtime_macros.h, GS/VU paths) uses SSE4.1/AVX2 intrinsics. MSVC gets
 # /arch:AVX2 from EnableFastReleaseMode, but GCC/Clang need the target flag in every config
 # or the always_inline intrinsics fail to compile. PUBLIC so the runner and generated code

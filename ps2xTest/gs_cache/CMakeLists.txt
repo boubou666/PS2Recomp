@@ -26,6 +26,10 @@ target_compile_definitions(ps2_gs_cache_backend_under_test PRIVATE PS2_RUNTIME_L
 target_link_libraries(ps2_gs_cache_backend_under_test PUBLIC Threads::Threads)
 set_target_properties(ps2_gs_cache_backend_under_test PROPERTIES CXX_EXTENSIONS OFF)
 
+if(NOT MSVC)
+    target_compile_options(ps2_gs_cache_backend_under_test PRIVATE -ffp-contract=off)
+endif()
+
 if(PS2_GS_CACHE_SANITIZERS)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" OR MSVC)
         message(FATAL_ERROR "PS2_GS_CACHE_SANITIZERS requires a GCC/Clang sanitizer toolchain")
