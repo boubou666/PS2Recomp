@@ -981,13 +981,20 @@ void PS2Memory::waitForVif1Clock(uint64_t eeCycle) const
     if (!vif1BehindEe(eeCycle))
         return;
     const auto waitStart = std::chrono::steady_clock::now();
+    // The worker is running the microprogram the EE waits on, so the wait is usually short: spin, then yield, before
+    // sleeping (waking a sleeping thread costs more than most of these waits on Windows).
     for (uint32_t spin = 0; vif1BehindEe(eeCycle); ++spin)
     {
-        if (spin < 256u)
+        if (spin < 4096u)
         {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
             _mm_pause();
 #endif
+            continue;
+        }
+        if (spin < 4096u + 256u)
+        {
+            std::this_thread::yield();
             continue;
         }
         m_vif1ClockWaiter.store(true, std::memory_order_relaxed);
@@ -1040,6 +1047,14 @@ void PS2Memory::vif1WorkerMain()
     for (;;)
     {
         Vif1Job job;
+        // The EE often queues the next transfer right after the last one ends: spin a little before sleeping.
+        for (uint32_t spin = 0; spin < 2048u && m_vif1Queued.load(std::memory_order_acquire) <=
+                                                     m_vif1Done.load(std::memory_order_acquire); ++spin)
+        {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+            _mm_pause();
+#endif
+        }
         {
             std::unique_lock<std::mutex> lock(m_vif1Mutex);
             m_vif1WorkCv.wait(lock, [&]() { return m_vif1Stop || !m_vif1Jobs.empty(); });

@@ -2064,7 +2064,6 @@ void EeScheduler::processDueDeadlines()
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
             std::unique_lock lock(m_eventMutex);
-            const auto now = std::chrono::steady_clock::now();
             // m_deadlines is sorted by cycle: only its prefix up to the current cycle can be due.
             const auto dueEnd = std::find_if(m_deadlines.begin(), m_deadlines.end(), [this](const ScheduledEvent &item)
                                              { return item.deadlineCycle > m_eeCycle; });
@@ -2080,6 +2079,7 @@ void EeScheduler::processDueDeadlines()
                 return;
             }
 
+            const auto now = std::chrono::steady_clock::now();
             if (now < pacingDeadline && interruptInvocationPending())
             {
                 m_deadlinesHeldUntil = pacingDeadline;
