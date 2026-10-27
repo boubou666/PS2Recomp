@@ -270,6 +270,56 @@ static bool writeMinimalMipsElfWithUnmappedEntryHint(const std::filesystem::path
     return writer.save(elfPath.string());
 }
 
+static bool writeMinimalMipsElfWithTailJumpIntoBoundRoutine(const std::filesystem::path &elfPath)
+{
+    ELFIO::elfio writer;
+    writer.create(ELFIO::ELFCLASS32, ELFIO::ELFDATA2LSB);
+    writer.set_os_abi(ELFIO::ELFOSABI_NONE);
+    writer.set_type(ELFIO::ET_EXEC);
+    writer.set_machine(ELFIO::EM_MIPS);
+    writer.set_entry(0x00100000u);
+
+    ELFIO::section *text = writer.sections.add(".text");
+    text->set_type(ELFIO::SHT_PROGBITS);
+    text->set_flags(ELFIO::SHF_ALLOC | ELFIO::SHF_EXECINSTR);
+    text->set_addr_align(4);
+    text->set_address(0x00100000u);
+    const std::array<uint32_t, 8> textWords = {
+        0x08040004u, 0x00000000u, // wrapper: j 0x00100010
+        0x00000000u, 0x00000000u,
+        0x03E00008u, 0x00000000u, // routine at 0x00100010, bound to a runtime handler
+        0x00000000u, 0x00000000u,
+    };
+    text->set_data(reinterpret_cast<const char *>(textWords.data()),
+                   static_cast<ELFIO::Elf_Word>(textWords.size() * sizeof(uint32_t)));
+
+    ELFIO::section *strtab = writer.sections.add(".strtab");
+    strtab->set_type(ELFIO::SHT_STRTAB);
+    strtab->set_addr_align(1);
+
+    ELFIO::section *symtab = writer.sections.add(".symtab");
+    symtab->set_type(ELFIO::SHT_SYMTAB);
+    symtab->set_info(1);
+    symtab->set_link(strtab->get_index());
+    symtab->set_addr_align(4);
+    symtab->set_entry_size(writer.get_default_entry_size(ELFIO::SHT_SYMTAB));
+
+    ELFIO::symbol_section_accessor symbols(writer, symtab);
+    ELFIO::string_section_accessor strings(strtab);
+    symbols.add_symbol(strings, "", 0, 0,
+                       ELFIO::STB_LOCAL, ELFIO::STT_NOTYPE, 0, ELFIO::SHN_UNDEF);
+    symbols.add_symbol(strings, "wrapper_over_routine", 0x00100000u, 0x20u,
+                       ELFIO::STB_GLOBAL, ELFIO::STT_FUNC, 0, text->get_index());
+
+    ELFIO::segment *textSegment = writer.segments.add();
+    textSegment->set_type(ELFIO::PT_LOAD);
+    textSegment->set_flags(ELFIO::PF_R | ELFIO::PF_X);
+    textSegment->set_align(0x1000);
+    textSegment->add_section_index(text->get_index(), text->get_addr_align());
+
+    return writer.save(elfPath.string());
+}
+
 static bool writeMinimalMipsElfWithStandaloneEntryBlock(const std::filesystem::path &elfPath)
 {
     ELFIO::elfio writer;
@@ -1550,6 +1600,49 @@ void register_ps2_recompiler_tests()
                     callsHandler = callsHandler || text.find("sceCdGetReadPos(rdram, ctx, runtime)") != std::string::npos;
                 }
                 t.IsTrue(callsHandler, "the synthesized wrapper should call the runtime handler");
+            }
+
+            std::error_code removeError;
+            std::filesystem::remove_all(tempRoot, removeError);
+        });
+
+        tc.Run("a function covering a stub-bound start ends there so its jump reaches the handler", [](TestCase &t) {
+            const std::string uniqueSuffix =
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path tempRoot =
+                std::filesystem::temp_directory_path() / ("ps2recomp-stub-boundary-" + uniqueSuffix);
+            const std::filesystem::path elfPath = tempRoot / "stub-boundary.elf";
+            const std::filesystem::path configPath = tempRoot / "stub-boundary.toml";
+            const std::filesystem::path outputPath = tempRoot / "output";
+            std::filesystem::create_directories(tempRoot);
+
+            const bool elfWritten = writeMinimalMipsElfWithTailJumpIntoBoundRoutine(elfPath);
+            const bool configWritten = writeRecompilerTestConfig(
+                configPath, elfPath, outputPath, {}, {"sceCdGetReadPos@0x00100010"});
+            t.IsTrue(elfWritten && configWritten, "stub boundary regression inputs should be generated");
+
+            if (elfWritten && configWritten)
+            {
+                PS2Recompiler recompiler(configPath.string());
+                t.IsTrue(recompiler.initialize(), "stub boundary config should initialize");
+                t.IsTrue(recompiler.recompile(), "stub boundary should recompile");
+                recompiler.generateOutput();
+
+                bool localLabel = false;
+                bool wrapperCallsBound = false;
+                for (const auto &entry : std::filesystem::directory_iterator(outputPath))
+                {
+                    std::ifstream source(entry.path());
+                    const std::string text{std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
+                    localLabel = localLabel || text.find("label_100010:") != std::string::npos;
+                    if (text.find("// Address: 0x100000") != std::string::npos)
+                    {
+                        wrapperCallsBound = text.find("_0x100010(rdram, ctx, runtime)") != std::string::npos ||
+                                            text.find("0x100010u, 0x100000u") != std::string::npos;
+                    }
+                }
+                t.IsFalse(localLabel, "the bound routine must not be emitted as a label inside the wrapper");
+                t.IsTrue(wrapperCallsBound, "the wrapper's jump should reach the bound routine's wrapper");
             }
 
             std::error_code removeError;
