@@ -2656,6 +2656,8 @@ namespace ps2_stubs
         }();
         if (skipMovies && playback.picturesServed > 0u)
         {
+            if (runtime)
+                runtime->memory().setIpuInputEnabled(false);
             setReturnS32(ctx, 1);
             return;
         }
@@ -2694,7 +2696,10 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
+        const bool isEnd = ended && playback.decodedFrames.empty() && presentationComplete;
+        if (isEnd && runtime)
+            runtime->memory().setIpuInputEnabled(false);
+        setReturnS32(ctx, isEnd ? 1 : 0);
     }
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
