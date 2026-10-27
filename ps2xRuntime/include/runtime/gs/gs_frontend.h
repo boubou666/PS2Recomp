@@ -332,7 +332,7 @@ private:
     uint64_t m_scanmsk = 0;
     uint64_t m_dimx = 0;
     uint64_t m_dthe = 0;
-    uint64_t m_colclamp = 0;
+    uint64_t m_colclamp = 1;
     GSTexaReg m_texa{0u, false, 0u};
     GSTexClutReg m_texclut{0u, 0u, 0u};
 

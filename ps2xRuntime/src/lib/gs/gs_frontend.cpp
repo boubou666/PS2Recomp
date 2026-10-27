@@ -771,7 +771,7 @@ void GS::reset()
     m_scanmsk = 0u;
     m_dimx = 0u;
     m_dthe = 0u;
-    m_colclamp = 0u;
+    m_colclamp = 1u;
     m_texa = {0u, false, 0u};
     m_texclut = {0u, 0u, 0u};
     m_bitbltbuf = {};

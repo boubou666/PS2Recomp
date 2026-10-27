@@ -46,6 +46,7 @@ void GSGifDecoder::reset()
     m_state.flags = GSStateImage::HasVertexQueue;
     m_state.setReg(GS_REG_PRMODECONT, 1u);
     m_state.setReg(GS_REG_RGBAQ, 0x80808080ull | (uint64_t(kOneBits) << 32));
+    m_state.setReg(GS_REG_COLCLAMP, 1u);
     m_state.setReg(GS_REG_TRXDIR, 3u);
     for (uint8_t i = 0; i < 2u; ++i)
     {

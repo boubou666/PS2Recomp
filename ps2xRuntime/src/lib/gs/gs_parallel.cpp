@@ -365,7 +365,11 @@ namespace
             }
         }
 
-        void reset() override { m_interface.reset_context_state(); }
+        void reset() override
+        {
+            m_interface.reset_context_state();
+            writeRegister(GS_REG_COLCLAMP, 1u);
+        }
 
     private:
         static constexpr size_t kPageBytes = 8192u;
