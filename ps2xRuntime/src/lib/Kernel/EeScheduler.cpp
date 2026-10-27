@@ -2105,19 +2105,48 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                uint64_t deadlineCycle = scheduled.deadlineCycle;
                 auto anchor = scheduled.hostDeadline;
+                const bool held = m_vblankHeldSince != std::chrono::steady_clock::time_point{};
+                if (m_vblankHold.load(std::memory_order_relaxed))
+                {
+                    // Held (setVBlankHold): again in a moment, unless it has waited its limit.
+                    constexpr auto kHoldStep = std::chrono::microseconds(250);
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!held)
+                    {
+                        m_vblankHeldSince = scheduled.hostDeadline;
+                        m_vblankHeldCycle = scheduled.deadlineCycle;
+                    }
+                    if (now - m_vblankHeldSince < m_vblankHoldLimit)
+                    {
+                        scheduleEvent(std::max(scheduled.deadlineCycle, m_eeCycle) + microsecondsToEeCycles(250u),
+                                      now + kHoldStep, scheduled.event);
+                        continue;
+                    }
+                    // The frame overran even the limit: it gets its second field as without the hold, the
+                    // fields keep their times.
+                    deadlineCycle = m_vblankHeldCycle;
+                    anchor = m_vblankHeldSince;
+                }
+                else if (held)
+                {
+                    // Released in time: the next field counts from now.
+                    m_vblanksHeld.fetch_add(1u, std::memory_order_relaxed);
+                }
+                m_vblankHeldSince = {};
                 if (wallClockCatchUp() == WallClockCatchUp::Off)
                 {
                     const auto now = std::chrono::steady_clock::now();
                     if (now - anchor > m_vblankPeriod)
                         anchor = now;
                 }
-                m_timelineCycle.store(scheduled.deadlineCycle, std::memory_order_relaxed);
+                m_timelineCycle.store(deadlineCycle, std::memory_order_relaxed);
                 m_timelineHostTicks.store(anchor.time_since_epoch().count(), std::memory_order_relaxed);
-                scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                scheduleEvent(deadlineCycle + kVBlankDurationCycles,
                               anchor + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
+                scheduleEvent(deadlineCycle + m_vblankPeriodCycles,
                               anchor + std::chrono::duration_cast<std::chrono::steady_clock::duration>(m_vblankPeriod),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }

@@ -410,6 +410,12 @@ public:
     void setWallClockCatchUp(WallClockCatchUp mode) noexcept { m_wallClockCatchUp = mode; }
     [[nodiscard]] WallClockCatchUp wallClockCatchUp() const noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
+    // Variable refresh, for a game override: while the hold is on, a VBlankStart that falls due waits, in steps of
+    // 250 us, until the hold is released or `limit` has passed since its time; the next field then counts from when it
+    // fired. A frame that overruns the field by a little takes that little longer instead of a whole second field.
+    void setVBlankHold(bool held) noexcept { m_vblankHold.store(held, std::memory_order_relaxed); }
+    void setVBlankHoldLimit(std::chrono::microseconds limit) noexcept { m_vblankHoldLimit = limit; }
+    [[nodiscard]] uint64_t vblanksHeld() const noexcept { return m_vblanksHeld.load(std::memory_order_relaxed); }
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
     void completeVSync(uint64_t tick);
@@ -526,6 +532,11 @@ private:
     std::atomic<uint64_t> m_timelineCycle{0};
     std::atomic<std::chrono::steady_clock::rep> m_timelineHostTicks{0};
     std::chrono::nanoseconds m_vblankPeriod{0};
+    std::atomic<bool> m_vblankHold{false};
+    std::chrono::microseconds m_vblankHoldLimit{6000};
+    std::chrono::steady_clock::time_point m_vblankHeldSince{}; // the held vblank's own time (zero: none held)
+    uint64_t m_vblankHeldCycle = 0;
+    std::atomic<uint64_t> m_vblanksHeld{0};
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::deque<std::function<void()>> m_tasks; // guarded by m_eventMutex
