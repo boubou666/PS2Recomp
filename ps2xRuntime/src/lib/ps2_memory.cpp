@@ -1721,11 +1721,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
+void PS2Memory::setIpuInputEnabled(bool enabled)
+{
+    m_ipuInputEnabled = enabled;
+    if (!enabled && m_ipuInputDma.active)
+    {
+        m_ipuInputDma.active = false;
+        completeDmacChannel(kToIpuChannel, 4u);
+    }
+}
+
 std::vector<uint8_t> PS2Memory::pullIpuInput(size_t minBytes)
 {
     constexpr int kMaxTags = 4096;
     std::vector<uint8_t> out;
     IpuInputDma &dma = m_ipuInputDma;
+    dma.pollsWithoutPull = 0u;
     int tags = 0;
     while (dma.active && out.size() < minBytes)
     {
@@ -3222,7 +3233,13 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if (address == kToIpuChannel && m_ipuInputDma.active)
             {
-                return m_ioRegisters[address] | 0x100u;
+                constexpr uint32_t kPollsBeforeRelease = 4096u;
+                if (++m_ipuInputDma.pollsWithoutPull <= kPollsBeforeRelease)
+                {
+                    return m_ioRegisters[address] | 0x100u;
+                }
+                m_ipuInputDma.active = false;
+                completeDmacChannel(kToIpuChannel, 4u);
             }
             if ((address & 0xFF) == 0x00 && !dmaChannelSignalStalled(address))
             {
