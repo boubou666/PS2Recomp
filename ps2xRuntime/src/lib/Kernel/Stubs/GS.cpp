@@ -102,7 +102,7 @@ namespace ps2_stubs
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
         }
 
-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
+        void writeGuestU32(uint8_t *rdram, PS2Runtime *runtime, uint32_t addr, uint32_t value);
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr);
 
         void initPacketBuilderState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -137,12 +137,18 @@ namespace ps2_stubs
                 currentAddr += 4u;
             }
 
+            uint32_t dmaTagAddr = 0u;
+            uint32_t dmaTagWord = 0u;
+            if (tryReadWordFromGuest(rdram, runtime, stateAddr + 8u, dmaTagAddr) &&
+                dmaTagAddr != 0u &&
+                tryReadWordFromGuest(rdram, runtime, dmaTagAddr, dmaTagWord))
+            {
+                const int32_t qwc = (static_cast<int32_t>(currentAddr - dmaTagAddr) >> 4) - 1;
+                writeGuestU32(rdram, runtime, dmaTagAddr, dmaTagWord + static_cast<uint32_t>(qwc));
+            }
+
+            writeGuestU32(rdram, runtime, stateAddr + 8u, 0u);
             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr);
-            writeGuestBytes(rdram,
-                            runtime,
-                            stateAddr + 8u,
-                            reinterpret_cast<const uint8_t *>(&zero),
-                            sizeof(zero));
             return currentAddr;
         }
 
@@ -207,39 +213,9 @@ namespace ps2_stubs
                             sizeof(temp));
         }
 
-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr)
-        {
-            uint32_t currentAddr = 0u;
-            uint32_t pendingCountAddr = 0u;
-            if (!tryReadWordFromGuest(rdram, runtime, stateAddr, currentAddr) ||
-                !tryReadWordFromGuest(rdram, runtime, stateAddr + 8u, pendingCountAddr) ||
-                pendingCountAddr == 0u ||
-                currentAddr <= pendingCountAddr)
-            {
-                return;
-            }
-
-            uint32_t countWord = 0u;
-            if (!tryReadWordFromGuest(rdram, runtime, pendingCountAddr, countWord))
-            {
-                return;
-            }
-
-            const uint32_t deltaBytes = currentAddr - pendingCountAddr;
-            uint32_t deltaQwords = 0u;
-            if (deltaBytes >= 16u)
-            {
-                deltaQwords = (deltaBytes >> 4u) - 1u;
-            }
-
-            countWord = (countWord & 0xFFFF0000u) | (deltaQwords & 0xFFFFu);
-            writeGuestU32(rdram, runtime, pendingCountAddr, countWord);
-        }
-
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr)
         {
             writeGuestU32(rdram, runtime, stateAddr, currentAddr);
-            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
         }
 
         uint32_t reservePacketBuilderWords(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t wordCount)
