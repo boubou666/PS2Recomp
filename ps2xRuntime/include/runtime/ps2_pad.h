@@ -11,6 +11,9 @@ public:
     ~PSPadBackend() = default;
 
     bool readState(int port, int slot, uint8_t *data, size_t size);
+    // Port 0 always (gamepad 0, else the keyboard); port 1 while a second gamepad is plugged in, or with
+    // PS2X_PAD2_SCRIPT (the same format as PS2X_PAD_SCRIPT, for player 2).
+    bool connected(int port) const;
 };
 
 // Buttons a PS2X_PAD_SCRIPT string holds down at a time (seconds since process start), as a mask of

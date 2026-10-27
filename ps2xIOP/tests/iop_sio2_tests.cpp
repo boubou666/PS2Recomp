@@ -47,7 +47,7 @@ int main()
     IopSio2 sio2(memory);
     memory.setSio2(&sio2);
     uint16_t buttons = 0xFFFFu;
-    sio2.setPadStateReader([&](uint8_t *state, size_t size)
+    sio2.setPadStateReader(0, [&](uint8_t *state, size_t size)
                            {
         if (size < 8u)
             return false;
@@ -82,6 +82,26 @@ int main()
     // Other ports: no device.
     reply = transfer(memory, 1u, {0x01, 0x42, 0x00, 0x00, 0x00});
     if (!expect(reply[1] == 0xFFu && memory.read32(kRecv1) == 0x1D100u, "port 1 reports no device")) return 1;
+
+    // A second controller: port 1 answers once the host reports one plugged in, with its own buttons.
+    uint16_t buttons2 = static_cast<uint16_t>(~0x0010u); // up held
+    sio2.setPadStateReader(1, [&](uint8_t *state, size_t size)
+                           {
+        if (size < 8u)
+            return false;
+        state[2] = static_cast<uint8_t>(buttons2);
+        state[3] = static_cast<uint8_t>(buttons2 >> 8);
+        return true; });
+    bool pad2Plugged = false;
+    sio2.setPadPresence([&](int port) { return port == 0 || (port == 1 && pad2Plugged); });
+    reply = transfer(memory, 1u, {0x01, 0x42, 0x00, 0x00, 0x00});
+    if (!expect(reply[1] == 0xFFu && memory.read32(kRecv1) == 0x1D100u, "port 1 still empty while unplugged")) return 1;
+    pad2Plugged = true;
+    reply = transfer(memory, 1u, {0x01, 0x42, 0x00, 0x00, 0x00});
+    if (!expect(reply == std::vector<uint8_t>{0xFF, 0x41, 0x5A, 0xEF, 0xFF}, "port 1 polls the second pad")) return 1;
+    if (!expect(memory.read32(kRecv1) == 0x1100u, "RECV1 reports the second pad connected")) return 1;
+    reply = transfer(memory, 0u, {0x01, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+    if (!expect(reply[3] == 0xFFu && reply[4] == 0xFFu, "port 0 keeps its own buttons")) return 1;
 
     // DMA out: replies land in RAM instead of the FIFO.
     sio2.armDmaFromDevice(0x1000u, 9u);
