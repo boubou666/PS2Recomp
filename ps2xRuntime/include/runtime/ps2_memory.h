@@ -388,6 +388,7 @@ public:
     bool isPath3Masked() const { return m_path3Masked; }
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
+    void submitPendingPath2Image(const uint8_t *data, uint32_t chunkQw, bool directHl);
     // dmaTransfer: PATH3 data of a GIF DMA transfer, whose last GIF tag may continue in the next transfer.
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false,
                          bool dmaTransfer = false);
@@ -516,6 +517,8 @@ public:
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    // The DIRECT that left the IMAGE pending ran out of buffer: its data continues raw at the next VIF1 data.
+    bool m_vif1PendingPath2ImageRaw = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct DmaSegment

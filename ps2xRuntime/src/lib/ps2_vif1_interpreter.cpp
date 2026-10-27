@@ -551,6 +551,51 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+namespace
+{
+    // After a DIRECT that left a GIF IMAGE pending, VIFcodes come next on hardware, the image continuing in the
+    // next DIRECT/DIRECTHL's data (a TTE tag's [NOP, DIRECTHL n] before REF'd pixels). Streams that carry the image
+    // qwords right after the DIRECT, without a VIFcode, are still taken as raw continuation.
+    bool directCodeFollows(const uint8_t *data, uint32_t bytes)
+    {
+        auto isDirect = [](uint32_t code)
+        {
+            const uint32_t opcode = (code >> 24) & 0x7Fu;
+            return opcode == 0x50u || opcode == 0x51u;
+        };
+        uint32_t first = 0u;
+        if (bytes < 4u)
+            return false;
+        std::memcpy(&first, data, 4u);
+        if (isDirect(first))
+            return true;
+        uint32_t second = 0u;
+        if (first != 0u || bytes < 8u)
+            return false;
+        std::memcpy(&second, data + 4u, 4u);
+        return isDirect(second);
+    }
+}
+
+void PS2Memory::submitPendingPath2Image(const uint8_t *data, uint32_t chunkQw, bool directHl)
+{
+    std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+    const uint64_t imageTag =
+        static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+        ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+        (static_cast<uint64_t>(kGifFmtImage) << 58);
+    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+    std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(chunkQw) * 16u);
+    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, directHl);
+
+    m_vif1PendingPath2ImageQwc -= chunkQw;
+    if (m_vif1PendingPath2ImageQwc == 0u)
+    {
+        m_vif1PendingPath2DirectHl = false;
+        m_vif1PendingPath2ImageRaw = false;
+    }
+}
+
 uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
@@ -581,7 +626,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
 
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        if (m_vif1PendingPath2ImageQwc != 0u && (m_vif1PendingPath2ImageRaw || !directCodeFollows(data + pos, sizeBytes - pos)))
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
@@ -590,21 +635,8 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             }
 
             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
+            submitPendingPath2Image(data + pos, chunkQw, m_vif1PendingPath2DirectHl);
             pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
             continue;
         }
 
@@ -773,6 +805,14 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
+            if (qwCount > 0 && m_vif1PendingPath2ImageQwc != 0u)
+            {
+                const uint32_t chunkQw = std::min(m_vif1PendingPath2ImageQwc, qwCount);
+                submitPendingPath2Image(data + pos, chunkQw, opcode == VIF_DIRECTHL);
+                pos += chunkQw * 16u;
+                qwCount -= chunkQw;
+            }
+
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
@@ -798,6 +838,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     m_vif1PendingPath2ImageQwc = pendingImageQw;
                     m_vif1PendingPath2DirectHl = directHl;
+                    m_vif1PendingPath2ImageRaw = truncated;
                 }
             }
 

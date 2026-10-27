@@ -3272,6 +3272,53 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
         });
 
+        tc.Run("VIF1 DIRECT image tag continues in the next DIRECTHL after a TTE tag's VIFcodes", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            GS gs;
+            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                gs.processGIFPacket(data, sizeBytes);
+            });
+            mem.setGifArbiter(&arbiter);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, (1ull << 16) | (1ull << 48));
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (1ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            // sceVif1PkRefLoadImage: CNT [NOP, DIRECTHL 1] + IMAGE tag, then REF [NOP, DIRECTHL 1] + the pixels.
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x51u, 0u, 1u));
+            appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packet, 0ull);
+            appendU32(packet, 0u);
+            appendU32(packet, makeVifCmd(0x51u, 0u, 1u));
+            for (uint32_t i = 0; i < 16u; ++i)
+                packet.push_back(static_cast<uint8_t>(0xE0u + i));
+
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            const uint8_t *vramOut = mem.getGSVRAM();
+            bool imageOk = true;
+            for (uint32_t x = 0; x < 4u && imageOk; ++x)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    if (vramOut[off + c] != static_cast<uint8_t>(0xE0u + x * 4u + c))
+                    {
+                        imageOk = false;
+                        break;
+                    }
+                }
+            }
+            t.IsTrue(imageOk, "the VIFcodes between the IMAGE tag and its pixels must not reach the GS as pixels");
+        });
+
         tc.Run("unaligned accesses throw", [](TestCase &t)
         {
             PS2Memory mem;
