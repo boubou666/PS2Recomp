@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <array>
 #include <functional>
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <atomic>
@@ -262,7 +263,9 @@ public:
     // first waits for the queued transfers (waitForVif1). PS2X_VIF1_THREAD=1 enables it.
     void setVif1Threaded(bool enabled);
     bool vif1Threaded() const { return m_vif1Threaded; }
-    void waitForVif1() const;
+    void waitForVif1(const char *site = __builtin_FUNCTION(), int line = __builtin_LINE()) const;
+    // Diagnostics: where the EE waited for the VIF1 worker since the last call (site:line ms, ...).
+    std::string takeVif1WaitSites() const;
     // GS lag (with the worker): the GS and VU1 may finish a frame while the EE runs the next one, as on the
     // hardware. PATH3 packets and GS privileged register writes then join the worker's queue in order instead of
     // waiting for it (CSR, live state, is read and written at once), the presented frame is latched by the worker

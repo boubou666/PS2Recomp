@@ -1174,7 +1174,8 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
         {
             static uint64_t lastVif1WaitNs = 0;
             const uint64_t vif1WaitNs = memory.vif1WaitNanoseconds();
-            text << ", waited " << (vif1WaitNs - lastVif1WaitNs) / 1000000u << " ms for the VIF1 worker";
+            text << ", waited " << (vif1WaitNs - lastVif1WaitNs) / 1000000u << " ms for the VIF1 worker (drains:"
+                 << memory.takeVif1WaitSites() << ")";
             lastVif1WaitNs = vif1WaitNs;
         }
         text << '\n';
@@ -3222,8 +3223,10 @@ uint64_t ps2CurrentEeCycle()
 
 bool ps2GsFifoEmpty()
 {
+    // CSR's FIFO bit as it is now: through gs() every CSR read would first drain the queued VIF1 transfers, so a game
+    // polling CSR for FINISH (VP2) waited for the whole frame on each poll, against the GS lag's design.
     PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);
-    return !runtime || runtime->gs().fifoEmpty();
+    return !runtime || runtime->gsForPresentation().fifoEmpty();
 }
 
 bool ps2ScheduleGsInterruptCheck(uint64_t delayCycles)

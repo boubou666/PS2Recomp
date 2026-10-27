@@ -1,4 +1,7 @@
 // Based on Blackline Interactive implementation
+#include <string>
+#include <algorithm>
+#include <map>
 #include "ThreadNaming.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/vif1_command_stats.h"
@@ -891,12 +894,40 @@ bool PS2Memory::onVif1Worker() const
     return t_onVif1Worker;
 }
 
-void PS2Memory::waitForVif1() const
+namespace
+{
+    std::mutex g_vif1WaitSiteMutex;
+    std::map<std::string, uint64_t> g_vif1WaitSiteNs;
+}
+
+void PS2Memory::waitForVif1(const char *site, int line) const
 {
     if (!m_vif1Threaded || t_onVif1Worker)
         return;
     const uint64_t queued = m_vif1Queued.load(std::memory_order_acquire);
+    if (m_vif1Done.load(std::memory_order_acquire) >= queued)
+        return;
+    const auto start = std::chrono::steady_clock::now();
     waitForVif1Until(queued);
+    const uint64_t ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    std::lock_guard<std::mutex> lock(g_vif1WaitSiteMutex);
+    g_vif1WaitSiteNs[std::string(site) + ":" + std::to_string(line)] += ns;
+}
+
+std::string PS2Memory::takeVif1WaitSites() const
+{
+    std::vector<std::pair<std::string, uint64_t>> sites;
+    {
+        std::lock_guard<std::mutex> lock(g_vif1WaitSiteMutex);
+        sites.assign(g_vif1WaitSiteNs.begin(), g_vif1WaitSiteNs.end());
+        g_vif1WaitSiteNs.clear();
+    }
+    std::sort(sites.begin(), sites.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    std::string text;
+    for (size_t i = 0; i < sites.size() && i < 8; ++i)
+        text += " " + sites[i].first + "=" + std::to_string(sites[i].second / 1000000u) + "ms";
+    return text;
 }
 
 void PS2Memory::markVif1Frame()
