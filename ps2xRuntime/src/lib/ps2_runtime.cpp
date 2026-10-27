@@ -2226,6 +2226,7 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     }();
     VU1State before{};
     std::vector<uint8_t> dataBefore;
+    ctx->vu0_itop = m_memory.vif0_regs.itops;
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
     if (s_check)
