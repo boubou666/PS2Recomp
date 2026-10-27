@@ -25,6 +25,9 @@ namespace ps2x::iop::detail
         m_servers.clear();
         m_cmdHandlers.clear();
         m_queueThreads.clear();
+        m_eeClients.clear();
+        m_eeCalls.clear();
+        m_nextEeCallToken = 1u;
         m_nextDmaId = 1u;
         m_sifInitialized = false;
         m_sregs.fill(0u);
@@ -166,6 +169,131 @@ namespace ps2x::iop::detail
         }
     }
 
+    // IOP -> EE RPC. The client is the sifrpc t_SifRpcClientData, the same layout as on the EE: buf +0x14, cbuf +0x18,
+    // server +0x24 (EE addresses). A bind that finds no EE server leaves server 0, the SDK's signal to retry.
+    bool IopRpcBridge::bindEeRpc(IopCpuState &cpu)
+    {
+        constexpr uint32_t kClientBuffer = 0x14u, kClientCallbackBuffer = 0x18u, kClientServer = 0x24u;
+        const uint32_t client = cpu.gpr[4];
+        const uint32_t sid = cpu.gpr[5];
+        cpu.gpr[2] = 0u;
+        IopHost::EeRpcServer server;
+        if (client == 0u || !m_memory.isRamRange(client, 0x28u) || !m_host.findEeRpcServer(sid, server))
+        {
+            static uint32_t logged = 0;
+            if (logged++ < 8u)
+            {
+                char message[128];
+                std::snprintf(message, sizeof(message), "[IOP sifcmd] sceSifBindRpc sid=0x%x: no EE server yet (client=0x%x)",
+                              sid, client);
+                m_host.log(LogLevel::Info, message);
+            }
+            return true;
+        }
+        m_memory.write32(client + kClientBuffer, server.buffer);
+        m_memory.write32(client + kClientCallbackBuffer, server.callbackBuffer);
+        m_memory.write32(client + kClientServer, server.serverData);
+        m_eeClients[client] = sid;
+        char message[128];
+        std::snprintf(message, sizeof(message), "[IOP sifcmd] sceSifBindRpc sid=0x%x -> EE server 0x%x (client=0x%x)", sid,
+                      server.serverData, client);
+        m_host.log(LogLevel::Info, message);
+        return true;
+    }
+
+    // The call goes to the host (the EE server thread serves it); the IRX caller sleeps until the reply unless the call
+    // is SIF_RPC_M_NOWAIT. The receive size is rounded up to whole quadwords, as the SIF DMA moves them.
+    bool IopRpcBridge::callEeRpc(IopCpuState &cpu)
+    {
+        constexpr uint32_t kRpcNowait = 0x1u;
+        const uint32_t client = cpu.gpr[4];
+        const uint32_t function = cpu.gpr[5];
+        const uint32_t mode = cpu.gpr[6];
+        const uint32_t send = cpu.gpr[7];
+        const uint32_t sp = cpu.gpr[29];
+        const uint32_t sendSize = m_memory.read32(sp + 16u);
+        const uint32_t receive = m_memory.read32(sp + 20u);
+        const uint32_t receiveSize = m_memory.read32(sp + 24u);
+        const uint32_t endFunction = m_memory.read32(sp + 28u);
+        const uint32_t endParam = m_memory.read32(sp + 32u);
+        const auto bound = m_eeClients.find(client);
+        if (bound == m_eeClients.end())
+        {
+            static uint32_t logged = 0;
+            if (logged++ < 8u)
+            {
+                char message[128];
+                std::snprintf(message, sizeof(message), "[IOP sifcmd] sceSifCallRpc on an unbound client 0x%x (fno=%u)",
+                              client, function);
+                m_host.log(LogLevel::Warning, message);
+            }
+            cpu.gpr[2] = static_cast<uint32_t>(-1);
+            return true;
+        }
+
+        IopHost::EeRpcCall call;
+        call.token = m_nextEeCallToken++;
+        call.sid = bound->second;
+        call.function = function;
+        if (send != 0u && sendSize != 0u && m_memory.isRamRange(send, sendSize))
+        {
+            call.send.resize(sendSize);
+            (void)m_memory.readRam(send, call.send.data(), sendSize);
+        }
+        const uint32_t transfer = receive != 0u ? (receiveSize + 15u) & ~15u : 0u;
+        call.receiveSize = transfer;
+
+        IopThread *const caller = m_kernel.currentThread();
+        const bool wait = (mode & kRpcNowait) == 0u && caller != nullptr;
+        EeCall pending;
+        pending.thread = wait ? caller->id : 0;
+        pending.receive = receive;
+        pending.receiveSize = transfer;
+        pending.endFunction = endFunction;
+        pending.endParam = endParam;
+        pending.gp = cpu.gpr[28];
+        const uint64_t token = call.token;
+        // Recorded first: a host that replies at once completes the call before callEeRpc returns.
+        m_eeCalls[token] = pending;
+        if (!m_host.callEeRpc(std::move(call)))
+        {
+            m_eeCalls.erase(token);
+            cpu.gpr[2] = static_cast<uint32_t>(-1);
+            return true;
+        }
+        cpu.gpr[2] = 0u;
+        if (wait && m_eeCalls.count(token) != 0u)
+            m_kernel.sleepCurrent(cpu);
+        return true;
+    }
+
+    std::optional<IopRpcBridge::EndFunction> IopRpcBridge::completeEeRpc(uint64_t token, const void *data, size_t size)
+    {
+        const auto it = m_eeCalls.find(token);
+        if (it == m_eeCalls.end())
+            return std::nullopt;
+        const EeCall call = it->second;
+        m_eeCalls.erase(it);
+        if (call.receive != 0u && call.receiveSize != 0u && m_memory.isRamRange(call.receive, call.receiveSize))
+        {
+            std::vector<uint8_t> words(call.receiveSize, 0u);
+            if (data != nullptr)
+                std::memcpy(words.data(), data, std::min<size_t>(size, words.size()));
+            (void)m_memory.writeRam(call.receive, words.data(), words.size());
+        }
+        if (call.thread != 0)
+        {
+            if (IopThread *thread = m_kernel.thread(call.thread); thread && thread->state == IopThreadState::Sleep)
+            {
+                thread->cpu.gpr[2] = 0u;
+                thread->state = IopThreadState::Ready;
+            }
+        }
+        if (call.endFunction == 0u)
+            return std::nullopt;
+        return EndFunction{call.endFunction, call.gp, call.endParam};
+    }
+
     std::optional<IopRpcBridge::CmdHandler> IopRpcBridge::cmdHandler(uint32_t cid) const
     {
         const auto it = m_cmdHandlers.find(cid);
@@ -214,22 +342,10 @@ namespace ps2x::iop::detail
         case 14: // InitRpc
             setV0(0);
             return true;
-        case 15: // sceSifBindRpc
-        case 16: // sceSifCallRpc
-        {
-            static uint32_t logged = 0;
-            if (logged++ < 32u)
-            {
-                char message[160];
-                std::snprintf(message, sizeof(message),
-                              "[IOP sifcmd] unsupported %s client=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x",
-                              ordinal == 15 ? "sceSifBindRpc" : "sceSifCallRpc",
-                              cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[31]);
-                m_host.log(LogLevel::Warning, message);
-            }
-            setV0(0);
-            return true;
-        }
+        case 15: // sceSifBindRpc(client, sid, mode): an EE server
+            return bindEeRpc(cpu);
+        case 16: // sceSifCallRpc(client, fno, mode, send, ssize, recv, rsize, end, endparam)
+            return callEeRpc(cpu);
         case 12: // sceSifSendCmd
         case 13: // isceSifSendCmd
         {

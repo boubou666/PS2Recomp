@@ -2,9 +2,21 @@
 
 #include "ps2_stubs.h"
 
+#include <functional>
+#include <vector>
+
 namespace ps2_stubs
 {
     bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize) noexcept;
+
+    // IOP -> EE RPC (an IRX calling a server the EE registered with sceSifRegisterRpc). findEeRpcServerForIop looks the
+    // server up for the IRX's bind. queueEeRpcFromIop hands a call to the EE: from any host thread, it is queued on the
+    // executor for the server's sceSifRpcLoop thread, which runs the server function at its own priority; `reply` then
+    // gets the receiveSize bytes the server returned (empty when the call could not be served).
+    bool findEeRpcServerForIop(uint8_t *rdram, uint32_t sid, uint32_t &serverData, uint32_t &buffer, uint32_t &callbackBuffer) noexcept;
+    using IopRpcReply = std::function<void(const std::vector<uint8_t> &)>;
+    bool queueEeRpcFromIop(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t function, std::vector<uint8_t> send, uint32_t receiveSize,
+                           IopRpcReply reply);
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

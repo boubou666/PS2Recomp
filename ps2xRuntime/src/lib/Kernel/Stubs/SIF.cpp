@@ -7,6 +7,10 @@
 #include "Syscalls/Helpers/State.h"
 
 #include <algorithm>
+#include <deque>
+#include <iostream>
+#include <memory>
+#include <unordered_map>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -633,9 +637,150 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 
+    namespace
+    {
+        // IOP -> EE RPC requests waiting for their server's sceSifRpcLoop thread, by queue (t_SifRpcDataQueue), in
+        // arrival order. Bounded: a full queue refuses the call (logged) instead of growing without end.
+        constexpr uint32_t kSifRpcLoopWaitType = 0x53525043u; // waitExternal type: a thread in sceSifRpcLoop
+        constexpr size_t kMaxIopRpcRequestsPerQueue = 64u;
+
+        struct IopRpcRequest
+        {
+            uint32_t sid = 0;
+            uint32_t function = 0;
+            std::vector<uint8_t> send;
+            uint32_t receiveSize = 0;
+            IopRpcReply reply;
+        };
+        std::unordered_map<uint32_t, std::deque<IopRpcRequest>> g_iopRpcRequests; // executor only
+
+        // An EE-side server registered by sceSifRegisterRpc. g_rpc_servers also holds placeholders for the IOP sids the
+        // EE bound to, which have no function.
+        const t_SifRpcServerData *eeServer(uint8_t *rdram, uint32_t sid, uint32_t *address = nullptr)
+        {
+            uint32_t sd = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                const auto it = g_rpc_servers.find(sid);
+                if (it == g_rpc_servers.end())
+                    return nullptr;
+                sd = it->second.sd_ptr;
+            }
+            const auto *server = sd ? reinterpret_cast<const t_SifRpcServerData *>(getMemPtr(rdram, sd)) : nullptr;
+            if (!server || server->func == 0u)
+                return nullptr;
+            if (address)
+                *address = sd;
+            return server;
+        }
+    }
+
+    bool findEeRpcServerForIop(uint8_t *rdram, uint32_t sid, uint32_t &serverData, uint32_t &buffer, uint32_t &callbackBuffer) noexcept
+    {
+        uint32_t address = 0u;
+        const t_SifRpcServerData *server = rdram ? eeServer(rdram, sid, &address) : nullptr;
+        if (!server)
+            return false;
+        serverData = address;
+        buffer = server->buf;
+        callbackBuffer = server->cbuf;
+        return true;
+    }
+
+    bool queueEeRpcFromIop(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t function, std::vector<uint8_t> send,
+                           uint32_t receiveSize, IopRpcReply reply)
+    {
+        if (!runtime || !rdram)
+            return false;
+        auto request = std::make_shared<IopRpcRequest>();
+        request->sid = sid;
+        request->function = function;
+        request->send = std::move(send);
+        request->receiveSize = receiveSize;
+        request->reply = std::move(reply);
+        // On the executor, at a safe point: the server thread then runs when the EE scheduler would run it.
+        runtime->eeScheduler().postTask([rdram, runtime, request]()
+        {
+            const t_SifRpcServerData *server = eeServer(rdram, request->sid);
+            const uint32_t queue = server ? server->base : 0u;
+            std::deque<IopRpcRequest> *pending = queue ? &g_iopRpcRequests[queue] : nullptr;
+            if (!pending || pending->size() >= kMaxIopRpcRequestsPerQueue)
+            {
+                std::cerr << "[sifrpc] IOP -> EE call sid=0x" << std::hex << request->sid << " fno=" << std::dec
+                          << request->function << (pending ? ": the server queue is full (" : ": no EE server queue (")
+                          << (pending ? pending->size() : size_t{0}) << " waiting), refused" << std::endl;
+                if (request->reply)
+                    request->reply({});
+                return;
+            }
+            pending->push_back(std::move(*request));
+            runtime->eeScheduler().completeExternalWait(kSifRpcLoopWaitType, queue, KE_OK);
+        });
+        return true;
+    }
+
+    // sceSifRpcLoop(qd): serves the IOP -> EE requests of its queue, one at a time, and never returns. With none waiting
+    // the thread blocks; each request runs the server function on this thread, func(fno, buf, size) -> reply pointer
+    // (0: the server buffer), then the reply goes back to the IOP and the loop starts again.
     void sceSifRpcLoop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        const uint32_t queue = getRegU32(ctx, 4);
+        if (!runtime || queue == 0u)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        auto it = g_iopRpcRequests.find(queue);
+        if (it == g_iopRpcRequests.end() || it->second.empty())
+        {
+            runtime->eeScheduler().waitExternal(EeWaitReason::External, kSifRpcLoopWaitType, queue,
+                                                [rdram, runtime](R5900Context &resume)
+                                                { sceSifRpcLoop(rdram, &resume, runtime); });
+        }
+        auto served = std::make_shared<IopRpcRequest>(std::move(it->second.front()));
+        it->second.pop_front();
+
+        const t_SifRpcServerData *server = eeServer(rdram, served->sid);
+        if (!server || !runtime->hasFunction(server->func))
+        {
+            std::cerr << "[sifrpc] IOP -> EE call sid=0x" << std::hex << served->sid << ": the server is gone or not recompiled"
+                      << std::dec << std::endl;
+            if (served->reply)
+                served->reply({});
+            sceSifRpcLoop(rdram, ctx, runtime);
+            return;
+        }
+        const uint32_t buffer = server->buf;
+        const uint32_t sendSize = static_cast<uint32_t>(served->send.size());
+        if (sendSize != 0u && (buffer == 0u || !writeEeRange(rdram, buffer, served->send.data(), sendSize)))
+        {
+            std::cerr << "[sifrpc] IOP -> EE call sid=0x" << std::hex << served->sid << ": the send data does not fit the buffer 0x"
+                      << buffer << std::dec << std::endl;
+        }
+
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::HleCall;
+        invocation.tag = served->sid;
+        invocation.context = *ctx;
+        invocation.context.pc = server->func;
+        SET_GPR_U32(&invocation.context, 4, served->function);
+        SET_GPR_U32(&invocation.context, 5, buffer);
+        SET_GPR_U32(&invocation.context, 6, sendSize);
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        invocation.onComplete = [rdram, runtime, served, buffer](const R5900Context &done, R5900Context &base)
+        {
+            uint32_t replyAddress = getRegU32(&done, 2);
+            if (replyAddress == 0u)
+                replyAddress = buffer;
+            std::vector<uint8_t> reply(served->receiveSize, 0u);
+            if (!reply.empty() && canAccessEeRange(rdram, replyAddress, served->receiveSize))
+                std::memcpy(reply.data(), getMemPtr(rdram, replyAddress), reply.size());
+            if (served->reply)
+                served->reply(reply);
+            sceSifRpcLoop(rdram, &base, runtime);
+        };
+        runtime->eeScheduler().invokeCurrent(std::move(invocation));
     }
 
     void sceSifSetCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

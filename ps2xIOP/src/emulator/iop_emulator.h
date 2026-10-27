@@ -26,6 +26,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] ModuleLoadResult loadModuleBufferFromIop(uint32_t iopAddress, const void *arguments, uint32_t argumentSize);
         // Queues an EE -> IOP SIF command for its IOP handler; false when no handler has that id.
         [[nodiscard]] bool sendSifCommand(uint32_t cid, const void *packet, uint32_t size);
+        void completeEeRpc(uint64_t token, const void *data, size_t size);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
