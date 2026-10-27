@@ -1,0 +1,2 @@
+# Shell scripts are sourced by bash on Windows too (MSYS2, Git Bash): keep them LF whatever core.autocrlf says.
+*.sh text eol=lf

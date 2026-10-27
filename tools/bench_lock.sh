@@ -33,8 +33,8 @@ bench_lock_queue_dir()
 
 bench_lock_announce()
 {
-    [ -n "$PS2X_BENCH_LOCK_ANNOUNCE" ] || return 0
-    ($PS2X_BENCH_LOCK_ANNOUNCE "$1" > /dev/null 2>&1 &)
+    [ -n "${PS2X_BENCH_LOCK_ANNOUNCE:-}" ] || return 0
+    (${PS2X_BENCH_LOCK_ANNOUNCE:-} "$1" > /dev/null 2>&1 &)
 }
 
 # True when the lock is free: empty, or its "until HH:MM" has passed.
