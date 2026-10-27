@@ -375,7 +375,13 @@ those functions. The differential fuzzer (6.5) exercises these paths specificall
 - Timing per pass for both renderers (GPU time from timestamp queries).
 
 Traces become renderer-neutral (`GSR2`: VRAM + `GSStateImage` instead of the frontend's private state), with a
-converter for existing `GSR1` traces (load into the CPU path, save as `GSR2`).
+converter for existing `GSR1` traces (load into the CPU path, save as `GSR2`): `ps2_gs_replay <in> --convert
+<out.gsr2>`. A `GSR1` trace is also replayed directly, through the same conversion in memory. The command records
+keep the `GSR1` layout (kind, four registers, payload) and gain two kinds: presentation latches (kind 3, the nine
+display registers and the vsync tick as payload, for the `--present` comparison) and queued register writes
+(kind 4, what `GS::writeRegister` queues for a stream renderer). `GSStateImage` serializes as a version, flags
+(vertex queue present, CLUT buffer present), (address, value) pairs for every register it holds, the vertex queue
+as the registers that made each vertex, then the CLUT buffer and CBP0/CBP1; all little endian.
 
 Corpus: traces live outside the repository, under `~/Games/PS2/gs-traces/<game>/<scene>.gsr2`, with a
 `manifest.toml` per game (scene, how to reach it, recording command, expected CPU VRAM hash). Recording:

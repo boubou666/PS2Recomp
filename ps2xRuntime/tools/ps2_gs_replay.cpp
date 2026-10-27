@@ -1,6 +1,7 @@
-// Replays a GS command stream recorded with PS2X_GS_RECORD and prints the time per pass and a hash of the final
-// VRAM, to time the rasterizer and check that a change draws the same pixels.
+// Replays a GS command stream recorded with PS2X_GS_RECORD (GSR2, or the older GSR1) and prints the time per pass
+// and a hash of the final VRAM, to time the rasterizer and check that a change draws the same pixels.
 //   ps2_gs_replay <trace> [repeat] [out.rgba] [--list] [--until N] [--dump NAME=FBP,FBW,PSM,WIDTH,HEIGHT ...]
+//                 [--convert OUT]
 // PS2X_GS_ASYNC_RASTER=1 (and PS2X_GS_RASTER_THREADS=<n>) replays on the rasterization workers.
 //
 // To inspect a multi-pass effect one pass at a time:
@@ -8,6 +9,7 @@
 //   --until N  replay commands 0..N-1 only
 //   --dump     after the replay, write a buffer as NAME.ppm: FBP in 2048-word pages, FBW in 64-pixel units, PSM as
 //              in the GS registers (0 CT32, 1 CT24, 2 CT16, 10 CT16S, 19 T8, 20 T4, 48-58 Z formats, as grey)
+//   --convert  write the trace as GSR2 to OUT (a GSR1 trace's drawing state goes through the CPU path) and exit
 // PS2X_GS_REPLAY_COMMANDS=<n> replays only the first n commands.
 // PS2X_GS_REPLAY_CHECK=<n> replays on the workers and on the caller side by side, compares their VRAM every n commands
 // and reports the first comparison that differs.
@@ -119,9 +121,10 @@ namespace
 
     void listCommand(size_t index, const GsTraceCommand &command)
     {
-        static const char *const kNames[] = {"gif", "native-gif", "upload"};
-        std::printf("%6zu %-10s %8zu", index, command.kind < 3u ? kNames[command.kind] : "?", command.bytes.size());
-        if (command.kind != GsTraceCommand::NativeImageUpload && command.bytes.size() >= 16u)
+        static const char *const kNames[] = {"gif", "native-gif", "upload", "latch", "register"};
+        std::printf("%6zu %-10s %8zu", index, command.kind < 5u ? kNames[command.kind] : "?", command.bytes.size());
+        if ((command.kind == GsTraceCommand::GifPacket || command.kind == GsTraceCommand::NativePackedGifPacket) &&
+            command.bytes.size() >= 16u)
         {
             uint64_t lo = 0;
             uint64_t hi = 0;
@@ -136,6 +139,17 @@ namespace
             const uint64_t bitbltbuf = command.registers[0];
             std::printf("  dbp=%u dbw=%u dpsm=0x%x", static_cast<unsigned>((bitbltbuf >> 32) & 0x3FFFu),
                         static_cast<unsigned>((bitbltbuf >> 48) & 0x3Fu), static_cast<unsigned>((bitbltbuf >> 56) & 0x3Fu));
+        }
+        else if (command.kind == GsTraceCommand::Register)
+            std::printf("  reg=0x%02x value=%016llx", static_cast<unsigned>(command.registers[0] & 0xFFu),
+                        static_cast<unsigned long long>(command.registers[1]));
+        else if (command.kind == GsTraceCommand::PresentationLatch &&
+                 command.bytes.size() >= GsTraceCommand::kPresentationLatchQwords * 8u)
+        {
+            uint64_t display[GsTraceCommand::kPresentationLatchQwords];
+            std::memcpy(display, command.bytes.data(), sizeof(display));
+            std::printf("  dispfb1=%016llx dispfb2=%016llx", static_cast<unsigned long long>(display[3]),
+                        static_cast<unsigned long long>(display[5]));
         }
         std::printf("\n");
     }
@@ -156,10 +170,29 @@ namespace
             gs.uploadImageNative(command.registers[0], command.registers[1], command.registers[2], command.registers[3],
                                  data, size);
             break;
+        case GsTraceCommand::Register:
+            gs.writeRegister(static_cast<uint8_t>(command.registers[0]), command.registers[1]);
+            break;
         }
     }
 
-    int checkWorkersAgainstCaller(const GsTraceHeader &header, const std::vector<GsTraceCommand> &commands, size_t interval)
+    bool loadTraceState(const GsTraceHeader &header, GSStateImage &image)
+    {
+        if (header.version != 1u)
+        {
+            image = header.image;
+            return true;
+        }
+        std::vector<uint8_t> vram(header.vram.size());
+        GS gs;
+        gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+        if (!gs.loadDrawingState(header.legacyState))
+            return false;
+        gs.saveState(image);
+        return true;
+    }
+
+    int checkWorkersAgainstCaller(const GsTraceHeader &header, const GSStateImage &image, const std::vector<GsTraceCommand> &commands, size_t interval)
     {
         GSCpuBackend::SetAsyncRasterization(true);
         std::vector<uint8_t> asyncVram(header.vram), serialVram(header.vram);
@@ -168,11 +201,8 @@ namespace
         serial.init(serialVram.data(), static_cast<uint32_t>(serialVram.size()), nullptr);
         if (auto *cpu = dynamic_cast<GSCpuBackend *>(serial.rasterBackend()))
             cpu->DisallowAsyncRasterization();
-        if (!async.loadDrawingState(header.state) || !serial.loadDrawingState(header.state))
-        {
-            std::fprintf(stderr, "bad drawing state\n");
-            return 1;
-        }
+        async.loadState(image);
+        serial.loadState(image);
         std::vector<uint8_t> asyncSnapshot, serialSnapshot;
         for (size_t index = 0; index < commands.size(); ++index)
         {
@@ -202,12 +232,13 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         std::fprintf(stderr, "usage: %s <trace> [repeat] [vram-out] [--list] [--until N] "
-                             "[--dump NAME=FBP,FBW,PSM,WIDTH,HEIGHT ...]\n", argv[0]);
+                             "[--dump NAME=FBP,FBW,PSM,WIDTH,HEIGHT ...] [--convert OUT]\n", argv[0]);
         return 2;
     }
     bool list = false;
     size_t until = SIZE_MAX;
     std::vector<DumpRequest> dumps;
+    const char *convertTo = nullptr;
     std::vector<const char *> positional;
     for (int i = 2; i < argc; ++i)
     {
@@ -216,6 +247,8 @@ int main(int argc, char **argv)
             list = true;
         else if (arg == "--until" && i + 1 < argc)
             until = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        else if (arg == "--convert" && i + 1 < argc)
+            convertTo = argv[++i];
         else if (arg == "--dump" && i + 1 < argc)
         {
             DumpRequest dump;
@@ -245,6 +278,28 @@ int main(int argc, char **argv)
         commands.push_back(std::move(command));
     }
     std::fclose(in);
+    GSStateImage image;
+    if (!loadTraceState(header, image))
+    {
+        std::fprintf(stderr, "bad drawing state\n");
+        return 1;
+    }
+    if (convertTo)
+    {
+        FILE *out = std::fopen(convertTo, "wb");
+        if (!out)
+        {
+            std::fprintf(stderr, "cannot write %s\n", convertTo);
+            return 2;
+        }
+        writeGsTraceHeader(out, header.vram, image);
+        for (const GsTraceCommand &command : commands)
+            writeGsTraceCommand(out, command.kind, command.registers, command.bytes.data(),
+                                static_cast<uint32_t>(command.bytes.size()));
+        const bool written = std::fclose(out) == 0;
+        std::printf("wrote %s (GSR2, %zu commands)\n", convertTo, commands.size());
+        return written ? 0 : 1;
+    }
     if (list)
     {
         for (size_t i = 0; i < commands.size(); ++i)
@@ -255,7 +310,7 @@ int main(int argc, char **argv)
     if (const char *limit = std::getenv("PS2X_GS_REPLAY_COMMANDS"))
         commands.resize(std::min<size_t>(commands.size(), std::strtoull(limit, nullptr, 0)));
     if (std::getenv("PS2X_GS_REPLAY_CHECK"))
-        return checkWorkersAgainstCaller(header, commands, std::max<size_t>(1u, std::strtoull(std::getenv("PS2X_GS_REPLAY_CHECK"), nullptr, 0)));
+        return checkWorkersAgainstCaller(header, image, commands, std::max<size_t>(1u, std::strtoull(std::getenv("PS2X_GS_REPLAY_CHECK"), nullptr, 0)));
     const size_t replayed = std::min(until, commands.size());
     const int repeat = !positional.empty() ? std::max(1, std::atoi(positional[0])) : 1;
     if (std::getenv("PS2X_GS_ASYNC_RASTER"))
@@ -269,11 +324,7 @@ int main(int argc, char **argv)
         std::memcpy(vram.data(), header.vram.data(), vram.size());
         GS gs;
         gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
-        if (!gs.loadDrawingState(header.state))
-        {
-            std::fprintf(stderr, "bad drawing state\n");
-            return 1;
-        }
+        gs.loadState(image);
         const auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < replayed; ++i)
             replayCommand(gs, commands[i]);

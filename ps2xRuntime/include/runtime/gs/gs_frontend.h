@@ -206,6 +206,7 @@ public:
 private:
     struct QueuedCommand
     {
+        // GsTraceCommand::Kind uses the same values for the kinds traces record.
         enum class Kind : uint8_t
         {
             GifPacket,

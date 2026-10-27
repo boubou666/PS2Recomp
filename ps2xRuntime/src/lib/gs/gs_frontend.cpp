@@ -451,6 +451,11 @@ void GS::workerLoop()
             m_workerBusy = true;
         }
 
+        static_assert(static_cast<uint8_t>(QueuedCommand::Kind::GifPacket) == GsTraceCommand::GifPacket &&
+                      static_cast<uint8_t>(QueuedCommand::Kind::NativePackedGifPacket) == GsTraceCommand::NativePackedGifPacket &&
+                      static_cast<uint8_t>(QueuedCommand::Kind::NativeImageUpload) == GsTraceCommand::NativeImageUpload &&
+                      static_cast<uint8_t>(QueuedCommand::Kind::PresentationLatch) == GsTraceCommand::PresentationLatch &&
+                      static_cast<uint8_t>(QueuedCommand::Kind::Register) == GsTraceCommand::Register);
         const uint8_t *data = command.bytes.data();
         const uint32_t size = static_cast<uint32_t>(command.bytes.size());
         if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow && !m_streamRenderer)
@@ -461,22 +466,31 @@ void GS::workerLoop()
                 const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
                 if (transfer.direction == 3u || transfer.totalPixels == 0u)
                 {
-                    GsTraceHeader header;
-                    m_backend->SnapshotVram(header.vram);
-                    header.state = saveDrawingState();
-                    writeGsTraceHeader(recorder.out, header);
+                    std::vector<uint8_t> vram;
+                    GSStateImage image;
+                    m_backend->SnapshotVram(vram);
+                    saveState(image);
+                    writeGsTraceHeader(recorder.out, vram, image);
                     recorder.started = true;
                     recorder.began = std::chrono::steady_clock::now();
                     std::fprintf(stderr, "[gs-record] started\n");
                 }
             }
-            if (recorder.started && command.kind != QueuedCommand::Kind::PresentationLatch)
+            if (recorder.started && command.kind != QueuedCommand::Kind::Call)
             {
                 if (std::chrono::duration<double>(std::chrono::steady_clock::now() - recorder.began).count() > recorder.seconds)
                 {
                     std::fclose(recorder.out);
                     recorder.finished = true;
                     std::fprintf(stderr, "[gs-record] done\n");
+                }
+                else if (command.kind == QueuedCommand::Kind::PresentationLatch)
+                {
+                    const GSPresentationRequest &r = command.displayRegisters;
+                    const uint64_t display[GsTraceCommand::kPresentationLatchQwords] = {
+                        r.pmode, r.smode1, r.smode2, r.dispfb1, r.display1, r.dispfb2, r.display2, r.bgcolor, r.vsyncTick};
+                    writeGsTraceCommand(recorder.out, GsTraceCommand::PresentationLatch, command.registers,
+                                        reinterpret_cast<const uint8_t *>(display), sizeof(display));
                 }
                 else
                     writeGsTraceCommand(recorder.out, static_cast<uint8_t>(command.kind), command.registers, data, size);
