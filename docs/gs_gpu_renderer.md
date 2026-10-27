@@ -373,11 +373,16 @@ those functions. The differential fuzzer (6.5) exercises these paths specificall
 
 `ps2_gs_replay` gains:
 
-- `--renderer cpu|gpu|parallel` to choose who replays (default `cpu`).
+- `--renderer cpu|gpu|parallel` to choose who replays (default `cpu`). Every renderer is replayed through
+  `GSStreamRenderer`, the CPU one included (a synchronous GS with the CPU backend), so the tool has one replay
+  path.
 - `--compare cpu` (with `--renderer gpu`): replays on both, compares VRAM every N commands (`--every N`, default
-  1 during bring-up, 64 for the corpus), and on the first difference prints the command index, its GIF tag and
-  draw state, the differing blocks, and for each the PSM-decoded (x, y) under the active FRAME / ZBUF / TEX0, then
-  writes both buffers with `--dump`. A bisect mode re-runs with `--every 1` inside the failing interval.
+  64; `--every 1` during bring-up), and on the first difference replays again comparing after every command of the
+  failing interval (the bisect step is automatic), then prints the command (as `--list` does), how many words and
+  pages differ, the first differing byte with both values, and which page-sized pixel rectangle of FRAME / ZBUF /
+  TEX0 of either context (as the CPU reference holds them after that command) it falls in; `--dump` writes the
+  buffer from both renderers as `NAME.<renderer>.ppm`. Phase 0 has this skeleton; decoding the exact pixel inside
+  the page and printing the draw state come with phase 2.
 - `--present` compares the presented frames at every latch.
 - Timing per pass for both renderers (GPU time from timestamp queries).
 
