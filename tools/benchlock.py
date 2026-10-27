@@ -24,6 +24,10 @@ deadline, or the session dies. Nothing has to be cleaned up by hand.
 -e is the holder's honest estimate of how long the job takes, announced so other sessions know when the box frees
 up. -d is the hard deadline (default: twice the estimate, at least 5 min more), capped per mode.
 
+Linux uses flock and a forked holder; Windows (native CPython, e.g. MSYS2 UCRT64 or python.org) uses byte-range
+locks, a detached holder and a Job object. Every process sharing one lock must use the same kind of Python: MSYS2's
+msys/cygwin Python and native Python do not see each other's locks.
+
 --wait 0 fails at once when busy; the default waits up to 30 min. Exit 75 when the wait runs out.
 
 Every take, release, deadline expiry and dead holder is announced in the c2c f2f lane through the tag's c2c_call.py,
@@ -32,7 +36,6 @@ the lock, and a take that cannot be announced is given back (exit 3).
 """
 import argparse
 import ctypes
-import fcntl
 import json
 import os
 import signal
@@ -40,12 +43,21 @@ import subprocess
 import sys
 import time
 
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+    from ctypes import wintypes
+else:
+    import fcntl
+
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "ps2bench")
 LOCAL = "local"
 LEASES = os.path.join(STATE, "leases")
 MAX = {"bench": 30 * 60, "comp": 90 * 60}
 EX_TEMPFAIL = 75
 EX_ANNOUNCE = 3
+# Windows has no shared file lock: comp holds one of these bytes of the lock file, bench and remote hosts all of them.
+SLOTS = 64
 ANNOUNCERS = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "ps2bench",
                           "announce.json")
 
@@ -99,7 +111,46 @@ def ended_text(lease, how):
             f"box free from my side.")
 
 
+if WINDOWS:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in
+                    ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                     "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION), ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
 def pid_alive(pid):
+    if WINDOWS:
+        # os.kill(pid, 0) would terminate the process on Windows.
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: exists, not ours
+        code = wintypes.DWORD()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
     try:
         os.kill(pid, 0)
         return True
@@ -109,9 +160,43 @@ def pid_alive(pid):
         return True
 
 
+class Job:
+    """The job of a `run`: killed as a whole at the deadline, and with its holder when that dies."""
+
+    def __init__(self, cmd):
+        if WINDOWS:
+            self.handle = kernel32.CreateJobObjectW(None, None)
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            kernel32.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info))
+            self.proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            kernel32.AssignProcessToJobObject(self.handle, int(self.proc._handle))
+        else:
+            self.proc = subprocess.Popen(cmd, start_new_session=True, preexec_fn=die_with_parent)
+
+    def signal(self, sig):
+        if WINDOWS:
+            kernel32.TerminateJobObject(self.handle, 1)
+            return
+        try:
+            os.killpg(self.proc.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def kill(self):
+        self.signal(signal.SIGTERM)
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.signal(getattr(signal, "SIGKILL", signal.SIGTERM))
+            self.proc.wait()
+
+
 def leases():
     out = []
     for name in sorted(os.listdir(LEASES)):
+        if not name.endswith(".json"):
+            continue
         path = os.path.join(LEASES, name)
         try:
             with open(path) as f:
@@ -148,14 +233,11 @@ def describe(lease, now):
             f"{clock(lease['start'] + lease['expect'] * 60)}, hard deadline in {left // 60}m{left % 60:02d}s)")
 
 
-def flock_wait(fd, op, deadline, what):
+def wait_until(attempt, deadline, what):
     announced = False
     while True:
-        try:
-            fcntl.flock(fd, op | fcntl.LOCK_NB)
+        if attempt():
             return True
-        except BlockingIOError:
-            pass
         if time.time() >= deadline:
             return False
         if not announced:
@@ -166,24 +248,77 @@ def flock_wait(fd, op, deadline, what):
         time.sleep(0.5)
 
 
+def try_flock(fd, op):
+    try:
+        fcntl.flock(fd, op | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def try_range(fd, start, length):
+    os.lseek(fd, start, os.SEEK_SET)
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, length)
+        return True
+    except OSError:
+        return False
+
+
+class Held:
+    def __init__(self, fd, start=0, length=0):
+        self.fd, self.start, self.length = fd, start, length
+
+    def release(self):
+        if WINDOWS:
+            os.lseek(self.fd, self.start, os.SEEK_SET)
+            msvcrt.locking(self.fd, msvcrt.LK_UNLCK, self.length)
+        else:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
 def acquire(mode, wait, host):
-    """Returns (lock_fd) holding the lock, or None when the wait ran out."""
+    """Returns a Held lock, or None when the wait ran out."""
     give_up = time.time() + wait
     gate_path, lock_path = lock_paths(host)
-    gate = os.open(gate_path, os.O_RDWR | os.O_CREAT, 0o666)
-    lock = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
-    if not flock_wait(gate, fcntl.LOCK_EX, give_up, "the gate"):
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    gate = os.open(gate_path, flags, 0o666)
+    lock = os.open(lock_path, flags, 0o666)
+    exclusive = mode == "bench" or host != LOCAL
+    if not wait_until(lambda: try_range(gate, 0, 1) if WINDOWS else try_flock(gate, fcntl.LOCK_EX), give_up,
+                      "the gate"):
         os.close(gate)
         os.close(lock)
         return None
-    op = fcntl.LOCK_EX if mode == "bench" or host != LOCAL else fcntl.LOCK_SH
+    held = None
     try:
-        if not flock_wait(lock, op, give_up, "the lock"):
-            os.close(lock)
-            return None
+        if WINDOWS:
+            slot = []
+
+            def attempt():
+                if exclusive:
+                    return try_range(lock, 0, SLOTS)
+                for i in range(SLOTS):
+                    if try_range(lock, i, 1):
+                        slot.append(i)
+                        return True
+                return False
+
+            if wait_until(attempt, give_up, "the lock"):
+                held = Held(lock, 0, SLOTS) if exclusive else Held(lock, slot[0], 1)
+        elif wait_until(lambda: try_flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH), give_up,
+                        "the lock"):
+            held = Held(lock)
     finally:
         os.close(gate)
-    return lock
+    if held is None:
+        os.close(lock)
+    return held
+
+
+def release_requested(path):
+    return os.path.exists(path[:-len(".json")] + ".release")
 
 
 def write_lease(args, deadline):
@@ -226,72 +361,67 @@ def cmd_run(args):
         return EX_ANNOUNCE
     log(f"acquired {describe(lease, time.time())}")
     ended = "released"
-    proc = subprocess.Popen(args.cmd, start_new_session=True, preexec_fn=die_with_parent)
+    job = Job(args.cmd)
 
     def forward(sig, _frame):
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            pass
+        job.signal(sig)
 
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, forward)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), forward)
     try:
         while True:
             try:
-                return proc.wait(timeout=max(0.0, deadline - time.time()))
+                return job.proc.wait(timeout=min(1.0, max(0.0, deadline - time.time())))
             except subprocess.TimeoutExpired:
+                if release_requested(path):
+                    log(f"release requested, killing {args.cmd[0]}")
+                    ended = "release requested, killed the job and released"
+                    job.kill()
+                    return 143
+                if time.time() < deadline:
+                    continue
                 log(f"deadline reached, killing {args.cmd[0]}")
                 ended = "deadline reached, killed the job and released"
-                forward(signal.SIGTERM, None)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    forward(signal.SIGKILL, None)
-                    proc.wait()
+                job.kill()
                 return 124
     finally:
         os.unlink(path)
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.release()
         announce(args.tag, ended_text(lease, ended[0].upper() + ended[1:]))
         log(f"released {lease['id']}")
 
 
-def cmd_take(args):
-    if not announcer(args.tag):
-        log(f"no announcer for tag {args.tag} in {ANNOUNCERS}")
+def take_reply(reply):
+    if not reply:
+        log("holder died before acquiring")
+        return 1
+    if reply.startswith("timeout"):
+        log("gave up waiting")
+        return EX_TEMPFAIL
+    if reply.startswith("unannounced"):
+        log("could not announce in f2f, lock given back")
         return EX_ANNOUNCE
-    read_end, write_end = os.pipe()
-    if os.fork():
-        os.close(write_end)
-        reply = os.read(read_end, 4096).decode()
-        if not reply:
-            log("holder died before acquiring")
-            return 1
-        if reply.startswith("timeout"):
-            log("gave up waiting")
-            return EX_TEMPFAIL
-        if reply.startswith("unannounced"):
-            log("could not announce in f2f, lock given back")
-            return EX_ANNOUNCE
-        print(reply)
-        return 0
-    os.close(read_end)
-    os.setsid()
+    print(reply)
+    return 0
+
+
+def hold(args, reply_fd):
+    """The holder of a `take`: acquires, answers on reply_fd, then holds until release or the deadline."""
     devnull = os.open(os.devnull, os.O_RDWR)
     os.dup2(devnull, 0)
     lock = acquire(args.mode, args.wait, args.host)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     if lock is None:
-        os.write(write_end, b"timeout")
-        os._exit(0)
+        os.write(reply_fd, b"timeout")
+        return
     deadline = time.time() + duration(args)
     lease, path = write_lease(args, deadline)
     if not announce(args.tag, f"took the {lease_text(lease)}."):
         os.unlink(path)
-        os.write(write_end, b"unannounced")
-        os._exit(0)
+        os.write(reply_fd, b"unannounced")
+        return
     released = False
 
     def stop(_sig, _frame):
@@ -299,18 +429,39 @@ def cmd_take(args):
         released = True
 
     signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    os.write(write_end, f"{lease['id']} ({lease['mode']}, until {time.strftime('%H:%M:%S', time.localtime(deadline))})".encode())
-    os.close(write_end)
+    for name in ("SIGHUP", "SIGINT", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+    os.write(reply_fd, f"{lease['id']} ({lease['mode']}, until {time.strftime('%H:%M:%S', time.localtime(deadline))})".encode())
+    os.close(reply_fd)
     while not released and time.time() < deadline:
+        released = release_requested(path)
         time.sleep(min(1.0, max(0.0, deadline - time.time())))
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    fcntl.flock(lock, fcntl.LOCK_UN)
+    for done in (path, path[:-len(".json")] + ".release"):
+        try:
+            os.unlink(done)
+        except FileNotFoundError:
+            pass
+    lock.release()
     announce(args.tag, ended_text(lease, "Released" if released else "Lease deadline reached, released"))
+
+
+def cmd_take(args):
+    if not announcer(args.tag):
+        log(f"no announcer for tag {args.tag} in {ANNOUNCERS}")
+        return EX_ANNOUNCE
+    if WINDOWS:
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        holder = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_hold", json.dumps(vars(args))],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, creationflags=flags)
+        return take_reply(holder.stdout.read().decode())
+    read_end, write_end = os.pipe()
+    if os.fork():
+        os.close(write_end)
+        return take_reply(os.read(read_end, 4096).decode())
+    os.close(read_end)
+    os.setsid()
+    hold(args, write_end)
     os._exit(0)
 
 
@@ -320,7 +471,10 @@ def cmd_release(args):
         log("nothing to release")
         return 1
     for lease in targets:
-        os.kill(lease["pid"], signal.SIGTERM)
+        if WINDOWS:
+            open(os.path.join(LEASES, f"{lease['pid']}.release"), "w").close()
+        else:
+            os.kill(lease["pid"], signal.SIGTERM)
         for _ in range(600):
             if not pid_alive(lease["pid"]):
                 break
@@ -360,6 +514,9 @@ def main():
     g.add_argument("-t", "--tag")
     g.add_argument("--id")
     sub.add_parser("status")
+    if len(sys.argv) == 3 and sys.argv[1] == "_hold":
+        hold(argparse.Namespace(**json.loads(sys.argv[2])), os.dup(sys.stdout.fileno()))
+        return 0
     args = parser.parse_args()
     if getattr(args, "cmd", None) and args.cmd[0] == "--":
         args.cmd = args.cmd[1:]
