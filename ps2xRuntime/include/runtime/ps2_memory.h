@@ -366,6 +366,12 @@ public:
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
+
+    // DMA channel 4 (toIPU) for the HLE MPEG decoder. Once enabled, a start leaves the channel busy and the decoder
+    // pulls the source data as it needs it, as the IPU does; a game may loop a whole movie held in memory with a
+    // chain that never ends. Disabled, the channel is not emulated.
+    void setIpuInputEnabled(bool enabled) { m_ipuInputEnabled = enabled; }
+    std::vector<uint8_t> pullIpuInput(size_t minBytes);
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
@@ -505,6 +511,17 @@ public:
     std::vector<TLBEntry> m_tlbEntries;
 
     GifPacketCallback m_gifPacketCallback;
+    struct IpuInputDma
+    {
+        bool active = false;
+        bool chain = false;
+        bool endAfterData = false;
+        uint32_t tadr = 0;
+        uint32_t madr = 0;
+        uint32_t qwc = 0;
+    };
+    bool m_ipuInputEnabled = false;
+    IpuInputDma m_ipuInputDma;
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu0MscalCallback m_vu0MscalCallback;

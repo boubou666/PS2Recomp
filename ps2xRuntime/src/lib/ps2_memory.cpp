@@ -111,6 +111,7 @@ namespace
     constexpr uint32_t kVif1Stat = 0x10003C00u;
     constexpr uint32_t kVif1StatFdr = 1u << 23;
     constexpr uint32_t kGifChannel = 0x1000A000u;
+    constexpr uint32_t kToIpuChannel = 0x1000B400u;
     constexpr uint32_t kGsImrRegOffset = 0x1010u;
 
     struct PendingGsEvent
@@ -1589,6 +1590,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10008000 && address < 0x1000F000)
     {
+        if (address == kToIpuChannel && (value & 0x100u) == 0u)
+        {
+            m_ipuInputDma.active = false;
+        }
         if ((address & 0xFF) == 0x00 && (value & 0x100))
         {
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
@@ -1611,6 +1616,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (channelBase == kVif1Channel && (value & 0x1u) == 0u && ((value >> 2) & 0x3u) == 0u && m_localToHostReader)
             {
                 downloadVif1Dma(channelBase);
+                return true;
+            }
+
+            if (channelBase == kToIpuChannel && m_ipuInputEnabled)
+            {
+                m_ipuInputDma = IpuInputDma{};
+                m_ipuInputDma.active = true;
+                m_ipuInputDma.chain = ((value >> 2) & 0x3u) == 1u;
+                m_ipuInputDma.endAfterData = !m_ipuInputDma.chain;
+                m_ipuInputDma.tadr = m_ioRegisters[channelBase + 0x30];
+                m_ipuInputDma.madr = madr;
+                m_ipuInputDma.qwc = qwc;
                 return true;
             }
 
@@ -1702,6 +1719,77 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     }
 
     return false;
+}
+
+std::vector<uint8_t> PS2Memory::pullIpuInput(size_t minBytes)
+{
+    constexpr int kMaxTags = 4096;
+    std::vector<uint8_t> out;
+    IpuInputDma &dma = m_ipuInputDma;
+    int tags = 0;
+    while (dma.active && out.size() < minBytes)
+    {
+        if (dma.qwc != 0u)
+        {
+            const uint32_t wanted = static_cast<uint32_t>((minBytes - out.size() + 15u) / 16u);
+            const uint32_t take = std::min(dma.qwc, std::max(wanted, 1u));
+            for (uint32_t i = 0; i < take * 16u; ++i)
+            {
+                out.push_back(m_rdram[(dma.madr + i) & (PS2_RAM_SIZE - 1u)]);
+            }
+            dma.madr += take * 16u;
+            dma.qwc -= take;
+            continue;
+        }
+        if (dma.endAfterData || ++tags > kMaxTags)
+        {
+            dma.active = false;
+            break;
+        }
+
+        uint64_t tag = 0;
+        std::memcpy(&tag, m_rdram + (dma.tadr & (PS2_RAM_SIZE - 16u)), sizeof(tag));
+        const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+        const uint32_t id = static_cast<uint32_t>(tag >> 28) & 0x7u;
+        const uint32_t addr = static_cast<uint32_t>(tag >> 32) & 0x7FFFFFF0u;
+        switch (id)
+        {
+        case 0u: // refe
+            dma.madr = addr;
+            dma.endAfterData = true;
+            break;
+        case 1u: // cnt
+            dma.madr = dma.tadr + 16u;
+            dma.tadr = dma.madr + qwc * 16u;
+            break;
+        case 2u: // next
+            dma.madr = dma.tadr + 16u;
+            dma.tadr = addr;
+            break;
+        case 3u: // ref
+        case 4u: // refs
+            dma.madr = addr;
+            dma.tadr += 16u;
+            break;
+        case 7u: // end
+            dma.madr = dma.tadr + 16u;
+            dma.endAfterData = true;
+            break;
+        default: // call, ret
+            dma.active = false;
+            break;
+        }
+        dma.qwc = dma.active ? qwc : 0u;
+    }
+
+    m_ioRegisters[kToIpuChannel + 0x10] = dma.madr;
+    m_ioRegisters[kToIpuChannel + 0x20] = dma.qwc;
+    m_ioRegisters[kToIpuChannel + 0x30] = dma.tadr;
+    if (!dma.active && (m_ioRegisters[kToIpuChannel] & 0x100u) != 0u)
+    {
+        completeDmacChannel(kToIpuChannel, 4u);
+    }
+    return out;
 }
 
 std::vector<uint8_t> PS2Memory::readDmaSourceChain(uint32_t channelBase, uint32_t chcr, std::vector<DmaSegment> *segments,
@@ -3132,6 +3220,10 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     {
         if (address >= 0x10008000 && address < 0x1000F000)
         {
+            if (address == kToIpuChannel && m_ipuInputDma.active)
+            {
+                return m_ioRegisters[address] | 0x100u;
+            }
             if ((address & 0xFF) == 0x00 && !dmaChannelSignalStalled(address))
             {
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
