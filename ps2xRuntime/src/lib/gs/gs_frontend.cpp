@@ -2017,6 +2017,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         int ci = (regAddr == GS_REG_TEX0_2) ? 1 : 0;
         auto &t = m_ctx[ci].tex0;
         t = GSReg::decodeTex0(value);
+        if ((m_ctx[ci].tex1 >> 9) & 1u)
+            m_ctx[ci].miptbp1 = GSReg::automaticMiptbp1(t);
         m_backend->LoadClut(t, m_texclut);
         break;
     }

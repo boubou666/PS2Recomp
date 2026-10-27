@@ -4,6 +4,7 @@
 // encode(decode(v)) keeps every bit the frontend uses; decode(encode(f)) == f.
 #include "runtime/gs/gs_types.h"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace GSReg
@@ -50,6 +51,44 @@ namespace GSReg
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+    }
+
+    inline uint32_t storedBitsPerTexel(uint8_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            return 16u;
+        case GS_PSM_T8:
+            return 8u;
+        case GS_PSM_T4:
+            return 4u;
+        default:
+            return 32u;
+        }
+    }
+
+    // MIPTBP1 as a TEX0 write sets it when TEX1.MTBA = 1.
+    inline uint64_t automaticMiptbp1(const GSTex0Reg &tex0)
+    {
+        uint64_t width = 1ull << std::min<uint32_t>(tex0.tw, 10u);
+        uint64_t height = std::max<uint64_t>(1ull << std::min<uint32_t>(tex0.th, 10u), width);
+        uint32_t tbp = tex0.tbp0;
+        uint32_t tbw = tex0.tbw;
+        const uint64_t bits = storedBitsPerTexel(tex0.psm);
+        uint64_t miptbp1 = 0u;
+        for (uint32_t level = 0; level < 3u; ++level)
+        {
+            tbp += static_cast<uint32_t>(std::max<uint64_t>(width * height * bits / 2048u, 1u));
+            width = std::max<uint64_t>(width / 2u, 1u);
+            height = std::max<uint64_t>(height / 2u, 1u);
+            tbw = std::max<uint32_t>(tbw / 2u, 1u);
+            miptbp1 |= (static_cast<uint64_t>(tbp & 0x3FFFu) | (static_cast<uint64_t>(tbw & 0x3Fu) << 14)) << (level * 20u);
+        }
+        return miptbp1;
     }
 
     inline GSXYOffsetReg decodeXyoffset(uint64_t value)

@@ -1,5 +1,6 @@
 #include "gs_gif_decoder.h"
 
+#include "runtime/gs/gs_registers.h"
 #include "runtime/gs/gs_types.h"
 
 #include <cstring>
@@ -203,6 +204,15 @@ void GSGifDecoder::writeRegister(uint8_t address, uint64_t value)
     case GS_REG_XYZ3:
         kick(value, static_cast<uint8_t>(m_state.reg(GS_REG_FOG) >> 56), address == GS_REG_XYZ2);
         break;
+    case GS_REG_TEX0_1:
+    case GS_REG_TEX0_2:
+    {
+        const uint8_t i = address == GS_REG_TEX0_1 ? 0u : 1u;
+        m_state.setReg(address, value);
+        if ((m_state.reg(GS_REG_TEX1_1 + i) >> 9) & 1u)
+            m_state.setReg(GS_REG_MIPTBP1_1 + i, GSReg::automaticMiptbp1(GSReg::decodeTex0(value)));
+        break;
+    }
     case GS_REG_TEX2_1:
     case GS_REG_TEX2_2:
     {
