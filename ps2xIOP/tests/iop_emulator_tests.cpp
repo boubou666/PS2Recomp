@@ -496,7 +496,9 @@ namespace
     // IRX with a real RPC server thread (priority 30): it runs sceSifSetRpcQueue(0x10380, its id),
     // sceSifRegisterRpc(0x103A0, sid, 0x10200, buffer 0x10400, -, -, 0x10380), then sceSifRpcLoop. The server function
     // blocks in DelayThread(1000) for fno 1 (not for other numbers), then writes 0x5A5A to its buffer and returns it.
-    void writeQueueRpcServerIrx(TestHost &host, uint32_t address, uint32_t sid)
+    // For fno 3 it binds the EE server `eeSid` (client 0x10340) and calls it with WAIT (fno 5, its first 4 bytes out,
+    // 16 bytes back into its buffer), then returns the buffer as the EE answered it: the nested EE -> IOP -> EE case.
+    void writeQueueRpcServerIrx(TestHost &host, uint32_t address, uint32_t sid, uint32_t eeSid = 0u)
     {
         constexpr uint32_t codeOffset = 0x100u;
         constexpr uint32_t loadAddress = 0x00010000u;
@@ -510,6 +512,8 @@ namespace
         constexpr uint32_t registerRpcStub = sifcmdTable + 20u;
         constexpr uint32_t setRpcQueueStub = registerRpcStub + 8u;
         constexpr uint32_t rpcLoopStub = setRpcQueueStub + 8u;
+        constexpr uint32_t bindStub = rpcLoopStub + 8u;
+        constexpr uint32_t callStub = bindStub + 8u;
 
         ElfHeader header{};
         header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
@@ -520,7 +524,7 @@ namespace
 
         ProgramHeader program{};
         program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
-        program.filesz = 0x500u; program.memsz = 0x500u; program.flags = 7u; program.align = 4u;
+        program.filesz = 0x600u; program.memsz = 0x600u; program.flags = 7u; program.align = 4u;
 
         const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
         const auto jump = [](uint32_t target) { return 0x08000000u | ((target >> 2u) & 0x03FFFFFFu); };
@@ -549,13 +553,26 @@ namespace
             jump(loopAddress), 0x00000000u,                   // never returns
         };
         const uint32_t server[] = {
-            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u,            // addiu sp, -0x20; save ra, s0
+            0x27BDFFC0u, 0xAFBF003Cu, 0xAFB00038u,            // addiu sp, -0x40; save ra, s0
             0x00A08021u,                                      // s0 = buffer
+            0x24080003u, 0x14880018u, 0x00000000u,            // if (fno != 3) go to the fno 1 check
+            0x3C040001u, 0x34840340u,                         // a0 = client 0x10340
+            0x3C050000u | ((eeSid >> 16u) & 0xFFFFu), 0x34A50000u | (eeSid & 0xFFFFu),
+            0x00003021u, jal(bindStub), 0x00000000u,          // sceSifBindRpc(client, eeSid, 0)
+            0x3C040001u, 0x34840340u,                         // a0 = client
+            0x24050005u, 0x00003021u,                         // a1 = fno 5, a2 = mode 0 (WAIT)
+            0x02003821u,                                      // a3 = send: the buffer
+            0x24080004u, 0xAFA80010u,                         // send size 4
+            0xAFB00014u,                                      // receive: the buffer
+            0x24080010u, 0xAFA80018u,                         // receive size 16
+            0xAFA0001Cu, 0xAFA00020u,                         // no end function
+            jal(callStub), 0x00000000u,                       // sceSifCallRpc: sleeps until the EE replies
+            0x10000009u, 0x00000000u,                         // return the buffer as the EE answered it
             0x24080001u, 0x14880004u, 0x00000000u,            // if (fno != 1) skip the delay
             0x240403E8u, jal(delayThreadStub), 0x00000000u,   // DelayThread(1000): blocks
             0x34095A5Au, 0xAE090000u,                         // *buffer = 0x5A5A
             0x02001021u,                                      // return the buffer
-            0x8FB00018u, 0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00000000u,
+            0x8FB00038u, 0x8FBF003Cu, 0x27BD0040u, 0x03E00008u, 0x00000000u,
         };
         const uint32_t thbaseImports[] = {
             0x41E00000u, 0u, 0x00000101u,
@@ -572,10 +589,13 @@ namespace
             0x03E00008u, 0x24000011u, // sceSifRegisterRpc
             0x03E00008u, 0x24000013u, // sceSifSetRpcQueue
             0x03E00008u, 0x24000016u, // sceSifRpcLoop
+            0x03E00008u, 0x2400000Fu, // sceSifBindRpc
+            0x03E00008u, 0x24000010u, // sceSifCallRpc
             0u, 0u,
         };
         const uint32_t threadDescriptor[] = {0u, 0u, threadAddress, 0x800u, 30u};
-        static_assert(sizeof(entry) <= 0x100u && sizeof(thread) <= 0x100u && sizeof(server) <= 0x100u,
+        static_assert(sizeof(entry) <= 0x100u && sizeof(thread) <= 0x100u && sizeof(server) <= 0x100u &&
+                          0x4C0u + sizeof(sifcmdImports) <= 0x600u,
                       "code overlaps the next block");
 
         std::vector<uint8_t> segment(program.filesz, 0u);
@@ -1902,6 +1922,62 @@ int main()
         const RpcResult inlineBlocked = call(1u, false);
         if (!expect(inlineBlocked.handled && !inlineBlocked.deferred && receivedWord() == 0x5A5Au,
                     "Without allowDeferred a blocking server should still run inline to its reply")) return 1;
+        iop.reset();
+    }
+
+    // Nested EE -> IOP -> EE (JC2's M2IOPSYS): the handed-off server calls an EE server with WAIT; the EE -> IOP call
+    // completes only once the EE has answered the IOP -> EE one, with that answer in the EE receive buffer.
+    {
+        constexpr uint32_t serverSid = 0x00020001u;
+        constexpr uint32_t eeSid = 0x00010003u;
+        constexpr uint32_t receive = 0x00000C00u;
+        host.eeRpcSid = eeSid;
+        host.eeRpcServer = IopHost::EeRpcServer{0x0089DDB0u, 0x0089DE00u, 0x0089DF00u};
+        host.eeRpcCalls.clear();
+        host.deferredDone.clear();
+        iop.reset();
+        writeQueueRpcServerIrx(host, 0x100u, serverSid, eeSid);
+        const ModuleLoadResult serverModule = iop.loadModuleBuffer(0x100u);
+        if (!expect(serverModule.handled && serverModule.startResult == 0, "Nested RPC server IRX did not start")) return 1;
+        for (int i = 0; i < 64 && !iop.canBindRpc(serverSid); ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(iop.canBindRpc(serverSid), "The nested RPC server did not register")) return 1;
+
+        const uint32_t sent = 0x13572468u;
+        std::memset(host.guest.data() + receive, 0, 16u);
+        std::memcpy(host.guest.data() + 0x00000B00u, &sent, sizeof(sent));
+        RpcRequest request{};
+        request.sid = serverSid;
+        request.function = 3u;
+        request.send = {0x00000B00u, 4u};
+        request.receive = {receive, 16u};
+        request.allowDeferred = true;
+        const RpcResult nested = iop.handleRpc(request);
+        if (!expect(nested.handled && nested.deferred, "A server that calls the EE with WAIT should be handed off")) return 1;
+        for (int i = 0; i < 64 && host.eeRpcCalls.empty(); ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(host.eeRpcCalls.size() == 1u, "The handed-off server's IOP -> EE call did not reach the EE")) return 1;
+        const auto &inner = host.eeRpcCalls.front();
+        uint32_t innerFirstWord = 0u;
+        if (inner.send.size() >= 4u)
+            std::memcpy(&innerFirstWord, inner.send.data(), sizeof(innerFirstWord));
+        if (!expect(inner.sid == eeSid && inner.function == 5u && innerFirstWord == sent,
+                    "The IOP -> EE call should carry what the EE sent the IOP server")) return 1;
+        for (int i = 0; i < 8; ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(host.deferredDone.empty(), "The EE -> IOP call should not complete before the EE answers the inner one")) return 1;
+
+        uint8_t reply[16];
+        for (uint32_t i = 0; i < sizeof(reply); ++i)
+            reply[i] = static_cast<uint8_t>(0xA0u + i);
+        iop.completeEeRpc(inner.token, reply, sizeof(reply));
+        for (int i = 0; i < 64 && host.deferredDone.empty(); ++i)
+            iop.runEeCycles(200000u);
+        if (!expect(host.deferredDone.size() == 1u && host.deferredDone.front() == nested.deferredToken,
+                    "The EE -> IOP call should complete once the inner call is answered")) return 1;
+        if (!expect(std::memcmp(host.guest.data() + receive, reply, sizeof(reply)) == 0,
+                    "The EE receive buffer should hold the inner call's answer, which the IOP server returned")) return 1;
+        host.eeRpcSid = 0u;
         iop.reset();
     }
 
