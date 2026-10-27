@@ -1553,7 +1553,8 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     if (low11 == 0x2FFu || low11 == 0x33Cu)
         return;
 
-    float *vd = m_state.vf[fd];
+    alignas(16) float discarded[4];
+    float *vd = fd != 0u ? m_state.vf[fd] : discarded;
     alignas(16) float normalizedVs[4];
     alignas(16) float normalizedVt[4];
     alignas(16) float normalizedAcc[4];
@@ -1744,7 +1745,7 @@ PS2X_VU_INLINE void VU1Interpreter::execUpper(uint32_t instr)
     case 0x3F:
     {
         const uint8_t specialOp = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
-        float *vtDest = m_state.vf[ft];
+        float *vtDest = ft != 0u ? m_state.vf[ft] : discarded;
 
         switch (specialOp)
         {
