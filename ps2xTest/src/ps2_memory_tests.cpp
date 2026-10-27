@@ -2614,7 +2614,7 @@ void register_ps2_memory_tests()
                      "tag high-half VIFcodes must stay hidden when CHCR.TTE is clear");
         });
 
-        tc.Run("VIF1 packet builders keep chain qwc live before terminate", [](TestCase &t)
+        tc.Run("VIF1 packet builders fill the chain qwc at terminate", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -2657,7 +2657,13 @@ void register_ps2_memory_tests()
 
             uint32_t dmaTagWord = 0u;
             std::memcpy(&dmaTagWord, rdram + kBaseAddr, sizeof(dmaTagWord));
-            t.Equals(dmaTagWord & 0xFFFFu, 1u, "live packet head qwc should reflect one qword before terminate");
+            t.Equals(dmaTagWord & 0xFFFFu, 0u, "packet head qwc should stay zero until terminate");
+
+            std::memset(&ctx, 0, sizeof(ctx));
+            setRegU32(ctx, 4, kStateAddr);
+            ps2_stubs::sceVif1PkTerminate(rdram, &ctx, nullptr);
+            std::memcpy(&dmaTagWord, rdram + kBaseAddr, sizeof(dmaTagWord));
+            t.Equals(dmaTagWord & 0xFFFFu, 1u, "terminate should fill the packet head qwc with one qword");
 
             std::vector<std::vector<uint8_t>> captured;
             mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
@@ -2671,8 +2677,8 @@ void register_ps2_memory_tests()
 
             mem.processPendingTransfers();
 
-            t.Equals(captured.size(), static_cast<size_t>(1u), "live VIF1 packet should emit one GIF packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "live VIF1 packet should emit one qword");
+            t.Equals(captured.size(), static_cast<size_t>(1u), "terminated VIF1 packet should emit one GIF packet");
+            t.Equals(captured[0].size(), static_cast<size_t>(16u), "terminated VIF1 packet should emit one qword");
 
             bool payloadOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
@@ -2683,7 +2689,7 @@ void register_ps2_memory_tests()
                     break;
                 }
             }
-            t.IsTrue(payloadOk, "live VIF1 packet payload should reach the GIF callback");
+            t.IsTrue(payloadOk, "terminated VIF1 packet payload should reach the GIF callback");
         });
 
         tc.Run("VIF1 DMA chain latches terminal tag bits in CHCR", [](TestCase &t)

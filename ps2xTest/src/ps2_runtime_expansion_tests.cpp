@@ -1715,7 +1715,7 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(getRegS32(ctx, 2), 0, "sceVu0TransposeMatrix should report success");
         });
 
-        tc.Run("sceVif1PkReset preserves the packet base pointer and clears open tag state", [](TestCase &t)
+        tc.Run("sceVif1PkReset rewinds pCurrent and drops pDmaTag, leaving the open codes alone", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             R5900Context ctx{};
@@ -1754,8 +1754,8 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(current, kBaseAddr, "sceVif1PkReset should restore current pointer to the packet base");
             t.Equals(base, kBaseAddr, "sceVif1PkReset should preserve the packet base pointer");
             t.Equals(pending, 0u, "sceVif1PkReset should clear pending count tracking");
-            t.Equals(directOpen, 0u, "sceVif1PkReset should clear direct-code open state");
-            t.Equals(gifOpen, 0u, "sceVif1PkReset should clear GIF-tag open state");
+            t.Equals(directOpen, dirtyDirectOpen, "sceVif1PkReset should leave pVifCode as libvif does");
+            t.Equals(gifOpen, dirtyGifOpen, "sceVif1PkReset should leave pGifTag as libvif does");
             t.Equals(::getRegU32(&ctx, 2), kBaseAddr, "sceVif1PkReset should return the packet base pointer");
         });
 
@@ -1793,6 +1793,184 @@ void register_ps2_runtime_expansion_tests()
             uint32_t directCmd = 0u;
             std::memcpy(&directCmd, rdram.data() + kBaseAddr + 12u, sizeof(directCmd));
             t.Equals(directCmd, 0x50000001u, "sceVif1PkCloseDirectCode should store a 1-QW DIRECT length");
+        });
+
+        tc.Run("sceVif1Pk builders emit libvif's DIRECT block with a PACKED A+D GIFtag and an IMAGE transfer", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kStateAddr = 0x00100600u;
+            constexpr uint32_t kBaseAddr = 0x00103000u;
+            auto call = [&](void (*fn)(uint8_t *, R5900Context *, PS2Runtime *), uint32_t a1 = 0u)
+            {
+                std::memset(&ctx, 0, sizeof(ctx));
+                setRegU32(ctx, 4, kStateAddr);
+                setRegU32(ctx, 5, a1);
+                fn(rdram.data(), &ctx, nullptr);
+            };
+            auto addGsAD = [&](uint32_t reg, uint64_t data)
+            {
+                std::memset(&ctx, 0, sizeof(ctx));
+                setRegU32(ctx, 4, kStateAddr);
+                setRegU32(ctx, 5, reg);
+                ctx.r[6] = _mm_set_epi64x(0, static_cast<int64_t>(data));
+                ps2_stubs::sceVif1PkAddGsAD(rdram.data(), &ctx, nullptr);
+            };
+            auto openGifTag = [&](uint64_t lo, uint64_t hi)
+            {
+                std::memset(&ctx, 0, sizeof(ctx));
+                setRegU32(ctx, 4, kStateAddr);
+                ctx.r[5] = _mm_set_epi64x(static_cast<int64_t>(hi), static_cast<int64_t>(lo));
+                ps2_stubs::sceVif1PkOpenGifTag(rdram.data(), &ctx, nullptr);
+            };
+            auto word = [&](uint32_t addr)
+            {
+                uint32_t value = 0u;
+                std::memcpy(&value, rdram.data() + addr, sizeof(value));
+                return value;
+            };
+
+            std::memset(rdram.data() + kBaseAddr, 0xAA, 0x100u);
+
+            call(ps2_stubs::sceVif1PkInit, kBaseAddr);
+            call(ps2_stubs::sceVif1PkCnt, 0u);
+            call(ps2_stubs::sceVif1PkOpenDirectCode, 0u);
+            openGifTag(0x1000000000008000ull, 0xEull);
+            addGsAD(0x50u, 0x00013FC000000000ull);
+            addGsAD(0x51u, 0x0000000000000000ull);
+            addGsAD(0x52u, 0x0000000200000008ull);
+            addGsAD(0x53u, 0x0000000000000000ull);
+            call(ps2_stubs::sceVif1PkCloseGifTag);
+            openGifTag(0x0800000000008000ull, 0ull);
+            call(ps2_stubs::sceVif1PkReserve, 8u);
+            const uint32_t imageAddr = ::getRegU32(&ctx, 2);
+            for (uint32_t i = 0; i < 8u; ++i)
+            {
+                const uint32_t pixel = 0xFF000000u | i;
+                std::memcpy(rdram.data() + imageAddr + i * 4u, &pixel, sizeof(pixel));
+            }
+            call(ps2_stubs::sceVif1PkCloseGifTag);
+            call(ps2_stubs::sceVif1PkCloseDirectCode);
+
+            t.Equals(word(kBaseAddr), 0x10000000u, "the CNT tag qwc stays zero until the next tag or terminate");
+
+            call(ps2_stubs::sceVif1PkEnd, 0u);
+            call(ps2_stubs::sceVif1PkTerminate);
+            t.Equals(::getRegU32(&ctx, 2), kBaseAddr + 0xA0u, "sceVif1PkTerminate returns the qword-aligned end");
+
+            const uint32_t expected[] = {
+                0x10000008u, 0x00000000u, 0x00000000u, 0x50000008u,
+                0x00008004u, 0x10000000u, 0x0000000Eu, 0x00000000u,
+                0x00000000u, 0x00013FC0u, 0x00000050u, 0x00000000u,
+                0x00000000u, 0x00000000u, 0x00000051u, 0x00000000u,
+                0x00000008u, 0x00000002u, 0x00000052u, 0x00000000u,
+                0x00000000u, 0x00000000u, 0x00000053u, 0x00000000u,
+                0x00008002u, 0x08000000u, 0x00000000u, 0x00000000u,
+                0xFF000000u, 0xFF000001u, 0xFF000002u, 0xFF000003u,
+                0xFF000004u, 0xFF000005u, 0xFF000006u, 0xFF000007u,
+                0x70000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+            };
+            for (uint32_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i)
+            {
+                t.Equals(word(kBaseAddr + i * 4u), expected[i], "packet word " + std::to_string(i));
+            }
+            t.Equals(word(kBaseAddr + 0xA0u), 0xAAAAAAAAu, "nothing is written past the terminated packet");
+
+            t.Equals(word(kStateAddr + 0x00u), kBaseAddr + 0xA0u, "pCurrent points past the END tag padding");
+            t.Equals(word(kStateAddr + 0x04u), kBaseAddr, "pBase is untouched");
+            t.Equals(word(kStateAddr + 0x08u), 0u, "terminate clears pDmaTag");
+            t.Equals(word(kStateAddr + 0x0Cu), 0u, "sceVif1PkEnd clears pVifCode");
+            t.Equals(word(kStateAddr + 0x14u), 0u, "sceVif1PkCloseGifTag clears pGifTag");
+        });
+
+        tc.Run("sceVif1PkTerminate adds the qwc to the tag word like libvif", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kStateAddr = 0x00100700u;
+            constexpr uint32_t kBaseAddr = 0x00104000u;
+            const uint32_t state[3] = {kBaseAddr + 0x24u, kBaseAddr, kBaseAddr};
+            std::memcpy(rdram.data() + kStateAddr, state, sizeof(state));
+            const uint32_t tagWord = 0x10000003u;
+            std::memcpy(rdram.data() + kBaseAddr, &tagWord, sizeof(tagWord));
+
+            setRegU32(ctx, 4, kStateAddr);
+            ps2_stubs::sceVif1PkTerminate(rdram.data(), &ctx, nullptr);
+
+            uint32_t tag = 0u;
+            std::memcpy(&tag, rdram.data() + kBaseAddr, sizeof(tag));
+            t.Equals(tag, 0x10000005u, "terminate adds the two payload qwords to the existing tag word");
+            t.Equals(::getRegU32(&ctx, 2), kBaseAddr + 0x30u, "terminate pads to the next qword");
+        });
+
+        tc.Run("sceVif1PkAlign pads to the requested word of the next aligned block", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kStateAddr = 0x00100800u;
+            constexpr uint32_t kBaseAddr = 0x00105000u;
+            std::memset(rdram.data() + kBaseAddr, 0xAA, 0x40u);
+            const uint32_t current = kBaseAddr + 0x18u;
+            std::memcpy(rdram.data() + kStateAddr, &current, sizeof(current));
+
+            setRegU32(ctx, 4, kStateAddr);
+            setRegU32(ctx, 5, 2u);
+            setRegU32(ctx, 6, 1u);
+            ps2_stubs::sceVif1PkAlign(rdram.data(), &ctx, nullptr);
+
+            uint32_t after = 0u;
+            std::memcpy(&after, rdram.data() + kStateAddr, sizeof(after));
+            t.Equals(after, kBaseAddr + 0x24u, "a position already passed moves to the next 16-byte block");
+            for (uint32_t addr = kBaseAddr + 0x18u; addr < kBaseAddr + 0x24u; addr += 4u)
+            {
+                uint32_t value = 0xFFFFFFFFu;
+                std::memcpy(&value, rdram.data() + addr, sizeof(value));
+                t.Equals(value, 0u, "alignment padding is VIF NOPs");
+            }
+        });
+
+        tc.Run("sceGifPkCnt and sceGifPkEnd put the two option words after the tag address", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kStateAddr = 0x00100900u;
+            constexpr uint32_t kBaseAddr = 0x00106000u;
+
+            setRegU32(ctx, 4, kStateAddr);
+            setRegU32(ctx, 5, kBaseAddr);
+            ps2_stubs::sceGifPkInit(rdram.data(), &ctx, nullptr);
+
+            auto tagCall = [&](void (*fn)(uint8_t *, R5900Context *, PS2Runtime *), uint32_t opt1, uint32_t opt2, uint32_t flag)
+            {
+                std::memset(&ctx, 0, sizeof(ctx));
+                setRegU32(ctx, 4, kStateAddr);
+                setRegU32(ctx, 5, opt1);
+                setRegU32(ctx, 6, opt2);
+                setRegU32(ctx, 7, flag);
+                fn(rdram.data(), &ctx, nullptr);
+            };
+
+            tagCall(ps2_stubs::sceGifPkCnt, 0x11111111u, 0x22222222u, 0x80000000u);
+            std::memset(&ctx, 0, sizeof(ctx));
+            setRegU32(ctx, 4, kStateAddr);
+            setRegU32(ctx, 5, 4u);
+            ps2_stubs::sceGifPkReserve(rdram.data(), &ctx, nullptr);
+            tagCall(ps2_stubs::sceGifPkEnd, 0x33333333u, 0x44444444u, 0u);
+
+            uint32_t words[12]{};
+            std::memcpy(words, rdram.data() + kBaseAddr, sizeof(words));
+            t.Equals(words[0], 0x90000001u, "CNT tag carries the flag and the one payload qword");
+            t.Equals(words[1], 0u, "CNT tag ADDR is zero");
+            t.Equals(words[2], 0x11111111u, "CNT opt1 follows the tag");
+            t.Equals(words[3], 0x22222222u, "CNT opt2 follows opt1");
+            t.Equals(words[8], 0x70000000u, "END tag id");
+            t.Equals(words[9], 0u, "END tag ADDR is zero");
+            t.Equals(words[10], 0x33333333u, "END opt1 follows the tag address");
+            t.Equals(words[11], 0x44444444u, "END opt2 follows opt1");
         });
 
         tc.Run("DVD reads seek by distance and transfer faster towards the outer edge", [](TestCase &t)
