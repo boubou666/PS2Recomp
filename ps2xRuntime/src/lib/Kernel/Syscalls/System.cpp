@@ -528,6 +528,7 @@ namespace ps2_syscalls
             if (stackSizeSigned > 0)
             {
                 sp = stack + static_cast<uint32_t>(stackSizeSigned);
+                runtime->reserveMainThreadStack(stack, sp);
             }
             else
             {
@@ -558,7 +559,7 @@ namespace ps2_syscalls
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM":
-        // up to the runtime's heap hard limit (see PS2Runtime::configureReservedMemory).
+        // up to the runtime's heap hard limit (see PS2Runtime::configureReservedMemory and reserveMainThreadStack).
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
         const uint32_t heapEnd = runtime ? runtime->guestHeapHardLimit() : kDefaultGuestHeapEnd;
         uint32_t heapLimit = heapEnd;
