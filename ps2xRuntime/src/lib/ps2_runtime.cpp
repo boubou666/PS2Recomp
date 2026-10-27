@@ -1137,7 +1137,8 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
         const uint64_t idleNs = runtime.eeScheduler().idleWaitNanoseconds();
         const uint64_t catchUp = runtime.eeScheduler().catchUpCycles();
         text << "[state] ee cycle=" << ee.eeCycle << " idle=" << ee.idleCycles << " running=" << ee.runningThreadId
-             << " host-idle-ms=" << (idleNs - lastIdleNs) / 1000000u << " catch-up=" << (catchUp - lastCatchUp) << '\n';
+             << " host-idle-ms=" << (idleNs - lastIdleNs) / 1000000u << " catch-up=" << (catchUp - lastCatchUp)
+             << " deadlines=" << runtime.eeScheduler().deadlineSummary() << '\n';
         lastIdleNs = idleNs;
         lastCatchUp = catchUp;
     }

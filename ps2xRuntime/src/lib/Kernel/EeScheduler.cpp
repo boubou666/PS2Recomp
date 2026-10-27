@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -1727,6 +1728,25 @@ void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
     }
 }
 
+std::string EeScheduler::deadlineSummary() const
+{
+    std::lock_guard lock(m_eventMutex);
+    std::map<uint32_t, size_t> byType;
+    uint64_t furthest = 0;
+    for (const ScheduledEvent &item : m_deadlines)
+    {
+        ++byType[static_cast<uint32_t>(item.event.type)];
+        if (item.deadlineCycle > m_eeCycle)
+            furthest = std::max(furthest, item.deadlineCycle - m_eeCycle);
+    }
+    std::ostringstream text;
+    text << m_deadlines.size() << " (furthest +" << furthest << " cycles;";
+    for (const auto &[type, count] : byType)
+        text << " type" << type << "=" << count;
+    text << ")";
+    return text.str();
+}
+
 EeKernelSnapshot EeScheduler::snapshot() const
 {
     std::lock_guard lock(m_snapshotMutex);
@@ -2045,14 +2065,13 @@ void EeScheduler::processDueDeadlines()
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
-            for (const ScheduledEvent &item : m_deadlines)
+            // m_deadlines is sorted by cycle: only its prefix up to the current cycle can be due.
+            const auto dueEnd = std::find_if(m_deadlines.begin(), m_deadlines.end(), [this](const ScheduledEvent &item)
+                                             { return item.deadlineCycle > m_eeCycle; });
+            for (auto item = m_deadlines.begin(); item != dueEnd; ++item)
             {
-                if (item.deadlineCycle <= m_eeCycle &&
-                    (pacingDeadline == std::chrono::steady_clock::time_point{} ||
-                     item.hostDeadline < pacingDeadline))
-                {
-                    pacingDeadline = item.hostDeadline;
-                }
+                if (pacingDeadline == std::chrono::steady_clock::time_point{} || item->hostDeadline < pacingDeadline)
+                    pacingDeadline = item->hostDeadline;
             }
 
             if (pacingDeadline == std::chrono::steady_clock::time_point{})
@@ -2083,10 +2102,11 @@ void EeScheduler::processDueDeadlines()
             }
 
             const auto pacedNow = std::chrono::steady_clock::now();
-            auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
-                                              [this, pacedNow](const ScheduledEvent &item)
-                                              { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
+            const auto cycleDueEnd = std::find_if(m_deadlines.begin(), m_deadlines.end(), [this](const ScheduledEvent &item)
+                                                  { return item.deadlineCycle > m_eeCycle; });
+            auto firstFuture = std::stable_partition(m_deadlines.begin(), cycleDueEnd,
+                                                     [pacedNow](const ScheduledEvent &item)
+                                                     { return item.hostDeadline <= pacedNow; });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
@@ -2484,15 +2504,7 @@ void EeScheduler::waitForEvent()
     std::string deadlineKind = "timer";
     if (!m_deadlines.empty())
     {
-        const auto next = std::min_element(m_deadlines.begin(), m_deadlines.end(),
-                                           [](const ScheduledEvent &left, const ScheduledEvent &right)
-                                           {
-                                               if (left.deadlineCycle != right.deadlineCycle)
-                                               {
-                                                   return left.deadlineCycle < right.deadlineCycle;
-                                               }
-                                               return left.sequence < right.sequence;
-                                           });
+        const auto next = m_deadlines.begin(); // sorted by cycle, then sequence
         deadlineCycle = next->deadlineCycle;
         hostDeadline = next->hostDeadline;
         deadlineKind = "deadline:" + std::to_string(static_cast<int>(next->event.type));
@@ -2542,7 +2554,10 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
 {
     {
         std::lock_guard lock(m_eventMutex);
-        m_deadlines.push_back(ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});
+        // Sorted by cycle, then by sequence (a new event goes after the others due on the same cycle).
+        const auto at = std::upper_bound(m_deadlines.begin(), m_deadlines.end(), deadlineCycle,
+                                         [](uint64_t cycle, const ScheduledEvent &item) { return cycle < item.deadlineCycle; });
+        m_deadlines.insert(at, ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});
         updateNextDeadline();
     }
     m_eventCv.notify_one();
@@ -2555,15 +2570,7 @@ void EeScheduler::updateNextDeadline()
         m_nextDeadlineCycle.store(0u, std::memory_order_release);
         return;
     }
-    const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
-                                     [](const ScheduledEvent &left, const ScheduledEvent &right)
-                                     {
-                                         if (left.deadlineCycle != right.deadlineCycle)
-                                         {
-                                             return left.deadlineCycle < right.deadlineCycle;
-                                         }
-                                         return left.sequence < right.sequence;
-                                     });
+    const auto it = m_deadlines.begin(); // sorted by cycle, then sequence
     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
     m_nextDeadlineHostTicks.store(it->hostDeadline.time_since_epoch().count(), std::memory_order_release);
 }

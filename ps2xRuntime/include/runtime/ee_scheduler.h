@@ -450,6 +450,8 @@ public:
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
+    // Pending deadlines by event type, with how far ahead the furthest is (state dump).
+    [[nodiscard]] std::string deadlineSummary() const;
     void publishSnapshot();
 
 private:
