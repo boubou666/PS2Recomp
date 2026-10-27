@@ -1187,6 +1187,7 @@ struct GSCpuBackend::PixelPipeline
     bool zmask = false;
     bool frame16 = false;
     bool frame24 = false;
+    bool colclamp = true;
     ReadVramFunc readFrame = nullptr;
     ReadVramFunc readZ = nullptr;
     WriteVramFunc writeFrame = nullptr;
@@ -1405,6 +1406,7 @@ GSCpuBackend::PixelPipeline GSCpuBackend::MakePixelPipeline(const GSDrawState &s
     p.passReadsFramebuffer = p.dateNeedsRead || p.fbmsk != 0u || p.abe;
     p.frame16 = bitsPerPixel(p.fpsm) == 16;
     p.frame24 = p.fpsm == GS_PSM_CT24;
+    p.colclamp = (state.colclamp & 1u) != 0u;
     p.readFrame = m_readVramFuncs[p.fpsm & 0x3Fu];
     p.readZ = m_readVramFuncs[p.zpsm & 0x3Fu];
     p.writeFrame = m_writeVramFuncs[p.fpsm & 0x3Fu];
@@ -2534,9 +2536,12 @@ void GSCpuBackend::WritePixel(const PixelPipeline &p, int x, int y, uint32_t z, 
             const int cAlpha = (p.csel == 0) ? a : (p.csel == 1) ? da
                                                                  : p.fix;
 
-            r = clampU8(((pickRGB(p.asel, r, dr) - pickRGB(p.bsel, r, dr)) * cAlpha >> 7) + pickRGB(p.dsel, r, dr));
-            g = clampU8(((pickRGB(p.asel, g, dg) - pickRGB(p.bsel, g, dg)) * cAlpha >> 7) + pickRGB(p.dsel, g, dg));
-            b = clampU8(((pickRGB(p.asel, b, db) - pickRGB(p.bsel, b, db)) * cAlpha >> 7) + pickRGB(p.dsel, b, db));
+            const int br = ((pickRGB(p.asel, r, dr) - pickRGB(p.bsel, r, dr)) * cAlpha >> 7) + pickRGB(p.dsel, r, dr);
+            const int bg = ((pickRGB(p.asel, g, dg) - pickRGB(p.bsel, g, dg)) * cAlpha >> 7) + pickRGB(p.dsel, g, dg);
+            const int bb = ((pickRGB(p.asel, b, db) - pickRGB(p.bsel, b, db)) * cAlpha >> 7) + pickRGB(p.dsel, b, db);
+            r = p.colclamp ? clampU8(br) : static_cast<uint8_t>(br & 0xFF);
+            g = p.colclamp ? clampU8(bg) : static_cast<uint8_t>(bg & 0xFF);
+            b = p.colclamp ? clampU8(bb) : static_cast<uint8_t>(bb & 0xFF);
         }
 
         if (writeMask.writeAlpha && p.fba)
@@ -2725,10 +2730,24 @@ void GSCpuBackend::WritePixelBlock(const PixelPipeline &p, int x0, int y, uint32
             const int32_t bg = (((((g[i] & as) | (dg & ad)) - ((g[i] & bs) | (dg & bd))) * c) >> 7) + ((g[i] & ds) | (dg & dd));
             const int32_t bb = (((((b[i] & as) | (db & ad)) - ((b[i] & bs) | (db & bd))) * c) >> 7) + ((b[i] & ds) | (db & dd));
             const int32_t blend = ((a[i] & 0x80) != 0 ? -1 : 0) | everyPixel;
-            r[i] = (std::min(std::max(br, 0), 255) & blend) | (r[i] & ~blend);
-            g[i] = (std::min(std::max(bg, 0), 255) & blend) | (g[i] & ~blend);
-            b[i] = (std::min(std::max(bb, 0), 255) & blend) | (b[i] & ~blend);
+            r[i] = (br & blend) | (r[i] & ~blend);
+            g[i] = (bg & blend) | (g[i] & ~blend);
+            b[i] = (bb & blend) | (b[i] & ~blend);
         }
+        if (p.colclamp)
+            for (int i = 0; i < N; ++i)
+            {
+                r[i] = std::min(std::max(r[i], 0), 255);
+                g[i] = std::min(std::max(g[i], 0), 255);
+                b[i] = std::min(std::max(b[i], 0), 255);
+            }
+        else
+            for (int i = 0; i < N; ++i)
+            {
+                r[i] &= 0xFF;
+                g[i] &= 0xFF;
+                b[i] &= 0xFF;
+            }
     }
 
     uint32_t out[N];
