@@ -113,6 +113,7 @@ namespace ps2x::iop::detail
         void wakeOneSemaphore(int id);
         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
         void wakeEventWaiters(EventFlag &event);
+        [[nodiscard]] bool runsBefore(const IopThread &thread, const IopThread &other) const noexcept;
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;
@@ -122,5 +123,6 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        int m_slicedThread = 0;
     };
 }

@@ -63,6 +63,7 @@ namespace ps2x::iop::detail
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
         m_currentThread = nullptr;
+        m_slicedThread = 0;
     }
 
     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
@@ -706,6 +707,15 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
+    bool IopKernel::runsBefore(const IopThread &thread, const IopThread &other) const noexcept
+    {
+        if (thread.priority != other.priority)
+            return thread.priority < other.priority;
+        if (other.id == m_slicedThread)
+            return false;
+        return thread.id == m_slicedThread || thread.id < other.id;
+    }
+
     IopThread *IopKernel::readyAtOrAbove(uint32_t priority, int excluded) noexcept
     {
         IopThread *best = nullptr;
@@ -713,7 +723,7 @@ namespace ps2x::iop::detail
         {
             if (id == excluded || thread.state != IopThreadState::Ready || thread.priority > priority)
                 continue;
-            if (best == nullptr || thread.priority < best->priority || (thread.priority == best->priority && id < best->id))
+            if (best == nullptr || runsBefore(thread, *best))
                 best = &thread;
         }
         return best;
@@ -737,8 +747,7 @@ namespace ps2x::iop::detail
             }
             if (thread.state != IopThreadState::Ready)
                 continue;
-            if (next == nullptr || thread.priority < next->priority ||
-                (thread.priority == next->priority && thread.id < next->id))
+            if (next == nullptr || runsBefore(thread, *next))
                 next = &thread;
         }
         if (nextDelayWake)
@@ -771,10 +780,15 @@ namespace ps2x::iop::detail
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
     {
+        m_slicedThread = 0;
         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
             thread.state = IopThreadState::Dormant;
         else if (thread.state == IopThreadState::Running)
+        {
             thread.state = IopThreadState::Ready;
+            if (!thread.cpu.yielded)
+                m_slicedThread = thread.id;
+        }
         m_currentThread = nullptr;
         cleanupDeadThreads();
     }
