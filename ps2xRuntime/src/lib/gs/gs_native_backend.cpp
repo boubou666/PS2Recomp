@@ -61,6 +61,9 @@ uniform int uFog;
 uniform vec3 uFogColor;
 uniform int uAlphaTest;
 uniform float uAlphaRef;
+uniform int uBlendOut;
+uniform int uBlendFactor;
+uniform float uBlendFix;
 void main()
 {
     vec4 vc = vColor * (255.0 / 128.0);
@@ -91,8 +94,16 @@ void main()
     else if (uAlphaTest == 7) pass = a != uAlphaRef;
     if (!pass)
         discard;
-    outColor = vec4(clamp(c.rgb, 0.0, 1.0), clamp(c.a, 0.0, 2.0) * (128.0 / 255.0));
-    outFactor = vec4(clamp(c.a, 0.0, 1.0));
+    // The GS blend's C: the source alpha or FIX (0x80 is 1.0). Blends that fixed-function GL cannot express take
+    // part of the work here: the factor as colour (Cd * (1 + C) through DST_COLOR, ONE), or Cs * (1 + C).
+    float factor = uBlendFactor == 2 ? uBlendFix : clamp(c.a, 0.0, 2.0);
+    vec3 rgb = c.rgb;
+    if (uBlendOut == 1)
+        rgb = vec3(factor);
+    else if (uBlendOut == 2)
+        rgb = c.rgb * (1.0 + factor);
+    outColor = vec4(clamp(rgb, 0.0, 1.0), clamp(c.a, 0.0, 2.0) * (128.0 / 255.0));
+    outFactor = vec4(clamp(factor, 0.0, 1.0));
 }
 )";
 
@@ -255,6 +266,9 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.alphaTest = glGetUniformLocation(m_program, "uAlphaTest");
     m_uniforms.alphaRef = glGetUniformLocation(m_program, "uAlphaRef");
     m_uniforms.sampler = glGetUniformLocation(m_program, "uSampler");
+    m_uniforms.blendOut = glGetUniformLocation(m_program, "uBlendOut");
+    m_uniforms.blendFactor = glGetUniformLocation(m_program, "uBlendFactor");
+    m_uniforms.blendFix = glGetUniformLocation(m_program, "uBlendFix");
     m_uniforms.fst = glGetUniformLocation(m_program, "uTexAlphaScale");
 
     glGenVertexArrays(1, &m_vertexArray);
@@ -647,6 +661,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
 
 void GSNativeBackend::applyBlend(const GSDrawState &state)
 {
+    m_blendOut = 0;
     if (!state.prim.abe)
     {
         glDisable(GL_BLEND);
@@ -685,6 +700,20 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
         equation = GL_FUNC_SUBTRACT, source = GL_ONE, destination = factor;
     else if (a == Cd && b == Zero && d == Zero)
         source = GL_ZERO, destination = factor;
+    else if (a == Cd && b == Zero && d == Cd && c != 1u)
+        m_blendOut = 1, source = GL_DST_COLOR, destination = GL_ONE; // Cd * C + Cd: brightening
+    else if (a == Cs && b == Zero && d == Cs)
+        m_blendOut = 2, source = GL_ONE, destination = GL_ZERO; // Cs * (1 + C)
+    else if (a == Cs && b == Cd && d == Zero)
+        equation = GL_FUNC_SUBTRACT, source = factor, destination = factor;
+    else if (a == Cd && b == Cs && d == Zero)
+        equation = GL_FUNC_REVERSE_SUBTRACT, source = factor, destination = factor;
+    else if (a == Zero && b == Cs && d == Cs)
+        source = inverse, destination = GL_ZERO;
+    else if (a == Zero && b == Cd && d == Cd)
+        source = GL_ZERO, destination = inverse;
+    else if (a == Zero && d == Zero)
+        source = GL_ZERO, destination = GL_ZERO; // a negative result clamps to black
     else
         mapped = false;
     if (!mapped)
@@ -749,6 +778,9 @@ void GSNativeBackend::flushBatch()
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     glUseProgram(m_program);
+    glUniform1i(m_uniforms.blendOut, state.prim.abe ? m_blendOut : 0);
+    glUniform1i(m_uniforms.blendFactor, static_cast<int>(context.alpha >> 4 & 0x3u));
+    glUniform1f(m_uniforms.blendFix, static_cast<float>(context.alpha >> 32 & 0xFFu) / 128.0f);
     glUniform2f(m_uniforms.targetSize, static_cast<float>(target.width), static_cast<float>(target.height));
     float texWidth = 1.0f, texHeight = 1.0f;
     const bool textured = state.prim.tme && bindTexture(state, target, texWidth, texHeight);

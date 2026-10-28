@@ -98,6 +98,8 @@ private:
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
     void applyBlend(const GSDrawState &state);
+    // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
+    int m_blendOut = 0;
     // One PCRTC read circuit's picture (RGBA8, alpha as the GS stores it), from its render target or else GS memory.
     bool readCircuit(uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels, uint32_t &width,
                      uint32_t &height, uint32_t &fbp);
@@ -121,7 +123,7 @@ private:
     struct Uniforms
     {
         int targetSize = -1, texSize = -1, textured = -1, fst = -1, tfx = -1, tcc = -1, fog = -1, fogColor = -1;
-        int alphaTest = -1, alphaRef = -1, sampler = -1;
+        int alphaTest = -1, alphaRef = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
     } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
