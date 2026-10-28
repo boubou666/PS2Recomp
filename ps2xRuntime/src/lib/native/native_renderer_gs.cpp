@@ -217,8 +217,27 @@ void main()
                 m_stream.pop_front();
             }
         }
-        if (batches.empty() || target.framebuffer == 0u)
-            return; // nothing for this group, or a GS renderer without GL targets (CPU, paraLLEl): present() draws
+        if (target.framebuffer == 0u)
+        {
+            // A GS renderer without GL targets (CPU, paraLLEl): present() draws these groups, clipped as the GS has
+            // them here (the groups before this marker had none of their own: the same state).
+            const float ox = static_cast<float>(target.xOffset) / 16.0f, oy = static_cast<float>(target.yOffset) / 16.0f;
+            const uint64_t from = batches.empty() ? group : std::min(batches.front().group, group);
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            for (uint64_t g = std::max(from, group > kClips ? group - kClips + 1u : 1u); g <= group; ++g)
+            {
+                Clip &clip = m_clips[g % kClips];
+                clip.group = g;
+                clip.x0 = ox + static_cast<float>(target.scissorX0);
+                clip.y0 = oy + static_cast<float>(target.scissorY0);
+                clip.x1 = ox + static_cast<float>(target.scissorX1) + 1.0f;
+                clip.y1 = oy + static_cast<float>(target.scissorY1) + 1.0f;
+            }
+            m_markedGroup.store(group, std::memory_order_release);
+            return;
+        }
+        if (batches.empty())
+            return; // nothing for this group
         if (!m_gsPass)
         {
             m_gsPass = new GsPass();

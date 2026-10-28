@@ -117,6 +117,13 @@ namespace
 
         void flush() override { m_interface.flush(); }
 
+        void contextRegisters(int context, uint64_t &xyoffset, uint64_t &scissor) const override
+        {
+            const auto &ctx = m_interface.get_register_state().ctx[context != 0 ? 1 : 0];
+            xyoffset = ctx.xyoffset.bits;
+            scissor = ctx.scissor.bits;
+        }
+
         PresentationFrame present(const GSPresentationRequest &request) override
         {
             PrivRegisterState &priv = m_interface.get_priv_register_state();

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -162,6 +163,8 @@ void main()
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
         batch.key = m_key;
+        batch.group = m_streamDraws ? m_group : 0u;
+        m_building.lastGroup = std::max(m_building.lastGroup, batch.group);
         m_building.vertices.insert(m_building.vertices.end(), vertices, vertices + count);
         if (m_streamDraws)
         {
@@ -202,12 +205,29 @@ void main()
 
     bool Renderer::present(float x, float y, float width, float height)
     {
-        std::shared_ptr<Frame> frame, previous;
+        std::shared_ptr<Frame> published, before;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            frame = m_published;
-            previous = m_previous;
+            published = m_published;
+            before = m_previous;
         }
+        // The game publishes a frame before the GS reaches its groups' markers (their clips), often the next one too:
+        // the newest of the two the GS has reached the last group of is shown (the latest one after 100 ms of
+        // neither, markers that never come).
+        {
+            const uint64_t marked = m_markedGroup.load(std::memory_order_acquire);
+            const auto reached = [marked](const std::shared_ptr<Frame> &f) { return f && (f->lastGroup == 0u || marked >= f->lastGroup); };
+            std::shared_ptr<Frame> next = reached(published) ? published : reached(before) ? before : nullptr;
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (!next && published && (!m_shown || now - m_shown->time > 0.1))
+                next = published;
+            if (next && next != m_shown && (!m_shown || next->time > m_shown->time))
+            {
+                m_shownPrevious = std::move(m_shown);
+                m_shown = std::move(next);
+            }
+        }
+        const std::shared_ptr<Frame> frame = m_shown, previous = m_shownPrevious;
         if (!frame || !m_enabled || m_drewIntoGs.load(std::memory_order_relaxed))
             return false; // or the GS frame has the native draws already (drawn into it in the GS stream)
         if (!m_gpu)
@@ -272,9 +292,47 @@ void main()
             const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
             alpha = static_cast<float>(std::clamp((now - frame->time) / (frame->time - previous->time), 0.0, 1.0));
         }
-        for (const Batch &batch : frame->batches)
+        // Each batch's clip (its group's GS scissor) in the target's pixels, bottom-up; x1 <= x0: none.
+        struct Rect
         {
+            int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        };
+        std::vector<Rect> clips(frame->batches.size());
+        {
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            for (size_t i = 0; i < frame->batches.size(); ++i)
+            {
+                const uint64_t group = frame->batches[i].group;
+                const Clip &clip = m_clips[group % kClips];
+                if (group == 0u || clip.group != group)
+                    continue;
+                const float sx = static_cast<float>(w) / screen.width, sy = static_cast<float>(h) / screen.height;
+                // PS2X_NATIVE_LOG_CLIPS=1: now and then, a batch's clip.
+                static const bool s_logClips = std::getenv("PS2X_NATIVE_LOG_CLIPS") != nullptr;
+                static uint32_t s_clipLogs = 0;
+                if (s_logClips && ++s_clipLogs % 5000u == 1u)
+                    std::fprintf(stderr, "[native] clip group %llu: %.1f %.1f - %.1f %.1f (screen %.1f %.1f %.1fx%.1f)\n",
+                                 static_cast<unsigned long long>(group), clip.x0, clip.y0, clip.x1, clip.y1, screen.originX,
+                                 screen.originY, screen.width, screen.height);
+                Rect &rect = clips[i];
+                rect.x0 = std::clamp(static_cast<int>(std::lround((clip.x0 - screen.originX) * sx)), 0, w);
+                rect.x1 = std::clamp(static_cast<int>(std::lround((clip.x1 - screen.originX) * sx)), 0, w);
+                rect.y0 = std::clamp(static_cast<int>(std::lround(h - (clip.y1 - screen.originY) * sy)), 0, h);
+                rect.y1 = std::clamp(static_cast<int>(std::lround(h - (clip.y0 - screen.originY) * sy)), 0, h);
+                if (rect.x0 == 0 && rect.y0 == 0 && rect.x1 == w && rect.y1 == h)
+                    rect = Rect{}; // the whole target: no clip
+                else if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                    rect = Rect{0, 0, 0, -1}; // nothing shows
+            }
+        }
+        bool scissored = false;
+        for (size_t index = 0; index < frame->batches.size(); ++index)
+        {
+            const Batch &batch = frame->batches[index];
             const Material &m = batch.material;
+            const Rect &clip = clips[index];
+            if (clip.y1 < 0)
+                continue;
             float matrix[16];
             std::memcpy(matrix, batch.matrix, sizeof(matrix));
             if (s_interpolate && previous && batch.key != 0u)
@@ -344,8 +402,20 @@ void main()
                 rlActiveTextureSlot(0);
                 rlEnableTexture(gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), texture));
             }
+            if (clip.x1 > clip.x0)
+            {
+                rlEnableScissorTest();
+                rlScissor(clip.x0, clip.y0, clip.x1 - clip.x0, clip.y1 - clip.y0);
+                scissored = true;
+            }
+            else if (scissored)
+            {
+                rlDisableScissorTest();
+                scissored = false;
+            }
             rlDrawVertexArray(static_cast<int>(batch.first), static_cast<int>(batch.count));
         }
+        rlDisableScissorTest();
         rlDisableVertexArray();
         rlDisableShader();
         rlDisableTexture();

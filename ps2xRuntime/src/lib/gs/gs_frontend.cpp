@@ -623,8 +623,21 @@ void GS::queueNativeDraw(uint64_t group, int context)
     const int index = context != 0 ? 1 : 0;
     auto draw = [this, group, index]() {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-        if (m_backend)
-            m_backend->NativeDraw(group, m_ctx[index]);
+        if (!m_backend)
+            return;
+        GSContext context = m_ctx[index];
+        if (m_parallel) // the packets go to paraLLEl-GS whole: its registers, not the front end's
+        {
+            uint64_t xyoffset = 0, scissor = 0;
+            m_parallel->contextRegisters(index, xyoffset, scissor);
+            context.xyoffset.ofx = static_cast<uint16_t>(xyoffset & 0xFFFFu);
+            context.xyoffset.ofy = static_cast<uint16_t>((xyoffset >> 32) & 0xFFFFu);
+            context.scissor.x0 = static_cast<uint16_t>(scissor & 0x7FFu);
+            context.scissor.x1 = static_cast<uint16_t>((scissor >> 16) & 0x7FFu);
+            context.scissor.y0 = static_cast<uint16_t>((scissor >> 32) & 0x7FFu);
+            context.scissor.y1 = static_cast<uint16_t>((scissor >> 48) & 0x7FFu);
+        }
+        m_backend->NativeDraw(group, context);
     };
     if (!shouldQueue())
     {

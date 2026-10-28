@@ -114,6 +114,7 @@ namespace ps2x::native
             Material material;
             float matrix[16];
             uint32_t first = 0, count = 0;
+            uint64_t group = 0; // beginGroup's (its clip at present: the GS scissor where that group's marker was)
             uint64_t key = 0; // setKey
             // Taken from the texture cache when the batch is drawn (the game's thread, in stream order): games reuse
             // texture memory before the frame is presented. Null when its upload was not there yet (an upload in the
@@ -128,6 +129,7 @@ namespace ps2x::native
             std::vector<Batch> batches;
             double time = 0.0;                           // when it was published (seconds)
             std::unordered_map<uint64_t, uint32_t> keys; // key -> its first batch
+            uint64_t lastGroup = 0;                      // its batches' latest group (0: none)
         };
 
     private:
@@ -159,6 +161,18 @@ namespace ps2x::native
         std::deque<StreamBatch> m_stream; // batches waiting for their group's point of the GS stream
         GsPass *m_gsPass = nullptr;       // its GL objects live in the GS thread's context: kept to the end
         std::atomic<bool> m_drewIntoGs{false};
+        // Without GL targets (present() draws the frame over the GS one): each group's GS scissor, in primitive
+        // coordinates (scissor plus XYOFFSET), as the GS reached its marker; a frame is shown once the GS has reached
+        // its last group, so its clips are known (until then, the one before).
+        struct Clip
+        {
+            uint64_t group = 0;
+            float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+        };
+        static constexpr size_t kClips = 1u << 14;
+        std::unique_ptr<Clip[]> m_clips{new Clip[kClips]};
+        std::atomic<uint64_t> m_markedGroup{0}; // the latest group whose marker the GS reached
+        std::shared_ptr<Frame> m_shown, m_shownPrevious; // present thread: the frame drawn and the one before it
     };
 }
 
