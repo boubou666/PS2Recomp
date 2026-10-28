@@ -82,6 +82,11 @@ namespace ps2x::native
         // A group has batches waiting (its GS marker is worth queueing): the VIF1 interpreter reaches a program after
         // the native port has drawn it (at the transfer's start), so a group without batches by then has none.
         bool hasGroup(uint64_t group);
+        // Frames faster than the game's (PS2X_NATIVE_INTERPOLATE=1): the native port keys each object's batches by
+        // something stable from one game frame to the next (its own data, not its place in the stream); present()
+        // then draws a key found in the previous frame too with its matrix between the two, by how far the window's
+        // time is into the current game frame (one game frame behind, as interpolation is). 0: not interpolated.
+        void setKey(uint64_t key) { m_key = key; }
 
         // Present thread: draws the latest frame into the given window rectangle; false when there is none yet.
         bool present(float x, float y, float width, float height);
@@ -109,6 +114,7 @@ namespace ps2x::native
             Material material;
             float matrix[16];
             uint32_t first = 0, count = 0;
+            uint64_t key = 0; // setKey
             // Taken from the texture cache when the batch is drawn (the game's thread, in stream order): games reuse
             // texture memory before the frame is presented. Null when its upload was not there yet (an upload in the
             // same VIF1 transfer reaches the cache when VIF1 gets to it): looked up again where the batch is drawn,
@@ -120,6 +126,8 @@ namespace ps2x::native
             Screen screen;
             std::vector<Vertex> vertices;
             std::vector<Batch> batches;
+            double time = 0.0;                           // when it was published (seconds)
+            std::unordered_map<uint64_t, uint32_t> keys; // key -> its first batch
         };
 
     private:
@@ -140,6 +148,8 @@ namespace ps2x::native
         Frame m_building;
         std::mutex m_mutex;
         std::shared_ptr<Frame> m_published;
+        std::shared_ptr<Frame> m_previous; // the one before m_published (interpolation)
+        uint64_t m_key = 0;
         int m_gsFrame[4] = {}; // id, width, height, pixel format
         std::unique_ptr<Gpu> m_gpu; // present thread only
         bool m_enabled = false;

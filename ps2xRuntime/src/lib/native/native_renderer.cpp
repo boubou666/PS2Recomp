@@ -4,6 +4,7 @@
 #include "rlgl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -160,6 +161,7 @@ void main()
             batch.texture = ps2x::native::textures().texture(material.tex0, material.texa);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
+        batch.key = m_key;
         m_building.vertices.insert(m_building.vertices.end(), vertices, vertices + count);
         if (m_streamDraws)
         {
@@ -180,7 +182,13 @@ void main()
     {
         auto frame = std::make_shared<Frame>(std::move(m_building));
         m_building = Frame{};
+        m_key = 0;
+        frame->time = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        for (uint32_t i = 0; i < frame->batches.size(); ++i)
+            if (frame->batches[i].key != 0u)
+                frame->keys.emplace(frame->batches[i].key, i);
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_previous = std::move(m_published);
         m_published = std::move(frame);
     }
 
@@ -194,10 +202,11 @@ void main()
 
     bool Renderer::present(float x, float y, float width, float height)
     {
-        std::shared_ptr<Frame> frame;
+        std::shared_ptr<Frame> frame, previous;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             frame = m_published;
+            previous = m_previous;
         }
         if (!frame || !m_enabled || m_drewIntoGs.load(std::memory_order_relaxed))
             return false; // or the GS frame has the native draws already (drawn into it in the GS stream)
@@ -250,9 +259,32 @@ void main()
         const int slot = 0;
         rlDisableBackfaceCulling();
         rlEnableDepthTest();
+        // PS2X_NATIVE_INTERPOLATE=1: matrices between the previous game frame and this one (setKey).
+        static const bool s_interpolate = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_INTERPOLATE");
+            return value && *value == '1';
+        }();
+        float alpha = 1.0f;
+        static uint64_t s_matched = 0; // batches drawn interpolated since the last stats line
+        if (s_interpolate && previous && frame->time > previous->time)
+        {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            alpha = static_cast<float>(std::clamp((now - frame->time) / (frame->time - previous->time), 0.0, 1.0));
+        }
         for (const Batch &batch : frame->batches)
         {
             const Material &m = batch.material;
+            float matrix[16];
+            std::memcpy(matrix, batch.matrix, sizeof(matrix));
+            if (s_interpolate && previous && batch.key != 0u)
+                if (const auto it = previous->keys.find(batch.key); it != previous->keys.end())
+                {
+                    ++s_matched;
+                    const float *from = previous->batches[it->second].matrix;
+                    for (int i = 0; i < 16; ++i)
+                        matrix[i] = from[i] + (batch.matrix[i] - from[i]) * alpha;
+                }
             // Blend state first: rlSetBlendMode flushes raylib's own batch, which unbinds the shader and the vertex
             // array (even with nothing to draw), so they are bound after it.
             if (m.blend == Material::Blend::Opaque)
@@ -273,7 +305,7 @@ void main()
             rlSetUniform(gpu.locScreen, screenRect, RL_SHADER_UNIFORM_VEC4, 1);
             rlSetUniform(gpu.locDepthMax, &screen.depthMax, RL_SHADER_UNIFORM_FLOAT, 1);
             rlSetUniform(gpu.locTex, &slot, RL_SHADER_UNIFORM_INT, 1);
-            rlSetUniform(gpu.locM, batch.matrix, RL_SHADER_UNIFORM_VEC4, 4);
+            rlSetUniform(gpu.locM, matrix, RL_SHADER_UNIFORM_VEC4, 4);
             std::shared_ptr<const TextureCache::Texture> texture = batch.texture;
             if (m.textured && !texture)
                 texture = ps2x::native::textures().texture(m.tex0, m.texa);
@@ -312,8 +344,12 @@ void main()
         }();
         static uint32_t s_presents = 0;
         if (s_stats && ++s_presents % 250u == 0u)
-            std::fprintf(stderr, "[native] present %u: %zu batches, %zu vertices, shader %u (default %u), target %dx%d\n",
-                         s_presents, frame->batches.size(), frame->vertices.size(), gpu.shader, rlGetShaderIdDefault(), w, h);
+        {
+            std::fprintf(stderr, "[native] present %u: %zu batches, %zu vertices, shader %u (default %u), target %dx%d, alpha %.2f, interpolated batches %llu\n",
+                         s_presents, frame->batches.size(), frame->vertices.size(), gpu.shader, rlGetShaderIdDefault(), w, h, alpha,
+                         static_cast<unsigned long long>(s_matched));
+            s_matched = 0;
+        }
 
         // PS2X_NATIVE_CAPTURE_DIR=<dir>: the native frame as native_<n>.png every PS2X_NATIVE_CAPTURE_INTERVAL seconds
         // (default 5), at the window's resolution, to look at it without the GS frame; with gs_<n>.png, the GS frame of

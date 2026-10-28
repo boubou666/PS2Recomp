@@ -3515,9 +3515,16 @@ void PS2Runtime::run()
         // A game on native frame pacing sets the rate: the window follows its frame cap (0 = unlimited).
         {
             static int s_targetFps = 60;
+            // PS2X_PRESENT_FPS=<n>: the window's rate otherwise (0 = unlimited), e.g. above the game's with
+            // PS2X_NATIVE_INTERPOLATE=1.
+            static const int s_presentFps = []
+            {
+                const char *value = std::getenv("PS2X_PRESENT_FPS");
+                return value && *value ? std::atoi(value) : 60;
+            }();
             const int targetFps = m_eeScheduler && m_eeScheduler->nativeFrames()
                                       ? static_cast<int>(m_framePacer.cap())
-                                      : 60;
+                                      : s_presentFps;
             if (targetFps != s_targetFps)
             {
                 SetTargetFPS(targetFps);
