@@ -433,6 +433,13 @@ public:
         m_frameWaitPcEnd = end;
         m_frameWaitHoldsVBlank = holdVBlank;
     }
+    // Native frames: a game that runs its own loop on real time (FramePacer) shows each frame when it ends it
+    // (presentGuestFrame, from the game's frame end on the EE thread) instead of at vblanks, which then latch
+    // nothing, and keeps EE time on real time itself: events fire once EE time reaches them, never held for their
+    // host deadline. The vblank timer keeps running for whatever else of the game counts on it.
+    void setNativeFrames(bool enabled) noexcept { m_nativeFrames = enabled; }
+    [[nodiscard]] bool nativeFrames() const noexcept { return m_nativeFrames; }
+    void presentGuestFrame();
     // Whether a thread of equal priority takes over at the end of a time slice (default yes; PS2X_EE_SLICE_EQUAL=0
     // no). The real EE kernel never round-robins equal priorities: a thread runs until it blocks or a higher
     // priority one becomes ready.
@@ -565,6 +572,8 @@ private:
     uint32_t m_frameWaitPcBegin = 0;
     uint32_t m_frameWaitPcEnd = 0;
     bool m_frameWaitHoldsVBlank = false;
+    bool m_nativeFrames = false;
+    void latchGuestFrame();
     // The setGuestFrameWait thread, when it is running or ready: whether it sits in its wait loop.
     [[nodiscard]] std::optional<bool> guestFrameWaiting();
     std::atomic<bool> m_equalPrioritySlicing{[]
