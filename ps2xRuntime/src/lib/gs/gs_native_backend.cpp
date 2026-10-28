@@ -859,6 +859,10 @@ void GSNativeBackend::flushBatch()
             std::fprintf(stderr, "[gs:probe]   extent x %.1f..%.1f y %.1f..%.1f s %.1f..%.1f t %.1f..%.1f z %.6f "
                                  "tex %.0fx%.0f\n",
                          x0, x1, y0, y1, s0, s1, t0, t1, z0, texWidth, texHeight);
+            if (m_batch.size() <= 6u)
+                for (const Vertex &v : m_batch)
+                    std::fprintf(stderr, "[gs:probe]   vertex (%.1f,%.1f) z=%.6f rgba=%u,%u,%u,%u\n", v.x, v.y, v.z, v.r,
+                                 v.g, v.b, v.a);
         }
     }
     glBindVertexArray(0);
