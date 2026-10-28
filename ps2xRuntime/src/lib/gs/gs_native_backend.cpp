@@ -959,6 +959,25 @@ void GSNativeBackend::resolveAllTargets()
     flushBatch();
     if (!ensureContext())
         return;
+    // PS2X_GS_NATIVE_VRAMCHECK=1: the GPU copy against GS memory, block by block, for pages not resolved on the GPU.
+    if (static const bool check = std::getenv("PS2X_GS_NATIVE_VRAMCHECK") != nullptr; check && m_vram && m_vramFramebuffer)
+    {
+        syncVramToGpu();
+        std::vector<uint32_t> gpu(1024u * 1024u);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, 1024, 1024, GL_RED_INTEGER, GL_UNSIGNED_INT, gpu.data());
+        uint32_t differing = 0;
+        for (uint32_t block = 0; block < 16384u; ++block)
+        {
+            if (m_gpuNewer[block / 32u])
+                continue;
+            if (std::memcmp(gpu.data() + block * 64u, m_vram + static_cast<size_t>(block) * 256u, 256u) != 0 &&
+                differing++ < 40u)
+                std::fprintf(stderr, "[gs:native] vram check: block %u (page %u) differs\n", block, block / 32u);
+        }
+        std::fprintf(stderr, "[gs:native] vram check: %u blocks differ\n", differing);
+    }
     for (auto &[fbp, target] : m_targets)
         if (target.dirty && target.usedHeight != 0u)
             resolveTarget(target);
