@@ -438,6 +438,46 @@ void GSNativeBackend::appendPrimitive(const GSPrimitiveBatch &batch)
     }
 }
 
+void GSNativeBackend::resolveTarget(RenderTarget &target)
+{
+    const uint32_t width = target.fbw * 64u;
+    const uint32_t height = target.usedHeight;
+    target.dirty = false;
+    if (width == 0u || height == 0u || width > target.width)
+        return;
+    // The pixels as a host-to-local CT32 transfer at the frame's base: rows top first (GL row 0 is GS row 0), alpha
+    // as the GS stores it.
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE,
+                 pixels.data());
+    const uint64_t bitbltbuf = static_cast<uint64_t>(target.fbp * 32u) << 32 | static_cast<uint64_t>(target.fbw) << 48 |
+                               static_cast<uint64_t>(0x00u) << 56;
+    const uint64_t trxreg = static_cast<uint64_t>(width) | static_cast<uint64_t>(height) << 32;
+    ps2x::native::Renderer::instance().textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
+}
+
+void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
+{
+    // The texture's blocks: TBW * 64 texels by its height, at its format's size (a conservative extent).
+    static constexpr uint32_t kBits[64] = {32, 24, 16, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 4, 0, 0, 0,
+                                           0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4};
+    const uint32_t bits = kBits[tex0.psm & 0x3Fu] ? kBits[tex0.psm & 0x3Fu] : 32u;
+    const uint64_t texRows = 1ull << std::min<uint32_t>(tex0.th, 10u);
+    const uint64_t texBlocks = (std::max<uint32_t>(tex0.tbw, 1u) * 64ull * texRows * bits / 8u + 255u) / 256u;
+    for (auto &[fbp, target] : m_targets)
+    {
+        if (!target.dirty || target.usedHeight == 0u)
+            continue;
+        const uint64_t base = static_cast<uint64_t>(fbp) * 32u;
+        // CT32 pages are 64 x 32 pixels, 32 blocks each.
+        const uint64_t blocks = static_cast<uint64_t>(target.fbw) * ((target.usedHeight + 31u) / 32u) * 32u;
+        if (tex0.tbp0 < base + blocks && base < tex0.tbp0 + texBlocks)
+            resolveTarget(target);
+    }
+}
+
 bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height)
 {
     const GSContext &context = state.context;
@@ -508,6 +548,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     }
     if (!fromTarget)
     {
+        resolveTargetsUnder(context.tex0);
         const uint64_t tex0 = rawTex0(context.tex0);
         const uint64_t texa = rawTexa(state.texa);
         const std::shared_ptr<const ps2x::native::TextureCache::Texture> decoded =
@@ -612,6 +653,8 @@ void GSNativeBackend::flushBatch()
     const GSDrawState &state = m_batchState;
     const GSContext &context = state.context;
     RenderTarget &target = renderTarget(context.frame);
+    target.dirty = true;
+    target.usedHeight = std::min(target.height, std::max<uint32_t>(target.usedHeight, context.scissor.y1 + 1u));
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glViewport(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height));
     glEnable(GL_SCISSOR_TEST);

@@ -61,6 +61,8 @@ private:
         uint32_t framebuffer = 0;
         uint32_t color = 0;
         uint32_t depth = 0;
+        uint32_t usedHeight = 0; // rows drawn so far (the scissor's bottom), what a resolve reads back
+        bool dirty = false;      // drawn since its pixels were last written to GS memory (resolveTarget)
     };
 
     struct Vertex
@@ -84,6 +86,10 @@ private:
     bool ensureContext(bool create = false);
     RenderTarget &renderTarget(const GSFrameReg &frame);
     RenderTarget *renderTargetAtBlock(uint32_t block);
+    // A texture read the GPU cannot serve from a render target (another format, an offset base) sees GS memory:
+    // first write back there the drawn pixels of every render target it overlaps.
+    void resolveTargetsUnder(const GSTex0Reg &tex0);
+    void resolveTarget(RenderTarget &target);
     void appendPrimitive(const GSPrimitiveBatch &batch);
     void flushBatch();
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
