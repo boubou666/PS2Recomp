@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/gs/gs_backend.h"
+#include "runtime/native/native_texture_cache.h"
 
 #include <cstdint>
 #include <memory>
@@ -151,6 +152,12 @@ private:
     };
     std::unordered_map<uint32_t, ReadbackBuffers> m_readbacks; // per displayed buffer (readCircuit)
     std::unordered_map<uint64_t, UploadedTexture> m_uploaded;
+    struct LastLookup
+    {
+        uint64_t tex0 = 0, texa = 0, uploads = ~0ull;
+        std::shared_ptr<const ps2x::native::TextureCache::Texture> texture;
+    };
+    std::unordered_map<uint64_t, LastLookup> m_lastLookups; // texture cache lookups since the last upload
 
     // The batch being collected: draws whose state draws the same way (sameDrawState).
     std::vector<Vertex> m_batch;

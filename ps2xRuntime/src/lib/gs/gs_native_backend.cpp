@@ -721,8 +721,18 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
         resolveTargetsUnder(context.tex0);
         const uint64_t tex0 = rawTex0(context.tex0);
         const uint64_t texa = rawTexa(state.texa);
-        const std::shared_ptr<const ps2x::native::TextureCache::Texture> decoded =
-            ps2x::native::textures().texture(tex0, texa);
+        // The cache revalidates a texture's pages on every lookup; while nothing was uploaded since this TEX0/TEXA was
+        // last looked up, its texture is still the same one.
+        ps2x::native::TextureCache &cache = ps2x::native::textures();
+        LastLookup &last = m_lastLookups[tex0 ^ (texa * 0x9E3779B97F4A7C15ull)];
+        if (!last.texture || last.tex0 != tex0 || last.texa != texa || last.uploads != cache.uploads())
+        {
+            last.texture = cache.texture(tex0, texa);
+            last.tex0 = tex0;
+            last.texa = texa;
+            last.uploads = cache.uploads();
+        }
+        const std::shared_ptr<const ps2x::native::TextureCache::Texture> decoded = last.texture;
         if (!decoded || decoded->width == 0u || decoded->height == 0u || decoded->rgba.empty())
             return false;
         const uint64_t version = decoded->version;
