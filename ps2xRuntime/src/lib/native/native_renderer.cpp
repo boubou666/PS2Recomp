@@ -309,6 +309,24 @@ void main()
             std::shared_ptr<const TextureCache::Texture> texture = batch.texture;
             if (m.textured && !texture)
                 texture = ps2x::native::textures().texture(m.tex0, m.texa);
+            // PS2X_NATIVE_DUMP_TEXTURE=<tex0, hex>: that texture as the cache decoded it, once, as texture_<tex0>.png
+            // (in PS2X_NATIVE_CAPTURE_DIR, or the current folder).
+            static const uint64_t s_dumpTex0 = []
+            {
+                const char *value = std::getenv("PS2X_NATIVE_DUMP_TEXTURE");
+                return value && *value ? std::strtoull(value, nullptr, 16) : 0ull;
+            }();
+            static bool s_dumped = false;
+            if (s_dumpTex0 != 0u && !s_dumped && texture && m.tex0 == s_dumpTex0)
+            {
+                s_dumped = true;
+                Image image{const_cast<uint32_t *>(texture->rgba.data()), static_cast<int>(texture->width),
+                            static_cast<int>(texture->height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                const char *dir = std::getenv("PS2X_NATIVE_CAPTURE_DIR");
+                char path[1024];
+                std::snprintf(path, sizeof(path), "%s/texture_%016llx.png", dir && *dir ? dir : ".", static_cast<unsigned long long>(s_dumpTex0));
+                ExportImage(image, path);
+            }
             const int textured = m.textured && texture ? 1 : 0, alphaTest = m.alphaTest ? 1 : 0;
             const int opaque = m.blend == Material::Blend::Opaque ? 1 : 0;
             rlSetUniform(gpu.locOpaque, &opaque, RL_SHADER_UNIFORM_INT, 1);
