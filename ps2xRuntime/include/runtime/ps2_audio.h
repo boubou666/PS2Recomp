@@ -24,7 +24,7 @@ public:
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
-    void setAudioReady(bool ready) { m_audioReady = ready; }
+    void setAudioReady(bool ready);
 
     // SPU2 output of the IOP emulator: interleaved stereo frames at 48 kHz of emulated time,
     // played through one raylib stream that follows the emulation speed.
@@ -40,6 +40,7 @@ public:
     // Before CloseAudioDevice.
     void closeSpu2Stream();
     struct Spu2Stream;
+    void openSpu2Stream();
 
 private:
     struct DecodedSample

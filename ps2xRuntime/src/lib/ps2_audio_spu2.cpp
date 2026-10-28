@@ -138,10 +138,10 @@ void PS2AudioBackend::Spu2StreamDeleter::operator()(Spu2Stream *stream) const
     delete stream;
 }
 
-void PS2AudioBackend::pushSpu2Frames(const int16_t *frames, size_t count)
+// The SPU2's stream (and PS2X_SPU2_WAV) the first time it is needed, and its playback once the audio device is
+// ready (the SPU2 on the wall clock asks for it as the IOP starts, before the window opens the device).
+void PS2AudioBackend::openSpu2Stream()
 {
-    if (!frames || count == 0u)
-        return;
     if (!m_spu2)
     {
         m_spu2.reset(new Spu2Stream());
@@ -151,22 +151,37 @@ void PS2AudioBackend::pushSpu2Frames(const int16_t *frames, size_t count)
             if (m_spu2->wav.is_open())
                 writeWavHeader(m_spu2->wav, 0u);
         }
-#if !defined(PLATFORM_VITA)
-        if (m_audioReady && IsAudioDeviceReady())
-        {
-            SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamBufferFrames));
-            m_spu2->stream = LoadAudioStream(kSampleRate, 16u, 2u);
-            SetAudioStreamBufferSizeDefault(0);
-            if (IsAudioStreamValid(m_spu2->stream))
-            {
-                g_spu2Stream.store(m_spu2.get());
-                SetAudioStreamCallback(m_spu2->stream, spu2StreamCallback);
-                PlayAudioStream(m_spu2->stream);
-                m_spu2->playing = true;
-            }
-        }
-#endif
     }
+#if !defined(PLATFORM_VITA)
+    if (!m_spu2->playing && m_audioReady && IsAudioDeviceReady())
+    {
+        SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamBufferFrames));
+        m_spu2->stream = LoadAudioStream(kSampleRate, 16u, 2u);
+        SetAudioStreamBufferSizeDefault(0);
+        if (IsAudioStreamValid(m_spu2->stream))
+        {
+            g_spu2Stream.store(m_spu2.get());
+            SetAudioStreamCallback(m_spu2->stream, spu2StreamCallback);
+            PlayAudioStream(m_spu2->stream);
+            m_spu2->playing = true;
+        }
+    }
+#endif
+}
+
+void PS2AudioBackend::setAudioReady(bool ready)
+{
+    m_audioReady = ready;
+    if (ready && m_spu2)
+        openSpu2Stream();
+}
+
+void PS2AudioBackend::pushSpu2Frames(const int16_t *frames, size_t count)
+{
+    if (!frames || count == 0u)
+        return;
+    if (!m_spu2 || !m_spu2->playing)
+        openSpu2Stream();
     {
         std::lock_guard<std::mutex> lock(m_spu2MixerMutex);
         if (m_spu2Mixer)
@@ -181,11 +196,8 @@ void PS2AudioBackend::pushSpu2Frames(const int16_t *frames, size_t count)
 
 void PS2AudioBackend::setSpu2Source(Spu2Source source)
 {
-    if (source && !m_spu2)
-    {
-        const int16_t silence[2] = {0, 0};
-        pushSpu2Frames(silence, 1u); // opens the stream (and PS2X_SPU2_WAV) as the first pushed frames would
-    }
+    if (source)
+        openSpu2Stream();
     if (m_spu2)
     {
         std::lock_guard<std::mutex> lock(m_spu2->mutex);
