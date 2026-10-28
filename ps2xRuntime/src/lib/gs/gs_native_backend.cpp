@@ -460,6 +460,27 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     const GSContext &context = state.context;
     GLuint texture = 0;
     bool fromTarget = false;
+    // PS2X_GS_NATIVE_LOG: each distinct texture read that overlaps a render target's pages, as (render target, texture
+    // format and base, offset in pages): what still falls back to the texture cache, which has no drawn pixels.
+    if (static const bool logOverlaps = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logOverlaps)
+    {
+        static std::unordered_map<uint64_t, uint32_t> s_seen;
+        for (const auto &[fbp, rt] : m_targets)
+        {
+            const uint32_t base = fbp * 32u;
+            const uint32_t blocks = (rt.fbw * 64u * rt.height * 4u) / 256u;
+            if (context.tex0.tbp0 < base || context.tex0.tbp0 >= base + blocks)
+                continue;
+            const uint64_t key = static_cast<uint64_t>(fbp) << 40 | static_cast<uint64_t>(context.tex0.psm) << 32 |
+                                 static_cast<uint64_t>(context.tex0.tbp0 - base) << 8 | context.tex0.tbw;
+            if (s_seen.size() < 300u && s_seen.emplace(key, 0u).second)
+                std::fprintf(stderr,
+                             "[gs:native] read over target fbp=%u fbw=%u psm=0x%x: tex psm=0x%x tbp0=+%u blocks tbw=%u "
+                             "tw=%u th=%u into fbp=%u\n",
+                             fbp, rt.fbw, rt.psm, context.tex0.psm, context.tex0.tbp0 - base, context.tex0.tbw,
+                             context.tex0.tw, context.tex0.th, target.fbp);
+        }
+    }
     if (colorFormat(context.tex0.psm))
     {
         if (RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0))
