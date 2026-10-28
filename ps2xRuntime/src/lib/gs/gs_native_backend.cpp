@@ -791,6 +791,22 @@ void GSNativeBackend::flushBatch()
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_batch.size() * sizeof(Vertex)), m_batch.data(),
                  GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
+    // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
+    if (static const char *probe = std::getenv("PS2X_GS_NATIVE_PROBE");
+        probe && std::strtoul(probe, nullptr, 10) == target.fbp)
+    {
+        static uint32_t s_probes = 0;
+        if (s_probes++ < 60u)
+        {
+            uint8_t pixel[4] = {};
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+            glReadPixels(320, 128, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+            std::fprintf(stderr, "[gs:probe] fbp=%u after %zu verts tme=%d textured=%d tbp=%u: (320,128)=%u,%u,%u,%u "
+                                 "fbo=%x\n",
+                         target.fbp, m_batch.size(), state.prim.tme ? 1 : 0, textured ? 1 : 0, context.tex0.tbp0,
+                         pixel[0], pixel[1], pixel[2], pixel[3], glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+        }
+    }
     glBindVertexArray(0);
     m_batch.clear();
     m_batchMaxY = 0.0f;
