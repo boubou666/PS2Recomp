@@ -280,6 +280,13 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     uint16_t btns = 0xFFFFu;
     const int kGamepad = port == 1 ? 1 : 0;
     const bool useGamepad = IsGamepadAvailable(kGamepad);
+    static bool s_wasAvailable[2] = {};
+    if (useGamepad != s_wasAvailable[kGamepad])
+    {
+        s_wasAvailable[kGamepad] = useGamepad;
+        std::fprintf(stderr, "[pad] gamepad %d %s%s\n", kGamepad, useGamepad ? "connected: " : "disconnected",
+                     useGamepad ? GetGamepadName(kGamepad) : "");
+    }
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
@@ -329,6 +336,12 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     }
     else if (port == 0)
     {
+        // The movement keys also push the left stick fully, for games that move with it (sticks are read only in
+        // analog mode).
+        const bool up = IsKeyDown(KEY_UP) || IsKeyDown(KEY_W), down = IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S);
+        const bool left = IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A), right = IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D);
+        data[6] = static_cast<uint8_t>(left == right ? kPadStickCenter : left ? 0x00 : 0xFF);
+        data[7] = static_cast<uint8_t>(up == down ? kPadStickCenter : up ? 0x00 : 0xFF);
         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
             clearBit(PAD_UP);
         if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))

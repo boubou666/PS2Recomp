@@ -214,10 +214,19 @@ namespace ps2_stubs
             return &g_padPorts[port];
         }
 
+        // Real pads open DIGITAL (CURID=4, mode 0x41) until the player presses ANALOG, which a PC controller has no
+        // button for. PS2X_PAD_START_ANALOG=1 opens them in analog (DualShock) mode, for games that never switch
+        // the pad themselves but need the sticks (VP2's battles move the party with the left stick).
+        bool padStartsAnalog()
+        {
+            static const bool analog = [] { const char *v = std::getenv("PS2X_PAD_START_ANALOG"); return v && v[0] == '1'; }();
+            return analog;
+        }
+
         void initializePadPortLocked(PadPortState &portState, uint32_t dmaAddr)
         {
             portState.open = true;
-            portState.analogMode = false;  // real pads open DIGITAL
+            portState.analogMode = padStartsAnalog();
             portState.pressureEnabled = false;
             portState.buttonMask = 0xFFFFu;
             portState.dmaAddr = dmaAddr;
@@ -619,7 +628,7 @@ namespace ps2_stubs
         }
 
         portState->open = true;
-        portState->analogMode = false;     // real pads open DIGITAL
+        portState->analogMode = padStartsAnalog();
         portState->pressureEnabled = false;
         portState->buttonMask = 0xFFFFu;
         portState->dmaAddr = dmaAddr;
