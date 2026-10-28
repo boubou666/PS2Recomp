@@ -72,6 +72,11 @@ namespace ps2x::native
         // point = M * (x, y, z, 1), then divided by w (as a VU's projection).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count);
         void endFrame();
+        // Depth a game reads back from the GS (a visibility test: TMB's lens flares sample the Z buffer, which the
+        // native frame is not in). While asked for (wantDepth, again within a second), present() copies the native
+        // frame's depth; depthAt gives it at a GS screen point as GS Z, from the frame presented last (false before).
+        void wantDepth();
+        bool depthAt(float gsX, float gsY, uint32_t &gsZ);
         // The frame being built's GS Z per unit of z / w (screen-space draws give GS Z over it).
         float gsZScale() const { return m_building.screen.gsZScale; }
         TextureCache &textures() { return ps2x::native::textures(); }
@@ -176,6 +181,11 @@ namespace ps2x::native
         std::unique_ptr<Clip[]> m_clips{new Clip[kClips]};
         std::atomic<uint64_t> m_markedGroup{0}; // the latest group whose marker the GS reached
         std::shared_ptr<Frame> m_shown, m_shownPrevious; // present thread: the frame drawn and the one before it
+        std::atomic<double> m_depthWantedAt{-10.0};      // wantDepth()'s time (seconds)
+        std::mutex m_depthMutex;
+        std::vector<float> m_depth; // window depth, bottom-up rows, of the frame presented last
+        int m_depthWidth = 0, m_depthHeight = 0;
+        Screen m_depthScreen;
     };
 }
 

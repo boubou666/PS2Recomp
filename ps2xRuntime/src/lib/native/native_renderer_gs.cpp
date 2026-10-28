@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 
 namespace ps2x::native
@@ -186,6 +187,52 @@ void main()
             return slot.id;
         }
     };
+
+    bool readFramebufferDepth(int width, int height, std::vector<float> &out)
+    {
+        // Asynchronous: this frame's depth goes into one pixel buffer while the other, read the frame before, is
+        // copied out (a synchronous read made the present thread wait for the GPU every frame).
+        static GLuint s_buffers[2] = {};
+        static int s_width = 0, s_height = 0, s_next = 0;
+        static bool s_filled[2] = {};
+        const GLsizeiptr bytes = static_cast<GLsizeiptr>(width) * height * 4;
+        GLint packBuffer = 0, alignment = 4;
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
+        glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+        if (s_buffers[0] == 0)
+            glGenBuffers(2, s_buffers);
+        if (width != s_width || height != s_height)
+        {
+            for (GLuint buffer : s_buffers)
+            {
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
+                glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+            }
+            s_width = width, s_height = height;
+            s_filled[0] = s_filled[1] = false;
+        }
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, s_buffers[s_next]);
+        glReadPixels(0, 0, width, height, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        s_filled[s_next] = true;
+        const int previous = 1 - s_next;
+        s_next = previous;
+        bool copied = false;
+        if (s_filled[previous])
+        {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, s_buffers[previous]);
+            if (const void *data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT))
+            {
+                out.resize(static_cast<size_t>(width) * height);
+                std::memcpy(out.data(), data, static_cast<size_t>(bytes));
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                copied = true;
+            }
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(packBuffer));
+        glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+        return copied;
+    }
 
     void Renderer::gsDraw(uint64_t group, const GsDrawTarget &target)
     {
