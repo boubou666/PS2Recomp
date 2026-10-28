@@ -11,12 +11,19 @@
 class GSCpuBackend;
 struct GLFWwindow;
 
+namespace ps2x::native
+{
+    class TextureCache;
+}
+
 // Native renderer (PS2X_GS_RENDERER=native): translates the primitives the GS frontend decodes into OpenGL draws
 // into GPU render targets, instead of reproducing the GS. See docs/native.md, layer 3.
 //
 // It runs on the GS thread, on an OpenGL context shared with the window's (createSharedContext, called on the main
-// thread after the window exists). GS local memory stays on the CPU for what is not translated yet: transfers,
-// CLUT loads, readbacks and VRAM access go to an internal CPU backend used as memory only (it never draws).
+// thread after the window exists). Textures come from the shared ps2x::native::TextureCache (fed with the game's
+// image uploads), or from a render target when a draw samples one (feedback effects). GS local memory also stays on
+// the CPU for what is not translated yet: transfers, CLUT loads, readbacks and VRAM access go to an internal CPU
+// backend used as memory only (it never draws).
 class GSNativeBackend final : public GSRasterBackend
 {
 public:
@@ -63,14 +70,28 @@ private:
     {
         float x, y, z;
         uint8_t r, g, b, a;
+        float s, t, q; // texel coordinates (UV), or S and T in texels with their Q (divided per pixel, as the GS)
+        float fog;
+    };
+
+    struct UploadedTexture
+    {
+        uint32_t texture = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint64_t version = 0;
     };
 
     // Makes our context current on the drawing (GS) thread the first time it draws (create = true); other calls
     // only use it when they run on that thread. The main thread presents the very first frame and must keep raylib's.
     bool ensureContext(bool create = false);
     RenderTarget &renderTarget(const GSFrameReg &frame);
+    RenderTarget *renderTargetAtBlock(uint32_t block);
     void appendPrimitive(const GSPrimitiveBatch &batch);
     void flushBatch();
+    // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
+    bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
+    void applyBlend(const GSDrawState &state);
 
     GLFWwindow *m_sharedContext = nullptr;
     bool m_contextReady = false;
@@ -79,16 +100,29 @@ private:
     std::thread::id m_glThread{};
     std::thread::id m_submitThread{}; // the thread that draws: the only one that may bind our context
     std::unique_ptr<GSCpuBackend> m_memory;
+    std::unique_ptr<ps2x::native::TextureCache> m_textures;
 
     uint32_t m_program = 0;
     uint32_t m_vertexArray = 0;
     uint32_t m_vertexBuffer = 0;
-    int m_targetSizeLocation = -1;
+    uint32_t m_feedbackTexture = 0; // copy of the render target a draw both samples and draws into
+    uint32_t m_feedbackWidth = 0;
+    uint32_t m_feedbackHeight = 0;
+    struct Uniforms
+    {
+        int targetSize = -1, texSize = -1, textured = -1, fst = -1, tfx = -1, tcc = -1, fog = -1, fogColor = -1;
+        int alphaTest = -1, alphaRef = -1, sampler = -1;
+    } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
-    // The batch being collected: draws that share a render target and the state that changes GL.
+    std::unordered_map<uint64_t, UploadedTexture> m_uploaded;
+
+    // The image transfer being received (host to local), handed to the texture cache once complete.
+    GSTransferCommand m_transfer{};
+    std::vector<uint8_t> m_transferData;
+    size_t m_transferBytes = 0;
+
+    // The batch being collected: draws whose state draws the same way (sameDrawState).
     std::vector<Vertex> m_batch;
-    uint32_t m_batchTarget = ~0u;
-    uint64_t m_batchStateKey = ~0ull;
     GSDrawState m_batchState{};
 };
