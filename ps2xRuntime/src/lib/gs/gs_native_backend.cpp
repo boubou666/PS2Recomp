@@ -566,6 +566,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
             width = static_cast<float>(source->width);
             height = static_cast<float>(source->height);
             texture = source->color;
+            m_lastSourceFramebuffer = source->framebuffer;
             if (source->fbp == target.fbp && !std::getenv("PS2X_GS_NATIVE_NOFEEDBACKCOPY"))
             {
                 if (!m_feedbackTexture || m_feedbackWidth != source->width || m_feedbackHeight != source->height)
@@ -805,6 +806,15 @@ void GSNativeBackend::flushBatch()
                                  "fbo=%x\n",
                          target.fbp, m_batch.size(), state.prim.tme ? 1 : 0, textured ? 1 : 0, context.tex0.tbp0,
                          pixel[0], pixel[1], pixel[2], pixel[3], glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+            if (m_lastSourceFramebuffer)
+            {
+                uint8_t texel[4] = {};
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, m_lastSourceFramebuffer);
+                glReadPixels(320, 224, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+                std::fprintf(stderr, "[gs:probe]   source (320,224)=%u,%u,%u,%u\n", texel[0], texel[1], texel[2],
+                             texel[3]);
+                m_lastSourceFramebuffer = 0;
+            }
             float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, s0 = 1e9f, s1 = -1e9f, t0 = 1e9f, t1 = -1e9f, z0 = 1e9f;
             for (const Vertex &v : m_batch)
             {

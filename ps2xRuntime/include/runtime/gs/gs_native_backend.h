@@ -114,6 +114,7 @@ private:
     uint32_t m_program = 0;
     uint32_t m_vertexArray = 0;
     uint32_t m_vertexBuffer = 0;
+    uint32_t m_lastSourceFramebuffer = 0; // the render target the last textured batch sampled (diagnostics)
     uint32_t m_feedbackTexture = 0; // copy of the render target a draw both samples and draws into
     uint32_t m_feedbackWidth = 0;
     uint32_t m_feedbackHeight = 0;
