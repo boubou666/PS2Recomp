@@ -318,7 +318,9 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    const int hostPad = gamepadForPort(port);
+    // PS2X_PAD_NO_HOST=1: neither keyboard nor gamepads, only the pad scripts (a replay nobody can disturb).
+    static const bool s_noHost = [] { const char *v = std::getenv("PS2X_PAD_NO_HOST"); return v && v[0] == '1'; }();
+    const int hostPad = s_noHost ? -1 : gamepadForPort(port);
     const bool useGamepad = hostPad >= 0;
     const int kGamepad = useGamepad ? hostPad : 0;
     auto clearBit = [&btns](uint16_t mask)
@@ -368,7 +370,7 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else if (port == 0)
+    else if (port == 0 && !s_noHost)
     {
         // The movement keys also push the left stick fully, for games that move with it (sticks are read only in
         // analog mode).
