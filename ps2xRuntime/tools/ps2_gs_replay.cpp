@@ -6,6 +6,8 @@
 // To inspect a multi-pass effect one pass at a time:
 //   --list     print every command: index, kind, size, and the first GIF tag or the upload destination
 //   --until N  replay commands 0..N-1 only
+//   --native   draw with the native renderer (GSNativeBackend, OpenGL on a hidden window) instead of the CPU GS
+//   --present FILE  after the replay, write the displayed picture (as the game's window shows it) as a PPM
 //   --dump     after the replay, write a buffer as NAME.ppm: FBP in 2048-word pages, FBW in 64-pixel units, PSM as
 //              in the GS registers (0 CT32, 1 CT24, 2 CT16, 10 CT16S, 19 T8, 20 T4, 48-58 Z formats, as grey)
 // PS2X_GS_REPLAY_COMMANDS=<n> replays only the first n commands.
@@ -14,6 +16,13 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_trace.h"
+#if defined(PS2X_HAVE_NATIVE_GS)
+#include "runtime/gs/gs_native_backend.h"
+#include "runtime/gs/gs_texture_page_cache.h"
+#include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/native/native_renderer.h"
+#include "raylib.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -197,6 +206,53 @@ namespace
     }
 }
 
+    // The displayed picture, through the same presentation path as the game's window, as a binary PPM.
+    bool writePresent(GS &gs, const char *path)
+    {
+        gs.latchHostPresentationFrame();
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0, height = 0;
+        if (!gs.copyLatchedHostPresentationFrame(pixels, width, height) || width == 0u || height == 0u)
+            return false;
+        FILE *out = std::fopen(path, "wb");
+        if (!out)
+            return false;
+        std::fprintf(out, "P6\n%u %u\n255\n", width, height);
+        for (size_t i = 0; i + 3u < pixels.size(); i += 4u)
+            std::fwrite(&pixels[i], 1, 3, out);
+        std::fclose(out);
+        std::printf("present %ux%u -> %s\n", width, height, path);
+        return true;
+    }
+
+#if defined(PS2X_HAVE_NATIVE_GS)
+    // The native renderer on a hidden window; its texture cache starts from the trace's GS memory (the uploads made
+    // before the recording), written whole as one CT32 1024x1024 image at block 0.
+    void useNativeRenderer(GS &gs, const std::vector<uint8_t> &vram)
+    {
+        static GLFWwindow *shared = nullptr;
+        if (!shared)
+        {
+            SetConfigFlags(FLAG_WINDOW_HIDDEN);
+            InitWindow(64, 64, "ps2_gs_replay");
+            shared = GSNativeBackend::createSharedContext();
+        }
+        ps2x::native::Renderer::instance().setEnabled(true);
+        std::vector<uint8_t> linear(1024u * 1024u * 4u);
+        GSMem::TexturePageCache cache;
+        cache.Invalidate();
+        for (uint32_t y = 0; y < 1024u; ++y)
+            for (uint32_t x = 0; x < 1024u; ++x)
+            {
+                const uint32_t c = GSMem::ReadTexture(cache, vram.data(), 0x00u, 0u, 16u, x, y);
+                std::memcpy(&linear[(static_cast<size_t>(y) * 1024u + x) * 4u], &c, 4u);
+            }
+        ps2x::native::Renderer::instance().textures().upload(16ull << 48, 0u, 1024ull | (1024ull << 32), linear.data(),
+                                                             linear.size());
+        gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+    }
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -206,6 +262,8 @@ int main(int argc, char **argv)
         return 2;
     }
     bool list = false;
+    bool native = false;
+    const char *presentPath = nullptr;
     size_t until = SIZE_MAX;
     std::vector<DumpRequest> dumps;
     std::vector<const char *> positional;
@@ -214,6 +272,10 @@ int main(int argc, char **argv)
         const std::string arg = argv[i];
         if (arg == "--list")
             list = true;
+        else if (arg == "--native")
+            native = true;
+        else if (arg == "--present" && i + 1 < argc)
+            presentPath = argv[++i];
         else if (arg == "--until" && i + 1 < argc)
             until = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--dump" && i + 1 < argc)
@@ -274,6 +336,16 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "bad drawing state\n");
             return 1;
         }
+#if defined(PS2X_HAVE_NATIVE_GS)
+        if (native)
+            useNativeRenderer(gs, header.vram);
+#else
+        if (native)
+        {
+            std::fprintf(stderr, "built without the native renderer\n");
+            return 2;
+        }
+#endif
         const auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < replayed; ++i)
             replayCommand(gs, commands[i]);
@@ -282,8 +354,13 @@ int main(int argc, char **argv)
         total += seconds;
         best = pass == 0 ? seconds : std::min(best, seconds);
         if (pass + 1 == repeat)
+        {
             for (const DumpRequest &dump : dumps)
                 writeDump(gs, dump);
+            if (presentPath && !writePresent(gs, presentPath))
+                std::fprintf(stderr, "no displayed picture
+");
+        }
     }
 
     uint64_t hash = 0xCBF29CE484222325ull;

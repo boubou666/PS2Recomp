@@ -481,7 +481,7 @@ if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID AND DEFINED raylib_SOURCE_DIR)
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_native_backend.cpp)
     set_source_files_properties(src/lib/gs/gs_native_backend.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON
         INCLUDE_DIRECTORIES "${raylib_SOURCE_DIR}/src;${raylib_SOURCE_DIR}/src/external/glfw/include")
-    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_NATIVE_GS=1)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_NATIVE_GS=1)
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
