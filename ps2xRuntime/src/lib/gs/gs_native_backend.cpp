@@ -890,7 +890,8 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
                 {
                     uint32_t v = 0;
                     std::memcpy(&v, &pixels[i * 4u], 4u);
-                    GSMem::WriteCT32(m_vram, bp, bw, x, y, v);
+                    // CT24 leaves the top byte alone (where a game keeps T8H / T4HL / T4HH textures, the GS too).
+                    (target.psm == 0x01u ? GSMem::WriteCT24 : GSMem::WriteCT32)(m_vram, bp, bw, x, y, v);
                 }
                 else
                 {
