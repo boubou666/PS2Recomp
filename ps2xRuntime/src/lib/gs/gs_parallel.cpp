@@ -146,9 +146,12 @@ namespace
             info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
             info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
             info.force_progressive = true;
-            info.anti_blur = true;
+            // PS2X_GS_ANTI_BLUR=0 keeps the console's circuit merge (the flicker filter of games that blend both
+            // read circuits one line apart, like VP2, whose text otherwise shows one field line-doubled).
+            static const bool s_antiBlur = [] { const char *v = std::getenv("PS2X_GS_ANTI_BLUR"); return !v || v[0] != '0'; }();
+            info.anti_blur = s_antiBlur;
             info.adapt_to_internal_horizontal_resolution = true;
-            info.raw_circuit_scanout = true;
+            info.raw_circuit_scanout = s_antiBlur;
             const ScanoutResult scanout = m_interface.vsync(info);
 
             PresentationFrame frame{};
