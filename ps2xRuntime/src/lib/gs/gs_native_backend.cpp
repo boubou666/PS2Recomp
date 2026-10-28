@@ -1516,7 +1516,9 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
         }
         glReadPixels(static_cast<GLint>(read.x), static_cast<GLint>(read.y), static_cast<GLsizei>(width),
                      static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        const int source = buffers.ready[previous] && buffers.bytes[previous] == bytes ? previous : current;
+        // PS2X_GS_NATIVE_SYNCREAD=1: show this presentation's own picture (waits for the GPU), for comparison.
+        static const bool syncRead = std::getenv("PS2X_GS_NATIVE_SYNCREAD") != nullptr;
+        const int source = !syncRead && buffers.ready[previous] && buffers.bytes[previous] == bytes ? previous : current;
         glBindBuffer(GL_PIXEL_PACK_BUFFER, buffers.pbo[source]);
         if (const void *mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT))
         {
