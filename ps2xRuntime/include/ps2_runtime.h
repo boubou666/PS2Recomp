@@ -36,6 +36,7 @@
 #include "runtime/ps2_pad.h"
 #include "runtime/ps2_rom_device.h"
 #include "runtime/ps2_vfs.h"
+#include "runtime/frame_pacer.h"
 #include "ps2x/iop/iop_types.h"
 #include "ps2_recomp_abi.h"
 
@@ -223,6 +224,8 @@ public:
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
+    // Native frame pacing for games that run their loop on real time (runtime/frame_pacer.h).
+    FramePacer &framePacer() { return m_framePacer; }
     void postEeEvent(EeEvent event);
     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
     friend bool ps2rCheckpointDue(PS2Runtime *runtime, uint32_t cycles) noexcept;
@@ -358,6 +361,7 @@ private:
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;
+    FramePacer m_framePacer;
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;

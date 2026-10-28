@@ -539,7 +539,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t overrideWidth = 0u;
     uint32_t overrideHeight = 0u;
     const bool overridden = rt->presentOverride(s_scratch, overrideWidth, overrideHeight);
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    // On native frame pacing every frame the game ends is a new picture; otherwise every vblank is.
+    const bool nativeFrames = rt->eeScheduler().nativeFrames();
+    const uint64_t currentTick = nativeFrames ? (1ull << 63) | rt->gsForPresentation().queuedLatchesDone()
+                                              : rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (overridden)
     {
@@ -3481,6 +3484,18 @@ void PS2Runtime::run()
 
             }
         });
+        // A game on native frame pacing sets the rate: the window follows its frame cap (0 = unlimited).
+        {
+            static int s_targetFps = 60;
+            const int targetFps = m_eeScheduler && m_eeScheduler->nativeFrames()
+                                      ? static_cast<int>(m_framePacer.cap())
+                                      : 60;
+            if (targetFps != s_targetFps)
+            {
+                SetTargetFPS(targetFps);
+                s_targetFps = targetFps;
+            }
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
