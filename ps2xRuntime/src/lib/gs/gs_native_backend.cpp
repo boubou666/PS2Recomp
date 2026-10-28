@@ -65,13 +65,89 @@ uniform sampler2D uDest; // a copy of the render target, for the destination alp
 uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
 uniform int uBlendFactor;
 uniform float uBlendFix;
+
+// Textures read straight from a GPU copy of GS memory (uVram: 1024 x 1024 32-bit words), through per-format page
+// swizzle tables (uSwizzle: a page's pixel offsets, one table per layout at its row): no CPU decode.
+uniform usampler2D uVram;
+uniform usampler2D uSwizzle;
+uniform int uDecode;
+uniform ivec4 uTexFmt;  // swizzle row, page width, page height, bits a pixel takes in memory
+uniform ivec4 uTexSel;  // bit offset in the word (T8H, T4HL, T4HH), bits kept, TBP0, TBW
+uniform ivec4 uTexKind; // 0 CT32 / 1 CT24 / 2 CT16 / 3 indexed, CT16 palette, CSA, palette entries
+uniform ivec4 uClutFmt; // the palette's layout, as uTexFmt
+uniform int uCbp;
+uniform vec3 uTexa;     // TA0, TA1, AEM
+uniform ivec4 uWrapU;   // CLAMP mode, 2^TW - 1, MINU, MAXU
+uniform ivec4 uWrapV;
+uniform int uLinear;
+
+uint gsRead(ivec4 fmt, int bitOffset, int maskBits, int bp, int bw, ivec2 p)
+{
+    int pw = fmt.y, ph = fmt.z;
+    int perRow = max(1, (bw * 64) / pw);
+    int page = bp / 32 + (p.y / ph) * perRow + p.x / pw;
+    int ppp = pw * ph;
+    uint offset = texelFetch(uSwizzle, ivec2(p.x % pw, fmt.x + p.y % ph), 0).r;
+    uint pixel = uint(page * ppp + (bp % 32) * (ppp / 32)) + offset;
+    uint bits = pixel * uint(fmt.w) + uint(bitOffset);
+    uint word = (bits >> 5u) & 0xFFFFFu;
+    uint value = texelFetch(uVram, ivec2(int(word & 1023u), int(word >> 10u)), 0).r >> (bits & 31u);
+    return maskBits >= 32 ? value : value & ((1u << uint(maskBits)) - 1u);
+}
+
+vec4 gsColor(uint v, int kind)
+{
+    if (kind == 2)
+    {
+        vec3 rgb = vec3(float(v & 31u), float((v >> 5u) & 31u), float((v >> 10u) & 31u)) * (8.0 / 255.0);
+        float a = (v & 0x8000u) != 0u ? uTexa.y : ((uTexa.z != 0.0 && (v & 0x7FFFu) == 0u) ? 0.0 : uTexa.x);
+        return vec4(rgb, a / 128.0);
+    }
+    vec3 rgb = vec3(float(v & 255u), float((v >> 8u) & 255u), float((v >> 16u) & 255u)) / 255.0;
+    if (kind == 1)
+        return vec4(rgb, (uTexa.z != 0.0 && (v & 0xFFFFFFu) == 0u) ? 0.0 : uTexa.x / 128.0);
+    return vec4(rgb, float(v >> 24u) / 128.0);
+}
+
+int gsWrap(int c, ivec4 w)
+{
+    if (w.x == 0) return c & w.y;
+    if (w.x == 1) return clamp(c, 0, w.y);
+    if (w.x == 2) return clamp(c, w.z, w.w);
+    return (c & w.z) | w.w;
+}
+
+vec4 gsTexel(ivec2 p)
+{
+    p = ivec2(gsWrap(p.x, uWrapU), gsWrap(p.y, uWrapV));
+    uint v = gsRead(uTexFmt, uTexSel.x, uTexSel.y, uTexSel.z, uTexSel.w, p);
+    if (uTexKind.x != 3)
+        return gsColor(v, uTexKind.x);
+    // CSM1 palette: entry i at (x, y) of a 16-wide image, a 16-entry palette CSA * 16 entries in.
+    uint index = uTexKind.w == 16 ? (uint(uTexKind.z) * 16u + v) & 255u : v;
+    ivec2 q = ivec2(int((index & 7u) | ((index & 16u) >> 1u)), int(((index >> 5u) << 1u) | ((index >> 3u) & 1u)));
+    uint entry = gsRead(uClutFmt, 0, uClutFmt.w, uCbp, 1, q);
+    return gsColor(entry, uTexKind.y != 0 ? 2 : 0);
+}
+
+vec4 gsSample(vec2 t)
+{
+    if (uLinear == 0)
+        return gsTexel(ivec2(floor(t)));
+    vec2 s = t - 0.5;
+    ivec2 p = ivec2(floor(s));
+    vec2 f = s - floor(s);
+    return mix(mix(gsTexel(p), gsTexel(p + ivec2(1, 0)), f.x), mix(gsTexel(p + ivec2(0, 1)), gsTexel(p + ivec2(1, 1)), f.x),
+               f.y);
+}
+
 void main()
 {
     vec4 vc = vColor * (255.0 / 128.0);
     vec4 c = vc;
     if (uTextured != 0)
     {
-        vec4 t = texture(uSampler, (vTex.xy / vTex.z) / uTexSize);
+        vec4 t = uDecode != 0 ? gsSample(vTex.xy / vTex.z) : texture(uSampler, (vTex.xy / vTex.z) / uTexSize);
         t.a *= uTexAlphaScale;
         if (uTfx == 0)
             c = vec4(t.rgb * vc.rgb, uTcc != 0 ? t.a * vc.a : vc.a);
@@ -128,6 +204,60 @@ void main()
             std::fprintf(stderr, "[gs:native] shader compile failed: %s\n", log);
         }
         return shader;
+    }
+
+    // The decoding shader's view of a pixel format: its page swizzle table (row in the table texture, page size,
+    // bits a pixel takes in memory) and what it keeps of the word.
+    struct GpuLayout
+    {
+        int row, pageWidth, pageHeight, bits;
+    };
+    constexpr GpuLayout kLayoutC32{0, 64, 32, 32}, kLayoutC16{32, 64, 64, 16}, kLayoutC16S{96, 64, 64, 16},
+        kLayoutP8{160, 128, 64, 8}, kLayoutP4{224, 128, 128, 4}, kLayoutZ32{352, 64, 32, 32}, kLayoutZ16{384, 64, 64, 16},
+        kLayoutZ16S{448, 64, 64, 16};
+    constexpr uint32_t kSwizzleWidth = 128u, kSwizzleHeight = 512u;
+
+    // Each layout's page: the pixel offset (in its own pixels) where page pixel (x, y) is stored, found by writing
+    // every pixel's index through GSMem and reading back where it landed (a few bits at a time for 8- and 4-bit).
+    std::vector<uint32_t> buildSwizzleTables()
+    {
+        GSMem::InitLookupTables();
+        std::vector<uint32_t> table(kSwizzleWidth * kSwizzleHeight, 0u);
+        std::vector<uint8_t> scratch(4u * 1024u * 1024u, 0u);
+        using Write = void (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        const std::pair<Write, GpuLayout> layouts[] = {
+            {GSMem::WriteCT32, kLayoutC32}, {GSMem::WriteCT16, kLayoutC16}, {GSMem::WriteCT16S, kLayoutC16S},
+            {GSMem::WriteP8, kLayoutP8},    {GSMem::WriteP4, kLayoutP4},    {GSMem::WriteZ32, kLayoutZ32},
+            {GSMem::WriteZ16, kLayoutZ16},  {GSMem::WriteZ16S, kLayoutZ16S}};
+        for (const auto &[write, layout] : layouts)
+        {
+            const uint32_t pw = layout.pageWidth, ph = layout.pageHeight, bits = layout.bits;
+            const uint32_t pixels = pw * ph, bw = pw / 64u;
+            const uint32_t mask = bits >= 32u ? ~0u : (1u << bits) - 1u;
+            std::vector<uint32_t> owner(pixels, 0u); // pixel address in the page -> index y * pw + x stored there
+            for (uint32_t shift = 0; shift < 16u; shift += bits)
+            {
+                std::fill(scratch.begin(), scratch.begin() + 8192, uint8_t{0});
+                for (uint32_t y = 0; y < ph; ++y)
+                    for (uint32_t x = 0; x < pw; ++x)
+                        write(scratch.data(), 0u, bw, x, y, ((y * pw + x) >> shift) & mask);
+                for (uint32_t address = 0; address < pixels; ++address)
+                {
+                    const uint32_t bit = address * bits;
+                    uint32_t word = 0;
+                    std::memcpy(&word, scratch.data() + (bit >> 5) * 4u, 4u);
+                    owner[address] |= ((word >> (bit & 31u)) & mask) << shift;
+                }
+                if (bits >= 16u)
+                    break;
+            }
+            for (uint32_t address = 0; address < pixels; ++address)
+            {
+                const uint32_t index = owner[address];
+                table[(layout.row + index / pw) * kSwizzleWidth + index % pw] = address;
+            }
+        }
+        return table;
     }
 
     // Z as a 0..1 depth for the ZBUF format's range: Z32, Z24, Z16/Z16S.
@@ -279,6 +409,18 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.fst = glGetUniformLocation(m_program, "uTexAlphaScale");
     m_uniforms.dest = glGetUniformLocation(m_program, "uDest");
     m_uniforms.date = glGetUniformLocation(m_program, "uDate");
+    m_uniforms.vram = glGetUniformLocation(m_program, "uVram");
+    m_uniforms.swizzle = glGetUniformLocation(m_program, "uSwizzle");
+    m_uniforms.decode = glGetUniformLocation(m_program, "uDecode");
+    m_uniforms.texFmt = glGetUniformLocation(m_program, "uTexFmt");
+    m_uniforms.texSel = glGetUniformLocation(m_program, "uTexSel");
+    m_uniforms.texKind = glGetUniformLocation(m_program, "uTexKind");
+    m_uniforms.clutFmt = glGetUniformLocation(m_program, "uClutFmt");
+    m_uniforms.cbp = glGetUniformLocation(m_program, "uCbp");
+    m_uniforms.texa = glGetUniformLocation(m_program, "uTexa");
+    m_uniforms.wrapU = glGetUniformLocation(m_program, "uWrapU");
+    m_uniforms.wrapV = glGetUniformLocation(m_program, "uWrapV");
+    m_uniforms.linear = glGetUniformLocation(m_program, "uLinear");
 
     glGenVertexArrays(1, &m_vertexArray);
     glGenBuffers(1, &m_vertexBuffer);
@@ -586,6 +728,79 @@ void GSNativeBackend::dropTargetsUnder(const GSTransferCommand &command)
     }
 }
 
+bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
+{
+    const GSContext &context = state.context;
+    const GSTex0Reg &tex0 = context.tex0;
+    GpuLayout layout{};
+    int bitOffset = 0, bitsKept = 0, kind = 0, entries = 0;
+    switch (tex0.psm)
+    {
+    case 0x00u: layout = kLayoutC32, bitsKept = 32, kind = 0; break;
+    case 0x01u: layout = kLayoutC32, bitsKept = 24, kind = 1; break;
+    case 0x02u: layout = kLayoutC16, bitsKept = 16, kind = 2; break;
+    case 0x0Au: layout = kLayoutC16S, bitsKept = 16, kind = 2; break;
+    case 0x13u: layout = kLayoutP8, bitsKept = 8, kind = 3, entries = 256; break;
+    case 0x14u: layout = kLayoutP4, bitsKept = 4, kind = 3, entries = 16; break;
+    case 0x1Bu: layout = kLayoutC32, bitOffset = 24, bitsKept = 8, kind = 3, entries = 256; break;
+    case 0x24u: layout = kLayoutC32, bitOffset = 24, bitsKept = 4, kind = 3, entries = 16; break;
+    case 0x2Cu: layout = kLayoutC32, bitOffset = 28, bitsKept = 4, kind = 3, entries = 16; break;
+    case 0x30u: layout = kLayoutZ32, bitsKept = 32, kind = 0; break;
+    case 0x31u: layout = kLayoutZ32, bitsKept = 24, kind = 1; break;
+    case 0x32u: layout = kLayoutZ16, bitsKept = 16, kind = 2; break;
+    case 0x3Au: layout = kLayoutZ16S, bitsKept = 16, kind = 2; break;
+    default: return false;
+    }
+    if (!m_vramTexture)
+    {
+        glGenTextures(1, &m_vramTexture);
+        glBindTexture(GL_TEXTURE_2D, m_vramTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        const std::vector<uint32_t> swizzle = buildSwizzleTables();
+        glGenTextures(1, &m_swizzleTexture);
+        glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, kSwizzleWidth, kSwizzleHeight, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                     swizzle.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    // The pages uploads (and render target resolves) changed since the last draw: 8 KiB, two rows of the texture.
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, m_vramTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    ps2x::native::textures().changedPages(m_vramGenerations, [](uint32_t page, const uint8_t *bytes) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                        bytes);
+    });
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+    glActiveTexture(GL_TEXTURE0);
+
+    const GpuLayout clut = tex0.cpsm == 0x02u ? kLayoutC16 : tex0.cpsm == 0x0Au ? kLayoutC16S : kLayoutC32;
+    const uint64_t clamp = context.clamp;
+    const int maxU = (1 << std::min<uint32_t>(tex0.tw, 10u)) - 1, maxV = (1 << std::min<uint32_t>(tex0.th, 10u)) - 1;
+    glUniform1i(m_uniforms.vram, 2);
+    glUniform1i(m_uniforms.swizzle, 3);
+    glUniform1i(m_uniforms.decode, 1);
+    glUniform4i(m_uniforms.texFmt, layout.row, layout.pageWidth, layout.pageHeight, layout.bits);
+    glUniform4i(m_uniforms.texSel, bitOffset, bitsKept, static_cast<int>(tex0.tbp0), static_cast<int>(tex0.tbw));
+    glUniform4i(m_uniforms.texKind, kind, clut.bits == 16 ? 1 : 0, static_cast<int>(tex0.csa), entries);
+    glUniform4i(m_uniforms.clutFmt, clut.row, clut.pageWidth, clut.pageHeight, clut.bits);
+    glUniform1i(m_uniforms.cbp, static_cast<int>(tex0.cbp));
+    glUniform3f(m_uniforms.texa, static_cast<float>(state.texa.ta0), static_cast<float>(state.texa.ta1),
+                state.texa.aem ? 1.0f : 0.0f);
+    glUniform4i(m_uniforms.wrapU, static_cast<int>(clamp & 0x3u), maxU, static_cast<int>(clamp >> 4 & 0x3FFu),
+                static_cast<int>(clamp >> 14 & 0x3FFu));
+    glUniform4i(m_uniforms.wrapV, static_cast<int>(clamp >> 2 & 0x3u), maxV, static_cast<int>(clamp >> 24 & 0x3FFu),
+                static_cast<int>(clamp >> 34 & 0x3FFu));
+    glUniform1i(m_uniforms.linear, (context.tex1 >> 5 & 0x1u) != 0u ? 1 : 0);
+    glUniform1f(m_uniforms.fst, 1.0f);
+    return true;
+}
+
 bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width, float &height)
 {
     const GSTex0Reg &tex0 = state.context.tex0;
@@ -716,9 +931,16 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
             }
         }
     }
+    glUniform1i(m_uniforms.decode, 0);
     if (!fromTarget)
     {
         resolveTargetsUnder(context.tex0);
+        if (static const bool cpuDecode = std::getenv("PS2X_GS_NATIVE_CPUDECODE") != nullptr;
+            !cpuDecode && bindDecodedTexture(state))
+        {
+            width = height = 1.0f;
+            return true;
+        }
         const uint64_t tex0 = rawTex0(context.tex0);
         const uint64_t texa = rawTexa(state.texa);
         // The cache revalidates a texture's pages on every lookup; while nothing was uploaded since this TEX0/TEXA was

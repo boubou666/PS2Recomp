@@ -109,6 +109,12 @@ private:
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
     uint32_t m_depthTexture = 0;
+    // The GPU decoding path (default; PS2X_GS_NATIVE_CPUDECODE=1 uses the texture cache's images): GS memory on the
+    // GPU, brought up to date page by page from the texture cache, and the formats' swizzle tables.
+    bool bindDecodedTexture(const GSDrawState &state);
+    uint32_t m_vramTexture = 0;
+    uint32_t m_swizzleTexture = 0;
+    std::vector<uint32_t> m_vramGenerations;
     uint32_t m_destTexture = 0; // copy of the render target for DATE
     uint32_t m_destWidth = 0;
     uint32_t m_destHeight = 0;
@@ -140,6 +146,8 @@ private:
         int targetSize = -1, texSize = -1, textured = -1, fst = -1, tfx = -1, tcc = -1, fog = -1, fogColor = -1;
         int alphaTest = -1, alphaRef = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
         int dest = -1, date = -1;
+        int vram = -1, swizzle = -1, decode = -1, texFmt = -1, texSel = -1, texKind = -1, clutFmt = -1, cbp = -1;
+        int texa = -1, wrapU = -1, wrapV = -1, linear = -1;
     } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
