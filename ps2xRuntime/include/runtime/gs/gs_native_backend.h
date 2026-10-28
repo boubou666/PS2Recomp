@@ -65,6 +65,7 @@ public:
         double zScale = 0.0;
     };
     FrameTarget frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf);
+    void NativeDraw(uint64_t group, const GSContext &context) override;
 
 private:
     struct RenderTarget

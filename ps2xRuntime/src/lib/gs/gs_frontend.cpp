@@ -616,6 +616,25 @@ void GS::processWithParallel(const QueuedCommand &command)
     }
 }
 
+void GS::queueNativeDraw(uint64_t group, int context)
+{
+    const int index = context != 0 ? 1 : 0;
+    auto draw = [this, group, index]() {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        if (m_backend)
+            m_backend->NativeDraw(group, m_ctx[index]);
+    };
+    if (!shouldQueue())
+    {
+        draw();
+        return;
+    }
+    QueuedCommand command;
+    command.kind = QueuedCommand::Kind::Call;
+    command.call = std::move(draw);
+    enqueue(std::move(command));
+}
+
 void GS::runOnWorker(std::function<void()> work)
 {
     if (!shouldQueue())

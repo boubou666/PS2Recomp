@@ -719,6 +719,28 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     return out;
 }
 
+void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
+{
+    const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
+    if (!hook)
+        return;
+    const FrameTarget frame = frameTarget(context.frame, context.zbuf);
+    ps2x::native::GsDrawTarget target;
+    target.framebuffer = frame.framebuffer;
+    target.color = frame.color;
+    target.depth = frame.depth;
+    target.width = frame.width;
+    target.height = frame.height;
+    target.zScale = frame.zScale;
+    target.xOffset = context.xyoffset.ofx;
+    target.yOffset = context.xyoffset.ofy;
+    target.scissorX0 = context.scissor.x0;
+    target.scissorY0 = context.scissor.y0;
+    target.scissorX1 = context.scissor.x1;
+    target.scissorY1 = context.scissor.y1;
+    hook(group, target);
+}
+
 void GSNativeBackend::resolveAllTargets()
 {
     flushBatch();

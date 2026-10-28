@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/gs/gs_types.h"
+#include "runtime/native/native_gs_hook.h"
 
 #include <cstdint>
 #include <vector>
@@ -31,4 +32,12 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+    // A native renderer's draws at this point of the stream (GS::queueNativeDraw): the hook with this context's
+    // render target. Renderers that keep GS memory themselves have none to give: a null target.
+    virtual void NativeDraw(uint64_t group, const GSContext &context)
+    {
+        (void)context;
+        if (const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook())
+            hook(group, ps2x::native::GsDrawTarget{});
+    }
 };
