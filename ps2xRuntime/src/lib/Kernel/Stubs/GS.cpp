@@ -550,6 +550,8 @@ namespace ps2_stubs
         GsImageMem img{};
         if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img, false))
         {
+            if (runtime)
+                runtime->memory().noteGifEvent('L', 1u, imgAddr);
             setReturnS32(ctx, -1);
             return;
         }
@@ -557,28 +559,29 @@ namespace ps2_stubs
         const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
         if (rowBytes == 0)
         {
+            runtime->memory().noteGifEvent('L', 2u, img.psm);
             setReturnS32(ctx, -1);
             return;
         }
 
         uint32_t fbw = img.vram_width ? img.vram_width : std::max<uint32_t>(1, (img.width + 63) / 64);
         const uint32_t totalImageBytes = rowBytes * static_cast<uint32_t>(img.height);
-        const uint32_t headerQwc = 6u;
+        // An IMAGE GIFtag moves at most 0x7FFF quadwords (NLOOP is 15 bits): a bigger image goes in several, as
+        // libgraph sends it. One tag for all of it made the GS read the rest of a full-screen picture as GIF tags
+        // (VP2's menu background: garbage in VRAM, stray SIGNAL/FINISH writes, and a hang).
+        constexpr uint32_t kMaxImageQwc = 0x7FFFu;
         const uint32_t imageQwc = (totalImageBytes + 15u) / 16u;
-        const uint32_t totalQwc = headerQwc + imageQwc;
+        const uint32_t imageTags = std::max<uint32_t>(1u, (imageQwc + kMaxImageQwc - 1u) / kMaxImageQwc);
+        const uint32_t headerQwc = 5u;
+        const uint32_t totalQwc = headerQwc + imageTags + imageQwc;
 
-        uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
-        if (pktAddr == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint8_t *pkt = getMemPtr(rdram, pktAddr);
+        // The packet is built on the host: the guest heap may have no room for a big image.
+        std::vector<uint8_t> packet(static_cast<size_t>(totalQwc) * 16u, 0u);
+        uint8_t *pkt = packet.data();
         const uint8_t *src = getConstMemPtr(rdram, srcAddr);
-        if (!pkt || !src)
+        if (!src || (srcAddr & PS2_RAM_MASK) + totalImageBytes > PS2_RAM_SIZE)
         {
-            runtime->guestFree(pktAddr);
+            runtime->memory().noteGifEvent('L', 3u, srcAddr);
             setReturnS32(ctx, -1);
             return;
         }
@@ -602,20 +605,25 @@ namespace ps2_stubs
         q[7] = 0x52ULL;
         q[8] = 0ULL;
         q[9] = 0x53ULL;
-        q[10] = (static_cast<uint64_t>(2) << 58) | (static_cast<uint64_t>(imageQwc) & 0x7FFF) |
-                (1ULL << 15);
-        q[11] = 0ULL;
+        uint8_t *out = pkt + headerQwc * 16u;
+        uint32_t copied = 0u;
+        for (uint32_t done = 0u; done < imageQwc || done == 0u;)
+        {
+            const uint32_t chunk = std::min(kMaxImageQwc, imageQwc - done);
+            const bool last = done + chunk >= imageQwc;
+            const uint64_t tag[2] = {(static_cast<uint64_t>(2) << 58) | chunk | (last ? (1ULL << 15) : 0ULL), 0ULL};
+            std::memcpy(out, tag, 16u);
+            out += 16u;
+            const uint32_t bytes = std::min(chunk * 16u, totalImageBytes - copied);
+            std::memcpy(out, src + copied, bytes);
+            out += chunk * 16u;
+            copied += bytes;
+            done += chunk;
+            if (chunk == 0u)
+                break;
+        }
 
-        std::memcpy(pkt + headerQwc * 16u, src, totalImageBytes);
-
-        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
-        auto &mem = runtime->memory();
-        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-        mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
-        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-        mem.processPendingTransfers();
-        runtime->guestFree(pktAddr);
+        runtime->memory().submitHostGifTransfer(pkt, totalQwc * 16u);
 
         setReturnS32(ctx, 0);
     }

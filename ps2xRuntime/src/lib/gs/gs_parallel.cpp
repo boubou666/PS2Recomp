@@ -86,6 +86,16 @@ namespace
 
             GSOptions options{};
             options.vram_size = m_vramSize;
+            // PS2X_GS_SSAA=2/4/8/16: paraLLEl's super-sampling; from 4 the scanout is doubled (see vsync), which
+            // draws text and edges at twice the resolution.
+            if (const char *ssaa = std::getenv("PS2X_GS_SSAA"))
+            {
+                const int rate = std::atoi(ssaa);
+                options.super_sampling = rate >= 16 ? SuperSampling::X16 : rate >= 8 ? SuperSampling::X8
+                                       : rate >= 4 ? SuperSampling::X4 : rate >= 2 ? SuperSampling::X2 : SuperSampling::X1;
+                options.super_sampled_textures = rate >= 2;
+                m_ssaa = rate;
+            }
             if (!m_interface.init(&m_device, options))
             {
                 std::fprintf(stderr, "[gs-parallel] renderer init failed (missing Vulkan features?)\n");
@@ -153,9 +163,13 @@ namespace
             info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
             info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
             info.force_progressive = true;
-            info.anti_blur = true;
+            // PS2X_GS_ANTI_BLUR=0 keeps the console's circuit merge (the flicker filter of games that blend both
+            // read circuits one line apart, like VP2, whose text otherwise shows one field line-doubled).
+            static const bool s_antiBlur = [] { const char *v = std::getenv("PS2X_GS_ANTI_BLUR"); return !v || v[0] != '0'; }();
+            info.anti_blur = s_antiBlur;
             info.adapt_to_internal_horizontal_resolution = true;
-            info.raw_circuit_scanout = true;
+            info.raw_circuit_scanout = s_antiBlur;
+            info.high_resolution_scanout = m_ssaa >= 4;
             const ScanoutResult scanout = m_interface.vsync(info);
 
             PresentationFrame frame{};
@@ -233,6 +247,7 @@ namespace
 
     private:
         uint32_t m_vramSize;
+        int m_ssaa = 1;
         Signals m_signals;
         Context m_context;
         Device m_device;

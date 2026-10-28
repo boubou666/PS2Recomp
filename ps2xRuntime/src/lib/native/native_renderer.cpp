@@ -158,7 +158,7 @@ void main()
         Batch batch;
         batch.material = material;
         std::memcpy(batch.matrix, matrix, sizeof(batch.matrix));
-        if (material.textured)
+        if (material.textured && !material.fromGsContext)
             batch.texture = ps2x::native::textures().texture(material.tex0, material.texa);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;

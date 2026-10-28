@@ -23,6 +23,12 @@ namespace ps2x::native
         // The context's XYOFFSET (12.4 fixed point, as written) and SCISSOR (pixels, inclusive).
         uint32_t xOffset = 0, yOffset = 0;
         uint32_t scissorX0 = 0, scissorY0 = 0, scissorX1 = 0, scissorY1 = 0;
+        // The context's drawing registers as written at the marker (raw GS layouts), for draws whose material is the
+        // GS state where they sit in the stream (Material::fromGsContext): TEX0, TEXA, ALPHA, TEST, CLAMP, FOGCOL,
+        // and the Z buffer's write mask.
+        uint64_t tex0 = 0, texa = 0, alpha = 0, test = 0, clamp = 0;
+        uint32_t fogcol = 0;
+        bool zmask = false;
     };
 
     using GsDrawHook = void (*)(uint64_t group, const GsDrawTarget &target);

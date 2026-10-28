@@ -190,6 +190,9 @@ struct GSContext
     uint64_t alpha = 0;
     uint64_t test = 0;
     uint64_t fba = 0;
+    // Global registers a native draw marker hands on with the context (GS::queueNativeDraw), raw.
+    uint64_t texaRaw = 0;
+    uint32_t fogcol = 0;
 };
 
 struct GSPrimReg

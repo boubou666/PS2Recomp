@@ -49,6 +49,11 @@ namespace ps2x::native
         bool clampU = false, clampV = false; // CLAMP's WMS / WMT: the texture's edge past 0..1 (else it repeats)
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
+        // The GS state where the draw's group sits in the stream (a stream draw, beginGroup) gives tex0, texa, blend,
+        // the alpha and depth tests, clampU / clampV and fogColour, for games whose meshes take their material from
+        // GS packets around them; textured, fog and alphaBlend (PRIM.ABE) stay the draw's own.
+        bool fromGsContext = false;
+        bool alphaBlend = true;
     };
 
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size

@@ -979,6 +979,7 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
         return;
     const FrameTarget frame = frameTarget(context.frame, context.zbuf);
     ps2x::native::GsDrawTarget target;
+    fillNativeRegisters(target, context);
     target.framebuffer = frame.framebuffer;
     target.color = frame.color;
     target.depth = frame.depth;

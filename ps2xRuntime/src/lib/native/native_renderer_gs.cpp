@@ -234,6 +234,37 @@ void main()
         return copied;
     }
 
+    namespace
+    {
+        // A fromGsContext material completed with the GS registers at its group's marker.
+        Material materialFromGs(Material m, const GsDrawTarget &target)
+        {
+            m.tex0 = target.tex0;
+            m.texa = target.texa;
+            const uint32_t a = target.alpha & 3u, b = (target.alpha >> 2) & 3u, c = (target.alpha >> 4) & 3u,
+                           d = (target.alpha >> 6) & 3u;
+            if (!m.alphaBlend)
+                m.blend = Material::Blend::Opaque;
+            else if (a == 0u && b == 2u && d == 1u) // (Cs - 0) * As/FIX + Cd
+                m.blend = Material::Blend::Additive;
+            else
+                m.blend = Material::Blend::Alpha; // (Cs - Cd) * As + Cd, and the cases this renderer does not have
+            (void)c;
+            const bool ate = target.test & 1u;
+            const uint32_t atst = (target.test >> 1) & 7u, aref = (target.test >> 4) & 0xFFu;
+            m.alphaTest = ate && (atst == 5u || atst == 6u); // GEQUAL / GREATER (the others: drawn as always)
+            m.alphaRef = static_cast<uint8_t>(atst == 5u && aref > 0u ? aref - 1u : aref);
+            const bool zte = (target.test >> 16) & 1u;
+            const uint32_t ztst = (target.test >> 17) & 3u;
+            m.depthTest = zte && ztst != 1u;
+            m.depthWrite = !target.zmask;
+            m.clampU = (target.clamp & 3u) == 1u;
+            m.clampV = ((target.clamp >> 2) & 3u) == 1u;
+            m.fogColour = target.fogcol;
+            return m;
+        }
+    }
+
     void Renderer::gsDraw(uint64_t group, const GsDrawTarget &target)
     {
         instance().drawGroups(group, target);
@@ -263,6 +294,17 @@ void main()
                 batches.push_back(std::move(m_stream.front()));
                 m_stream.pop_front();
             }
+        }
+        // PS2X_NATIVE_GS_LOG=1: the first markers, their batches and the target they draw into.
+        static const bool s_log = [] { const char *v = std::getenv("PS2X_NATIVE_GS_LOG"); return v && *v == '1'; }();
+        static int s_logged = 0;
+        if (s_log && s_logged < 40)
+        {
+            ++s_logged;
+            std::fprintf(stderr, "[native-gs] group %llu: %zu batch(es), target fb %u %ux%u off %u,%u scissor %u,%u-%u,%u tex0 %#llx\n",
+                         static_cast<unsigned long long>(group), batches.size(), target.framebuffer, target.width, target.height,
+                         target.xOffset, target.yOffset, target.scissorX0, target.scissorY0, target.scissorX1, target.scissorY1,
+                         static_cast<unsigned long long>(target.tex0));
         }
         if (target.framebuffer == 0u)
         {
@@ -332,7 +374,7 @@ void main()
         GLint first = 0;
         for (const StreamBatch &entry : batches)
         {
-            const Material &m = entry.batch.material;
+            const Material m = entry.batch.material.fromGsContext ? materialFromGs(entry.batch.material, target) : entry.batch.material;
             const GLsizei count = static_cast<GLsizei>(entry.vertices.size());
             glUniform1f(pass.locDepthScale, static_cast<float>(entry.gsZScale * target.zScale));
             glUniform4fv(pass.locM, 4, entry.batch.matrix);

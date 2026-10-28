@@ -1522,6 +1522,8 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
         (dmac ? m_pendingDmacMask : m_pendingIntcMask) |= 1u << cause;
+        if (dmac && cause == 2u)
+            m_runtime.memory().noteGifEvent('D', 0u, 1u);
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
@@ -1537,6 +1539,8 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    if (dmac && cause == 2u)
+        m_runtime.memory().noteGifEvent('D', static_cast<uint32_t>(matching.size()), 0u);
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};
@@ -1815,6 +1819,10 @@ void EeScheduler::publishSnapshot()
     next.runningThreadId = m_currentThreadId;
     next.enabledIntcMask = m_enabledIntcMask;
     next.pendingIntcMask = m_pendingIntcMask;
+    next.enabledDmacMask = m_enabledDmacMask;
+    next.pendingDmacMask = m_pendingDmacMask;
+    for (const auto &[id, handler] : m_dmacHandlers)
+        next.dmacHandlers.push_back(handler);
     next.pendingInvocations = static_cast<uint32_t>(m_pendingInvocations.size());
     next.heldUntilEi = m_heldUntilEi;
     next.threads.reserve(m_threads.size());
