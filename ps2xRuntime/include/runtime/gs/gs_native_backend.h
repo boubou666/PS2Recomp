@@ -95,6 +95,9 @@ private:
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
     void applyBlend(const GSDrawState &state);
+    // One PCRTC read circuit's picture (RGBA8, alpha as the GS stores it), from its render target or else GS memory.
+    bool readCircuit(uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels, uint32_t &width,
+                     uint32_t &height, uint32_t &fbp);
 
     GLFWwindow *m_sharedContext = nullptr;
     bool m_contextReady = false;
@@ -103,6 +106,7 @@ private:
     std::thread::id m_glThread{};
     std::thread::id m_submitThread{}; // the thread that draws: the only one that may bind our context
     std::unique_ptr<GSCpuBackend> m_memory;
+    uint8_t *m_vram = nullptr; // GS local memory (the CPU copy), for what is displayed without being drawn
 
     uint32_t m_program = 0;
     uint32_t m_vertexArray = 0;

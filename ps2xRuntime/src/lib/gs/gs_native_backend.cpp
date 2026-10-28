@@ -1,6 +1,8 @@
 #include "runtime/gs/gs_native_backend.h"
 
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/gs/gs_texture_page_cache.h"
 #include "runtime/native/native_renderer.h"
 #include "runtime/native/native_texture_cache.h"
 
@@ -707,6 +709,7 @@ void GSNativeBackend::flushBatch()
 
 void GSNativeBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
+    m_vram = vram;
     m_memory->Initialize(vram, vramSize);
 }
 
@@ -756,6 +759,50 @@ void GSNativeBackend::Sync(GSSyncReason reason)
     m_memory->Sync(reason);
 }
 
+bool GSNativeBackend::readCircuit(uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels,
+                                  uint32_t &width, uint32_t &height, uint32_t &fbp)
+{
+    const DisplayRead read = decodeDisplay(dispfb, display);
+    fbp = read.fbp;
+    const uint32_t lines = fieldMode ? (read.height + 1u) / 2u : read.height;
+    auto it = m_targets.find(read.fbp);
+    if (it != m_targets.end())
+    {
+        const RenderTarget &target = it->second;
+        width = std::min(read.width, target.width - std::min(read.x, target.width));
+        height = std::min(lines, target.height - std::min(read.y, target.height));
+        if (width == 0u || height == 0u)
+            return false;
+        pixels.resize(static_cast<size_t>(width) * height * 4u);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(static_cast<GLint>(read.x), static_cast<GLint>(read.y), static_cast<GLsizei>(width),
+                     static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        return true;
+    }
+    // Not drawn by us (an image the game uploaded straight into the displayed buffer): read GS memory, CT32 / CT24.
+    if (!m_vram)
+        return false;
+    const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
+    const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
+    width = std::min<uint32_t>(read.width, 2048u);
+    height = std::min<uint32_t>(lines, 1024u);
+    if (width == 0u || height == 0u || fbw == 0u || (psm != 0x00u && psm != 0x01u))
+        return false;
+    pixels.resize(static_cast<size_t>(width) * height * 4u);
+    thread_local GSMem::TexturePageCache cache;
+    cache.Invalidate();
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            uint32_t c = GSMem::ReadTexture(cache, m_vram, psm, read.fbp * 32u, fbw, read.x + x, read.y + y);
+            if (psm == 0x01u)
+                c |= 0x80000000u;
+            std::memcpy(&pixels[(static_cast<size_t>(y) * width + x) * 4u], &c, 4u);
+        }
+    return true;
+}
+
 PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
 {
     flushBatch();
@@ -764,29 +811,52 @@ PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
         return frame;
     // Interlaced field mode (SMODE2 INT and FFMD): the game draws one field of half the lines; show each line twice.
     const bool fieldMode = (request.smode2 & 0x3u) == 0x3u;
-    const bool crt1 = (request.pmode & 0x1u) != 0u;
-    const DisplayRead read = crt1 || (request.pmode & 0x2u) == 0u ? decodeDisplay(request.dispfb1, request.display1)
-                                                                    : decodeDisplay(request.dispfb2, request.display2);
-    auto it = m_targets.find(read.fbp);
-    if (it == m_targets.end())
+    // PMODE: EN1, EN2, MMOD (blend with ALP rather than circuit 1's alpha), SLBG (blend over BGCOLOR rather than
+    // circuit 2), ALP. Circuit 1 is blended over circuit 2 (or the background colour).
+    const uint64_t pmode = request.pmode;
+    const bool en1 = (pmode & 0x1u) != 0u, en2 = (pmode & 0x2u) != 0u;
+    const bool mmod = (pmode >> 5 & 0x1u) != 0u, slbg = (pmode >> 7 & 0x1u) != 0u;
+    const float alp = static_cast<float>(pmode >> 8 & 0xFFu) / 255.0f;
+    std::vector<uint8_t> top, bottom;
+    uint32_t topWidth = 0, topHeight = 0, topFbp = 0, bottomWidth = 0, bottomHeight = 0, bottomFbp = 0;
+    const bool haveTop = en1 && readCircuit(request.dispfb1, request.display1, fieldMode, top, topWidth, topHeight, topFbp);
+    const bool haveBottom = en2 && !slbg &&
+                            readCircuit(request.dispfb2, request.display2, fieldMode, bottom, bottomWidth, bottomHeight,
+                                        bottomFbp);
+    if (!haveTop && !haveBottom)
         return frame;
-    const RenderTarget &target = it->second;
-    const uint32_t width = std::min(read.width, target.width - std::min(read.x, target.width));
-    const uint32_t lines = fieldMode ? (read.height + 1u) / 2u : read.height;
-    const uint32_t height = std::min(lines, target.height - std::min(read.y, target.height));
-    if (width == 0u || height == 0u)
-        return frame;
+    const uint32_t width = std::max(haveTop ? topWidth : 0u, haveBottom ? bottomWidth : 0u);
+    const uint32_t height = std::max(haveTop ? topHeight : 0u, haveBottom ? bottomHeight : 0u);
     frame.width = width;
     frame.height = height;
-    frame.displayFbp = read.fbp;
-    frame.sourceFbp = read.fbp;
-    frame.pixels.resize(static_cast<size_t>(width) * height * 4u);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(static_cast<GLint>(read.x), static_cast<GLint>(read.y), static_cast<GLsizei>(width),
-                 static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, frame.pixels.data());
-    for (size_t i = 3; i < frame.pixels.size(); i += 4)
-        frame.pixels[i] = 0xFFu;
+    frame.displayFbp = haveTop ? topFbp : bottomFbp;
+    frame.sourceFbp = frame.displayFbp;
+    frame.pixels.assign(static_cast<size_t>(width) * height * 4u, 0u);
+    const uint8_t bg[3] = {static_cast<uint8_t>(request.bgcolor & 0xFFu), static_cast<uint8_t>(request.bgcolor >> 8 & 0xFFu),
+                           static_cast<uint8_t>(request.bgcolor >> 16 & 0xFFu)};
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            uint8_t *out = &frame.pixels[(static_cast<size_t>(y) * width + x) * 4u];
+            uint8_t under[3] = {bg[0], bg[1], bg[2]};
+            if (haveBottom && x < bottomWidth && y < bottomHeight)
+                std::memcpy(under, &bottom[(static_cast<size_t>(y) * bottomWidth + x) * 4u], 3u);
+            else if (!slbg && !haveBottom)
+                under[0] = under[1] = under[2] = 0u;
+            if (haveTop && x < topWidth && y < topHeight)
+            {
+                const uint8_t *over = &top[(static_cast<size_t>(y) * topWidth + x) * 4u];
+                // Circuit 1's alpha counts 0x80 as 1.0. With only circuit 1 shown it simply replaces the background.
+                const float a = !(en2 || slbg) ? 1.0f : mmod ? alp : std::min(1.0f, over[3] / 128.0f);
+                for (int c = 0; c < 3; ++c)
+                    out[c] = static_cast<uint8_t>(over[c] * a + under[c] * (1.0f - a) + 0.5f);
+            }
+            else
+            {
+                std::memcpy(out, under, 3u);
+            }
+            out[3] = 0xFFu;
+        }
     if (fieldMode)
     {
         std::vector<uint8_t> doubled(frame.pixels.size() * 2u);
