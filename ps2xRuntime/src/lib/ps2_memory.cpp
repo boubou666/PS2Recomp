@@ -1635,6 +1635,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
+                auto &channelQueue = channelBase == 0x1000A000u   ? m_pendingGifTransfers
+                                     : channelBase == 0x10009000u ? m_pendingVif1Transfers
+                                                                  : m_pendingVif0Transfers;
+                const size_t queuedBefore = channelQueue.size();
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
                     if (qwCount == 0)
@@ -1699,6 +1703,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 else if (qwc > 0)
                 {
                     enqueueTransfer(madr, qwc);
+                }
+
+                // Nothing to move (normal mode with QWC 0, or a chain with no data): the channel ends at once, as on
+                // the console. Without this its STR only cleared on the next CHCR read and its end interrupt never
+                // came (VP2's menu waits on its GIF queue for that interrupt).
+                if (channelQueue.size() == queuedBefore)
+                {
+                    completeDmacChannel(channelBase, channelBase == 0x1000A000u ? 2u : channelBase == 0x10009000u ? 1u : 0u);
+                    return true;
                 }
 
                 const bool autoProcessTransfers =
