@@ -51,7 +51,7 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
-    // Diagnostics (ps2_gs_replay --dump): every drawn render target's pixels written to the texture cache's GS memory.
+    // Diagnostics (ps2_gs_replay --dump): every drawn render target's pixels written to GS memory (m_vram).
     void resolveAllTargets();
 
     // For a native renderer drawing into the same frame (a mesh renderer's 3D between GS draws): the render target of
@@ -66,6 +66,7 @@ public:
     };
     FrameTarget frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf);
     void NativeDraw(uint64_t group, const GSContext &context) override;
+    bool PresentsOnDrawThread() const override { return true; }
 
 private:
     struct RenderTarget
@@ -82,6 +83,7 @@ private:
         bool dirty = false;      // drawn since its pixels were last written to GS memory (resolveTarget)
         uint32_t zbp = ~0u;      // the ZBUF its depth buffer was last written as (pages), for depth read as a texture
         uint8_t zpsm = 0;
+        bool alphaWritten = false; // a draw wrote its alpha (else GS memory's top bytes stay what they were)
     };
 
     struct Vertex
@@ -126,10 +128,26 @@ private:
     // GPU, brought up to date page by page from m_vram, and the formats' swizzle tables.
     bool bindDecodedTexture(const GSDrawState &state);
     uint32_t m_vramTexture = 0;
+    uint32_t m_inverseTexture = 0;
+    uint32_t m_vramFramebuffer = 0;
+    uint32_t m_resolveProgram = 0;
+    void ensureVram();
+    void syncVramToGpu();
+    // A render target written into the GPU copy of GS memory (CT32 / CT16 / CT16S); false for what only the CPU
+    // path does (CT24 keeps the top byte, which a GPU write cannot).
+    bool resolveTargetGpu(RenderTarget &target);
+    // Pages the GPU copy has newer than m_vram (resolved there): read back before the CPU reads or partly rewrites
+    // GS memory (transfers, CLUT, local-to-host, presentation from memory).
+    std::vector<uint8_t> m_gpuNewer = std::vector<uint8_t>(512u, 0u);
+    bool m_anyGpuNewer = false;
+    void pullGpuPages();
     uint32_t m_swizzleTexture = 0;
-    // Pages of GS memory (m_vram, written in stream order by the transfers, CLUT loads and resolves) the GPU copy
-    // has not received yet.
-    std::vector<uint8_t> m_dirtyPages = std::vector<uint8_t>(512u, 1u);
+    // 256-byte blocks of GS memory (m_vram, written in stream order by the transfers, CLUT writes and CPU resolves)
+    // the GPU copy has not received yet.
+    std::vector<uint8_t> m_dirtyBlocks = std::vector<uint8_t>(16384u, 1u);
+    bool m_anyDirty = true;
+    GSTransferCommand m_transfer{}; // the current transfer, whose data UploadImage brings
+    uint32_t m_transferDirect = 3u;
     void markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     uint32_t m_destTexture = 0; // copy of the render target for DATE
     uint32_t m_destWidth = 0;
