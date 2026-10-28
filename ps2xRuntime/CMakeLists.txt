@@ -568,9 +568,11 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
 endif()
 
 if(PS2X_ENABLE_RUNNER_PCH)
+    # Only the recomp ABI headers the generated code includes (fork 373bc18), not ps2_runtime.h / ps2_syscalls.h /
+    # ps2_stubs.h: a runtime header change then leaves the precompiled header, and so every generated file, untouched.
     set(PS2X_RUNNER_PCH_HEADERS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recomp_calls.h"
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
@@ -580,11 +582,6 @@ if(PS2X_ENABLE_RUNNER_PCH)
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
     endforeach()
-
-    list(APPEND PS2X_RUNNER_PCH_HEADERS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_stubs.h"
-    )
 
     target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
 endif()
