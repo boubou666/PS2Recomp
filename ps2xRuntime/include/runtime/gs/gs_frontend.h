@@ -164,6 +164,10 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // A native renderer's draws for a skipped VU1 program (runtime/native/native_gs_hook.h): a marker in the queue,
+    // in the order of the PATH1 packets around it, that calls the hook on the GS thread with context 0 or 1's
+    // render target. Does not wait.
+    void queueNativeDraw(uint64_t group, int context);
     // latchHostPresentationFrame() once the GS has drawn what is queued before it, with the display registers
     // as they are now (the caller's position in the GS's stream); on the GS thread if it has one.
     void queueHostPresentationLatch();

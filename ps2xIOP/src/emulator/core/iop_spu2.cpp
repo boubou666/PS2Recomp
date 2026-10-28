@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -621,7 +622,12 @@ namespace ps2x::iop::detail
             ++m_stats.dmaReads;
         }
         core.transferAddress = (core.transferAddress + words) & kRamMask;
-        core.dmaCompletionCycle = m_cycle + std::max<uint64_t>(static_cast<uint64_t>(bytes) / 2u, 64u);
+        // PS2X_SPU2_DMA_CYCLES_PER_2BYTES (default 1): IOP cycles per SPU2 word of a sound RAM transfer.
+        static const uint64_t cyclesPerWord = []() -> uint64_t {
+            const char *value = std::getenv("PS2X_SPU2_DMA_CYCLES_PER_2BYTES");
+            return value ? std::max<uint64_t>(1u, std::strtoull(value, nullptr, 10)) : 1u;
+        }();
+        core.dmaCompletionCycle = m_cycle + std::max<uint64_t>(static_cast<uint64_t>(bytes) / 2u * cyclesPerWord, 64u);
     }
 
     void IopSpu2::printDmaHistory() const

@@ -8,6 +8,9 @@
 #include "ps2_overlay_modules.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#if defined(PS2X_HAVE_NATIVE_GS)
+#include "runtime/gs/gs_native_backend.h"
+#endif
 #include "runtime/gs/gif_path_stats.h"
 #include "runtime/vif1_command_stats.h"
 #include "runtime/ee_scheduler.h"
@@ -544,7 +547,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t overrideWidth = 0u;
     uint32_t overrideHeight = 0u;
     const bool overridden = rt->presentOverride(s_scratch, overrideWidth, overrideHeight);
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    // On native frame pacing every frame the game ends is a new picture; otherwise every vblank is.
+    const bool nativeFrames = rt->eeScheduler().nativeFrames();
+    const uint64_t currentTick = nativeFrames ? (1ull << 63) | rt->gsForPresentation().queuedLatchesDone()
+                                              : rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (overridden)
     {
@@ -1421,6 +1427,18 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+#if defined(PS2X_HAVE_NATIVE_GS)
+        // The native renderer draws on a context shared with the window's (created here, on the main thread).
+        if (const char *renderer = std::getenv("PS2X_GS_RENDERER"); renderer && std::string_view(renderer) == "native")
+        {
+            if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
+            {
+                // The front end then feeds the shared texture cache every upload (native/native_texture_cache.h).
+                ps2x::native::setUploadsWanted(true);
+                m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+            }
+        }
+#endif
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -3486,6 +3504,18 @@ void PS2Runtime::run()
 
             }
         });
+        // A game on native frame pacing sets the rate: the window follows its frame cap (0 = unlimited).
+        {
+            static int s_targetFps = 60;
+            const int targetFps = m_eeScheduler && m_eeScheduler->nativeFrames()
+                                      ? static_cast<int>(m_framePacer.cap())
+                                      : 60;
+            if (targetFps != s_targetFps)
+            {
+                SetTargetFPS(targetFps);
+                s_targetFps = targetFps;
+            }
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);

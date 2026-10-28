@@ -616,6 +616,25 @@ void GS::processWithParallel(const QueuedCommand &command)
     }
 }
 
+void GS::queueNativeDraw(uint64_t group, int context)
+{
+    const int index = context != 0 ? 1 : 0;
+    auto draw = [this, group, index]() {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        if (m_backend)
+            m_backend->NativeDraw(group, m_ctx[index]);
+    };
+    if (!shouldQueue())
+    {
+        draw();
+        return;
+    }
+    QueuedCommand command;
+    command.kind = QueuedCommand::Kind::Call;
+    command.call = std::move(draw);
+    enqueue(std::move(command));
+}
+
 void GS::runOnWorker(std::function<void()> work)
 {
     if (!shouldQueue())
@@ -1150,6 +1169,23 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     request.preferredSource = m_preferredDisplaySourceFrame;
     request.preferredDestFbp = m_preferredDisplayDestFbp;
     request.hasPreferredSource = m_hasPreferredDisplaySource;
+    // PS2X_GS_DISPLAY_LOG=1: the display registers each time they change (what a trace replay presents with).
+    static const bool logDisplay = std::getenv("PS2X_GS_DISPLAY_LOG") != nullptr;
+    if (logDisplay)
+    {
+        static uint64_t last[6] = {};
+        const uint64_t now[6] = {request.pmode, request.smode2, request.dispfb1, request.display1, request.dispfb2,
+                                 request.display2};
+        if (std::memcmp(last, now, sizeof(now)) != 0)
+        {
+            std::memcpy(last, now, sizeof(now));
+            std::fprintf(stderr, "[gs-display] vsync=%llu --display %llx,%llx,%llx,%llx,%llx,%llx\n",
+                         static_cast<unsigned long long>(request.vsyncTick), static_cast<unsigned long long>(now[0]),
+                         static_cast<unsigned long long>(now[1]), static_cast<unsigned long long>(now[2]),
+                         static_cast<unsigned long long>(now[3]), static_cast<unsigned long long>(now[4]),
+                         static_cast<unsigned long long>(now[5]));
+        }
+    }
     return request;
 }
 

@@ -6,6 +6,10 @@
 // To inspect a multi-pass effect one pass at a time:
 //   --list     print every command: index, kind, size, and the first GIF tag or the upload destination
 //   --until N  replay commands 0..N-1 only
+//   --parallel replay on paraLLEl-GS instead (the reference picture; needs --present and --display)
+//   --native   draw with the native renderer (GSNativeBackend, OpenGL on a hidden window) instead of the CPU GS
+//   --present FILE  after the replay, write the displayed picture (as the game's window shows it) as a PPM
+//   --display PMODE,SMODE2,DISPFB1,DISPLAY1,DISPFB2,DISPLAY2  the display registers to present with (hex; traces lack them)
 //   --dump     after the replay, write a buffer as NAME.ppm: FBP in 2048-word pages, FBW in 64-pixel units, PSM as
 //              in the GS registers (0 CT32, 1 CT24, 2 CT16, 10 CT16S, 19 T8, 20 T4, 48-58 Z formats, as grey)
 // PS2X_GS_REPLAY_COMMANDS=<n> replays only the first n commands.
@@ -13,7 +17,15 @@
 // and reports the first comparison that differs.
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_parallel.h"
+#include "runtime/gs/gs_texture_page_cache.h"
 #include "runtime/gs/gs_trace.h"
+#include "runtime/gs/ps2_gs_memory.h"
+#if defined(PS2X_HAVE_NATIVE_GS)
+#include "runtime/gs/gs_native_backend.h"
+#include "runtime/native/native_texture_cache.h"
+#include "raylib.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -96,6 +108,22 @@ namespace
         }
     }
 
+    // --native: the render targets live on the GPU; a dump reads them as resolved into the texture cache's GS memory.
+    bool g_dumpNative = false;
+
+    uint32_t readDumped(GS &gs, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+    {
+#if defined(PS2X_HAVE_NATIVE_GS)
+        if (g_dumpNative)
+        {
+            static GSMem::TexturePageCache cache;
+            cache.Invalidate();
+            return GSMem::ReadTexture(cache, ps2x::native::textures().memory(), psm, base, bw, x, y);
+        }
+#endif
+        return gs.ReadVram(psm, base, bw, x, y);
+    }
+
     void writeDump(GS &gs, const DumpRequest &dump)
     {
         const std::string path = dump.name + ".ppm";
@@ -110,7 +138,7 @@ namespace
         for (uint32_t y = 0; y < dump.height; ++y)
         {
             for (uint32_t x = 0; x < dump.width; ++x)
-                toRgb(dump.psm, gs.ReadVram(dump.psm, dump.fbp * 32u, std::max<uint32_t>(dump.fbw, 1u), x, y), &row[x * 3u]);
+                toRgb(dump.psm, readDumped(gs, dump.psm, dump.fbp * 32u, std::max<uint32_t>(dump.fbw, 1u), x, y), &row[x * 3u]);
             std::fwrite(row.data(), 1, row.size(), file);
         }
         std::fclose(file);
@@ -147,6 +175,11 @@ namespace
         switch (command.kind)
         {
         case GsTraceCommand::GifPacket:
+#if defined(PS2X_HAVE_NATIVE_GS)
+            // The game's packets reach the native texture cache through GS::submitGIFPacket; this replays below it.
+            if (ps2x::native::uploadsWanted())
+                ps2x::native::textures().scanGifPacket(data, size);
+#endif
             gs.processGIFPacket(data, size);
             break;
         case GsTraceCommand::NativePackedGifPacket:
@@ -197,6 +230,154 @@ namespace
     }
 }
 
+    // The displayed picture, through the same presentation path as the game's window, as a binary PPM.
+    // Traces do not carry the privileged display registers: --display gives them (hex PMODE,SMODE2,DISPFB1,DISPLAY1,
+    // DISPFB2,DISPLAY2), and the backend presents them directly.
+    GSPresentationRequest g_display{};
+    bool g_haveDisplay = false;
+
+    bool parseDisplay(const char *text)
+    {
+        unsigned long long v[6] = {};
+        if (std::sscanf(text, "%llx,%llx,%llx,%llx,%llx,%llx", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+            return false;
+        g_display.pmode = v[0];
+        g_display.smode2 = v[1];
+        g_display.dispfb1 = v[2];
+        g_display.display1 = v[3];
+        g_display.dispfb2 = v[4];
+        g_display.display2 = v[5];
+        g_haveDisplay = true;
+        return true;
+    }
+
+    bool writePresent(GS &gs, const char *path)
+    {
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0, height = 0;
+        if (g_haveDisplay)
+        {
+            PresentationFrame frame = gs.rasterBackend()->Present(g_display);
+            if (!frame)
+                return false;
+            pixels = std::move(frame.pixels);
+            width = frame.width;
+            height = frame.height;
+        }
+        else
+        {
+            gs.latchHostPresentationFrame();
+            if (!gs.copyLatchedHostPresentationFrame(pixels, width, height) || width == 0u || height == 0u)
+                return false;
+        }
+        FILE *out = std::fopen(path, "wb");
+        if (!out)
+            return false;
+        std::fprintf(out, "P6\n%u %u\n255\n", width, height);
+        for (size_t i = 0; i + 3u < pixels.size(); i += 4u)
+            std::fwrite(&pixels[i], 1, 3, out);
+        std::fclose(out);
+        std::printf("present %ux%u -> %s\n", width, height, path);
+        return true;
+    }
+
+
+    // The trace's GS memory (the uploads made before the recording) as one linear CT32 1024x1024 image.
+    std::vector<uint8_t> linearVram(const std::vector<uint8_t> &vram)
+    {
+        std::vector<uint8_t> linear(1024u * 1024u * 4u);
+        GSMem::TexturePageCache cache;
+        cache.Invalidate();
+        for (uint32_t y = 0; y < 1024u; ++y)
+            for (uint32_t x = 0; x < 1024u; ++x)
+            {
+                const uint32_t c = GSMem::ReadTexture(cache, vram.data(), 0x00u, 0u, 16u, x, y);
+                std::memcpy(&linear[(static_cast<size_t>(y) * 1024u + x) * 4u], &c, 4u);
+            }
+        return linear;
+    }
+
+    // paraLLEl-GS as the reference: it starts from the trace's GS memory but not its drawing state (the frames the
+    // trace holds set their registers again), takes the raw GIF packets and presents with --display.
+    int replayOnParallel(const GsTraceHeader &header, const std::vector<GsTraceCommand> &commands, size_t replayed,
+                         const char *presentPath)
+    {
+        if (!presentPath || !g_haveDisplay)
+        {
+            std::fprintf(stderr, "--parallel needs --present and --display\n");
+            return 2;
+        }
+        std::unique_ptr<GSParallelRenderer> gs =
+            GSParallelRenderer::create(static_cast<uint32_t>(header.vram.size()), GSParallelRenderer::Callbacks{});
+        if (!gs)
+        {
+            std::fprintf(stderr, "no paraLLEl-GS in this build or no suitable Vulkan device\n");
+            return 2;
+        }
+        auto upload = [&](uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir, const uint8_t *data,
+                          uint32_t size) {
+            const uint64_t registers[4] = {bitbltbuf, trxpos, trxreg, trxdir};
+            for (uint32_t i = 0; i < 4u; ++i)
+                gs->writeRegister(static_cast<uint8_t>(GS_REG_BITBLTBUF + i), registers[i]);
+            const uint32_t qwords = (size + 15u) / 16u;
+            std::vector<uint8_t> packet(16u + qwords * 16u, 0u);
+            const uint64_t tag = qwords | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58);
+            std::memcpy(packet.data(), &tag, sizeof(tag));
+            std::memcpy(packet.data() + 16u, data, size);
+            gs->gifTransfer(packet.data(), static_cast<uint32_t>(packet.size()));
+        };
+        const std::vector<uint8_t> linear = linearVram(header.vram);
+        upload(16ull << 48, 0u, 1024ull | (1024ull << 32), 0u, linear.data(), static_cast<uint32_t>(linear.size()));
+        const auto start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < replayed; ++i)
+        {
+            const GsTraceCommand &command = commands[i];
+            if (command.kind == GsTraceCommand::NativeImageUpload)
+                upload(command.registers[0], command.registers[1], command.registers[2], command.registers[3],
+                       command.bytes.data(), static_cast<uint32_t>(command.bytes.size()));
+            else
+                gs->gifTransfer(command.bytes.data(), static_cast<uint32_t>(command.bytes.size()));
+        }
+        gs->flush();
+        PresentationFrame frame = gs->present(g_display);
+        std::printf("time %.1f ms\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        if (!frame)
+        {
+            std::fprintf(stderr, "no displayed picture\n");
+            return 1;
+        }
+        FILE *out = std::fopen(presentPath, "wb");
+        if (!out)
+            return 1;
+        std::fprintf(out, "P6\n%u %u\n255\n", frame.width, frame.height);
+        for (size_t i = 0; i + 3u < frame.pixels.size(); i += 4u)
+            std::fwrite(&frame.pixels[i], 1, 3, out);
+        std::fclose(out);
+        std::printf("present %ux%u -> %s\n", frame.width, frame.height, presentPath);
+        return 0;
+    }
+
+#if defined(PS2X_HAVE_NATIVE_GS)
+    // The native renderer on a hidden window; its texture cache starts from the trace's GS memory (the uploads made
+    // before the recording), written whole as one CT32 1024x1024 image at block 0.
+    void useNativeRenderer(GS &gs, const std::vector<uint8_t> &vram)
+    {
+        static GLFWwindow *shared = nullptr;
+        if (!shared)
+        {
+            SetConfigFlags(FLAG_WINDOW_HIDDEN);
+            InitWindow(64, 64, "ps2_gs_replay");
+            shared = GSNativeBackend::createSharedContext();
+        }
+        ps2x::native::setUploadsWanted(true);
+        const std::vector<uint8_t> linear = linearVram(vram);
+        ps2x::native::textures().upload(16ull << 48, 0u, 1024ull | (1024ull << 32), linear.data(),
+                                                             linear.size());
+        gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+    }
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -206,6 +387,9 @@ int main(int argc, char **argv)
         return 2;
     }
     bool list = false;
+    bool native = false;
+    bool parallel = false;
+    const char *presentPath = nullptr;
     size_t until = SIZE_MAX;
     std::vector<DumpRequest> dumps;
     std::vector<const char *> positional;
@@ -214,6 +398,20 @@ int main(int argc, char **argv)
         const std::string arg = argv[i];
         if (arg == "--list")
             list = true;
+        else if (arg == "--native")
+            native = true;
+        else if (arg == "--parallel")
+            parallel = true;
+        else if (arg == "--present" && i + 1 < argc)
+            presentPath = argv[++i];
+        else if (arg == "--display" && i + 1 < argc)
+        {
+            if (!parseDisplay(argv[++i]))
+            {
+                std::fprintf(stderr, "bad --display %s (hex PMODE,SMODE2,DISPFB1,DISPLAY1,DISPFB2,DISPLAY2)\n", argv[i]);
+                return 2;
+            }
+        }
         else if (arg == "--until" && i + 1 < argc)
             until = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--dump" && i + 1 < argc)
@@ -257,6 +455,8 @@ int main(int argc, char **argv)
     if (std::getenv("PS2X_GS_REPLAY_CHECK"))
         return checkWorkersAgainstCaller(header, commands, std::max<size_t>(1u, std::strtoull(std::getenv("PS2X_GS_REPLAY_CHECK"), nullptr, 0)));
     const size_t replayed = std::min(until, commands.size());
+    if (parallel)
+        return replayOnParallel(header, commands, replayed, presentPath);
     const int repeat = !positional.empty() ? std::max(1, std::atoi(positional[0])) : 1;
     if (std::getenv("PS2X_GS_ASYNC_RASTER"))
         GSCpuBackend::SetAsyncRasterization(true);
@@ -274,6 +474,16 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "bad drawing state\n");
             return 1;
         }
+#if defined(PS2X_HAVE_NATIVE_GS)
+        if (native)
+            useNativeRenderer(gs, header.vram);
+#else
+        if (native)
+        {
+            std::fprintf(stderr, "built without the native renderer\n");
+            return 2;
+        }
+#endif
         const auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < replayed; ++i)
             replayCommand(gs, commands[i]);
@@ -282,8 +492,20 @@ int main(int argc, char **argv)
         total += seconds;
         best = pass == 0 ? seconds : std::min(best, seconds);
         if (pass + 1 == repeat)
+        {
+#if defined(PS2X_HAVE_NATIVE_GS)
+            if (native && !dumps.empty())
+                if (auto *backend = dynamic_cast<GSNativeBackend *>(gs.rasterBackend()))
+                {
+                    backend->resolveAllTargets();
+                    g_dumpNative = true;
+                }
+#endif
             for (const DumpRequest &dump : dumps)
                 writeDump(gs, dump);
+            if (presentPath && !writePresent(gs, presentPath))
+                std::fprintf(stderr, "no displayed picture\n");
+        }
     }
 
     uint64_t hash = 0xCBF29CE484222325ull;

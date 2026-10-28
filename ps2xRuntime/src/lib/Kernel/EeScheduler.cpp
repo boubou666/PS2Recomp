@@ -1740,6 +1740,29 @@ void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
     }
 }
 
+void EeScheduler::latchGuestFrame()
+{
+    PS2Memory &memory = m_runtime.memory();
+    if (memory.gsLag())
+    {
+        // The worker may still be drawing the frame: the latch follows it through the worker's queue, then the GS
+        // thread's.
+        PS2Runtime *runtime = &m_runtime;
+        memory.queueVif1Callback([runtime]() { runtime->gsForPresentation().queueHostPresentationLatch(); });
+        memory.markVif1Frame();
+    }
+    else
+    {
+        m_runtime.gsForPresentation().latchHostPresentationFrame();
+    }
+}
+
+void EeScheduler::presentGuestFrame()
+{
+    assertExecutor();
+    latchGuestFrame();
+}
+
 std::optional<bool> EeScheduler::guestFrameWaiting()
 {
     if (m_frameWaitPcEnd == 0u)
@@ -2107,6 +2130,10 @@ void EeScheduler::processDueDeadlines()
                 return;
             }
 
+            // Native frames: the game's frame end paces the host and keeps EE time on real time, so an event is due
+            // once EE time reaches it; nothing waits for its host deadline.
+            if (m_nativeFrames)
+                pacingDeadline = std::chrono::steady_clock::time_point::min();
             const auto now = std::chrono::steady_clock::now();
             if (now < pacingDeadline && interruptInvocationPending())
             {
@@ -2129,7 +2156,8 @@ void EeScheduler::processDueDeadlines()
                 }
             }
 
-            const auto pacedNow = std::chrono::steady_clock::now();
+            const auto pacedNow = m_nativeFrames ? std::chrono::steady_clock::time_point::max()
+                                                            : std::chrono::steady_clock::now();
             const auto cycleDueEnd = std::find_if(m_deadlines.begin(), m_deadlines.end(), [this](const ScheduledEvent &item)
                                                   { return item.deadlineCycle > m_eeCycle; });
             auto firstFuture = std::stable_partition(m_deadlines.begin(), cycleDueEnd,
@@ -2266,7 +2294,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         // vblank (sceGsSyncV, WaitVSync...). A game running below the field rate is still drawing
         // when other vblanks pass; latching those shows a half-drawn layer every other frame. Games
         // that never wait that way still get a latch every kMaxVBlanksWithoutLatch vblanks.
-        if (latchPresentationOnVBlank())
+        if (latchPresentationOnVBlank() && !m_nativeFrames)
         {
             constexpr uint32_t kMaxVBlanksWithoutLatch = 3u;
             static uint32_t s_vblanksWithoutLatch = 0u;
@@ -2284,19 +2312,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             }
             if (frameComplete || ++s_vblanksWithoutLatch >= kMaxVBlanksWithoutLatch)
             {
-                PS2Memory &memory = m_runtime.memory();
-                if (memory.gsLag())
-                {
-                    // The worker may still be drawing the frame: the latch follows it through the worker's queue,
-                    // then the GS thread's.
-                    PS2Runtime *runtime = &m_runtime;
-                    memory.queueVif1Callback([runtime]() { runtime->gsForPresentation().queueHostPresentationLatch(); });
-                    memory.markVif1Frame();
-                }
-                else
-                {
-                    m_runtime.gsForPresentation().latchHostPresentationFrame();
-                }
+                latchGuestFrame();
                 s_vblanksWithoutLatch = 0u;
             }
         }
