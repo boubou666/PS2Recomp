@@ -87,6 +87,7 @@ public:
     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
     bool findEeRpcServer(uint32_t sid, EeRpcServer &server) const override;
     bool callEeRpc(EeRpcCall call) override;
+    void completeDeferredRpc(uint64_t token, const ps2x::iop::RpcResult &result) override;
 
     void submitAudio(const int16_t *frames, size_t count) override;
     void setAudioSource(std::function<void(int16_t *frames, size_t count)> source) override;

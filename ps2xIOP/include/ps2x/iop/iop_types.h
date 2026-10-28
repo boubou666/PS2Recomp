@@ -76,6 +76,9 @@ namespace ps2x::iop
         // The send buffer as it was at the call, for an RPC run after the call returned (PS2Runtime::queueIopRpc);
         // null: read it from EE memory at send.address.
         const uint8_t *sendData = nullptr;
+        // The EE caller can wait for the server to finish in IOP time: a server that blocks then goes on as its queue
+        // thread and the call completes later (RpcResult::deferred) instead of running the IOP inline until it returns.
+        bool allowDeferred = false;
     };
 
     enum class IopHandleKind : uint32_t
@@ -99,6 +102,10 @@ namespace ps2x::iop
     struct RpcResult
     {
         bool handled = false;
+        // The IOP server blocked and goes on as its queue thread (RpcRequest::allowDeferred): the call completes later,
+        // through IopHost::completeDeferredRpc with this token and the final result.
+        bool deferred = false;
+        uint64_t deferredToken = 0;
         uint32_t resultAddress = 0;
         bool signalNowaitCompletion = false;
         bool signalCompletion = false;

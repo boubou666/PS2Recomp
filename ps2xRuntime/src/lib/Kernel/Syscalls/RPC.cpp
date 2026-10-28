@@ -4,6 +4,8 @@
 
 #include <array>
 #include <chrono>
+#include <functional>
+#include <unordered_map>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -303,6 +305,26 @@ namespace ps2_syscalls
                 out << " recv=[" << formatRpcTraceBytes(row.last.recvPreview, row.last.recvPreviewSize) << "]";
             out << '\n';
         }
+    }
+
+    namespace
+    {
+        // EE -> IOP calls the IOP deferred (its server blocked and goes on as its thread), by token, until the IOP
+        // reports them done (completeDeferredIopRpc). Executor only.
+        constexpr uint32_t kDeferredIopRpcWaitType = 0x49525043u; // waitExternal type: a WAIT caller of a deferred call
+        std::unordered_map<uint64_t, std::function<void()>> g_deferredIopRpcs;
+    }
+
+    void completeDeferredIopRpc(PS2Runtime *runtime, uint64_t token)
+    {
+        (void)runtime;
+        const auto it = g_deferredIopRpcs.find(token);
+        if (it == g_deferredIopRpcs.end())
+            return;
+        std::function<void()> complete = std::move(it->second);
+        g_deferredIopRpcs.erase(it);
+        if (complete)
+            complete();
     }
 
     void SifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -643,17 +665,23 @@ namespace ps2_syscalls
             request.receive = {receiveBuffer, receiveSize};
             request.endFunction = endFunction;
             request.endParameter = endParameter;
+            // An IOP server: the EE keeps a placeholder record (no function) for each IOP sid it binds; only a real EE
+            // server, run on the EE below, cannot be deferred.
+            request.allowDeferred = !(server && server->func != 0u);
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
 
-            if (iopResult.signalNowaitCompletion &&
-                (mode & kSifRpcModeNowait) != 0u)
+            if (!iopResult.deferred)
             {
-                (void)signalRpcCompletionSema(runtime, completionSemaphore);
-            }
-            if (iopResult.signalCompletion)
-            {
-                (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                if (iopResult.signalNowaitCompletion &&
+                    (mode & kSifRpcModeNowait) != 0u)
+                {
+                    (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                }
+                if (iopResult.signalCompletion)
+                {
+                    (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                }
             }
         }
 
@@ -786,6 +814,62 @@ namespace ps2_syscalls
             }
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
+
+        if (iopResult.deferred)
+        {
+            // The IOP server blocked and goes on as its thread in IOP time (it may wait for an EE thread, such as an
+            // IOP -> EE call to a server this EE serves). The reply lands in the receive buffer when it returns.
+            const uint64_t token = iopResult.deferredToken;
+            const bool nowait = (mode & kSifRpcModeNowait) != 0u;
+            const auto signalDone = [=]()
+            {
+                if (nowait && iopResult.signalNowaitCompletion)
+                    (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                if (iopResult.signalCompletion)
+                    (void)signalRpcCompletionSema(runtime, completionSemaphore);
+            };
+            if (nowait)
+            {
+                // Returns now; when the server is done: semaphores, the client goes idle, and the end function runs
+                // like the RPC end interrupt.
+                const R5900Context caller = *ctx;
+                g_deferredIopRpcs[token] = [=]()
+                {
+                    signalDone();
+                    {
+                        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                        g_rpc_clients[clientPtr].busy = false;
+                        g_rpc_clients[clientPtr].stage = 4;
+                    }
+                    uint32_t callbackFunction = endFunction;
+                    if (callbackFunction != 0u && !runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
+                        runtime->hasFunction(callbackFunction - 0x10000u))
+                        callbackFunction -= 0x10000u;
+                    if (callbackFunction == 0u || !runtime->hasFunction(callbackFunction))
+                        return;
+                    GuestInvocation callback{};
+                    callback.kind = GuestInvocationKind::RpcCallback;
+                    callback.context = caller;
+                    callback.context.pc = callbackFunction;
+                    SET_GPR_U32(&callback.context, 4, endParameter);
+                    SET_GPR_U32(&callback.context, 29, 0u);
+                    SET_GPR_U32(&callback.context, 31, 0u);
+                    runtime->eeScheduler().queueInvocation(std::move(callback));
+                };
+                setReturnS32(ctx, 0);
+                return;
+            }
+            g_deferredIopRpcs[token] = [runtime, token]()
+            {
+                runtime->eeScheduler().completeExternalWait(kDeferredIopRpcWaitType, token, KE_OK);
+            };
+            runtime->eeScheduler().waitExternal(EeWaitReason::External, kDeferredIopRpcWaitType, token,
+                                                [finishCall, signalDone](R5900Context &resume)
+                                                {
+                                                    signalDone();
+                                                    finishCall(nullptr, resume);
+                                                });
+        }
 
         if (serverDispatched)
         {

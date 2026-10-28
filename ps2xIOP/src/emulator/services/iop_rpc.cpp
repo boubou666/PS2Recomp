@@ -27,8 +27,8 @@ namespace ps2x::iop::detail
         m_queueThreads.clear();
         m_eeClients.clear();
         m_eeCalls.clear();
-        // m_nextEeCallToken keeps counting: an EE server may still answer a call made before the reset (SC3 reboots
-        // the IOP at boot), and that reply must miss rather than match the first new call.
+        // m_nextEeCallToken and m_nextDeferredToken keep counting: a reply to a call made before the reset (SC3
+        // reboots the IOP at boot) must miss rather than match the first new call.
         m_nextDmaId = 1u;
         m_sifInitialized = false;
         m_sregs.fill(0u);
@@ -527,45 +527,75 @@ namespace ps2x::iop::detail
         if (traceRpc)
             std::fprintf(stderr, "[iop:rpc] sid=0x%x fno=%u mode=%u send=%u recv=%u -> server 0x%x (inline)\n", request.sid,
                          request.function, request.mode, request.send.size, request.receive.size, server.function);
+        // The reply: the server's return pointer (0: its buffer) copied to the EE receive buffer.
+        const uint32_t serverBuffer = server.buffer;
+        const auto finish = [this, request, serverBuffer](uint32_t returnPointer)
+        {
+            if (traceRpc)
+                std::fprintf(stderr, "[iop:rpc] sid=0x%x fno=%u returned 0x%x\n", request.sid, request.function, returnPointer);
+            if (returnPointer == 0u)
+                returnPointer = serverBuffer;
+            if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+            {
+                const uint32_t physical = IopMemory::physicalAddress(returnPointer);
+                if (physical < IopMemory::RamSize)
+                {
+                    const uint32_t copySize = std::min<uint32_t>(request.receive.size, IopMemory::RamSize - physical);
+                    (void)m_host.writeGuest(request.receive.address, m_memory.ram().data() + physical, copySize);
+                    if (copySize < request.receive.size)
+                        (void)m_host.zeroGuest(request.receive.address + copySize, request.receive.size - copySize);
+                }
+            }
+            RpcResult done{};
+            done.handled = true;
+            done.resultAddress = request.receive.address;
+            done.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
+            done.signalNowaitCompletion = true;
+            done.signalCompletion = true;
+            return done;
+        };
+
         // Run the server function as the thread that serves its queue, like sceSifRpcLoop does:
         // 989snd's bank load records GetThreadId() and sleeps until its loader thread wakes it.
         const auto queueThread = m_queueThreads.find(server.queue);
-        uint32_t returnPointer = queueThread != m_queueThreads.end()
-                                     ? executor.executeGuestFunctionAsThread(server.function,
-                                                                             request.function,
-                                                                             server.buffer,
-                                                                             request.send.size,
-                                                                             0u,
-                                                                             server.gp,
-                                                                             queueThread->second)
-                                     : executor.executeGuestFunction(server.function,
-                                                                     request.function,
-                                                                     server.buffer,
-                                                                     request.send.size,
-                                                                     0u,
-                                                                     server.gp);
-        if (traceRpc)
-            std::fprintf(stderr, "[iop:rpc] sid=0x%x fno=%u returned 0x%x\n", request.sid, request.function, returnPointer);
-        if (returnPointer == 0u)
-            returnPointer = server.buffer;
-        if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+        if (queueThread != m_queueThreads.end() && request.allowDeferred)
         {
-            const uint32_t physical = IopMemory::physicalAddress(returnPointer);
-            if (physical < IopMemory::RamSize)
-            {
-                const uint32_t copySize = std::min<uint32_t>(request.receive.size, IopMemory::RamSize - physical);
-                (void)m_host.writeGuest(request.receive.address, m_memory.ram().data() + physical, copySize);
-                if (copySize < request.receive.size)
-                    (void)m_host.zeroGuest(request.receive.address + copySize, request.receive.size - copySize);
-            }
+            // A server that blocks goes on as that thread in IOP time; the EE caller waits for it instead of the IOP
+            // running inline until it returns, so an EE thread the server waits for (an IOP -> EE call) can run.
+            const uint64_t token = m_nextDeferredToken++;
+            bool deferred = false;
+            const uint32_t returnPointer = executor.executeGuestFunctionAsThreadDeferrable(
+                server.function, request.function, server.buffer, request.send.size, 0u, server.gp, queueThread->second,
+                [this, finish, token](uint32_t v0) { m_host.completeDeferredRpc(token, finish(v0)); }, deferred);
+            if (!deferred)
+                return finish(returnPointer);
+            if (traceRpc)
+                std::fprintf(stderr, "[iop:rpc] sid=0x%x fno=%u blocked: handed off to thread %d (token %llu)\n", request.sid,
+                             request.function, queueThread->second, static_cast<unsigned long long>(token));
+            result.handled = true;
+            result.deferred = true;
+            result.deferredToken = token;
+            result.resultAddress = request.receive.address;
+            result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
+            result.signalNowaitCompletion = true;
+            result.signalCompletion = true;
+            return result;
         }
-
-        result.handled = true;
-        result.resultAddress = request.receive.address;
-        result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
-        result.signalNowaitCompletion = true;
-        result.signalCompletion = true;
-        return result;
+        const uint32_t returnPointer = queueThread != m_queueThreads.end()
+                                           ? executor.executeGuestFunctionAsThread(server.function,
+                                                                                   request.function,
+                                                                                   server.buffer,
+                                                                                   request.send.size,
+                                                                                   0u,
+                                                                                   server.gp,
+                                                                                   queueThread->second)
+                                           : executor.executeGuestFunction(server.function,
+                                                                           request.function,
+                                                                           server.buffer,
+                                                                           request.send.size,
+                                                                           0u,
+                                                                           server.gp);
+        return finish(returnPointer);
     }
 
     void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)

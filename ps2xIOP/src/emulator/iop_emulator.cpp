@@ -268,6 +268,8 @@ namespace ps2x::iop::detail
             pendingDmaInterrupts.clear();
             heldInterrupts.clear();
             pendingGuestCallbacks.clear();
+            handedOffServers.clear();
+            reservedCallStacks.clear();
             pendingSifCommands.clear();
             sifCommandBuffer = 0u;
             sio2.reset();
@@ -961,9 +963,9 @@ namespace ps2x::iop::detail
             cpu.gpr[6] = a2;
             cpu.gpr[7] = a3;
             cpu.gpr[28] = gp;
-            if (depth < kCallStackCapacity)
+            if (const uint32_t slot = callStackSlot(depth); slot < kCallStackCapacity)
             {
-                const uint32_t stackTop = kCallStackLimit - depth * kCallStackSize;
+                const uint32_t stackTop = kCallStackLimit - slot * kCallStackSize;
                 cpu.gpr[29] = stackTop - 32u;
             }
             else if (activeCpu && activeCpu->gpr[29] > kCallStackBase + kStackGuardBytes)
@@ -1146,6 +1148,25 @@ namespace ps2x::iop::detail
         void endTimeslice(IopThread &thread)
         {
             const int id = thread.id;
+            if (thread.cpu.stopped && thread.cpu.pc == kCallReturnSentinel)
+            {
+                if (auto it = handedOffServers.find(id); it != handedOffServers.end())
+                {
+                    // The server handed off to this thread (executeGuestFunctionAsThreadDeferrable) returned: the thread
+                    // goes back to its sceSifRpcLoop wait, then the deferred call completes with its v0.
+                    HandedOffServer server = std::move(it->second);
+                    handedOffServers.erase(it);
+                    const uint32_t v0 = thread.cpu.gpr[2];
+                    thread.cpu = server.rpcLoopCpu;
+                    thread.state = server.rpcLoopState;
+                    reservedCallStacks.erase(server.stackSlot);
+                    kernel.endTimeslice(thread, kThreadReturnSentinel);
+                    maskedThreadId = 0;
+                    if (server.onReturn)
+                        server.onReturn(v0);
+                    return;
+                }
+            }
             kernel.endTimeslice(thread, kThreadReturnSentinel);
             const IopThread *after = kernel.thread(id);
             maskedThreadId = memory.interruptControl() == 0u && after != nullptr && after->state == IopThreadState::Ready ? id : 0;
@@ -1159,9 +1180,32 @@ namespace ps2x::iop::detail
                                               uint32_t gp,
                                               int threadId) override
         {
+            bool deferred = false;
+            return executeGuestFunctionAsThreadDeferrable(address, a0, a1, a2, a3, gp, threadId, nullptr, deferred);
+        }
+
+        uint32_t executeGuestFunctionAsThreadDeferrable(uint32_t address,
+                                                        uint32_t a0,
+                                                        uint32_t a1,
+                                                        uint32_t a2,
+                                                        uint32_t a3,
+                                                        uint32_t gp,
+                                                        int threadId,
+                                                        std::function<void(uint32_t)> onReturn,
+                                                        bool &deferred) override
+        {
+            deferred = false;
             IopThread *owner = kernel.thread(threadId);
             if (owner == nullptr || owner == kernel.currentThread())
                 return callFunction(address, a0, a1, a2, a3, gp);
+            if (onReturn && handedOffServers.count(threadId) != 0u)
+            {
+                // Its thread still runs a server handed off earlier (on the IOP the request would wait in the queue):
+                // this one runs inline as before rather than taking over the thread's context.
+                std::fprintf(stderr, "[iop:call] 0x%x as thread %d: the thread still serves a handed-off call, running inline\n",
+                             address, threadId);
+                onReturn = nullptr;
+            }
 
             struct CallDepthGuard
             {
@@ -1177,7 +1221,8 @@ namespace ps2x::iop::detail
             cpu.gpr[6] = a2;
             cpu.gpr[7] = a3;
             cpu.gpr[28] = gp;
-            cpu.gpr[29] = (depth < kCallStackCapacity ? kCallStackLimit - depth * kCallStackSize : kCallStackBase) - 32u;
+            const uint32_t slot = callStackSlot(depth);
+            cpu.gpr[29] = (slot < kCallStackCapacity ? kCallStackLimit - slot * kCallStackSize : kCallStackBase) - 32u;
             cpu.gpr[31] = kCallReturnSentinel;
 
             // Bound the wait in IOP time so a server that never gets woken cannot hang the EE.
@@ -1275,6 +1320,18 @@ namespace ps2x::iop::detail
                 }
                 cpu.yielded = false;
                 ++blocks;
+                if (onReturn && slot < kCallStackCapacity)
+                {
+                    // Hand off: the server goes on as its thread from where it blocked, in IOP time, with the state its
+                    // wait set; the thread's sceSifRpcLoop context is kept to go back to when the server returns
+                    // (endTimeslice). Its call stack stays reserved meanwhile.
+                    handedOffServers.emplace(threadId, HandedOffServer{owner->cpu, ownerState, slot, std::move(onReturn)});
+                    reservedCallStacks.insert(slot);
+                    owner->cpu = cpu;
+                    kernel.setCurrentThread(previous);
+                    deferred = true;
+                    return 0u;
+                }
                 if (!runOthersUntilRunnable(*owner, deadline))
                 {
                     timedOut = true;
@@ -1751,6 +1808,32 @@ namespace ps2x::iop::detail
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
         bool lastThreadCallReturned = true;
+
+        // EE -> IOP servers handed off to their queue thread (executeGuestFunctionAsThreadDeferrable), by thread id.
+        struct HandedOffServer
+        {
+            CpuState rpcLoopCpu;               // the thread's sceSifRpcLoop context, restored when the server returns
+            IopThreadState rpcLoopState = IopThreadState::Sleep;
+            uint32_t stackSlot = 0u;           // the call stack the server runs on, kept until it returns
+            std::function<void(uint32_t)> onReturn;
+        };
+        std::map<int, HandedOffServer> handedOffServers;
+        std::set<uint32_t> reservedCallStacks;
+
+        // The call stack of an inline call at `depth`: the depth-th slot not kept by a handed-off server (slot ==
+        // depth when none is). kCallStackCapacity: none left.
+        uint32_t callStackSlot(uint32_t depth) const
+        {
+            uint32_t free = 0u;
+            for (uint32_t slot = 0u; slot < kCallStackCapacity; ++slot)
+            {
+                if (reservedCallStacks.count(slot) != 0u)
+                    continue;
+                if (free++ == depth)
+                    return slot;
+            }
+            return kCallStackCapacity;
+        }
         int maskedThreadId = 0;
         GuestCallback secrMcCommandHandler;
         GuestCallback secrMcDevIdHandler;
