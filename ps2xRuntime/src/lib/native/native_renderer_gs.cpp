@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 
 namespace ps2x::native
@@ -57,6 +58,7 @@ uniform float uAlphaRef;
 uniform int uOpaque;
 uniform int uFog;
 uniform vec3 uFogColour;
+uniform int uDebug;
 out vec4 fragColor;
 void main()
 {
@@ -69,6 +71,8 @@ void main()
         c.rgb = mix(uFogColour, c.rgb, clamp(vFog, 0.0, 1.0));
     if (uOpaque != 0)
         c.a *= 128.0 / 255.0;
+    if (uDebug != 0)
+        c = vec4(1.0, 0.0, 1.0, 128.0 / 255.0);
     fragColor = c;
 }
 )";
@@ -246,6 +250,13 @@ void main()
         glUniform2fv(pass.locOffset, 1, offset);
         glUniform2fv(pass.locTargetSize, 1, size);
         glUniform1i(pass.locTex, 0);
+        // PS2X_NATIVE_GS_DEBUG=1: every native fragment magenta (where the draws land in the GS frame).
+        static const int s_debug = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_GS_DEBUG");
+            return value && *value == '1' ? 1 : 0;
+        }();
+        glUniform1i(glGetUniformLocation(pass.program, "uDebug"), s_debug);
         glActiveTexture(GL_TEXTURE0);
         // Our textures' own filtering, not a sampler object the GS renderer left on unit 0.
         GLint sampler = 0;

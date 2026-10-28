@@ -682,9 +682,13 @@ namespace ps2x::iop::detail
                 m_cpu.pc = target;
                 for (;;)
                 {
+                    // A blocking import leaves the thread yielded with pc at its return address: it waits there (the
+                    // caller stops at that resume point), it has not returned yet.
+                    if (m_cpu.yielded || m_cpu.stopped)
+                        return false;
                     if (m_cpu.pc == ret)
                         return true;
-                    if (m_cpu.yielded || m_cpu.stopped || expired())
+                    if (expired())
                         return false;
                     const uint32_t physical = physicalAddress(m_cpu.pc);
                     if (const native::Function function = m_impl.nativeAt(physical))
