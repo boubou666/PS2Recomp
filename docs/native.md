@@ -49,3 +49,39 @@ What the game override does at its frame end (first user: VP2S, `port/vp2s_overr
 
 VP2S first field scene, cap 60: ~44 distinct frames/s, 48 presented/s, host never idle (the EE and the VIF1 worker
 are now the limit, which layers 3 and 5 address).
+
+## Layer 3: translating renderer (design, not started)
+
+Translate what the game asks the GS to draw into GPU work, instead of reproducing the GS. Generic: every PS2 game
+talks to the GS through the same GIF/register interface, so nothing here is game-specific.
+
+- **Placement:** implements the existing `GSParallelRenderer` interface (raw GIF packets, register writes,
+  `present`, local-to-host reads, VRAM reads), selected with `PS2X_GS_RENDERER=native`. Runs on the GS thread.
+- **API:** OpenGL 4.5 core on a context created on the GS thread and shared with raylib's window context (GLFW),
+  so the frame the renderer produces is a GL texture the window draws directly: no CPU copy, and post-process
+  passes are plain GLSL. (Vulkan was the alternative; it buys nothing here and needs interop to reach raylib.)
+- **State:** a GS state tracker fed by a GIF decoder (PACKED/REGLIST/IMAGE, both contexts, PRIM/PRMODE, TEX0/1/2,
+  CLAMP, ALPHA, TEST, FBA, PABE, FRAME, ZBUF, SCISSOR, FOG/FOGCOL, DTHE, COLCLAMP, TEXA, TEXCLUT, BITBLTBUF/TRXPOS/
+  TRXREG/TRXDIR).
+- **Geometry:** vertex kicks assembled into points/lines/triangles/strips/fans/sprites, batched while the state
+  does not change; positions from the 12.4 fixed-point XY with the XYOFFSET, Z as 24/32-bit depth.
+- **Render targets:** a cache keyed by FBP/FBW/PSM (and ZBP/PSM for depth) of GPU textures at an internal scale
+  (1x first, then the player's choice). Overlaps and format reinterpretations resolve by copy passes on the GPU.
+- **Textures:** a CPU shadow of GS local memory takes the uploads (swizzle via `ps2_gs_memory`); textures are
+  decoded from it per TBP/TBW/PSM/CLUT and cached on the GPU, invalidated by uploads that overlap them. A texture
+  whose TBP is a live render target samples that GPU texture directly (feedback effects: blur, bloom, DOF).
+- **Shading:** one shader family with specialisation by state: TFX (modulate/decal/highlight/highlight2), TCC,
+  texture function, alpha test and its fail modes, fog, FBA, dithering. GS blending (A-B)*C+D maps to fixed-function
+  blending for the common cases; the rest uses a framebuffer copy and a shader blend.
+- **Transfers:** host-to-local writes the shadow and invalidates; local-to-local copies run on the GPU;
+  local-to-host (readbacks, e.g. VP2's per-frame StoreImage) reads the render target back (one sync per readback,
+  later async with a frame of latency where the game allows).
+- **Presentation:** the PCRTC merge (DISPFB1/2, DISPLAY1/2, PMODE, BGCOLOR) as a GPU pass from the render targets
+  into the final frame texture, then the post-process chain, then the window.
+- **Validation:** GS recordings (`PS2X_GS_RECORD`, `ps2_gs_replay`) replayed through both the CPU reference and the
+  native renderer; images compared, not VRAM bytes (the native renderer is allowed to differ by rounding, filtering
+  and resolution).
+
+Order: state tracker, geometry and untextured draws into one render target at 1x; textures and CLUTs; blending
+and tests; render target cache and feedback textures; transfers and readbacks; PCRTC presentation; scale factor;
+post-process hook.
