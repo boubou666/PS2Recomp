@@ -54,6 +54,18 @@ public:
     // Diagnostics (ps2_gs_replay --dump): every drawn render target's pixels written to the texture cache's GS memory.
     void resolveAllTargets();
 
+    // For a native renderer drawing into the same frame (a mesh renderer's 3D between GS draws): the render target of
+    // a FRAME register, with the batch collected so far drawn first. GL objects on the GS thread's context. Depth is
+    // GS Z times zScale (1/2^32 Z32, 1/2^24 Z24, 1/2^16 Z16), larger nearer, cleared to 0; colour keeps the GS alpha
+    // as stored (0x80 = 1.0). Null framebuffer when the context is not available.
+    struct FrameTarget
+    {
+        uint32_t framebuffer = 0, color = 0, depth = 0;
+        uint32_t width = 0, height = 0;
+        double zScale = 0.0;
+    };
+    FrameTarget frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf);
+
 private:
     struct RenderTarget
     {

@@ -49,22 +49,6 @@ namespace ps2x::native
         const uint8_t *memory() const { return m_memory.data(); }
         uint64_t uploads() const { return m_uploads; }
 
-        // For a GPU copy of the memory: copy(page, bytes) for every 8 KiB page whose contents changed since
-        // `generations` was last brought up to date (every page the first time), under the cache's lock.
-        template <typename Copy>
-        void changedPages(std::vector<uint32_t> &generations, Copy &&copy) const
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (generations.size() != m_pageGeneration.size())
-                generations.assign(m_pageGeneration.size(), ~0u);
-            for (size_t page = 0; page < m_pageGeneration.size(); ++page)
-                if (generations[page] != m_pageGeneration[page])
-                {
-                    generations[page] = m_pageGeneration[page];
-                    copy(static_cast<uint32_t>(page), m_memory.data() + page * kPageBytes);
-                }
-        }
-
     private:
         uint32_t decodeTexel(uint32_t psm, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint64_t tex0,
                              uint64_t texa, const uint32_t *palette) const;

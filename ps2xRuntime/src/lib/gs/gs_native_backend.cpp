@@ -699,6 +699,26 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     ps2x::native::textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
 }
 
+GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf)
+{
+    FrameTarget out;
+    flushBatch();
+    if (!ensureContext(true))
+        return out;
+    RenderTarget &target = renderTarget(frame);
+    target.dirty = true;
+    target.usedHeight = target.height; // what another renderer draws is not tracked: resolve it whole
+    target.zbp = zbuf.zbp;
+    target.zpsm = zbuf.psm;
+    out.framebuffer = target.framebuffer;
+    out.color = target.color;
+    out.depth = target.depth;
+    out.width = target.width;
+    out.height = target.height;
+    out.zScale = depthScale(zbuf.psm);
+    return out;
+}
+
 void GSNativeBackend::resolveAllTargets()
 {
     flushBatch();
