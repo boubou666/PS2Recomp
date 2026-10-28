@@ -431,7 +431,14 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 
     if (port == 0)
         recordPhysicalButtons(static_cast<uint16_t>(~btns));
-    btns &= static_cast<uint16_t>(~(port == 1 ? pad2ScriptedButtonsDown() : scriptedButtonsDown()));
+    const uint16_t scripted = port == 1 ? pad2ScriptedButtonsDown() : scriptedButtonsDown();
+    btns &= static_cast<uint16_t>(~scripted);
+    // Scripted directions push the left stick too, as the movement keys do: a recorded keyboard session moved
+    // with them where the game reads only the stick (VP2's battles).
+    if (scripted & (PAD_LEFT | PAD_RIGHT))
+        data[6] = (scripted & PAD_LEFT) ? 0x00 : 0xFF;
+    if (scripted & (PAD_UP | PAD_DOWN))
+        data[7] = (scripted & PAD_UP) ? 0x00 : 0xFF;
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
