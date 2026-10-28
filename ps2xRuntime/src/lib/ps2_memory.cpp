@@ -1598,6 +1598,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         }
         if ((address & 0xFF) == 0x00 && (value & 0x100))
         {
+            DmaStartRecord *gifStart = nullptr;
+            if (address == 0x1000A000u)
+            {
+                const uint32_t slot = m_gifStartNext.fetch_add(1, std::memory_order_relaxed) % kGifStartRecords;
+                gifStart = &m_gifStartRecords[slot];
+                *gifStart = {value, m_ioRegisters[0x1000A010u], m_ioRegisters[0x1000A020u] & 0xFFFFu,
+                             m_ioRegisters[0x1000A030u], 0u};
+            }
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
             if (!dmacEnabled)
@@ -1612,6 +1620,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
+                if (gifStart)
+                    gifStart->outcome = 1u;
                 return true;
             }
 
@@ -1708,6 +1718,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 // Nothing to move (normal mode with QWC 0, or a chain with no data): the channel ends at once, as on
                 // the console. Without this its STR only cleared on the next CHCR read and its end interrupt never
                 // came (VP2's menu waits on its GIF queue for that interrupt).
+                if (gifStart)
+                    gifStart->outcome = channelQueue.size() == queuedBefore ? 3u : 2u;
                 if (channelQueue.size() == queuedBefore)
                 {
                     completeDmacChannel(channelBase, channelBase == 0x1000A000u ? 2u : channelBase == 0x10009000u ? 1u : 0u);
