@@ -71,6 +71,12 @@ namespace ps2x::native
         uint64_t m_decodes = 0;
     };
 
+    // The one texture cache every native consumer shares (the mesh API, the GS translating backend), fed by the
+    // runtime's GS front end with every upload while uploadsWanted() (any consumer turns it on).
+    TextureCache &textures();
+    bool uploadsWanted();
+    void setUploadsWanted(bool wanted);
+
     // Index of palette entry `index` in a CSM1 palette stored as a 16-pixel-wide CT32 / CT16 image: (x, y).
     inline void csm1Position(uint32_t index, uint32_t &x, uint32_t &y)
     {

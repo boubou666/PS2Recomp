@@ -64,12 +64,17 @@ namespace ps2x::native
         // point = M * (x, y, z, 1), then divided by w (as a VU's projection).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count);
         void endFrame();
-        TextureCache &textures() { return m_textures; }
+        TextureCache &textures() { return ps2x::native::textures(); }
 
         // Present thread: draws the latest frame into the given window rectangle; false when there is none yet.
         bool present(float x, float y, float width, float height);
         bool enabled() const { return m_enabled; }
-        void setEnabled(bool on) { m_enabled = on; }
+        void setEnabled(bool on)
+        {
+            m_enabled = on;
+            if (on)
+                setUploadsWanted(true);
+        }
 
         struct Batch
         {
@@ -89,7 +94,6 @@ namespace ps2x::native
         ~Renderer();
         struct Gpu;
 
-        TextureCache m_textures; // uploads from the GS thread, decodes from the game thread (it locks)
         Frame m_building;
         std::mutex m_mutex;
         std::shared_ptr<Frame> m_published;

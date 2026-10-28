@@ -3,6 +3,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 
@@ -110,6 +111,20 @@ namespace ps2x::native
             std::call_once(once, [] { GSMem::InitLookupTables(); });
         }
     }
+
+    namespace
+    {
+        std::atomic<bool> g_uploadsWanted{false};
+    }
+
+    TextureCache &textures()
+    {
+        static TextureCache cache;
+        return cache;
+    }
+
+    bool uploadsWanted() { return g_uploadsWanted.load(std::memory_order_relaxed); }
+    void setUploadsWanted(bool wanted) { g_uploadsWanted.store(wanted, std::memory_order_relaxed); }
 
     TextureCache::TextureCache()
         : m_memory(kMemoryBytes, 0u), m_pageGeneration(kMemoryBytes / kPageBytes, 0u)

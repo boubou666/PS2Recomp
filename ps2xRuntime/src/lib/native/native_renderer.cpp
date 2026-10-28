@@ -4,6 +4,7 @@
 #include "rlgl.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -201,30 +202,16 @@ void main()
         BeginTextureMode(gpu.target);
         ClearBackground(BLANK);
         rlDrawRenderBatchActive();
-        rlEnableShader(gpu.shader);
         const Screen &screen = frame->screen;
         const float screenRect[4] = {screen.originX, screen.originY, screen.width, screen.height};
-        rlSetUniform(gpu.locScreen, screenRect, RL_SHADER_UNIFORM_VEC4, 1);
-        rlSetUniform(gpu.locDepthMax, &screen.depthMax, RL_SHADER_UNIFORM_FLOAT, 1);
         const int slot = 0;
-        rlSetUniform(gpu.locTex, &slot, RL_SHADER_UNIFORM_INT, 1);
         rlDisableBackfaceCulling();
         rlEnableDepthTest();
-        rlEnableVertexArray(gpu.vao);
         for (const Batch &batch : frame->batches)
         {
             const Material &m = batch.material;
-            rlSetUniform(gpu.locM, batch.matrix, RL_SHADER_UNIFORM_VEC4, 4);
-            const int textured = m.textured ? 1 : 0, alphaTest = m.alphaTest ? 1 : 0;
-            const float alphaRef = m.alphaRef / 128.0f;
-            rlSetUniform(gpu.locTextured, &textured, RL_SHADER_UNIFORM_INT, 1);
-            rlSetUniform(gpu.locAlphaTest, &alphaTest, RL_SHADER_UNIFORM_INT, 1);
-            rlSetUniform(gpu.locAlphaRef, &alphaRef, RL_SHADER_UNIFORM_FLOAT, 1);
-            if (m.textured)
-            {
-                rlActiveTextureSlot(0);
-                rlEnableTexture(gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), m_textures.texture(m.tex0, m.texa)));
-            }
+            // Blend state first: rlSetBlendMode flushes raylib's own batch, which unbinds the shader and the vertex
+            // array (even with nothing to draw), so they are bound after it.
             if (m.blend == Material::Blend::Opaque)
                 rlDisableColorBlend();
             else
@@ -237,6 +224,22 @@ void main()
                 rlEnableDepthMask();
             else
                 rlDisableDepthMask();
+            rlEnableShader(gpu.shader);
+            rlEnableVertexArray(gpu.vao);
+            rlSetUniform(gpu.locScreen, screenRect, RL_SHADER_UNIFORM_VEC4, 1);
+            rlSetUniform(gpu.locDepthMax, &screen.depthMax, RL_SHADER_UNIFORM_FLOAT, 1);
+            rlSetUniform(gpu.locTex, &slot, RL_SHADER_UNIFORM_INT, 1);
+            rlSetUniform(gpu.locM, batch.matrix, RL_SHADER_UNIFORM_VEC4, 4);
+            const int textured = m.textured ? 1 : 0, alphaTest = m.alphaTest ? 1 : 0;
+            const float alphaRef = m.alphaRef / 128.0f;
+            rlSetUniform(gpu.locTextured, &textured, RL_SHADER_UNIFORM_INT, 1);
+            rlSetUniform(gpu.locAlphaTest, &alphaTest, RL_SHADER_UNIFORM_INT, 1);
+            rlSetUniform(gpu.locAlphaRef, &alphaRef, RL_SHADER_UNIFORM_FLOAT, 1);
+            if (m.textured)
+            {
+                rlActiveTextureSlot(0);
+                rlEnableTexture(gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), ps2x::native::textures().texture(m.tex0, m.texa)));
+            }
             rlDrawVertexArray(static_cast<int>(batch.first), static_cast<int>(batch.count));
         }
         rlDisableVertexArray();
@@ -247,6 +250,17 @@ void main()
         rlEnableColorBlend();
         rlSetBlendMode(RL_BLEND_ALPHA);
         EndTextureMode();
+
+        static const bool s_stats = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_STATS");
+            return value && *value == '1';
+        }();
+        static uint32_t s_presents = 0;
+        if (s_stats && ++s_presents % 250u == 0u)
+            std::fprintf(stderr, "[native] present %u: %zu batches, %zu vertices, shader %u (default %u), target %dx%d
+",
+                         s_presents, frame->batches.size(), frame->vertices.size(), gpu.shader, rlGetShaderIdDefault(), w, h);
 
         // PS2X_NATIVE_CAPTURE_DIR=<dir>: the native frame as native_<n>.png every PS2X_NATIVE_CAPTURE_INTERVAL seconds
         // (default 5), at the window's resolution, to look at it without the GS frame.
