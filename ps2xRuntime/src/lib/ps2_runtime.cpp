@@ -3567,6 +3567,30 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        // PS2X_CAPTURE_WINDOW_DIR=<folder>: the window as shown (whatever the GS renderer, native 3D included) as
+        // window_<tenths of seconds>.png every PS2X_CAPTURE_INTERVAL seconds (default 5).
+        static const char *s_windowCaptureDir = std::getenv("PS2X_CAPTURE_WINDOW_DIR");
+        if (s_windowCaptureDir && *s_windowCaptureDir)
+        {
+            static const double s_interval = []
+            {
+                const char *value = std::getenv("PS2X_CAPTURE_INTERVAL");
+                const double parsed = value ? std::atof(value) : 0.0;
+                return parsed > 0.0 ? parsed : 5.0;
+            }();
+            static const double s_start = GetTime();
+            static double s_next = s_interval;
+            const double elapsed = GetTime() - s_start;
+            if (elapsed >= s_next)
+            {
+                s_next += s_interval;
+                Image image = LoadImageFromScreen();
+                char path[1024];
+                std::snprintf(path, sizeof(path), "%s/window_%06d.png", s_windowCaptureDir, static_cast<int>(elapsed * 10.0));
+                ExportImage(image, path);
+                UnloadImage(image);
+            }
+        }
         EndDrawing();
 
         if (WindowShouldClose())
