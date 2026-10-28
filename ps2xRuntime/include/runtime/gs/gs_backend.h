@@ -36,11 +36,20 @@ public:
     // GS queue.
     virtual bool PresentsOnDrawThread() const { return false; }
     // A native renderer's draws at this point of the stream (GS::queueNativeDraw): the hook with this context's
-    // render target. Renderers that keep GS memory themselves have none to give: a null target.
+    // render target. Renderers that keep GS memory themselves have none to give: a null target, with the context's
+    // offset and scissor still (the native renderer clips its own frame to them).
     virtual void NativeDraw(uint64_t group, const GSContext &context)
     {
-        (void)context;
         if (const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook())
-            hook(group, ps2x::native::GsDrawTarget{});
+        {
+            ps2x::native::GsDrawTarget target;
+            target.xOffset = context.xyoffset.ofx;
+            target.yOffset = context.xyoffset.ofy;
+            target.scissorX0 = context.scissor.x0;
+            target.scissorY0 = context.scissor.y0;
+            target.scissorX1 = context.scissor.x1;
+            target.scissorY1 = context.scissor.y1;
+            hook(group, target);
+        }
     }
 };

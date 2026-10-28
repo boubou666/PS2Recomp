@@ -272,6 +272,11 @@ void PS2IopHostAdapter::submitAudio(const int16_t *frames, size_t count)
     m_runtime.audioBackend().pushSpu2Frames(frames, count);
 }
 
+void PS2IopHostAdapter::setAudioSource(std::function<void(int16_t *frames, size_t count)> source)
+{
+    m_runtime.audioBackend().setSpu2Source(std::move(source));
+}
+
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 {
     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();

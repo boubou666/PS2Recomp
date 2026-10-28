@@ -9,9 +9,12 @@
 // the latest published frame. Textures come from the game's own GS uploads (textures(), a TextureCache, fed by the
 // runtime's GS front end), decoded when the frame is drawn, by which time the frame's own uploads have arrived.
 
+#include "runtime/native/native_gs_hook.h"
 #include "runtime/native/native_texture_cache.h"
 
+#include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -43,6 +46,7 @@ namespace ps2x::native
         bool alphaTest = false;
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
         bool depthWrite = true;
+        bool clampU = false, clampV = false; // CLAMP's WMS / WMT: the texture's edge past 0..1 (else it repeats)
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
     };
@@ -54,6 +58,7 @@ namespace ps2x::native
         float originX = 2048.0f - 320.0f, originY = 2048.0f - 256.0f;
         float width = 640.0f, height = 512.0f;
         float depthMax = 16777215.0f; // the Z buffer's range (24-bit)
+        float gsZScale = 1.0f;        // GS Z per unit of the matrices' z / w (a microprogram writing FTOI4 z: 16)
     };
 
     class Renderer
@@ -67,7 +72,24 @@ namespace ps2x::native
         // point = M * (x, y, z, 1), then divided by w (as a VU's projection).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count);
         void endFrame();
+        // The frame being built's GS Z per unit of z / w (screen-space draws give GS Z over it).
+        float gsZScale() const { return m_building.screen.gsZScale; }
         TextureCache &textures() { return ps2x::native::textures(); }
+        // Drawing inside the GS stream (runtime/native/native_gs_hook.h). The native port numbers the VU1 programs it
+        // draws instead of VU1, in stream order (1, 2, ...: the VIF1 interpreter numbers the programs it skips the
+        // same way), and draws a program's batches after beginGroup(its number). With a GS renderer that keeps GL
+        // render targets, each group is drawn into its target at its point of the GS stream, so it sorts with the GS
+        // draws around it, and present() leaves the frame to the GS; otherwise present() draws as before.
+        void setStreamDraws(bool on);
+        void beginGroup(uint64_t group) { m_group = group; }
+        // A group has batches waiting (its GS marker is worth queueing): the VIF1 interpreter reaches a program after
+        // the native port has drawn it (at the transfer's start), so a group without batches by then has none.
+        bool hasGroup(uint64_t group);
+        // Frames faster than the game's (PS2X_NATIVE_INTERPOLATE=1): the native port keys each object's batches by
+        // something stable from one game frame to the next (its own data, not its place in the stream); present()
+        // then draws a key found in the previous frame too with its matrix between the two, by how far the window's
+        // time is into the current game frame (one game frame behind, as interpolation is). 0: not interpolated.
+        void setKey(uint64_t key) { m_key = key; }
 
         // Present thread: draws the latest frame into the given window rectangle; false when there is none yet.
         bool present(float x, float y, float width, float height);
@@ -80,7 +102,8 @@ namespace ps2x::native
             m_gsFrame[3] = format;
         }
         bool enabled() const { return m_enabled; }
-        // The latest published frame has something to draw (not a menu or a movie the native port does not draw yet).
+        // The latest published frame has something to draw (not a menu or a movie the native port does not draw yet),
+        // and present() draws it (the GS frame does not already have it).
         bool hasDraws();
         void setEnabled(bool on)
         {
@@ -94,8 +117,12 @@ namespace ps2x::native
             Material material;
             float matrix[16];
             uint32_t first = 0, count = 0;
+            uint64_t group = 0; // beginGroup's (its clip at present: the GS scissor where that group's marker was)
+            uint64_t key = 0; // setKey
             // Taken from the texture cache when the batch is drawn (the game's thread, in stream order): games reuse
-            // texture memory before the frame is presented.
+            // texture memory before the frame is presented. Null when its upload was not there yet (an upload in the
+            // same VIF1 transfer reaches the cache when VIF1 gets to it): looked up again where the batch is drawn,
+            // in the GS stream (after the upload) or at present.
             std::shared_ptr<const TextureCache::Texture> texture;
         };
         struct Frame
@@ -103,19 +130,52 @@ namespace ps2x::native
             Screen screen;
             std::vector<Vertex> vertices;
             std::vector<Batch> batches;
+            double time = 0.0;                           // when it was published (seconds)
+            std::unordered_map<uint64_t, uint32_t> keys; // key -> its first batch
+            uint64_t lastGroup = 0;                      // its batches' latest group (0: none)
         };
 
     private:
         Renderer();
         ~Renderer();
         struct Gpu;
+        struct GsPass; // GS thread only (native_renderer_gs.cpp)
+        struct StreamBatch
+        {
+            uint64_t group = 0;
+            float gsZScale = 1.0f;
+            Batch batch;
+            std::vector<Vertex> vertices;
+        };
+        static void gsDraw(uint64_t group, const GsDrawTarget &target);
+        void drawGroups(uint64_t group, const GsDrawTarget &target);
 
         Frame m_building;
         std::mutex m_mutex;
         std::shared_ptr<Frame> m_published;
+        std::shared_ptr<Frame> m_previous; // the one before m_published (interpolation)
+        uint64_t m_key = 0;
         int m_gsFrame[4] = {}; // id, width, height, pixel format
         std::unique_ptr<Gpu> m_gpu; // present thread only
         bool m_enabled = false;
+        bool m_streamDraws = false;
+        uint64_t m_group = 0;
+        std::mutex m_streamMutex;
+        std::deque<StreamBatch> m_stream; // batches waiting for their group's point of the GS stream
+        GsPass *m_gsPass = nullptr;       // its GL objects live in the GS thread's context: kept to the end
+        std::atomic<bool> m_drewIntoGs{false};
+        // Without GL targets (present() draws the frame over the GS one): each group's GS scissor, in primitive
+        // coordinates (scissor plus XYOFFSET), as the GS reached its marker; a frame is shown once the GS has reached
+        // its last group, so its clips are known (until then, the one before).
+        struct Clip
+        {
+            uint64_t group = 0;
+            float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+        };
+        static constexpr size_t kClips = 1u << 14;
+        std::unique_ptr<Clip[]> m_clips{new Clip[kClips]};
+        std::atomic<uint64_t> m_markedGroup{0}; // the latest group whose marker the GS reached
+        std::shared_ptr<Frame> m_shown, m_shownPrevious; // present thread: the frame drawn and the one before it
     };
 }
 

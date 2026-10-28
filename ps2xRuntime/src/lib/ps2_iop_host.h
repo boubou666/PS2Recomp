@@ -89,6 +89,7 @@ public:
     bool callEeRpc(EeRpcCall call) override;
 
     void submitAudio(const int16_t *frames, size_t count) override;
+    void setAudioSource(std::function<void(int16_t *frames, size_t count)> source) override;
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 
 private:

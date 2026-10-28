@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -136,6 +137,8 @@ namespace ps2x::iop::detail
     IopSpu2::IopSpu2(IopMemory &memory) noexcept
         : m_memory(memory), m_ram(RamWords)
     {
+        const char *wallClock = std::getenv("PS2X_SPU2_WALLCLOCK");
+        m_wallClock = wallClock && *wallClock == '1';
         reset();
     }
 
@@ -164,6 +167,7 @@ namespace ps2x::iop::detail
 
     uint16_t IopSpu2::read16(uint32_t address)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         catchUp();
         const uint32_t offset = (address - Base) & 0x7FEu;
         if (offset >= 0x760u)
@@ -252,6 +256,7 @@ namespace ps2x::iop::detail
 
     void IopSpu2::write16(uint32_t address, uint16_t value)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         catchUp();
         const struct ScheduleGuard
         {
@@ -495,6 +500,25 @@ namespace ps2x::iop::detail
 
     void IopSpu2::keyOn(int coreIndex, uint32_t mask)
     {
+        // PS2X_SPU2_KEYON_LOG=1: the key-ons so far every 10 s of wall time (how many sounds start per real second,
+        // to compare the sound drivers' tempo between runs at different frame rates).
+        static const bool s_log = []
+        {
+            const char *value = std::getenv("PS2X_SPU2_KEYON_LOG");
+            return value && *value == '1';
+        }();
+        if (s_log)
+        {
+            using Clock = std::chrono::steady_clock;
+            static const Clock::time_point s_start = Clock::now();
+            static double s_next = 10.0;
+            const double elapsed = std::chrono::duration<double>(Clock::now() - s_start).count();
+            if (elapsed >= s_next)
+            {
+                s_next += 10.0;
+                std::fprintf(stderr, "[spu2:keyon] %.0f s: %llu key-ons\n", elapsed, static_cast<unsigned long long>(m_stats.keyOns));
+            }
+        }
         Core &core = m_cores[coreIndex];
         for (int index = 0; index < 24; ++index)
         {
@@ -530,6 +554,7 @@ namespace ps2x::iop::detail
 
     uint32_t IopSpu2::readDma32(uint32_t address)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         catchUp();
         const int coreIndex = address >= DmaBase[1] ? 1 : 0;
         const Core &core = m_cores[coreIndex];
@@ -546,6 +571,7 @@ namespace ps2x::iop::detail
 
     void IopSpu2::writeDma32(uint32_t address, uint32_t value)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         catchUp();
         const struct ScheduleGuard
         {
@@ -657,7 +683,7 @@ namespace ps2x::iop::detail
         core.chcr &= ~kDmaStart;
         core.bcr &= 0xFFFFu;
         if (m_interrupt)
-            m_interrupt(DmaIrq[coreIndex]);
+            raise(DmaIrq[coreIndex]);
     }
 
     void IopSpu2::fillInputHalf(int coreIndex, int half)
@@ -707,8 +733,7 @@ namespace ps2x::iop::detail
                 continue;
             m_irqInfo |= bit;
             ++m_stats.irqs;
-            if (m_interrupt)
-                m_interrupt(Irq);
+            raise(Irq);
         }
     }
 
@@ -983,8 +1008,42 @@ namespace ps2x::iop::detail
         m_pending.push_back(static_cast<int16_t>(out.right));
         m_stats.peak = std::max({m_stats.peak, std::abs(out.left), std::abs(out.right)});
         ++m_stats.samples;
-        if (m_pending.size() >= kOutputChunk * 2u)
+        if (!m_wallClock && m_pending.size() >= kOutputChunk * 2u)
             flush();
+    }
+
+    void IopSpu2::raise(int irq)
+    {
+        if (m_wallClock)
+        {
+            m_deferredIrqs.fetch_or(irq == Irq ? 1u : irq == DmaIrq[0] ? 2u : 4u, std::memory_order_acq_rel);
+            return;
+        }
+        if (m_interrupt)
+            m_interrupt(irq);
+    }
+
+    void IopSpu2::deliverDeferred()
+    {
+        const uint32_t irqs = m_deferredIrqs.exchange(0u, std::memory_order_acq_rel);
+        if (!m_interrupt || irqs == 0u)
+            return;
+        if (irqs & 1u)
+            m_interrupt(Irq);
+        if (irqs & 2u)
+            m_interrupt(DmaIrq[0]);
+        if (irqs & 4u)
+            m_interrupt(DmaIrq[1]);
+    }
+
+    void IopSpu2::pull(int16_t *frames, size_t count)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_pending.clear();
+        for (size_t i = 0; i < count; ++i)
+            renderSample();
+        std::copy_n(m_pending.begin(), std::min(m_pending.size(), count * 2u), frames);
+        m_pending.clear();
     }
 
     void IopSpu2::flush()
@@ -996,6 +1055,22 @@ namespace ps2x::iop::detail
 
     void IopSpu2::advanceTo(uint64_t cycle)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        if (m_wallClock)
+        {
+            // Mixing is the audio callback's (pull): the IOP clock only ends the transfers that are not AutoDMA.
+            if (cycle > m_cycle)
+                m_cycle = cycle;
+            for (int coreIndex = 0; coreIndex < 2; ++coreIndex)
+            {
+                const Core &core = m_cores[coreIndex];
+                if (core.dmaBusy && !core.admaRunning && core.dmaCompletionCycle <= m_cycle)
+                    finishDma(coreIndex);
+            }
+            deliverDeferred();
+            updateNextEvent();
+            return;
+        }
         while (m_cycle < cycle)
         {
             uint64_t next = std::min(cycle, m_nextSampleCycle);
@@ -1020,6 +1095,16 @@ namespace ps2x::iop::detail
 
     void IopSpu2::updateNextEvent() noexcept
     {
+        if (m_wallClock)
+        {
+            // Often enough for the IOP to see the interrupts the mixing raised soon (1 ms of IOP time).
+            uint64_t next = m_cycle + SampleRate / 1000u * CyclesPerSample;
+            for (const Core &core : m_cores)
+                if (core.dmaBusy && !core.admaRunning)
+                    next = std::min(next, core.dmaCompletionCycle);
+            m_nextEvent = next;
+            return;
+        }
         uint64_t next = m_nextSampleCycle + (kBatchSamples - 1u) * CyclesPerSample;
         for (const Core &core : m_cores)
         {

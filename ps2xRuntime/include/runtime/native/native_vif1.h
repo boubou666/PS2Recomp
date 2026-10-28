@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+struct VIFRegisters;
+
 namespace ps2x::native
 {
     // The VIF1 stream a game sends, handed to its native adapter as the game sends it (on the EE thread, so EE memory
@@ -21,4 +23,10 @@ namespace ps2x::native
 
     void setVu1Gate(Vu1Gate gate);
     bool vu1Skipped(const uint8_t *vu1Code, uint32_t startPc);
+
+    // One UNPACK as VIF1 does it (STCYCL, STMOD, STMASK, STROW / STCOL in regs, TOPS for the FLG bit), into VU data
+    // memory of vuDataSize bytes: an adapter that keeps its own copy of VU1 memory (to run microprograms itself,
+    // ps2x::native::Vu1Sandbox) fills it the same way. cmd is the UNPACK code; returns the payload bytes it used.
+    uint32_t vifUnpack(VIFRegisters &regs, uint8_t *vuData, uint32_t vuDataSize, uint32_t cmd, const uint8_t *payload,
+                       uint32_t available);
 }

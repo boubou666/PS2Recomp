@@ -414,6 +414,12 @@ namespace
     }
 }
 
+uint32_t ps2x::native::vifUnpack(VIFRegisters &regs, uint8_t *vuData, uint32_t vuDataSize, uint32_t cmd, const uint8_t *payload,
+                                 uint32_t available)
+{
+    return executeVifUnpack(regs, vuData, vuDataSize, vuDataSize / 16u - 1u, cmd, payload, available);
+}
+
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -732,6 +738,8 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
             m_vu1ProgramSkipped = ps2x::native::vu1Skipped(m_vu1Code, startPC);
+            if (m_vu1ProgramSkipped && m_vu1SkipCallback)
+                m_vu1SkipCallback(startPC);
             if (m_vu1MscalCallback && !m_vu1ProgramSkipped)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;

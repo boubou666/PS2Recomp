@@ -37,5 +37,7 @@ public:
     // Local to host transfer data (TRXDIR 1), in 16-byte words.
     virtual void readTransferFifo(uint8_t *dst, uint32_t qwords) = 0;
     virtual void readVram(std::vector<uint8_t> &out) = 0;
+    // A drawing context's XYOFFSET and SCISSOR as the packets so far set them (context 0 or 1).
+    virtual void contextRegisters(int context, uint64_t &xyoffset, uint64_t &scissor) const = 0;
     virtual void reset() = 0;
 };

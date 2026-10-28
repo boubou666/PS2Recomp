@@ -47,7 +47,8 @@ namespace
 {
     // PS2X_VU1_RECORD=<file> (+ PS2X_VU1_RECORD_AT=<sec>, PS2X_VU1_RECORD_COUNT=<runs>, default 4000): records
     // VU1 microprogram runs (inputs, outputs, PATH1 packets) for the ps2_vu1_replay tool.
-    // PS2X_VU1_RECORD_PC=<pc>: only the MSCALs starting at that pc (one program over many frames).
+    // PS2X_VU1_RECORD_PC=<pc>[,<pc>...]: only the MSCALs starting at those pcs, and the MSCNTs that continue them
+    // (a program family over many frames: an object's setup, vertex pass and strips).
     class Vu1Recorder
     {
     public:
@@ -62,7 +63,9 @@ namespace
         void run(VU1Interpreter &vu1, PS2Memory &memory, bool resume, uint32_t startPC, uint32_t top, uint32_t itop,
                  uint32_t maxCycles, Body &&body)
         {
-            if (!m_out || m_remaining == 0u || (m_onlyPc >= 0 && (resume || startPC != static_cast<uint32_t>(m_onlyPc))) ||
+            if (!m_onlyPcs.empty() && !resume)
+                m_following = std::find(m_onlyPcs.begin(), m_onlyPcs.end(), startPC) != m_onlyPcs.end();
+            if (!m_out || m_remaining == 0u || (!m_onlyPcs.empty() && !m_following) ||
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start).count() < m_startAt)
             {
                 body();
@@ -110,14 +113,16 @@ namespace
                 m_startAt = std::atof(at);
             if (const char *count = std::getenv("PS2X_VU1_RECORD_COUNT"))
                 m_remaining = static_cast<uint32_t>(std::atoi(count));
-            if (const char *pc = std::getenv("PS2X_VU1_RECORD_PC"))
-                m_onlyPc = static_cast<int64_t>(std::strtoul(pc, nullptr, 0));
+            if (const char *pcs = std::getenv("PS2X_VU1_RECORD_PC"))
+                for (char *end = const_cast<char *>(pcs); *pcs; pcs = *end ? end + 1 : end)
+                    m_onlyPcs.push_back(static_cast<uint32_t>(std::strtoul(pcs, &end, 0)));
         }
 
         FILE *m_out = nullptr;
         double m_startAt = 0.0;
         uint32_t m_remaining = 4000u;
-        int64_t m_onlyPc = -1;
+        std::vector<uint32_t> m_onlyPcs;
+        bool m_following = false; // the last MSCAL was one of m_onlyPcs: its MSCNTs are recorded too
         uint64_t m_codeGeneration = 0u;
         bool m_wroteCode = false;
         // Process start (static initialization), not the first VU1 run.
@@ -898,6 +903,28 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    // PS2X_IOP_WALLCLOCK=1: the IOP's time follows the host's clock (in EE cycles, the IOP running at an eighth),
+    // not the EE cycles the game ran: its timers, vblank interrupts and scheduler, and so the sound drivers' ticks,
+    // keep real time whatever the frame rate. A gap longer than 50 ms (a pause, a debugger) counts as 50 ms.
+    static const bool s_wallClock = []
+    {
+        const char *value = std::getenv("PS2X_IOP_WALLCLOCK");
+        return value && *value == '1';
+    }();
+    if (s_wallClock)
+    {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point s_last = Clock::now();
+        static double s_carry = 0.0;
+        const Clock::time_point now = Clock::now();
+        const double seconds = std::min(std::chrono::duration<double>(now - s_last).count(), 0.05);
+        s_last = now;
+        const double cycles = seconds * 294912000.0 + s_carry;
+        eeCycles = static_cast<uint64_t>(cycles);
+        s_carry = cycles - static_cast<double>(eeCycles);
+        if (eeCycles == 0u)
+            return;
+    }
     if (!m_iopThreaded.load(std::memory_order_relaxed))
     {
         m_iopSubsystem->runEeCycles(eeCycles);
@@ -1319,6 +1346,14 @@ bool PS2Runtime::syncCoreSubsystems()
     // completion. A cap of 65536 cycles cut long batches (VP2 transforms hundreds of vertices per
     // call) in the middle, leaving VU memory half written and the next program working on it.
     constexpr uint32_t kVu1ProgramCycleLimit = 1u << 24;
+    // A program VU1 skips for the native port: its draws go in the GS stream where its PATH1 output would have
+    // (numbered as the native port numbers them: 1, 2, ... in stream order).
+    m_memory.setVu1SkipCallback([this](uint32_t)
+                                {
+                                    static uint64_t s_group = 0;
+                                    if (ps2x::native::Renderer::instance().hasGroup(++s_group))
+                                        m_gs.queueNativeDraw(s_group, 0); // (a setup's group has none: its strips follow)
+                                });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      // On the VIF1 worker the EE has moved on: use its FBRST from when the transfer was
@@ -3538,9 +3573,16 @@ void PS2Runtime::run()
         // A game on native frame pacing sets the rate: the window follows its frame cap (0 = unlimited).
         {
             static int s_targetFps = 60;
+            // PS2X_PRESENT_FPS=<n>: the window's rate otherwise (0 = unlimited), e.g. above the game's with
+            // PS2X_NATIVE_INTERPOLATE=1.
+            static const int s_presentFps = []
+            {
+                const char *value = std::getenv("PS2X_PRESENT_FPS");
+                return value && *value ? std::atoi(value) : 60;
+            }();
             const int targetFps = m_eeScheduler && m_eeScheduler->nativeFrames()
                                       ? static_cast<int>(m_framePacer.cap())
-                                      : 60;
+                                      : s_presentFps;
             if (targetFps != s_targetFps)
             {
                 SetTargetFPS(targetFps);
@@ -3591,6 +3633,30 @@ void PS2Runtime::run()
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
+        }
+        // PS2X_CAPTURE_WINDOW_DIR=<folder>: the window as shown (whatever the GS renderer, native 3D included) as
+        // window_<tenths of seconds>.png every PS2X_CAPTURE_INTERVAL seconds (default 5).
+        static const char *s_windowCaptureDir = std::getenv("PS2X_CAPTURE_WINDOW_DIR");
+        if (s_windowCaptureDir && *s_windowCaptureDir)
+        {
+            static const double s_interval = []
+            {
+                const char *value = std::getenv("PS2X_CAPTURE_INTERVAL");
+                const double parsed = value ? std::atof(value) : 0.0;
+                return parsed > 0.0 ? parsed : 5.0;
+            }();
+            static const double s_start = GetTime();
+            static double s_next = s_interval;
+            const double elapsed = GetTime() - s_start;
+            if (elapsed >= s_next)
+            {
+                s_next += s_interval;
+                Image image = LoadImageFromScreen();
+                char path[1024];
+                std::snprintf(path, sizeof(path), "%s/window_%06d.png", s_windowCaptureDir, static_cast<int>(elapsed * 10.0));
+                ExportImage(image, path);
+                UnloadImage(image);
+            }
         }
         EndDrawing();
 

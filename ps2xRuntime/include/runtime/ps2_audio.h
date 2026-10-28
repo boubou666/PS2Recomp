@@ -24,7 +24,7 @@ public:
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
-    void setAudioReady(bool ready) { m_audioReady = ready; }
+    void setAudioReady(bool ready);
 
     // SPU2 output of the IOP emulator: interleaved stereo frames at 48 kHz of emulated time,
     // played through one raylib stream that follows the emulation speed.
@@ -33,9 +33,14 @@ public:
     // emulated time. Called on the thread that pushes SPU2 frames.
     using Spu2Mixer = std::function<void(int16_t *frames, size_t count)>;
     void setSpu2Mixer(Spu2Mixer mixer);
+    // The SPU2 on the wall clock: the stream's callback takes its frames from source as it plays them (no time
+    // stretching: nothing to catch up with).
+    using Spu2Source = std::function<void(int16_t *frames, size_t count)>;
+    void setSpu2Source(Spu2Source source);
     // Before CloseAudioDevice.
     void closeSpu2Stream();
     struct Spu2Stream;
+    void openSpu2Stream();
 
 private:
     struct DecodedSample
