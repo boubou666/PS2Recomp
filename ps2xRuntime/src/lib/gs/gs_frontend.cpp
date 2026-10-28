@@ -1193,8 +1193,9 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
-    // paraLLEl-GS presents on the GS thread, after what is queued before it.
-    if (m_parallelRequested && shouldQueue())
+    // paraLLEl-GS, and a backend whose GPU context lives on the GS thread (GSNativeBackend), present on the GS
+    // thread, after what is queued before it.
+    if ((m_parallelRequested || (m_backend && m_backend->PresentsOnDrawThread())) && shouldQueue())
     {
         queueHostPresentationLatch();
         return;

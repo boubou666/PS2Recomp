@@ -32,6 +32,9 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+    // Present can only run on the thread that draws (a GPU context there): presentation latches go through the
+    // GS queue.
+    virtual bool PresentsOnDrawThread() const { return false; }
     // A native renderer's draws at this point of the stream (GS::queueNativeDraw): the hook with this context's
     // render target. Renderers that keep GS memory themselves have none to give: a null target.
     virtual void NativeDraw(uint64_t group, const GSContext &context)

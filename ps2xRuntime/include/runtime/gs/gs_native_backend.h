@@ -66,6 +66,7 @@ public:
     };
     FrameTarget frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf);
     void NativeDraw(uint64_t group, const GSContext &context) override;
+    bool PresentsOnDrawThread() const override { return true; }
 
 private:
     struct RenderTarget
