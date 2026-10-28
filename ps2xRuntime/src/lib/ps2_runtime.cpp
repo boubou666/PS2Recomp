@@ -43,7 +43,8 @@ namespace
 {
     // PS2X_VU1_RECORD=<file> (+ PS2X_VU1_RECORD_AT=<sec>, PS2X_VU1_RECORD_COUNT=<runs>, default 4000): records
     // VU1 microprogram runs (inputs, outputs, PATH1 packets) for the ps2_vu1_replay tool.
-    // PS2X_VU1_RECORD_PC=<pc>: only the MSCALs starting at that pc (one program over many frames).
+    // PS2X_VU1_RECORD_PC=<pc>[,<pc>...]: only the MSCALs starting at those pcs, and the MSCNTs that continue them
+    // (a program family over many frames: an object's setup, vertex pass and strips).
     class Vu1Recorder
     {
     public:
@@ -58,7 +59,9 @@ namespace
         void run(VU1Interpreter &vu1, PS2Memory &memory, bool resume, uint32_t startPC, uint32_t top, uint32_t itop,
                  uint32_t maxCycles, Body &&body)
         {
-            if (!m_out || m_remaining == 0u || (m_onlyPc >= 0 && (resume || startPC != static_cast<uint32_t>(m_onlyPc))) ||
+            if (!m_onlyPcs.empty() && !resume)
+                m_following = std::find(m_onlyPcs.begin(), m_onlyPcs.end(), startPC) != m_onlyPcs.end();
+            if (!m_out || m_remaining == 0u || (!m_onlyPcs.empty() && !m_following) ||
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start).count() < m_startAt)
             {
                 body();
@@ -106,14 +109,16 @@ namespace
                 m_startAt = std::atof(at);
             if (const char *count = std::getenv("PS2X_VU1_RECORD_COUNT"))
                 m_remaining = static_cast<uint32_t>(std::atoi(count));
-            if (const char *pc = std::getenv("PS2X_VU1_RECORD_PC"))
-                m_onlyPc = static_cast<int64_t>(std::strtoul(pc, nullptr, 0));
+            if (const char *pcs = std::getenv("PS2X_VU1_RECORD_PC"))
+                for (char *end = const_cast<char *>(pcs); *pcs; pcs = *end ? end + 1 : end)
+                    m_onlyPcs.push_back(static_cast<uint32_t>(std::strtoul(pcs, &end, 0)));
         }
 
         FILE *m_out = nullptr;
         double m_startAt = 0.0;
         uint32_t m_remaining = 4000u;
-        int64_t m_onlyPc = -1;
+        std::vector<uint32_t> m_onlyPcs;
+        bool m_following = false; // the last MSCAL was one of m_onlyPcs: its MSCNTs are recorded too
         uint64_t m_codeGeneration = 0u;
         bool m_wroteCode = false;
         // Process start (static initialization), not the first VU1 run.
