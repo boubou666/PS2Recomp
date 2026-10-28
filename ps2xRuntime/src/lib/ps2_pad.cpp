@@ -370,6 +370,14 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+        if (IsKeyDown(KEY_F))
+            clearBit(PAD_L3);
+        if (IsKeyDown(KEY_G))
+            clearBit(PAD_R3);
+        // Right stick on I/J/K/L (US layout positions).
+        const bool rUp = IsKeyDown(KEY_I), rDown = IsKeyDown(KEY_K), rLeft = IsKeyDown(KEY_J), rRight = IsKeyDown(KEY_L);
+        data[4] = static_cast<uint8_t>(rLeft == rRight ? kPadStickCenter : rLeft ? 0x00 : 0xFF);
+        data[5] = static_cast<uint8_t>(rUp == rDown ? kPadStickCenter : rUp ? 0x00 : 0xFF);
     }
 
     if (port == 0)
