@@ -55,17 +55,15 @@ are now the limit, which layers 3 and 5 address).
 Translate what the game asks the GS to draw into GPU work, instead of reproducing the GS. Generic: every PS2 game
 talks to the GS through the same GIF/register interface, so nothing here is game-specific.
 
-- **Placement:** written from scratch, no paraLLEl-GS code. It plugs into the GS thread's renderer socket (today
-  the abstract `GSParallelRenderer` class: raw GIF packets, register writes, `present`, local-to-host reads, VRAM
-  reads), which gets a neutral name (`GSRendererBackend`) so paraLLEl-GS is just one implementation of it. Selected
-  with `PS2X_GS_RENDERER=native`. Once the native renderer covers the games, paraLLEl-GS (and its LGPL dependency)
-  leaves the project; the CPU GS stays as the reference for validation only.
+- **Placement:** written from scratch, no paraLLEl-GS code. It implements the GS frontend's `GSRasterBackend`
+  interface, the one the CPU rasterizer implements: the frontend keeps decoding GIF and tracking GS state, and hands
+  the backend decoded primitives (`Submit(GSPrimitiveBatch)`: vertices plus the full drawing state), CLUT loads,
+  transfers, presentation, readbacks and VRAM access. Selected with `PS2X_GS_RENDERER=native`. Once it covers the
+  games, paraLLEl-GS (and its LGPL dependency) leaves the project; the CPU GS stays as the validation reference.
 - **API:** OpenGL 4.5 core on a context created on the GS thread and shared with raylib's window context (GLFW),
   so the frame the renderer produces is a GL texture the window draws directly: no CPU copy, and post-process
   passes are plain GLSL. (Vulkan was the alternative; it buys nothing here and needs interop to reach raylib.)
-- **State:** a GS state tracker fed by a GIF decoder (PACKED/REGLIST/IMAGE, both contexts, PRIM/PRMODE, TEX0/1/2,
-  CLAMP, ALPHA, TEST, FBA, PABE, FRAME, ZBUF, SCISSOR, FOG/FOGCOL, DTHE, COLCLAMP, TEXA, TEXCLUT, BITBLTBUF/TRXPOS/
-  TRXREG/TRXDIR).
+- **State:** comes decoded with each primitive (`GSDrawState`); the backend only notices changes to batch draws.
 - **Geometry:** vertex kicks assembled into points/lines/triangles/strips/fans/sprites, batched while the state
   does not change; positions from the 12.4 fixed-point XY with the XYOFFSET, Z as 24/32-bit depth.
 - **Render targets:** a cache keyed by FBP/FBW/PSM (and ZBP/PSM for depth) of GPU textures at an internal scale
