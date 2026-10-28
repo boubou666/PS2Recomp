@@ -54,7 +54,7 @@ void register_native_texture_cache_tests()
             for (size_t i = 3; i < pixels.size(); i += 4)
                 pixels[i] = 0x80;
             cache.upload(bitbltbuf(0, 1, 0x00), 0, trxreg(8, 8), pixels.data(), pixels.size());
-            const TextureCache::Texture &texture = cache.texture(tex0(0, 1, 0x00, 3, 3));
+            const TextureCache::Texture &texture = *cache.texture(tex0(0, 1, 0x00, 3, 3));
             t.Equals(texture.width, 8u, "width 2^TW");
             bool same = true;
             for (size_t i = 0; i < 64; ++i)
@@ -74,7 +74,7 @@ void register_native_texture_cache_tests()
             const std::vector<uint8_t> palette = csm1Palette();
             cache.upload(bitbltbuf(64, 1, 0x13), 0, trxreg(16, 16), indices.data(), indices.size());
             cache.upload(bitbltbuf(200, 1, 0x00), 0, trxreg(16, 16), palette.data(), palette.size());
-            const TextureCache::Texture &texture = cache.texture(tex0(64, 1, 0x13, 4, 4, 200));
+            const TextureCache::Texture &texture = *cache.texture(tex0(64, 1, 0x13, 4, 4, 200));
             bool same = true;
             for (uint32_t i = 0; i < 256; ++i)
                 same &= texture.rgba[i] == opaque(colour(i));
@@ -90,7 +90,7 @@ void register_native_texture_cache_tests()
             const std::vector<uint8_t> palette = csm1Palette();
             cache.upload(bitbltbuf(128, 1, 0x14), 0, trxreg(16, 1), indices.data(), indices.size());
             cache.upload(bitbltbuf(200, 1, 0x00), 0, trxreg(16, 16), palette.data(), palette.size());
-            const TextureCache::Texture &texture = cache.texture(tex0(128, 1, 0x14, 4, 0, 200, 3));
+            const TextureCache::Texture &texture = *cache.texture(tex0(128, 1, 0x14, 4, 0, 200, 3));
             bool same = true;
             for (uint32_t i = 0; i < 16; ++i)
                 same &= texture.rgba[i] == opaque(colour(48u + i));
@@ -103,10 +103,10 @@ void register_native_texture_cache_tests()
             std::vector<uint8_t> pixels(8 * 8 * 4, 0x10);
             cache.upload(bitbltbuf(0, 1, 0x00), 0, trxreg(8, 8), pixels.data(), pixels.size());
             const uint64_t tex = tex0(0, 1, 0x00, 3, 3);
-            t.Equals(cache.texture(tex).rgba[0] & 0xffu, 0x10u, "first upload");
+            t.Equals(cache.texture(tex)->rgba[0] & 0xffu, 0x10u, "first upload");
             std::vector<uint8_t> again(8 * 8 * 4, 0x22);
             cache.upload(bitbltbuf(0, 1, 0x00), 0, trxreg(8, 8), again.data(), again.size());
-            t.Equals(cache.texture(tex).rgba[0] & 0xffu, 0x22u, "the second upload replaces the cached image");
+            t.Equals(cache.texture(tex)->rgba[0] & 0xffu, 0x22u, "the second upload replaces the cached image");
         });
     });
 }

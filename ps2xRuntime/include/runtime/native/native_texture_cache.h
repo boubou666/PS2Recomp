@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -36,8 +38,13 @@ namespace ps2x::native
         // pixels packed in the destination format (rows of TRXREG width, 4-bit pixels low nibble first).
         void upload(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, const uint8_t *data, size_t bytes);
 
+        // The image transfers inside GIF packets as a game sends them (PACKED A+D writes of BITBLTBUF, TRXPOS,
+        // TRXREG, TRXDIR, then IMAGE data, possibly split over packets): fed to upload().
+        void scanGifPacket(const uint8_t *packet, size_t bytes);
+
         // The texture a draw selects: TEX0 (the CLD bits are ignored), and TEXA for the alpha of CT24 / CT16 texels.
-        const Texture &texture(uint64_t tex0, uint64_t texa = 0);
+        // Shared, never modified once decoded: uploads may arrive from the GS thread while another thread draws.
+        std::shared_ptr<const Texture> texture(uint64_t tex0, uint64_t texa = 0);
 
         const uint8_t *memory() const { return m_memory.data(); }
         uint64_t uploads() const { return m_uploads; }
@@ -50,9 +57,16 @@ namespace ps2x::native
                          std::vector<std::pair<uint32_t, uint32_t>> *record);
         bool stillValid(const Texture &texture) const;
 
+        void uploadLocked(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, const uint8_t *data, size_t bytes);
+
+        mutable std::mutex m_mutex;
         std::vector<uint8_t> m_memory;
+        // scanGifPacket's transfer state: registers, and the image data of a transfer split over packets
+        uint64_t m_bitbltbuf = 0, m_trxpos = 0, m_trxreg = 0;
+        std::vector<uint8_t> m_pending;
+        size_t m_pendingWanted = 0;
         std::vector<uint32_t> m_pageGeneration;
-        std::unordered_map<uint64_t, Texture> m_textures;
+        std::unordered_map<uint64_t, std::shared_ptr<const Texture>> m_textures;
         uint64_t m_uploads = 0;
         uint64_t m_decodes = 0;
     };

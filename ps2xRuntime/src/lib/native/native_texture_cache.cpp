@@ -3,6 +3,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 
 namespace ps2x::native
@@ -136,6 +137,70 @@ namespace ps2x::native
 
     void TextureCache::upload(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, const uint8_t *data, size_t bytes)
     {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        uploadLocked(bitbltbuf, trxpos, trxreg, data, bytes);
+    }
+
+    void TextureCache::scanGifPacket(const uint8_t *packet, size_t bytes)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t i = 0;
+        auto u64 = [&](size_t at) { uint64_t v; std::memcpy(&v, packet + at, 8); return v; };
+        while (i + 16u <= bytes)
+        {
+            const uint64_t lo = u64(i), hi = u64(i + 8u);
+            i += 16u;
+            const uint32_t nloop = lo & 0x7fffu;
+            const uint32_t flg = (lo >> 58) & 3u;
+            const uint32_t nreg = ((lo >> 60) & 0xfu) ? static_cast<uint32_t>((lo >> 60) & 0xfu) : 16u;
+            if (flg == 0u) // PACKED: only A+D can address the transfer registers
+            {
+                for (uint32_t n = 0; n < nloop; ++n)
+                    for (uint32_t r = 0; r < nreg; ++r)
+                    {
+                        if (i + 16u > bytes)
+                            return;
+                        const uint32_t reg = (hi >> (4u * r)) & 0xfu;
+                        const uint64_t data = u64(i), addr = u64(i + 8u) & 0xffu;
+                        i += 16u;
+                        if (reg != 0xeu)
+                            continue;
+                        if (addr == 0x50u)
+                            m_bitbltbuf = data;
+                        else if (addr == 0x51u)
+                            m_trxpos = data;
+                        else if (addr == 0x52u)
+                            m_trxreg = data;
+                        else if (addr == 0x53u && (data & 3u) == 0u) // host to local
+                        {
+                            const uint64_t w = m_trxreg & 0xfffu, h = (m_trxreg >> 32) & 0xfffu;
+                            m_pending.clear();
+                            m_pendingWanted = static_cast<size_t>((w * h * bitsPerPixel((m_bitbltbuf >> 56) & 0x3fu) + 7u) / 8u);
+                        }
+                    }
+            }
+            else if (flg == 1u) // REGLIST
+                i += ((static_cast<size_t>(nloop) * nreg + 1u) & ~size_t{1}) * 8u;
+            else // IMAGE
+            {
+                const size_t size = std::min<size_t>(static_cast<size_t>(nloop) * 16u, bytes - i);
+                if (m_pendingWanted != 0u)
+                {
+                    m_pending.insert(m_pending.end(), packet + i, packet + i + size);
+                    if (m_pending.size() >= m_pendingWanted)
+                    {
+                        uploadLocked(m_bitbltbuf, m_trxpos, m_trxreg, m_pending.data(), m_pending.size());
+                        m_pending.clear();
+                        m_pendingWanted = 0u;
+                    }
+                }
+                i += size;
+            }
+        }
+    }
+
+    void TextureCache::uploadLocked(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, const uint8_t *data, size_t bytes)
+    {
         const uint32_t dbp = (bitbltbuf >> 32) & 0x3fffu;
         const uint32_t dbw = (bitbltbuf >> 48) & 0x3fu;
         const uint32_t dpsm = (bitbltbuf >> 56) & 0x3fu;
@@ -191,14 +256,15 @@ namespace ps2x::native
         }
     }
 
-    const TextureCache::Texture &TextureCache::texture(uint64_t tex0, uint64_t texa)
+    std::shared_ptr<const TextureCache::Texture> TextureCache::texture(uint64_t tex0, uint64_t texa)
     {
+        std::lock_guard<std::mutex> lock(m_mutex);
         // TBP0 TBW PSM TW TH TCC, CBP CPSM CSM CSA (TFX and CLD do not change the image).
         const uint64_t selected = tex0 & ~((uint64_t{3} << 35) | (uint64_t{7} << 61));
         const uint32_t psm = (tex0 >> 20) & 0x3fu;
         const uint64_t key = selected ^ (indexed(psm) || psm == CT32 ? 0u : (texa * 0x9e3779b97f4a7c15ull));
         auto found = m_textures.find(key);
-        if (found != m_textures.end() && stillValid(found->second))
+        if (found != m_textures.end() && stillValid(*found->second))
             return found->second;
 
         Texture texture;
@@ -235,6 +301,8 @@ namespace ps2x::native
         forEachPage(psm, tbp, tbw, 0, 0, texture.width, texture.height, &texture.pages);
         std::sort(texture.pages.begin(), texture.pages.end());
         texture.pages.erase(std::unique(texture.pages.begin(), texture.pages.end()), texture.pages.end());
-        return m_textures[key] = std::move(texture);
+        auto shared = std::make_shared<const Texture>(std::move(texture));
+        m_textures[key] = shared;
+        return shared;
     }
 }

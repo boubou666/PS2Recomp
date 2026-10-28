@@ -1,3 +1,4 @@
+#include "runtime/native/native_renderer.h"
 #include "ThreadNaming.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
@@ -560,6 +561,8 @@ void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     if (!data || sizeBytes < 16u)
         return;
+    if (ps2x::native::Renderer::instance().enabled()) // the native renderer's textures: the game's own uploads
+        ps2x::native::Renderer::instance().textures().scanGifPacket(data, sizeBytes);
     if (!shouldQueue())
     {
         processGIFPacket(data, sizeBytes);
@@ -1449,6 +1452,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (data && sizeBytes >= 16u && ps2x::native::Renderer::instance().enabled())
+        ps2x::native::Renderer::instance().textures().scanGifPacket(data, sizeBytes);
     if (!shouldQueue())
         return processNativePackedGIFPacketNow(data, sizeBytes);
     // Validation only looks at the packet, so the EE can still fall back when it fails.
@@ -1520,6 +1525,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
+    if (data && sizeBytes != 0u && (trxdir & 3u) == 0u && ps2x::native::Renderer::instance().enabled())
+        ps2x::native::Renderer::instance().textures().upload(bitbltbuf, trxpos, trxreg, data, sizeBytes);
     if (!shouldQueue())
     {
         uploadImageNativeNow(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);

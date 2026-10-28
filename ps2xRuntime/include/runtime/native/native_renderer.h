@@ -6,7 +6,8 @@
 // GPU at the window's resolution, over the GS frame while a game is only partly native.
 //
 // Game thread: beginFrame(), draw(...) per mesh, endFrame() publishes the frame. Present thread: present() draws
-// the latest published frame. Textures come from the game's own GS uploads (textures(), a TextureCache).
+// the latest published frame. Textures come from the game's own GS uploads (textures(), a TextureCache, fed by the
+// runtime's GS front end), decoded when the frame is drawn, by which time the frame's own uploads have arrived.
 
 #include "runtime/native/native_texture_cache.h"
 
@@ -81,7 +82,6 @@ namespace ps2x::native
             Screen screen;
             std::vector<Vertex> vertices;
             std::vector<Batch> batches;
-            std::vector<std::pair<uint64_t, std::shared_ptr<const TextureCache::Texture>>> textures;
         };
 
     private:
@@ -89,9 +89,7 @@ namespace ps2x::native
         ~Renderer();
         struct Gpu;
 
-        TextureCache m_textures; // game thread only
-        // One shared copy per texture, replaced when the cache decodes a new version (frames keep theirs alive).
-        std::unordered_map<uint64_t, std::shared_ptr<const TextureCache::Texture>> m_shared;
+        TextureCache m_textures; // uploads from the GS thread, decodes from the game thread (it locks)
         Frame m_building;
         std::mutex m_mutex;
         std::shared_ptr<Frame> m_published;

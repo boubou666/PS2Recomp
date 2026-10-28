@@ -138,19 +138,6 @@ void main()
         batch.count = count;
         m_building.vertices.insert(m_building.vertices.end(), vertices, vertices + count);
         m_building.batches.push_back(batch);
-        if (material.textured)
-        {
-            const auto known = std::find_if(m_building.textures.begin(), m_building.textures.end(),
-                                            [&](const auto &entry) { return entry.first == material.tex0; });
-            if (known == m_building.textures.end())
-            {
-                const TextureCache::Texture &texture = m_textures.texture(material.tex0, material.texa);
-                std::shared_ptr<const TextureCache::Texture> &shared = m_shared[material.tex0];
-                if (!shared || shared->version != texture.version)
-                    shared = std::make_shared<const TextureCache::Texture>(texture);
-                m_building.textures.emplace_back(material.tex0, shared);
-            }
-        }
     }
 
     void Renderer::endFrame()
@@ -233,13 +220,8 @@ void main()
             rlSetUniform(gpu.locAlphaRef, &alphaRef, RL_SHADER_UNIFORM_FLOAT, 1);
             if (m.textured)
             {
-                const auto source = std::find_if(frame->textures.begin(), frame->textures.end(),
-                                                 [&](const auto &entry) { return entry.first == m.tex0; });
-                if (source != frame->textures.end())
-                {
-                    rlActiveTextureSlot(0);
-                    rlEnableTexture(gpu.texture(m.tex0, source->second));
-                }
+                rlActiveTextureSlot(0);
+                rlEnableTexture(gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), m_textures.texture(m.tex0, m.texa)));
             }
             if (m.blend == Material::Blend::Opaque)
                 rlDisableColorBlend();
