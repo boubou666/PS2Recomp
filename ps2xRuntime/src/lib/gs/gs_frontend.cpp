@@ -707,7 +707,8 @@ void GS::queueNativeDraw(uint64_t group, int context)
     // Draws every native group up to the cell's value: a marker still at the queue's tail (nothing queued after it,
     // not taken by the GS thread yet) takes the new group instead of a second marker following it.
     auto cell = std::make_shared<std::atomic<uint64_t>>(group);
-    if (shouldQueue())
+    static const bool s_noCoalesce = std::getenv("PS2X_NATIVE_NO_COALESCE") != nullptr; // one marker per group (A/B)
+    if (shouldQueue() && !s_noCoalesce)
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         if (m_markerGroup && m_markerIndex + 1u == m_pushed && m_popped <= m_markerIndex && m_markerContext == index)
