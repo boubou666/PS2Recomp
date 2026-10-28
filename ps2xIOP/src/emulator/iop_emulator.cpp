@@ -1333,6 +1333,36 @@ namespace ps2x::iop::detail
             }
         }
 
+        // PS2X_IOP_DUMP_MODULES=<folder>: each module as loaded, relocated at its base and before its start routine
+        // runs, as <name>_<base>.bin, with <name>_<base>.json (base, size, entry, gp, the file's FNV-1a 64 hash): the
+        // input of tools/iop_recomp.py, which recompiles IRX code to native C++.
+        void dumpModule(const Module &module, std::span<const uint8_t> file) const
+        {
+            static const char *s_dir = std::getenv("PS2X_IOP_DUMP_MODULES");
+            if (!s_dir || !*s_dir || module.size == 0u)
+                return;
+            uint64_t hash = 1469598103934665603ull;
+            for (const uint8_t byte : file)
+                hash = (hash ^ byte) * 1099511628211ull;
+            std::vector<uint8_t> bytes(module.size);
+            if (!memory.readRam(module.base, bytes.data(), bytes.size()))
+                return;
+            char stem[512];
+            std::snprintf(stem, sizeof(stem), "%s/%s_%06x", s_dir, module.name.c_str(), module.base);
+            if (FILE *out = std::fopen((std::string(stem) + ".bin").c_str(), "wb"))
+            {
+                std::fwrite(bytes.data(), 1, bytes.size(), out);
+                std::fclose(out);
+            }
+            if (FILE *out = std::fopen((std::string(stem) + ".json").c_str(), "w"))
+            {
+                std::fprintf(out, "{\"name\": \"%s\", \"base\": %u, \"size\": %u, \"entry\": %u, \"gp\": %u, \"hash\": \"%016llx\"}\n",
+                             module.name.c_str(), module.base, module.size, module.entry, module.gp,
+                             static_cast<unsigned long long>(hash));
+                std::fclose(out);
+            }
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -1360,6 +1390,7 @@ namespace ps2x::iop::detail
             module.gp = loaded.gp;
             if (nativeBitScan == 0u)
                 findNativeFunctions(module.base, module.size);
+            dumpModule(module, image);
 
             // Like loadcore: start(argc, argv) with argv[0] the module path, then one entry per
             // NUL-separated argument. The block stays allocated, as resident modules may keep argv strings.
