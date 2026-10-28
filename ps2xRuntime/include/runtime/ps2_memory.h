@@ -147,15 +147,16 @@ public:
         uint32_t kind = 0, a = 0, b = 0, c = 0;
     };
     static constexpr uint32_t kGifEvents = 32u;
-    void noteGifEvent(uint32_t kind, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0)
+    // Also GS events: 'p' posted (event 0 SIGNAL / 1 FINISH / 2 LABEL, CSR), 'a' applied (event, CSR after).
+    static void noteGifEvent(uint32_t kind, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0)
     {
-        const uint32_t slot = m_gifEventNext.fetch_add(1, std::memory_order_relaxed) % kGifEvents;
-        m_gifEvents[slot] = {kind, a, b, c};
+        const uint32_t slot = s_gifEventNext.fetch_add(1, std::memory_order_relaxed) % kGifEvents;
+        s_gifEvents[slot] = {kind, a, b, c};
     }
     std::array<GifEvent, kGifEvents> gifEvents(uint32_t &next) const
     {
-        next = m_gifEventNext.load(std::memory_order_relaxed);
-        return m_gifEvents;
+        next = s_gifEventNext.load(std::memory_order_relaxed);
+        return s_gifEvents;
     }
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
@@ -352,8 +353,8 @@ public:
 
     bool m_seenGifCopy;
     std::atomic<uint64_t> m_dmaStartCount{0};
-    std::array<GifEvent, kGifEvents> m_gifEvents{};
-    std::atomic<uint32_t> m_gifEventNext{0};
+    static inline std::array<GifEvent, kGifEvents> s_gifEvents{};
+    static inline std::atomic<uint32_t> s_gifEventNext{0};
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};

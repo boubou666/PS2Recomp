@@ -160,6 +160,8 @@ namespace
                !(g_gsPendingEvents.front().event == GsCpuEvent::Signal && (regs.csr.load() & 0x1ull) != 0u))
         {
             raised |= applyGsEvent(regs, g_gsPendingEvents.front());
+            PS2Memory::noteGifEvent('a', static_cast<uint32_t>(g_gsPendingEvents.front().event),
+                                    static_cast<uint32_t>(regs.csr.load()));
             g_gsPendingEvents.pop_front();
         }
         return raised;
@@ -212,11 +214,17 @@ namespace
     inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
     {
         if (off == 0u)
+        {
+            if (value & 0x3u)
+                PS2Memory::noteGifEvent('c', value);
             csr.fetch_and(~(static_cast<uint64_t>(value) & kGsCsrW1cMask));
+        }
     }
 
     inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
     {
+        if (value & 0x3u)
+            PS2Memory::noteGifEvent('c', static_cast<uint32_t>(value));
         csr.fetch_and(~(value & kGsCsrW1cMask));
     }
 
@@ -499,6 +507,7 @@ bool PS2Memory::initialize(size_t ramSize)
 uint32_t ps2GsPostEvent(GSRegisters &regs, GsCpuEvent event, uint32_t id, uint32_t mask, uint64_t due, uint64_t now)
 {
     std::lock_guard<std::mutex> lock(g_gsEventMutex);
+    PS2Memory::noteGifEvent('p', static_cast<uint32_t>(event), static_cast<uint32_t>(regs.csr.load()));
     g_gsPendingEvents.push_back({event, id, mask, std::max(due, g_gsPendingEvents.empty() ? 0u : g_gsPendingEvents.back().due)});
     return drainGsEvents(regs, now);
 }
