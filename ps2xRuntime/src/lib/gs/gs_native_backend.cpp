@@ -114,10 +114,12 @@ GSNativeBackend::GSNativeBackend(GLFWwindow *sharedContext)
 
 GSNativeBackend::~GSNativeBackend() = default;
 
-bool GSNativeBackend::ensureContext()
+bool GSNativeBackend::ensureContext(bool create)
 {
     if (m_contextReady)
         return std::this_thread::get_id() == m_glThread;
+    if (!create || std::this_thread::get_id() != m_submitThread)
+        return false;
     if (m_contextFailed || !m_sharedContext)
     {
         m_contextFailed = true;
@@ -279,7 +281,7 @@ void GSNativeBackend::flushBatch()
 {
     if (m_batch.empty())
         return;
-    if (!ensureContext())
+    if (!ensureContext(true))
     {
         if (m_contextFailed)
             m_batch.clear();
@@ -332,6 +334,8 @@ void GSNativeBackend::Reset()
 
 void GSNativeBackend::Submit(const GSPrimitiveBatch &batch)
 {
+    if (m_submitThread == std::thread::id{})
+        m_submitThread = std::this_thread::get_id();
     appendPrimitive(batch);
 }
 

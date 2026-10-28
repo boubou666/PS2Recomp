@@ -65,7 +65,9 @@ private:
         uint8_t r, g, b, a;
     };
 
-    bool ensureContext();
+    // Makes our context current on the drawing (GS) thread the first time it draws (create = true); other calls
+    // only use it when they run on that thread. The main thread presents the very first frame and must keep raylib's.
+    bool ensureContext(bool create = false);
     RenderTarget &renderTarget(const GSFrameReg &frame);
     void appendPrimitive(const GSPrimitiveBatch &batch);
     void flushBatch();
@@ -75,6 +77,7 @@ private:
     bool m_contextFailed = false;
     // Framebuffers and vertex arrays do not cross contexts: GL work happens only on the thread that made ours current.
     std::thread::id m_glThread{};
+    std::thread::id m_submitThread{}; // the thread that draws: the only one that may bind our context
     std::unique_ptr<GSCpuBackend> m_memory;
 
     uint32_t m_program = 0;
