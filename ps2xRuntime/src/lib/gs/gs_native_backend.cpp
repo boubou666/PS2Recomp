@@ -1480,8 +1480,8 @@ void GSNativeBackend::Sync(GSSyncReason reason)
     m_memory->Sync(reason);
 }
 
-bool GSNativeBackend::readCircuit(uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels,
-                                  uint32_t &width, uint32_t &height, uint32_t &fbp)
+bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode,
+                                  std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height, uint32_t &fbp)
 {
     const DisplayRead read = decodeDisplay(dispfb, display);
     fbp = read.fbp;
@@ -1498,10 +1498,12 @@ bool GSNativeBackend::readCircuit(uint64_t dispfb, uint64_t display, bool fieldM
         pixels.resize(bytes);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        // Asynchronous read back through two pixel buffers per displayed buffer: this frame's read is queued and the
-        // previous one is copied out, so the GS thread does not wait for the GPU to finish the frame (one frame of
-        // latency). A size change, or the first frame, reads synchronously.
-        ReadbackBuffers &buffers = m_readbacks[read.fbp];
+        // Asynchronous read back through two pixel buffers per read circuit: this frame's read is queued and the
+        // previous presentation's is copied out, so the GS thread does not wait for the GPU to finish the frame (one
+        // presentation of latency). Per circuit, not per displayed buffer: a game alternating two buffers (one per
+        // field) would otherwise get every buffer's picture of two presentations ago, every other one repeated.
+        // A size change, or the first frame, reads synchronously.
+        ReadbackBuffers &buffers = m_readbacks[static_cast<uint32_t>(circuit)];
         if (!buffers.pbo[0])
             glGenBuffers(2, buffers.pbo);
         const int current = buffers.next;
@@ -1565,9 +1567,9 @@ PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
     const float alp = static_cast<float>(pmode >> 8 & 0xFFu) / 255.0f;
     std::vector<uint8_t> top, bottom;
     uint32_t topWidth = 0, topHeight = 0, topFbp = 0, bottomWidth = 0, bottomHeight = 0, bottomFbp = 0;
-    const bool haveTop = en1 && readCircuit(request.dispfb1, request.display1, fieldMode, top, topWidth, topHeight, topFbp);
+    const bool haveTop = en1 && readCircuit(1, request.dispfb1, request.display1, fieldMode, top, topWidth, topHeight, topFbp);
     const bool haveBottom = en2 && !slbg &&
-                            readCircuit(request.dispfb2, request.display2, fieldMode, bottom, bottomWidth, bottomHeight,
+                            readCircuit(2, request.dispfb2, request.display2, fieldMode, bottom, bottomWidth, bottomHeight,
                                         bottomFbp);
     if (static const bool logPresents = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logPresents)
     {
