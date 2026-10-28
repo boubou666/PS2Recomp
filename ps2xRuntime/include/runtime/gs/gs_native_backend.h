@@ -63,6 +63,8 @@ private:
         uint32_t depth = 0;
         uint32_t usedHeight = 0; // rows drawn so far (the lowest vertex, within the scissor), what a resolve reads back
         bool dirty = false;      // drawn since its pixels were last written to GS memory (resolveTarget)
+        uint32_t zbp = ~0u;      // the ZBUF its depth buffer was last written as (pages), for depth read as a texture
+        uint8_t zpsm = 0;
     };
 
     struct Vertex
@@ -99,6 +101,10 @@ private:
     void flushBatch();
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
+    // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
+    // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
+    bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
+    uint32_t m_depthTexture = 0;
     void applyBlend(const GSDrawState &state);
     // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
     int m_blendOut = 0;

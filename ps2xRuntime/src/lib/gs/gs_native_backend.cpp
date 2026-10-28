@@ -531,6 +531,56 @@ void GSNativeBackend::dropTargetsUnder(const GSTransferCommand &command)
     }
 }
 
+bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width, float &height)
+{
+    const GSTex0Reg &tex0 = state.context.tex0;
+    RenderTarget *source = nullptr;
+    for (auto &[fbp, target] : m_targets)
+        if (target.zbp != ~0u && target.zbp * 32u == tex0.tbp0 && target.usedHeight != 0u)
+            source = &target;
+    if (!source)
+        return false;
+    const uint32_t w = source->width, h = source->usedHeight;
+    std::vector<float> depth(static_cast<size_t>(w) * h);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
+    // Back to GS Z in the Z buffer's range, then laid out as the texture format reads it: Z32 as CT32, Z24 as CT24
+    // (alpha from TEXA), Z16 as CT16.
+    const double range = 1.0 / depthScale(source->zpsm);
+    const uint8_t ta0 = static_cast<uint8_t>(state.texa.ta0), ta1 = static_cast<uint8_t>(state.texa.ta1);
+    std::vector<uint8_t> texels(depth.size() * 4u);
+    for (size_t i = 0; i < depth.size(); ++i)
+    {
+        const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(depth[i]) * range, range - 1.0));
+        uint8_t *t = &texels[i * 4u];
+        switch (tex0.psm)
+        {
+        case 0x30u:
+            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu, t[3] = z >> 24 & 0xFFu;
+            break;
+        case 0x31u:
+            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu;
+            t[3] = state.texa.aem && (z & 0xFFFFFFu) == 0u ? 0u : ta0;
+            break;
+        default:
+            t[0] = static_cast<uint8_t>((z & 0x1Fu) << 3), t[1] = static_cast<uint8_t>((z >> 5 & 0x1Fu) << 3);
+            t[2] = static_cast<uint8_t>((z >> 10 & 0x1Fu) << 3);
+            t[3] = (z & 0x8000u) ? ta1 : (state.texa.aem && (z & 0x7FFFu) == 0u ? 0u : ta0);
+            break;
+        }
+    }
+    if (!m_depthTexture)
+        glGenTextures(1, &m_depthTexture);
+    glBindTexture(GL_TEXTURE_2D, m_depthTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, texels.data());
+    width = static_cast<float>(w);
+    height = static_cast<float>(h);
+    return true;
+}
+
 bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height)
 {
     const GSContext &context = state.context;
@@ -557,7 +607,12 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
                              context.tex0.tw, context.tex0.th, target.fbp);
         }
     }
-    if (colorFormat(context.tex0.psm))
+    if ((context.tex0.psm & 0x30u) == 0x30u && bindDepthAsTexture(state, width, height))
+    {
+        fromTarget = true;
+        texture = m_depthTexture;
+    }
+    else if (colorFormat(context.tex0.psm))
     {
         if (RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0))
         {
@@ -759,6 +814,11 @@ void GSNativeBackend::flushBatch()
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(kDepthFunc[context.test >> 17 & 0x3u]);
         glDepthMask(context.zbuf.zmask ? GL_FALSE : GL_TRUE);
+        if (!context.zbuf.zmask)
+        {
+            target.zbp = context.zbuf.zbp;
+            target.zpsm = context.zbuf.psm;
+        }
     }
     else
     {
