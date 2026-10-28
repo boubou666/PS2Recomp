@@ -50,6 +50,9 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // Diagnostics (ps2_gs_replay --dump): every drawn render target's pixels written to the texture cache's GS memory.
+    void resolveAllTargets();
+
 private:
     struct RenderTarget
     {

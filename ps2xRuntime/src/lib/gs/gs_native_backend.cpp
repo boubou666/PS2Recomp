@@ -502,6 +502,16 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     ps2x::native::textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
 }
 
+void GSNativeBackend::resolveAllTargets()
+{
+    flushBatch();
+    if (!ensureContext())
+        return;
+    for (auto &[fbp, target] : m_targets)
+        if (target.dirty && target.usedHeight != 0u)
+            resolveTarget(target);
+}
+
 void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
 {
     // The texture's blocks: TBW * 64 texels by its height, at its format's size (a conservative extent).

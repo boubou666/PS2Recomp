@@ -108,6 +108,22 @@ namespace
         }
     }
 
+    // --native: the render targets live on the GPU; a dump reads them as resolved into the texture cache's GS memory.
+    bool g_dumpNative = false;
+
+    uint32_t readDumped(GS &gs, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+    {
+#if defined(PS2X_HAVE_NATIVE_GS)
+        if (g_dumpNative)
+        {
+            static GSMem::TexturePageCache cache;
+            cache.Invalidate();
+            return GSMem::ReadTexture(cache, ps2x::native::textures().memory(), psm, base, bw, x, y);
+        }
+#endif
+        return gs.ReadVram(psm, base, bw, x, y);
+    }
+
     void writeDump(GS &gs, const DumpRequest &dump)
     {
         const std::string path = dump.name + ".ppm";
@@ -122,7 +138,7 @@ namespace
         for (uint32_t y = 0; y < dump.height; ++y)
         {
             for (uint32_t x = 0; x < dump.width; ++x)
-                toRgb(dump.psm, gs.ReadVram(dump.psm, dump.fbp * 32u, std::max<uint32_t>(dump.fbw, 1u), x, y), &row[x * 3u]);
+                toRgb(dump.psm, readDumped(gs, dump.psm, dump.fbp * 32u, std::max<uint32_t>(dump.fbw, 1u), x, y), &row[x * 3u]);
             std::fwrite(row.data(), 1, row.size(), file);
         }
         std::fclose(file);
@@ -472,6 +488,14 @@ int main(int argc, char **argv)
         best = pass == 0 ? seconds : std::min(best, seconds);
         if (pass + 1 == repeat)
         {
+#if defined(PS2X_HAVE_NATIVE_GS)
+            if (native && !dumps.empty())
+                if (auto *backend = dynamic_cast<GSNativeBackend *>(gs.rasterBackend()))
+                {
+                    backend->resolveAllTargets();
+                    g_dumpNative = true;
+                }
+#endif
             for (const DumpRequest &dump : dumps)
                 writeDump(gs, dump);
             if (presentPath && !writePresent(gs, presentPath))
