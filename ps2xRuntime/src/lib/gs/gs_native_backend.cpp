@@ -892,16 +892,52 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
     flushBatch();
     if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
     {
-        static uint32_t s_logged = 0;
-        if (s_logged++ < 400u)
+        static uint32_t s_logged = 0, s_copies = 0;
+        if (command.direction == 0u ? s_logged++ < 100u : s_copies++ < 300u)
             std::fprintf(stderr, "[gs:native] transfer dir=%u dbp=%u dbw=%u dpsm=0x%x dst=%u,%u sbp=%u size=%ux%u\n",
                          command.direction, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm,
                          command.trxpos.dsax, command.trxpos.dsay, command.bitbltbuf.sbp, command.trxreg.rrw,
                          command.trxreg.rrh);
     }
+    if (command.direction == 2u && copyBetweenTargets(command))
+    {
+        m_memory->BeginTransfer(command);
+        return;
+    }
     if (command.direction == 0u || command.direction == 2u)
         dropTargetsUnder(command);
     m_memory->BeginTransfer(command);
+}
+
+bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
+{
+    // A local-to-local copy out of a render target (a frame copied to the displayed buffer, a region saved for
+    // later): the same copy on the GPU, into the destination render target (made if need be).
+    const GSBitBltBuf &b = command.bitbltbuf;
+    const bool colour = [](uint8_t psm) { return psm == 0x00u || psm == 0x01u; }(b.spsm);
+    if (!colour || b.spsm != b.dpsm || b.sbp % 32u != 0u || b.dbp % 32u != 0u || !ensureContext())
+        return false;
+    auto source = m_targets.find(b.sbp / 32u);
+    if (source == m_targets.end() || source->second.fbw != b.sbw)
+        return false;
+    GSFrameReg frame{};
+    frame.fbp = b.dbp / 32u;
+    frame.fbw = b.dbw;
+    frame.psm = b.dpsm;
+    RenderTarget &destination = renderTarget(frame);
+    const RenderTarget &from = m_targets.find(b.sbp / 32u)->second; // renderTarget may have rehashed the map
+    const GLint sx = command.trxpos.ssax, sy = command.trxpos.ssay;
+    const GLint dx = command.trxpos.dsax, dy = command.trxpos.dsay;
+    const GLint w = command.trxreg.rrw, h = command.trxreg.rrh;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination.framebuffer);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBlitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    destination.dirty = true;
+    destination.usedHeight = std::min(destination.height,
+                                      std::max(destination.usedHeight, static_cast<uint32_t>(dy + h)));
+    return true;
 }
 
 void GSNativeBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)

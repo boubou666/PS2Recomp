@@ -93,6 +93,8 @@ private:
     // An image transfer into GS memory overwrites what the render targets under it hold: those are dropped (the
     // texture cache has the uploaded image; a later draw starts the target again).
     void dropTargetsUnder(const GSTransferCommand &command);
+    // A local-to-local transfer whose source is a render target, done on the GPU; false when it is not one.
+    bool copyBetweenTargets(const GSTransferCommand &command);
     void appendPrimitive(const GSPrimitiveBatch &batch);
     void flushBatch();
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
