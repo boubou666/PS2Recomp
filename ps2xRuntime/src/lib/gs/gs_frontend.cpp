@@ -733,8 +733,9 @@ void GS::queueNativeDraw(uint64_t group, int context)
         }
         // Objects whose material is the GS state here go to this renderer as triangles under that state (textures
         // decoded where the GS keeps them, the same blending and tests as GS primitives); the rest to the hook.
-        if (!m_parallel)
-            ps2x::native::Renderer::instance().takeGsContextBatches(group, &GS::submitNativeBatch, this);
+        // (The hook's target flushes this renderer's batch: only for groups that still have batches for it.)
+        if (!m_parallel && !ps2x::native::Renderer::instance().takeGsContextBatches(group, &GS::submitNativeBatch, this))
+            return;
         m_backend->NativeDraw(group, context);
     };
     if (!shouldQueue())

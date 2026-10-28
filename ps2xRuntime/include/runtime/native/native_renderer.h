@@ -96,7 +96,9 @@ namespace ps2x::native
         // there (its own renderer, textures decoded where the GS keeps them) instead of this renderer's pass.
         using StreamVisitor = void (*)(void *user, const Material &material, const float matrix[16], float gsZScale,
                                        const Vertex *vertices, uint32_t count);
-        void takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user);
+        // Returns whether batches up to `group` are left for the hook (GsDrawHook): none, and the GS front end needs
+        // no target for this marker.
+        bool takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user);
         // Frames faster than the game's (PS2X_NATIVE_INTERPOLATE=1): the native port keys each object's batches by
         // something stable from one game frame to the next (its own data, not its place in the stream); present()
         // then draws a key found in the previous frame too with its matrix between the two, by how far the window's

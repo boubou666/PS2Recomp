@@ -230,9 +230,10 @@ void main()
         setGsDrawHook(on ? &Renderer::gsDraw : nullptr);
     }
 
-    void Renderer::takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user)
+    bool Renderer::takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user)
     {
         std::vector<StreamBatch> taken;
+        bool left = false;
         {
             std::lock_guard<std::mutex> lock(m_streamMutex);
             for (auto it = m_stream.begin(); it != m_stream.end() && it->group <= group;)
@@ -243,7 +244,10 @@ void main()
                     it = m_stream.erase(it);
                 }
                 else
+                {
+                    left = true;
                     ++it;
+                }
             }
         }
         if (!taken.empty()) // the GS frame has them: present() must not draw the frame over it again
@@ -251,6 +255,7 @@ void main()
         for (const StreamBatch &entry : taken)
             visit(user, entry.batch.material, entry.batch.matrix, entry.gsZScale, entry.vertices.data(),
                   static_cast<uint32_t>(entry.vertices.size()));
+        return left;
     }
 
     bool Renderer::hasGroup(uint64_t group)
