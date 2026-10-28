@@ -24,6 +24,14 @@ namespace ps2x::native
     void setVu1Gate(Vu1Gate gate);
     bool vu1Skipped(const uint8_t *vu1Code, uint32_t startPc);
 
+    // A DIRECT packet the native port draws itself (a game's particles sent as GS packets in its VIF1 stream): the GS
+    // does not get it. Asked on the VIF1 thread for each whole DIRECT (not one finishing an image transfer) with its
+    // size in quadwords, as the VIFcode gives it; a skipped one counts as a skipped program (the GS stream's groups).
+    using DirectGate = bool (*)(uint32_t qwords);
+
+    void setDirectGate(DirectGate gate);
+    bool directSkipped(uint32_t qwords);
+
     // One UNPACK as VIF1 does it (STCYCL, STMOD, STMASK, STROW / STCOL in regs, TOPS for the FLG bit), into VU data
     // memory of vuDataSize bytes: an adapter that keeps its own copy of VU1 memory (to run microprograms itself,
     // ps2x::native::Vu1Sandbox) fills it the same way. cmd is the UNPACK code; returns the payload bytes it used.

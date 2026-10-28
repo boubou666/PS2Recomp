@@ -127,8 +127,7 @@ namespace ps2x::native
             }
             else // IMAGE (a texture upload: the texture cache has it from the GS front end)
                 q += nloop;
-            if (eop)
-                break;
+            (void)eop; // a DIRECT packet can hold several GIF packets: all of it is read
         }
     }
 
