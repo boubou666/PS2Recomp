@@ -22,6 +22,11 @@ namespace ps2x::native
         uint32_t itop = 0;
         // Sends a GIF packet on PATH1, as XGKICK would, in order with the rest of the GIF stream.
         void (*kick)(void *user, const uint8_t *packet, uint32_t bytes) = nullptr;
+        // Draws the native renderer's group `group` at this point of the GS stream, where the kick would have gone
+        // (GS::queueNativeDraw with the context the program draws with): for a handler that draws the program's
+        // output natively (ps2x::native::Renderer with beginGroup / setStreamDraws) instead of kicking it.
+        void (*nativeDraw)(void *user, uint64_t group, int context) = nullptr;
+        void *nativeUser = nullptr;
         void *user = nullptr;
     };
 

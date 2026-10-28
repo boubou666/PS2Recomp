@@ -1383,6 +1383,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                          run.user = &m_memory;
                                          run.kick = [](void *user, const uint8_t *packet, uint32_t bytes)
                                          { static_cast<PS2Memory *>(user)->submitGifPacket(GifPathId::Path1, packet, bytes); };
+                                         run.nativeUser = &m_gs;
+                                         run.nativeDraw = [](void *user, uint64_t group, int context)
+                                         { static_cast<GS *>(user)->queueNativeDraw(group, context); };
                                          if (hle(run))
                                          {
                                              g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);

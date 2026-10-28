@@ -633,6 +633,8 @@ void GS::queueNativeDraw(uint64_t group, int context)
         if (!m_backend)
             return;
         GSContext context = m_ctx[index];
+        context.texaRaw = static_cast<uint64_t>(m_texa.ta0) | (m_texa.aem ? (1ull << 15) : 0ull) | (static_cast<uint64_t>(m_texa.ta1) << 32);
+        context.fogcol = static_cast<uint32_t>(m_fogR) | (static_cast<uint32_t>(m_fogG) << 8) | (static_cast<uint32_t>(m_fogB) << 16);
         if (m_parallel) // the packets go to paraLLEl-GS whole: its registers, not the front end's
         {
             uint64_t xyoffset = 0, scissor = 0;
