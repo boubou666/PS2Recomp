@@ -854,7 +854,8 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     if (noResolve || width == 0u || height == 0u || width > target.width)
         return;
     static const bool cpuDecode = std::getenv("PS2X_GS_NATIVE_CPUDECODE") != nullptr;
-    if (!cpuDecode && resolveTargetGpu(target))
+    static const bool cpuResolve = std::getenv("PS2X_GS_NATIVE_CPURESOLVE") != nullptr; // diagnostics
+    if (!cpuDecode && !cpuResolve && resolveTargetGpu(target))
         return;
     pullGpuPages();
     // The pixels as a host-to-local CT32 transfer at the frame's base: rows top first (GL row 0 is GS row 0), alpha
