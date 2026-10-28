@@ -8,6 +8,9 @@
 #include "ps2_overlay_modules.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#if defined(PS2X_HAVE_NATIVE_GS)
+#include "runtime/gs/gs_native_backend.h"
+#endif
 #include "runtime/gs/gif_path_stats.h"
 #include "runtime/vif1_command_stats.h"
 #include "runtime/ee_scheduler.h"
@@ -1419,6 +1422,14 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+#if defined(PS2X_HAVE_NATIVE_GS)
+        // The native renderer draws on a context shared with the window's (created here, on the main thread).
+        if (const char *renderer = std::getenv("PS2X_GS_RENDERER"); renderer && std::string_view(renderer) == "native")
+        {
+            if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
+                m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+        }
+#endif
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
