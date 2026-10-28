@@ -904,10 +904,9 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const GsTrailingArgs2 trailing = decodeGsTrailingArgs2(rdram, ctx);
         const uint32_t ztest = trailing.arg0;
         const uint32_t zpsm = trailing.arg1;
-        const uint32_t clear = trailing.arg2;
 
         if (w == 0u)
         {
@@ -975,10 +974,10 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
-        (void)clear;
+        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const uint32_t ztest = trailing.arg0;
+        const uint32_t zpsm = trailing.arg1;
+        const uint32_t clear = trailing.arg2;
 
         if (w == 0u)
         {
