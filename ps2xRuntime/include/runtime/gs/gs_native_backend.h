@@ -147,7 +147,7 @@ private:
         int alphaTest = -1, alphaRef = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
         int dest = -1, date = -1;
         int vram = -1, swizzle = -1, decode = -1, texFmt = -1, texSel = -1, texKind = -1, clutFmt = -1, cbp = -1;
-        int texa = -1, wrapU = -1, wrapV = -1, linear = -1;
+        int texa = -1, wrapU = -1, wrapV = -1, linear = -1, targetWrap = -1;
     } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;

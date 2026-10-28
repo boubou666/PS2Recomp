@@ -80,6 +80,7 @@ uniform vec3 uTexa;     // TA0, TA1, AEM
 uniform ivec4 uWrapU;   // CLAMP mode, 2^TW - 1, MINU, MAXU
 uniform ivec4 uWrapV;
 uniform int uLinear;
+uniform int uTargetWrap; // a render target sampled directly: apply uWrapU / uWrapV to its texel coordinates
 
 uint gsRead(ivec4 fmt, int bitOffset, int maskBits, int bp, int bw, ivec2 p)
 {
@@ -147,7 +148,19 @@ void main()
     vec4 c = vc;
     if (uTextured != 0)
     {
-        vec4 t = uDecode != 0 ? gsSample(vTex.xy / vTex.z) : texture(uSampler, (vTex.xy / vTex.z) / uTexSize);
+        vec2 tc = vTex.xy / vTex.z;
+        if (uDecode == 0 && uTargetWrap != 0)
+        {
+            // A render target sampled directly: the GS's CLAMP modes over 2^TW x 2^TH texels (or the region), not
+            // the GL texture's whole size, so filtering never reaches rows the game did not draw.
+            if (uWrapU.x == 0) tc.x = mod(tc.x, float(uWrapU.y + 1));
+            else if (uWrapU.x == 1) tc.x = clamp(tc.x, 0.5, float(uWrapU.y) + 0.5);
+            else if (uWrapU.x == 2) tc.x = clamp(tc.x, float(uWrapU.z) + 0.5, float(uWrapU.w) + 0.5);
+            if (uWrapV.x == 0) tc.y = mod(tc.y, float(uWrapV.y + 1));
+            else if (uWrapV.x == 1) tc.y = clamp(tc.y, 0.5, float(uWrapV.y) + 0.5);
+            else if (uWrapV.x == 2) tc.y = clamp(tc.y, float(uWrapV.z) + 0.5, float(uWrapV.w) + 0.5);
+        }
+        vec4 t = uDecode != 0 ? gsSample(tc) : texture(uSampler, tc / uTexSize);
         t.a *= uTexAlphaScale;
         if (uTfx == 0)
             c = vec4(t.rgb * vc.rgb, uTcc != 0 ? t.a * vc.a : vc.a);
@@ -421,6 +434,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.wrapU = glGetUniformLocation(m_program, "uWrapU");
     m_uniforms.wrapV = glGetUniformLocation(m_program, "uWrapV");
     m_uniforms.linear = glGetUniformLocation(m_program, "uLinear");
+    m_uniforms.targetWrap = glGetUniformLocation(m_program, "uTargetWrap");
 
     glGenVertexArrays(1, &m_vertexArray);
     glGenBuffers(1, &m_vertexBuffer);
@@ -998,8 +1012,19 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     const GLint wrapT = (context.clamp >> 2 & 0x3u) == 1u || (context.clamp >> 2 & 0x3u) == 2u ? GL_CLAMP_TO_EDGE
                                                                                               : GL_REPEAT;
     const GLint filter = (context.tex1 >> 5 & 0x1u) != 0u ? GL_LINEAR : GL_NEAREST;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, fromTarget ? GL_CLAMP_TO_EDGE : wrapS);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, fromTarget ? GL_CLAMP_TO_EDGE : wrapT);
+    glUniform1i(m_uniforms.targetWrap, fromTarget ? 1 : 0);
+    if (fromTarget)
+    {
+        const uint64_t clamp = context.clamp;
+        const int maxU = (1 << std::min<uint32_t>(context.tex0.tw, 10u)) - 1;
+        const int maxV = (1 << std::min<uint32_t>(context.tex0.th, 10u)) - 1;
+        glUniform4i(m_uniforms.wrapU, static_cast<int>(clamp & 0x3u), maxU, static_cast<int>(clamp >> 4 & 0x3FFu),
+                    static_cast<int>(clamp >> 14 & 0x3FFu));
+        glUniform4i(m_uniforms.wrapV, static_cast<int>(clamp >> 2 & 0x3u), maxV, static_cast<int>(clamp >> 24 & 0x3FFu),
+                    static_cast<int>(clamp >> 34 & 0x3FFu));
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     glUniform1f(m_uniforms.fst, fromTarget ? 2.0f : 1.0f);
