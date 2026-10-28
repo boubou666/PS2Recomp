@@ -16,8 +16,8 @@ namespace ps2x::native
     {
         // The object's matrix takes a vertex to PS2 screen space (x, y in GS window coordinates, z GS depth, w); the
         // PS2 divides by w. Here the same point goes to the window: NDC from the screen rectangle, depth from the Z
-        // range (larger is nearer on the GS), and w kept so texture coordinates interpolate in perspective. The PS2
-        // divides by w whatever its sign (some of a game's matrices make it negative), so |w| goes to the GPU.
+        // range (larger is nearer on the GS), and w kept so texture coordinates interpolate in perspective and the
+        // GPU clips what lies behind the camera (w <= 0: where the PS2 relies on the microprogram's clipping).
         const char *kVertexShader = R"(#version 330
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aUv;
@@ -30,7 +30,7 @@ out vec4 vCol;
 void main()
 {
     vec4 c = uM[0] * aPos.x + uM[1] * aPos.y + uM[2] * aPos.z + uM[3];
-    float w = abs(c.w);
+    float w = c.w;
     vec2 s = c.xy / c.w;
     vec2 ndc = vec2((s.x - uScreen.x) / uScreen.z * 2.0 - 1.0, 1.0 - (s.y - uScreen.y) / uScreen.w * 2.0);
     float z = clamp(c.z / c.w / uDepthMax, 0.0, 1.0);
