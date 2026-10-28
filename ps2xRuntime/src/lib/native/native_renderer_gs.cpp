@@ -246,6 +246,8 @@ void main()
                     ++it;
             }
         }
+        if (!taken.empty()) // the GS frame has them: present() must not draw the frame over it again
+            m_drewIntoGs.store(true, std::memory_order_relaxed);
         for (const StreamBatch &entry : taken)
             visit(user, entry.batch.material, entry.batch.matrix, entry.gsZScale, entry.vertices.data(),
                   static_cast<uint32_t>(entry.vertices.size()));
