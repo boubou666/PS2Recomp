@@ -1322,7 +1322,8 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1SkipCallback([this](uint32_t)
                                 {
                                     static uint64_t s_group = 0;
-                                    m_gs.queueNativeDraw(++s_group, 0);
+                                    if (ps2x::native::Renderer::instance().hasGroup(++s_group))
+                                        m_gs.queueNativeDraw(s_group, 0); // (a setup's group has none: its strips follow)
                                 });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {

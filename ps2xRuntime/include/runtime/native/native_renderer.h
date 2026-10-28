@@ -79,6 +79,9 @@ namespace ps2x::native
         // draws around it, and present() leaves the frame to the GS; otherwise present() draws as before.
         void setStreamDraws(bool on);
         void beginGroup(uint64_t group) { m_group = group; }
+        // A group has batches waiting (its GS marker is worth queueing): the VIF1 interpreter reaches a program after
+        // the native port has drawn it (at the transfer's start), so a group without batches by then has none.
+        bool hasGroup(uint64_t group);
 
         // Present thread: draws the latest frame into the given window rectangle; false when there is none yet.
         bool present(float x, float y, float width, float height);

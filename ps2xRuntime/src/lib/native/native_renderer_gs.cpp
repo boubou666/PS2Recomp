@@ -176,6 +176,14 @@ void main()
         setGsDrawHook(on ? &Renderer::gsDraw : nullptr);
     }
 
+    bool Renderer::hasGroup(uint64_t group)
+    {
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        const auto it = std::lower_bound(m_stream.begin(), m_stream.end(), group,
+                                         [](const StreamBatch &entry, uint64_t g) { return entry.group < g; });
+        return it != m_stream.end() && it->group == group;
+    }
+
     void Renderer::drawGroups(uint64_t group, const GsDrawTarget &target)
     {
         std::vector<StreamBatch> batches;
