@@ -55,8 +55,11 @@ are now the limit, which layers 3 and 5 address).
 Translate what the game asks the GS to draw into GPU work, instead of reproducing the GS. Generic: every PS2 game
 talks to the GS through the same GIF/register interface, so nothing here is game-specific.
 
-- **Placement:** implements the existing `GSParallelRenderer` interface (raw GIF packets, register writes,
-  `present`, local-to-host reads, VRAM reads), selected with `PS2X_GS_RENDERER=native`. Runs on the GS thread.
+- **Placement:** written from scratch, no paraLLEl-GS code. It plugs into the GS thread's renderer socket (today
+  the abstract `GSParallelRenderer` class: raw GIF packets, register writes, `present`, local-to-host reads, VRAM
+  reads), which gets a neutral name (`GSRendererBackend`) so paraLLEl-GS is just one implementation of it. Selected
+  with `PS2X_GS_RENDERER=native`. Once the native renderer covers the games, paraLLEl-GS (and its LGPL dependency)
+  leaves the project; the CPU GS stays as the reference for validation only.
 - **API:** OpenGL 4.5 core on a context created on the GS thread and shared with raylib's window context (GLFW),
   so the frame the renderer produces is a GL texture the window draws directly: no CPU copy, and post-process
   passes are plain GLSL. (Vulkan was the alternative; it buys nothing here and needs interop to reach raylib.)
