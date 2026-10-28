@@ -358,8 +358,7 @@ int main(int argc, char **argv)
             for (const DumpRequest &dump : dumps)
                 writeDump(gs, dump);
             if (presentPath && !writePresent(gs, presentPath))
-                std::fprintf(stderr, "no displayed picture
-");
+                std::fprintf(stderr, "no displayed picture\n");
         }
     }
 
