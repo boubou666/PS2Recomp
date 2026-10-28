@@ -328,10 +328,12 @@ PS2Memory::PS2Memory()
     ps2SetScratchpadHostPtr(nullptr);
     if (const char *stall = std::getenv("PS2X_GS_SIGNAL_STALL"); stall && stall[0] == '0')
         m_signalStallEnabled = false;
+    ps2x::native::setVif1Registers(&vif1_regs);
 }
 
 PS2Memory::~PS2Memory()
 {
+    ps2x::native::setVif1Registers(nullptr);
     stopVif1Worker();
     if (m_rdram)
     {

@@ -32,6 +32,11 @@ namespace ps2x::native
     void setDirectGate(DirectGate gate);
     bool directSkipped(uint32_t qwords);
 
+    // VIF1's own registers (the VIF1 thread's, read without a lock): STMASK / STROW / STCOL / STMOD a game set in a
+    // transfer the adapter did not see (at boot) are there. Null before the runtime registers them.
+    void setVif1Registers(const VIFRegisters *registers);
+    const VIFRegisters *vif1Registers();
+
     // One UNPACK as VIF1 does it (STCYCL, STMOD, STMASK, STROW / STCOL in regs, TOPS for the FLG bit), into VU data
     // memory of vuDataSize bytes: an adapter that keeps its own copy of VU1 memory (to run microprograms itself,
     // ps2x::native::Vu1Sandbox) fills it the same way. cmd is the UNPACK code; returns the payload bytes it used.
