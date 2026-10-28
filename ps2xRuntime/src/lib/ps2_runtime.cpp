@@ -3451,6 +3451,12 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    // The picture is scaled to the window bilinearly (raylib's default is nearest, which draws each PS2 pixel as a
+    // block and the text with stairs); PS2X_PRESENT_FILTER=point keeps nearest.
+    {
+        const char *filter = std::getenv("PS2X_PRESENT_FILTER");
+        SetTextureFilter(frameTex, filter && std::strcmp(filter, "point") == 0 ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
