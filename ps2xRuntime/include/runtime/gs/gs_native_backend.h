@@ -59,6 +59,8 @@ private:
     struct RenderTarget
     {
         uint32_t fbp = 0;
+        uint32_t fbw = 0;
+        uint8_t psm = 0;
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t framebuffer = 0;

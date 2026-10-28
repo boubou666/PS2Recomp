@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -297,6 +298,8 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
 
     RenderTarget target;
     target.fbp = frame.fbp;
+    target.fbw = frame.fbw;
+    target.psm = frame.psm;
     target.width = std::clamp<uint32_t>(frame.fbw * 64u, 64u, kMaxTargetWidth);
     target.height = kTargetHeight;
     glGenTextures(1, &target.color);
@@ -463,6 +466,18 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
         {
             // A render target sampled as a texture (copies, blurs, depth of field). When the draw also writes it,
             // sample a copy of it as it was before the draw.
+            static const bool logSamples = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr;
+            static uint32_t s_logged = 0;
+            if (logSamples && s_logged < 200u)
+            {
+                ++s_logged;
+                std::fprintf(stderr,
+                             "[gs:native] target as texture: fbp=%u fbw=%u psm=0x%x -> tex psm=0x%x tbw=%u tw=%u th=%u "
+                             "fst=%d into fbp=%u (self=%d)\n",
+                             source->fbp, source->fbw, source->psm, context.tex0.psm, context.tex0.tbw,
+                             context.tex0.tw, context.tex0.th, state.prim.fst ? 1 : 0, target.fbp,
+                             source->fbp == target.fbp ? 1 : 0);
+            }
             fromTarget = true;
             width = static_cast<float>(source->width);
             height = static_cast<float>(source->height);
@@ -728,6 +743,8 @@ PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
     PresentationFrame frame;
     if (!ensureContext())
         return frame;
+    // Interlaced field mode (SMODE2 INT and FFMD): the game draws one field of half the lines; show each line twice.
+    const bool fieldMode = (request.smode2 & 0x3u) == 0x3u;
     const bool crt1 = (request.pmode & 0x1u) != 0u;
     const DisplayRead read = crt1 || (request.pmode & 0x2u) == 0u ? decodeDisplay(request.dispfb1, request.display1)
                                                                     : decodeDisplay(request.dispfb2, request.display2);
@@ -736,7 +753,8 @@ PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
         return frame;
     const RenderTarget &target = it->second;
     const uint32_t width = std::min(read.width, target.width - std::min(read.x, target.width));
-    const uint32_t height = std::min(read.height, target.height - std::min(read.y, target.height));
+    const uint32_t lines = fieldMode ? (read.height + 1u) / 2u : read.height;
+    const uint32_t height = std::min(lines, target.height - std::min(read.y, target.height));
     if (width == 0u || height == 0u)
         return frame;
     frame.width = width;
@@ -750,6 +768,18 @@ PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
                  static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, frame.pixels.data());
     for (size_t i = 3; i < frame.pixels.size(); i += 4)
         frame.pixels[i] = 0xFFu;
+    if (fieldMode)
+    {
+        std::vector<uint8_t> doubled(frame.pixels.size() * 2u);
+        const size_t row = static_cast<size_t>(width) * 4u;
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            std::memcpy(&doubled[(2u * y) * row], &frame.pixels[y * row], row);
+            std::memcpy(&doubled[(2u * y + 1u) * row], &frame.pixels[y * row], row);
+        }
+        frame.pixels.swap(doubled);
+        frame.height = height * 2u;
+    }
     return frame;
 }
 
