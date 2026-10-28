@@ -765,13 +765,13 @@ void GSNativeBackend::flushBatch()
             std::fprintf(stderr,
                          "[gs:draw] #%llu fbp=%u psm=0x%x fbmsk=0x%x prim=%d tme=%d textured=%d tex0 psm=0x%x tbp=%u tbw=%u "
                          "tw=%u th=%u tfx=%u tcc=%u cbp=%u abe=%d alpha=0x%llx test=0x%llx fst=%d verts=%zu "
-                         "v0=(%.1f,%.1f a=%u) scissor=%u-%u,%u-%u\n",
+                         "v0=(%.1f,%.1f rgba=%u,%u,%u,%u st=%.1f,%.1f,%.2f) scissor=%u-%u,%u-%u\n",
                          static_cast<unsigned long long>(index), context.frame.fbp, context.frame.psm,
                          context.frame.fbmsk, static_cast<int>(state.prim.type), state.prim.tme ? 1 : 0,
                          textured ? 1 : 0, context.tex0.psm, context.tex0.tbp0, context.tex0.tbw, context.tex0.tw,
                          context.tex0.th, context.tex0.tfx, context.tex0.tcc, context.tex0.cbp, state.prim.abe ? 1 : 0,
                          static_cast<unsigned long long>(context.alpha), static_cast<unsigned long long>(context.test),
-                         state.prim.fst ? 1 : 0, m_batch.size(), m_batch[0].x, m_batch[0].y, m_batch[0].a,
+                         state.prim.fst ? 1 : 0, m_batch.size(), m_batch[0].x, m_batch[0].y, m_batch[0].r, m_batch[0].g, m_batch[0].b, m_batch[0].a, m_batch[0].s, m_batch[0].t, m_batch[0].q,
                          context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1);
     }
     glUniform1i(m_uniforms.textured, textured ? 1 : 0);
