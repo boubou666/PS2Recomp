@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace
 {
@@ -827,6 +828,24 @@ PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
     const bool haveBottom = en2 && !slbg &&
                             readCircuit(request.dispfb2, request.display2, fieldMode, bottom, bottomWidth, bottomHeight,
                                         bottomFbp);
+    if (static const bool logPresents = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logPresents)
+    {
+        static uint32_t s_presents = 0;
+        if ((s_presents++ % 50u) == 0u)
+        {
+            std::string targets;
+            for (const auto &[fbp, rt] : m_targets)
+                targets += std::string(" ") + std::to_string(fbp) + '/' + std::to_string(rt.fbw) + (rt.dirty ? "*" : "");
+            std::fprintf(stderr,
+                         "[gs:native] present #%u pmode=0x%llx dispfb1=0x%llx display1=0x%llx dispfb2=0x%llx "
+                         "display2=0x%llx smode2=0x%llx top=%d(fbp %u) bottom=%d(fbp %u) targets:%s\n",
+                         s_presents, static_cast<unsigned long long>(pmode),
+                         static_cast<unsigned long long>(request.dispfb1), static_cast<unsigned long long>(request.display1),
+                         static_cast<unsigned long long>(request.dispfb2), static_cast<unsigned long long>(request.display2),
+                         static_cast<unsigned long long>(request.smode2), haveTop ? 1 : 0, topFbp, haveBottom ? 1 : 0,
+                         bottomFbp, targets.c_str());
+        }
+    }
     if (!haveTop && !haveBottom)
         return frame;
     const uint32_t width = std::max(haveTop ? topWidth : 0u, haveBottom ? bottomWidth : 0u);
