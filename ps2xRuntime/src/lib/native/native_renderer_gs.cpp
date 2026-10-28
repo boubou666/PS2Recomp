@@ -294,7 +294,11 @@ void main()
                 texture = ps2x::native::textures().texture(m.tex0, m.texa);
             const bool textured = m.textured && texture;
             if (textured)
+            {
                 glBindTexture(GL_TEXTURE_2D, pass.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), texture));
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, m.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            }
             glUniform1i(pass.locTextured, textured ? 1 : 0);
             glUniform1i(pass.locAlphaTest, m.alphaTest ? 1 : 0);
             glUniform1f(pass.locAlphaRef, m.alphaRef / 128.0f);

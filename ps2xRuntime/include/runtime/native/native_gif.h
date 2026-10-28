@@ -48,7 +48,7 @@ namespace ps2x::native
         uint64_t m_rgbaq = 0x3f80000000000000ull; // Q = 1
         float m_s = 0, m_t = 0;
         uint64_t m_uv = 0, m_fog = 0;
-        uint64_t m_tex0[2] = {}, m_alpha[2] = {}, m_test[2] = {}, m_zbuf[2] = {};
+        uint64_t m_tex0[2] = {}, m_alpha[2] = {}, m_test[2] = {}, m_zbuf[2] = {}, m_clamp[2] = {};
         uint64_t m_texa = 0, m_fogcol = 0;
         Kick m_queue[3];
         int m_queued = 0, m_strip = 0; // vertices waiting, and kicks since the primitive started (strips, fans)

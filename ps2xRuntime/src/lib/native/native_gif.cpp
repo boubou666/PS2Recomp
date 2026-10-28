@@ -23,7 +23,7 @@ namespace ps2x::native
         {
             return a.tex0 == b.tex0 && a.texa == b.texa && a.textured == b.textured && a.blend == b.blend && a.alphaRef == b.alphaRef &&
                    a.alphaTest == b.alphaTest && a.depthTest == b.depthTest && a.depthWrite == b.depthWrite && a.fog == b.fog &&
-                   a.fogColour == b.fogColour;
+                   a.fogColour == b.fogColour && a.clampU == b.clampU && a.clampV == b.clampV;
         }
     }
 
@@ -44,6 +44,19 @@ namespace ps2x::native
             const uint32_t nloop = tag & 0x7fffu, flg = (tag >> 58) & 3u;
             const uint32_t nreg = ((tag >> 60) & 0xfu) ? static_cast<uint32_t>((tag >> 60) & 0xfu) : 16u;
             const bool eop = (tag >> 15) & 1u;
+            static const bool s_logTags = []
+            {
+                const char *value = std::getenv("PS2X_NATIVE_LOG_GIF");
+                return value && *value == '2';
+            }();
+            static int s_tags = 0;
+            if (s_logTags && (m_source >> 16) == 0x3270u && s_tags < 24)
+            {
+                ++s_tags;
+                std::fprintf(stderr, "[native] gif ribbon tag %s: nloop %u eop %d pre %d prim %#llx flg %u nreg %u regs %#llx (queued %d strip %d)\n",
+                             draw ? "draw" : "registers", nloop, eop ? 1 : 0, static_cast<int>((tag >> 46) & 1u),
+                             static_cast<unsigned long long>((tag >> 47) & 0x7ffu), flg, nreg, static_cast<unsigned long long>(regs), m_queued, m_strip);
+            }
             if (((tag >> 46) & 1u) && flg != 2u) // PRE: the tag's PRIM field
                 write(0x00, (tag >> 47) & 0x7ffu, draw);
             if (flg == 0u) // PACKED
@@ -88,9 +101,11 @@ namespace ps2x::native
                         }
                         case 0x6: write(0x06, lo, draw); break;
                         case 0x7: write(0x07, lo, draw); break;
+                        case 0x8: write(0x08, lo, draw); break;
+                        case 0x9: write(0x09, lo, draw); break;
                         case 0xa: m_fog = (w[3] >> 4) & 0xffu; break;
                         case 0xe: write(w[2] & 0xffu, lo, draw); break; // A+D
-                        default: break; // CLAMP, NOP
+                        default: break; // NOP
                         }
                     }
             }
@@ -138,6 +153,8 @@ namespace ps2x::native
         case 0x0d: vertex(value, false, false, draw); break;
         case 0x06: m_tex0[0] = value; break;
         case 0x07: m_tex0[1] = value; break;
+        case 0x08: m_clamp[0] = value; break;
+        case 0x09: m_clamp[1] = value; break;
         case 0x0a: m_fog = (value >> 56) & 0xffu; break;
         case 0x1a: m_prmodecont = value & 1u; break;
         case 0x1b: m_prmode = value; break;
@@ -240,6 +257,9 @@ namespace ps2x::native
         m.textured = (attributes >> 4) & 1u;
         m.tex0 = m.textured ? m_tex0[context] : 0u;
         m.texa = m_texa;
+        const uint32_t wms = m_clamp[context] & 3u, wmt = (m_clamp[context] >> 2) & 3u;
+        m.clampU = wms == 1u || wms == 2u; // CLAMP, REGION_CLAMP (its region taken as the texture)
+        m.clampV = wmt == 1u || wmt == 2u;
         m.blend = Material::Blend::Opaque;
         if ((attributes >> 6) & 1u) // ABE
         {
@@ -296,6 +316,18 @@ namespace ps2x::native
                 std::fprintf(stderr, "[native] gif source %#x prim %#llx:", m_source, static_cast<unsigned long long>(m_prim));
                 for (int i = 0; i < count; ++i)
                     std::fprintf(stderr, " (%.2f %.2f %.1f uv %.3f %.3f %08x)", kicks[i].x, kicks[i].y, kicks[i].z, kicks[i].u, kicks[i].v, kicks[i].rgba);
+                std::fprintf(stderr, "\n");
+            }
+            static int s_ribbons = 0;
+            if ((m_source >> 16) == 0x3270u && s_ribbons < 6)
+            {
+                ++s_ribbons;
+                const int ctx = ((m_prmodecont ? m_prim : m_prmode) >> 9) & 1u;
+                std::fprintf(stderr, "[native] gif ribbon tex0 %#llx clamp %#llx alpha %#llx test %#llx:", static_cast<unsigned long long>(m_tex0[ctx]),
+                             static_cast<unsigned long long>(m_clamp[ctx]), static_cast<unsigned long long>(m_alpha[ctx]),
+                             static_cast<unsigned long long>(m_test[ctx]));
+                for (int i = 0; i < count; ++i)
+                    std::fprintf(stderr, " (%.1f %.1f uv %.3f %.3f)", kicks[i].x, kicks[i].y, kicks[i].u, kicks[i].v);
                 std::fprintf(stderr, "\n");
             }
             Stat &stat = s_byKind[(static_cast<uint64_t>(m_source) << 8) | (m_prim & 0x7fu)];
