@@ -378,6 +378,7 @@ public:
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;
     uint8_t *m_vu1Code = nullptr;
+    bool m_vu1ProgramSkipped = false; // the native port draws the running microprogram (ps2x::native::setVu1Gate)
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;

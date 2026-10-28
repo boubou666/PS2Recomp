@@ -5,6 +5,7 @@
 #include <map>
 #include "ThreadNaming.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/native/native_vif1.h"
 #include "runtime/vif1_command_stats.h"
 #include <atomic>
 #include <chrono>
@@ -730,7 +731,8 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            if (m_vu1MscalCallback)
+            m_vu1ProgramSkipped = ps2x::native::vu1Skipped(m_vu1Code, startPC);
+            if (m_vu1MscalCallback && !m_vu1ProgramSkipped)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
         }
@@ -748,7 +750,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            if (m_vu1MscntCallback)
+            if (m_vu1MscntCallback && !m_vu1ProgramSkipped)
                 m_vu1MscntCallback(runTop, runItop);
             continue;
         }

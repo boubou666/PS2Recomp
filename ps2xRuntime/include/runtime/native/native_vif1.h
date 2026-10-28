@@ -14,4 +14,11 @@ namespace ps2x::native
     void setVif1Observer(Vif1Observer observer);
     bool vif1Observed();
     void observeVif1(const uint8_t *stream, size_t bytes);
+
+    // A microprogram the native port draws itself: VU1 does not run it, nor the MSCNTs that continue it. Asked on the
+    // VIF1 thread at each MSCAL / MSCALF with VU1's code memory as VIF1 left it and the start address.
+    using Vu1Gate = bool (*)(const uint8_t *vu1Code, uint32_t startPc);
+
+    void setVu1Gate(Vu1Gate gate);
+    bool vu1Skipped(const uint8_t *vu1Code, uint32_t startPc);
 }

@@ -7,6 +7,7 @@ namespace ps2x::native
     namespace
     {
         std::atomic<Vif1Observer> g_observer{nullptr};
+        std::atomic<Vu1Gate> g_gate{nullptr};
     }
 
     void setVif1Observer(Vif1Observer observer)
@@ -23,5 +24,16 @@ namespace ps2x::native
     {
         if (Vif1Observer observer = g_observer.load(std::memory_order_acquire); observer && bytes != 0u)
             observer(stream, bytes);
+    }
+
+    void setVu1Gate(Vu1Gate gate)
+    {
+        g_gate.store(gate, std::memory_order_release);
+    }
+
+    bool vu1Skipped(const uint8_t *vu1Code, uint32_t startPc)
+    {
+        const Vu1Gate gate = g_gate.load(std::memory_order_acquire);
+        return gate && vu1Code && gate(vu1Code, startPc);
     }
 }
