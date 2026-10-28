@@ -87,6 +87,25 @@ Order: state tracker, geometry and untextured draws into one render target at 1x
 and tests; render target cache and feedback textures; transfers and readbacks; PCRTC presentation; scale factor;
 post-process hook.
 
+## Microprograms an adapter does not translate (native/renderer)
+
+A game's adapter turns its main microprograms into its own data (meshes, matrices, lights) and draws them with
+`ps2x::native::Renderer`; VU1 skips them (`setVu1Gate`). The others (particles, billboards, effects) can still be
+native: `ps2x::native::Vu1Sandbox` (`runtime/native/native_vu1_sandbox.h`) runs them on a VU1 of the adapter's own,
+on its copy of VU1 code and data memory (filled from the VIF1 stream with `ps2x::native::vifUnpack`, VIF1's own
+UNPACK), on the game's thread in stream order, and `GifToNative` (`runtime/native/native_gif.h`) draws what they send
+the GS: it keeps the GS registers drawing depends on and submits the primitives in screen space. The adapter's gate
+then skips every program, so the whole VU1 part of the frame is native. Without it, with renderers that keep GS memory
+themselves (paraLLEl, CPU), what VU1 still draws is under the native frame: covered by it, or showing it through.
+
+- An MSCAL the adapter does not draw: `call(code, data, pc, TOP, ITOP)` under its own group (`beginGroup`); its
+  MSCNTs: `resume(...)`; an MPG: `codeChanged()`; a DIRECT packet: `gif().registers(...)` (its register writes, the
+  GS draws the packet).
+- `VU1Interpreter::setPacketsToObserverOnly` sends the sandbox's XGKICK packets to its observer only.
+- Native draws are clipped to the GS scissor (and XYOFFSET) where their group's marker reaches the GS, on every GS
+  renderer (paraLLEl-GS gives its own registers): a rear-view camera's strip, split screens.
+- TMB: `TMB_NATIVE_SANDBOX=0` keeps them on VU1.
+
 ## IOP modules recompiled (native/renderer)
 
 The IOP's own code (IRX modules: sound drivers, streaming, the game's helpers) runs as native C++ instead of being
