@@ -11,6 +11,7 @@
 #include "Kernel/Stubs/Pad.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+#include "runtime/ps2_input_bindings.h"
 #include "imgui.h"
 #include "rlImGui.h"
 #include "raylib.h"
@@ -2203,6 +2204,124 @@ void PS2DebugPanel::shutdown()
 #endif
 }
 
+void PS2DebugPanel::drawControlsWindow()
+{
+#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+    ImGui::SetNextWindowSize(ImVec2(640.0f, 600.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Controls (F2)", &m_controlsVisible))
+    {
+        ImGui::End();
+        return;
+    }
+    ps2_input::Config &config = ps2_input::config();
+    std::mutex &mutex = ps2_input::configMutex();
+
+    ImGui::RadioButton("Player 1", &m_controlsPlayer, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Player 2", &m_controlsPlayer, 1);
+    ps2_input::Profile &profile = config.players[m_controlsPlayer];
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ImGui::SameLine(0.0f, 30.0f);
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::InputInt("Gamepad", &profile.gamepad);
+        profile.gamepad = std::clamp(profile.gamepad, 0, 3);
+    }
+    ImGui::TextWrapped("Add: then press a key or a gamepad button, push a stick or trigger, or click, roll the wheel or "
+                       "move the mouse over the game picture. Click a binding to remove it.");
+
+    // Capture: the first input since Add was clicked (mouse input only over the game, not over these windows).
+    if (m_bindingAction >= 0)
+    {
+        ps2_input::Binding binding;
+        if (ps2_input::pollAnyInput(profile.gamepad, binding))
+        {
+            const bool mouse = binding.source == ps2_input::Source::MouseButton ||
+                               binding.source == ps2_input::Source::MouseWheel ||
+                               binding.source == ps2_input::Source::MouseMove;
+            if (!(mouse && ImGui::GetIO().WantCaptureMouse))
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                std::vector<ps2_input::Binding> &list = profile.actions[m_bindingAction];
+                if (std::find(list.begin(), list.end(), binding) == list.end())
+                    list.push_back(binding);
+                m_bindingAction = -1;
+            }
+        }
+    }
+
+    if (ImGui::BeginTable("bindings", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY,
+                          ImVec2(0.0f, ImGui::GetContentRegionAvail().y - 120.0f)))
+    {
+        ImGui::TableSetupColumn("PS2", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn("Bindings", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        for (int action = 0; action < ps2_input::ActionCount; ++action)
+        {
+            ImGui::PushID(action);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ps2_input::actionLabel(action));
+            ImGui::TableNextColumn();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                std::vector<ps2_input::Binding> &list = profile.actions[action];
+                for (size_t i = 0; i < list.size(); ++i)
+                {
+                    ImGui::PushID(static_cast<int>(i));
+                    if (i)
+                        ImGui::SameLine();
+                    if (ImGui::SmallButton(ps2_input::bindingName(list[i]).c_str()))
+                    {
+                        list.erase(list.begin() + static_cast<long>(i));
+                        ImGui::PopID();
+                        break;
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::TableNextColumn();
+            if (m_bindingAction == action)
+            {
+                if (ImGui::SmallButton("Cancel"))
+                    m_bindingAction = -1;
+            }
+            else if (ImGui::SmallButton("Add"))
+            {
+                m_bindingAction = action;
+                GetKeyPressed(); // drop keys pressed before
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Mouse");
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ImGui::SetNextItemWidth(200.0f);
+        ImGui::SliderFloat("Sensitivity", &config.mouse.sensitivity, 0.1f, 5.0f, "%.2f");
+        ImGui::SameLine();
+        ImGui::Checkbox("Invert Y", &config.mouse.invertY);
+        ImGui::SameLine();
+        ImGui::Checkbox("Capture the cursor while playing", &config.mouse.capture);
+    }
+    ImGui::Separator();
+    static std::string s_status;
+    if (ImGui::Button("Save"))
+        s_status = ps2_input::save() ? "saved to " + ps2_input::configPath() : "could not write " + ps2_input::configPath();
+    ImGui::SameLine();
+    if (ImGui::Button("Reset to defaults"))
+    {
+        ps2_input::resetToDefaults();
+        s_status = "defaults (not saved yet)";
+    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted(s_status.c_str());
+    ImGui::End();
+#endif
+}
+
 void PS2DebugPanel::draw(PS2Runtime &runtime)
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -2215,16 +2334,35 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     {
         toggleVisible();
     }
+    if (IsKeyPressed(KEY_F2))
+    {
+        m_controlsVisible = !m_controlsVisible;
+        m_bindingAction = -1;
+    }
+    // The mouse is the game's (cursor capture, mouse bindings) unless one of these windows is open.
+    ps2_input::setUiOpen(m_controlsVisible || (m_visible && m_debugExpanded));
 
-    if (!m_visible)
+    if (!m_visible && !m_controlsVisible)
     {
         return;
     }
 
     rlImGuiBegin();
 
+    if (m_controlsVisible)
+    {
+        drawControlsWindow();
+    }
+    if (!m_visible)
+    {
+        rlImGuiEnd();
+        return;
+    }
+
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
+    const bool debugOpen = ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar);
+    m_debugExpanded = debugOpen && !ImGui::IsWindowCollapsed();
+    if (debugOpen)
     {
         if (ImGui::BeginMenuBar())
         {

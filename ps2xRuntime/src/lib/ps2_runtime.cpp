@@ -1,6 +1,7 @@
 #include "runtime/native/native_renderer.h"
 #include "ps2_runtime.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/ps2_input_bindings.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -3558,6 +3559,7 @@ void PS2Runtime::run()
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();
+        ps2_input::frameUpdate(); // the mouse and the wheel, for the pad bindings (input.ini)
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));

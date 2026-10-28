@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include "runtime/ps2_input_bindings.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -225,87 +226,13 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
-    uint16_t btns = 0xFFFFu;
-    const int kGamepad = port == 1 ? 1 : 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
-    auto clearBit = [&btns](uint16_t mask)
-    { btns &= ~mask; };
-
-    if (useGamepad)
-    {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
-
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
-    }
-    else if (port == 0)
-    {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
-    }
+    // The player's bindings (runtime/ps2_input_bindings.h: input.ini, the Controls window).
+    const ps2_input::PadState state = ps2_input::padState(port == 1 ? 1 : 0);
+    uint16_t btns = state.buttons;
+    data[4] = state.rx;
+    data[5] = state.ry;
+    data[6] = state.lx;
+    data[7] = state.ly;
 
     btns &= static_cast<uint16_t>(~(port == 1 ? pad2ScriptedButtonsDown() : scriptedButtonsDown()));
 
