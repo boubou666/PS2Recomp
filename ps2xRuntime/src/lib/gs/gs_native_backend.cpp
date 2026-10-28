@@ -300,6 +300,13 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
             return existing;
         // The same memory drawn in another format or width (a CT32 buffer reused as CT16): its pixels go to GS
         // memory first, where the new target's readers will find them, and the target starts over.
+        if (static const bool log = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; log)
+        {
+            static uint32_t s_logged = 0;
+            if (s_logged++ < 100u)
+                std::fprintf(stderr, "[gs:native] target fbp=%u redrawn as psm=0x%x fbw=%u (was psm=0x%x fbw=%u)\n",
+                             frame.fbp, frame.psm, frame.fbw, existing.psm, existing.fbw);
+        }
         if (existing.dirty && existing.usedHeight != 0u)
             resolveTarget(existing);
         glDeleteFramebuffers(1, &existing.framebuffer);
