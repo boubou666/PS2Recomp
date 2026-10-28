@@ -152,6 +152,19 @@ void main()
             {
                 if (slot.id == 0)
                     glGenTextures(1, &slot.id);
+                // The GS renderer's unpack state stays its own (a pixel buffer bound for its transfers would make
+                // this read from it): plain client memory, tightly packed, then back as it was.
+                GLint unpackBuffer = 0, rowLength = 0, skipRows = 0, skipPixels = 0, alignment = 4;
+                glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
+                glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rowLength);
+                glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skipRows);
+                glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skipPixels);
+                glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+                glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
                 glBindTexture(GL_TEXTURE_2D, slot.id);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(source->width), static_cast<GLsizei>(source->height), 0,
                              GL_RGBA, GL_UNSIGNED_BYTE, source->rgba.data());
@@ -159,6 +172,11 @@ void main()
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<GLuint>(unpackBuffer));
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+                glPixelStorei(GL_UNPACK_SKIP_ROWS, skipRows);
+                glPixelStorei(GL_UNPACK_SKIP_PIXELS, skipPixels);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
                 slot.source = source;
             }
             return slot.id;
@@ -229,6 +247,10 @@ void main()
         glUniform2fv(pass.locTargetSize, 1, size);
         glUniform1i(pass.locTex, 0);
         glActiveTexture(GL_TEXTURE0);
+        // Our textures' own filtering, not a sampler object the GS renderer left on unit 0.
+        GLint sampler = 0;
+        glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
+        glBindSampler(0, 0);
 
         GLint first = 0;
         for (const StreamBatch &entry : batches)
@@ -270,6 +292,7 @@ void main()
             glDrawArrays(GL_TRIANGLES, first, count);
             first += count;
         }
+        glBindSampler(0, static_cast<GLuint>(sampler));
         glBindVertexArray(0);
         glUseProgram(0);
         glDepthMask(GL_TRUE);

@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "iop_emulator.h"
+#include "ps2x/iop/iop_native.h"
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
 #include "imports/iop_heaplib.h"
@@ -22,6 +23,8 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <cstddef>
 #include <array>
 #include <cctype>
 #include <cstdio>
@@ -36,6 +39,40 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+
+namespace ps2x::iop::native
+{
+    namespace
+    {
+        struct RegisteredModule
+        {
+            std::string name;
+            uint64_t fileHash = 0;
+            uint32_t base = 0, size = 0;
+            const Entry *entries = nullptr;
+            size_t count = 0;
+        };
+
+        std::vector<RegisteredModule> &registeredModules()
+        {
+            static std::vector<RegisteredModule> modules;
+            return modules;
+        }
+    }
+
+    Registration::Registration(const char *name, uint64_t fileHash, uint32_t base, uint32_t size, const Entry *entries, size_t count)
+    {
+        registeredModules().push_back(RegisteredModule{name, fileHash, base, size, entries, count});
+    }
+}
+
+static_assert(offsetof(ps2x::iop::detail::IopCpuState, gpr) == offsetof(ps2x::iop::native::NativeCpu, gpr) &&
+                  offsetof(ps2x::iop::detail::IopCpuState, hi) == offsetof(ps2x::iop::native::NativeCpu, hi) &&
+                  offsetof(ps2x::iop::detail::IopCpuState, lo) == offsetof(ps2x::iop::native::NativeCpu, lo) &&
+                  offsetof(ps2x::iop::detail::IopCpuState, pc) == offsetof(ps2x::iop::native::NativeCpu, pc) &&
+                  offsetof(ps2x::iop::detail::IopCpuState, cop0) == offsetof(ps2x::iop::native::NativeCpu, cop0),
+              "NativeCpu must lay out as IopCpuState starts");
 
 namespace ps2x::iop::detail
 {
@@ -533,6 +570,12 @@ namespace ps2x::iop::detail
                 runNativeBitScan(cpu);
                 return true;
             }
+            if (!cpu.branchPending)
+                if (const native::Function function = nativeAt(physicalAddress(cpu.pc)))
+                {
+                    runNative(cpu, function);
+                    return !cpu.stopped;
+                }
 
             if (const auto import = imports.decode(cpu.pc))
             {
@@ -551,6 +594,150 @@ namespace ps2x::iop::detail
             ++totalInstructions;
             ++totalCycles;
             return running;
+        }
+
+        // Recompiled modules (ps2x/iop/iop_native.h; PS2X_IOP_NATIVE=1): the native entries of the loaded modules
+        // whose file hash and base match a registration, by physical address, and a bit per word of RAM to check them.
+        const bool nativeModules = []
+        {
+            const char *value = std::getenv("PS2X_IOP_NATIVE");
+            return value && *value == '1';
+        }();
+        std::unordered_map<uint32_t, native::Function> nativeEntries;
+        std::vector<uint64_t> nativeBits = std::vector<uint64_t>(kRamSize / 4u / 64u, 0u);
+        uint64_t sliceEnd = ~0ull; // runCpu's: native code stops at its loop heads once there
+
+        native::Function nativeAt(uint32_t physical) const
+        {
+            if (physical >= kRamSize || !((nativeBits[physical >> 8] >> ((physical >> 2) & 63u)) & 1u))
+                return nullptr;
+            const auto it = nativeEntries.find(physical);
+            return it == nativeEntries.end() ? nullptr : it->second;
+        }
+
+        static uint64_t fileHash(std::span<const uint8_t> file)
+        {
+            uint64_t hash = 1469598103934665603ull;
+            for (const uint8_t byte : file)
+                hash = (hash ^ byte) * 1099511628211ull;
+            return hash;
+        }
+
+        void activateNative(const Module &module, std::span<const uint8_t> file)
+        {
+            if (!nativeModules)
+                return;
+            const uint64_t hash = fileHash(file);
+            for (const native::RegisteredModule &registered : native::registeredModules())
+            {
+                if (registered.fileHash != hash || registered.base != module.base)
+                    continue;
+                for (size_t i = 0; i < registered.count; ++i)
+                {
+                    const uint32_t physical = physicalAddress(registered.entries[i].pc);
+                    nativeEntries[physical] = registered.entries[i].function;
+                    nativeBits[physical >> 8] |= 1ull << ((physical >> 2) & 63u);
+                }
+                std::fprintf(stderr, "[IOP] native: %s (%zu entries)\n", module.name.c_str(), registered.count);
+                return;
+            }
+        }
+
+        void deactivateNative(const Module &module)
+        {
+            for (auto it = nativeEntries.begin(); it != nativeEntries.end();)
+            {
+                if (it->first >= physicalAddress(module.base) && it->first < physicalAddress(module.base) + module.size)
+                {
+                    nativeBits[it->first >> 8] &= ~(1ull << ((it->first >> 2) & 63u));
+                    it = nativeEntries.erase(it);
+                }
+                else
+                    ++it;
+            }
+        }
+
+        // The guest as native code sees it: reads of RAM directly, the rest through the IOP; the IOP's clock kept up
+        // before any access that is not RAM (the SPU2 and timers read it), and calls run natively where they can.
+        class NativeEnv final : public native::Env
+        {
+        public:
+            NativeEnv(Impl &impl, CpuState &cpu)
+                : native::Env(*reinterpret_cast<native::NativeCpu *>(&cpu)), m_impl(impl), m_cpu(cpu)
+            {
+                ram = const_cast<uint8_t *>(impl.memory.ram().data());
+                ramSize = static_cast<uint32_t>(impl.memory.ram().size());
+            }
+
+            void sync()
+            {
+                const uint64_t delta = executed - m_synced;
+                m_impl.totalInstructions += delta;
+                m_impl.totalCycles += delta;
+                m_synced = executed;
+            }
+
+            bool call(uint32_t target, uint32_t ret) override
+            {
+                m_cpu.pc = target;
+                for (;;)
+                {
+                    if (m_cpu.pc == ret)
+                        return true;
+                    if (m_cpu.yielded || m_cpu.stopped || expired())
+                        return false;
+                    const uint32_t physical = physicalAddress(m_cpu.pc);
+                    if (const native::Function function = m_impl.nativeAt(physical))
+                    {
+                        function(*this);
+                        continue;
+                    }
+                    if (const auto import = m_impl.imports.decode(m_cpu.pc))
+                    {
+                        sync();
+                        const ImportDisposition disposition = m_impl.dispatchImport(*import, m_cpu);
+                        tick(1);
+                        if (disposition != ImportDisposition::JumpToGuest)
+                            m_cpu.pc = m_cpu.gpr[31];
+                        continue;
+                    }
+                    return false; // interpreted code: the IOP goes on with it, and back into native code after
+                }
+            }
+
+        private:
+            uint8_t read8(uint32_t address) override { sync(); return m_impl.memory.read8(address); }
+            uint16_t read16(uint32_t address) override { sync(); return m_impl.memory.read16(address); }
+            uint32_t read32(uint32_t address) override { sync(); return m_impl.memory.read32(address); }
+            void write8(uint32_t address, uint8_t value) override { sync(); m_impl.memory.write8(address, value); m_impl.schedulePendingDma(); }
+            void write16(uint32_t address, uint16_t value) override { sync(); m_impl.memory.write16(address, value); m_impl.schedulePendingDma(); }
+            void write32(uint32_t address, uint32_t value) override { sync(); m_impl.memory.write32(address, value); m_impl.schedulePendingDma(); }
+
+            Impl &m_impl;
+            CpuState &m_cpu;
+            uint64_t m_synced = 0;
+        };
+
+        void runNative(CpuState &cpu, native::Function function)
+        {
+            if (cpu.pendingLoad)
+            {
+                if (cpu.pendingLoadReg != 0u)
+                    cpu.gpr[cpu.pendingLoadReg] = cpu.pendingLoadValue;
+                cpu.pendingLoad = false;
+            }
+            NativeEnv env(*this, cpu);
+            env.budget = sliceEnd > totalInstructions ? sliceEnd - totalInstructions : 1u;
+            const uint32_t entered = cpu.pc;
+            function(env);
+            env.sync();
+            if (env.executed == 0u && cpu.pc == entered)
+            {
+                // No progress (not an entry after all): interpret the instruction instead.
+                cpuCore.executeInstruction(cpu);
+                ++totalInstructions;
+                ++totalCycles;
+            }
         }
 
         // 989snd's voice search: the first voice from a1 (of 48, 24 per SPU2 core) set in the masks at a0 + 0x18,
@@ -672,6 +859,8 @@ namespace ps2x::iop::detail
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
+            const uint64_t previousSliceEnd = sliceEnd;
+            sliceEnd = start + instructionBudget;
             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
                 if (profiling && (totalInstructions & 63u) == 0u)
@@ -688,6 +877,7 @@ namespace ps2x::iop::detail
                     servicePendingGuestCallbacks();
             }
             activeCpu = previous;
+            sliceEnd = previousSliceEnd;
             return static_cast<uint32_t>(totalInstructions - start);
         }
 
@@ -1391,6 +1581,7 @@ namespace ps2x::iop::detail
             if (nativeBitScan == 0u)
                 findNativeFunctions(module.base, module.size);
             dumpModule(module, image);
+            activateNative(module, image);
 
             // Like loadcore: start(argc, argv) with argv[0] the module path, then one entry per
             // NUL-separated argument. The block stays allocated, as resident modules may keep argv strings.
@@ -1494,6 +1685,7 @@ namespace ps2x::iop::detail
             if (nativeBitScan >= physicalAddress(it->second.base) &&
                 nativeBitScan < physicalAddress(it->second.base) + it->second.size)
                 nativeBitScan = 0u;
+            deactivateNative(it->second);
             imports.eraseRange(it->second.base, it->second.size);
             modules.erase(it);
             kernel.cleanupDeadThreads();
