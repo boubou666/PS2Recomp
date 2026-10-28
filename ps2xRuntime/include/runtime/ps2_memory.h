@@ -142,9 +142,11 @@ public:
     // The last GIF channel events, for diagnostics: 'S' start (CHCR with STR: chcr, madr, qwc), 'Q' end interrupt
     // queued, 'C' end interrupts consumed (count, 1 = by a sceDmaSend stub), 'D' dispatched (handlers started,
     // 1 = held because the cause is disabled).
+    // No default member initializers: GCC rejects them in a type an in-class static inline member of the same class
+    // value-initializes (s_gifEvents{} zeroes the ring anyway).
     struct GifEvent
     {
-        uint32_t kind = 0, a = 0, b = 0, c = 0;
+        uint32_t kind, a, b, c;
     };
     static constexpr uint32_t kGifEvents = 32u;
     // Also GS events: 'p' posted (event 0 SIGNAL / 1 FINISH / 2 LABEL, CSR), 'a' applied (event, CSR after).
