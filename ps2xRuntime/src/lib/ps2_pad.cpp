@@ -162,9 +162,61 @@ namespace
         appendLivePresses(added, now, presses);
     }
 
+    // PS2X_PAD_SCRIPT_FILE=<file>: a pad script read from a file (entries separated by commas or new lines),
+    // for scripts too long for the environment, such as a PS2X_PAD_RECORD recording.
+    std::string padScriptFromFile()
+    {
+        std::string text;
+        if (const char *path = std::getenv("PS2X_PAD_SCRIPT_FILE"))
+        {
+            if (FILE *file = std::fopen(path, "rb"))
+            {
+                char chunk[4096];
+                for (size_t got; (got = std::fread(chunk, 1, sizeof(chunk), file)) != 0;)
+                    text.append(chunk, got);
+                std::fclose(file);
+            }
+            std::replace(text.begin(), text.end(), '\n', ',');
+            std::replace(text.begin(), text.end(), '\r', ',');
+        }
+        if (const char *inline_ = std::getenv("PS2X_PAD_SCRIPT"))
+            text = text.empty() ? std::string(inline_) : text + "," + inline_;
+        return text;
+    }
+
+    // PS2X_PAD_RECORD=<file>: the buttons pressed on pad 1 (keyboard or gamepad), one PS2X_PAD_SCRIPT entry
+    // per press ("<seconds since start>:<BUTTON>/<milliseconds held>") written when it is released, so a
+    // session can be replayed with PS2X_PAD_SCRIPT_FILE. Scripted presses are not recorded.
+    void recordPhysicalButtons(uint16_t down)
+    {
+        static const char *const path = std::getenv("PS2X_PAD_RECORD");
+        if (!path)
+            return;
+        static FILE *file = std::fopen(path, "w");
+        static uint16_t previous = 0;
+        static double pressedAt[16] = {};
+        if (!file || down == previous)
+            return;
+        static const char *const kNames[16] = {"SELECT", "L3", "R3", "START", "UP", "RIGHT", "DOWN", "LEFT",
+                                               "L2", "R2", "L1", "R1", "TRIANGLE", "CIRCLE", "CROSS", "SQUARE"};
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+        for (int bit = 0; bit < 16; ++bit)
+        {
+            const uint16_t mask = static_cast<uint16_t>(1u << bit);
+            if ((down & mask) && !(previous & mask))
+                pressedAt[bit] = now;
+            else if (!(down & mask) && (previous & mask))
+                std::fprintf(file, "%.3f:%s/%d\n", pressedAt[bit], kNames[bit],
+                             std::max(1, static_cast<int>((now - pressedAt[bit]) * 1000.0 + 0.5)));
+        }
+        std::fflush(file);
+        previous = down;
+    }
+
     uint16_t scriptedButtonsDown()
     {
-        static const std::vector<ScriptedPress> script = parsePadScript(std::getenv("PS2X_PAD_SCRIPT"));
+        static const std::string scriptText = padScriptFromFile();
+        static const std::vector<ScriptedPress> script = parsePadScript(scriptText.empty() ? nullptr : scriptText.c_str());
         static const char *const liveInput = std::getenv("PS2X_PAD_INPUT");
         if (script.empty() && !liveInput)
             return 0;
@@ -307,6 +359,8 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
             clearBit(PAD_SELECT);
     }
 
+    if (port == 0)
+        recordPhysicalButtons(static_cast<uint16_t>(~btns));
     btns &= static_cast<uint16_t>(~(port == 1 ? pad2ScriptedButtonsDown() : scriptedButtonsDown()));
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
