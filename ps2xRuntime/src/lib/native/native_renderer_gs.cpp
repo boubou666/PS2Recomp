@@ -317,7 +317,8 @@ void main()
             const char *value = std::getenv("PS2X_NATIVE_GS_DEBUG");
             return value && *value == '1' ? 1 : 0;
         }();
-        glUniform1i(glGetUniformLocation(pass.program, "uDebug"), s_debug);
+        static const GLint s_locDebug = glGetUniformLocation(pass.program, "uDebug"); // one program per GS thread
+        glUniform1i(s_locDebug, s_debug);
         glActiveTexture(GL_TEXTURE0);
         // Our textures' own filtering, not a sampler object the GS renderer left on unit 0.
         GLint sampler = 0;

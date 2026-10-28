@@ -235,7 +235,7 @@ private:
     void noteQueuedDrawing();
     uint64_t m_notedDrawingCycles = 0;
     void waitForGsFrames();
-    void enqueue(QueuedCommand &&command);
+    uint64_t enqueue(QueuedCommand &&command);
     void workerLoop();
     bool processNativePackedGIFPacketNow(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNativeNow(uint64_t bitbltbuf,
@@ -290,6 +290,12 @@ private:
     std::condition_variable m_queueIdle;
     std::deque<QueuedCommand> m_queue;
     size_t m_queuedBytes = 0;
+    // Commands pushed and popped so far, and the native draw marker last pushed (queueNativeDraw): a marker that is
+    // still the queue's tail takes a later group instead of a new marker following it (its draws all go in at once).
+    uint64_t m_pushed = 0, m_popped = 0;
+    uint64_t m_markerIndex = ~0ull;
+    int m_markerContext = 0;
+    std::shared_ptr<std::atomic<uint64_t>> m_markerGroup;
     // FINISH writes queued for / drawn by the GS thread: bounds how many frames it may lag.
     GsDrawEstimate m_drawEstimate;
     GsDrawEstimate::Rates m_drawRates{};

@@ -407,7 +407,7 @@ void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
-void GS::enqueue(QueuedCommand &&command)
+uint64_t GS::enqueue(QueuedCommand &&command)
 {
     std::unique_lock<std::mutex> lock(m_queueMutex);
     if (!m_worker.joinable())
@@ -415,11 +415,13 @@ void GS::enqueue(QueuedCommand &&command)
     m_queueIdle.wait(lock, [this]() { return m_queuedBytes < kMaxQueuedBytes; });
     m_queuedBytes += command.bytes.size();
     m_queue.push_back(std::move(command));
+    const uint64_t index = m_pushed++;
     m_queuedCommands.store(m_queue.size(), std::memory_order_release);
     const bool wake = m_workerSleeping;
     lock.unlock();
     if (wake)
         m_queueReady.notify_one();
+    return index;
 }
 
 void GS::workerLoop()
@@ -466,6 +468,7 @@ void GS::workerLoop()
             }
             command = std::move(m_queue.front());
             m_queue.pop_front();
+            ++m_popped;
             m_queuedCommands.store(m_queue.size(), std::memory_order_release);
             m_workerBusy = true;
         }
@@ -628,7 +631,20 @@ void GS::processWithParallel(const QueuedCommand &command)
 void GS::queueNativeDraw(uint64_t group, int context)
 {
     const int index = context != 0 ? 1 : 0;
-    auto draw = [this, group, index]() {
+    // Draws every native group up to the cell's value: a marker still at the queue's tail (nothing queued after it,
+    // not taken by the GS thread yet) takes the new group instead of a second marker following it.
+    auto cell = std::make_shared<std::atomic<uint64_t>>(group);
+    if (shouldQueue())
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        if (m_markerGroup && m_markerIndex + 1u == m_pushed && m_popped <= m_markerIndex && m_markerContext == index)
+        {
+            m_markerGroup->store(group, std::memory_order_release);
+            return;
+        }
+    }
+    auto draw = [this, cell, index]() {
+        const uint64_t group = cell->load(std::memory_order_acquire);
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         if (!m_backend)
             return;
@@ -656,7 +672,11 @@ void GS::queueNativeDraw(uint64_t group, int context)
     QueuedCommand command;
     command.kind = QueuedCommand::Kind::Call;
     command.call = std::move(draw);
-    enqueue(std::move(command));
+    const uint64_t pushedAt = enqueue(std::move(command));
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    m_markerIndex = pushedAt; // coalesces only while nothing was pushed after it
+    m_markerContext = index;
+    m_markerGroup = cell;
 }
 
 void GS::runOnWorker(std::function<void()> work)
