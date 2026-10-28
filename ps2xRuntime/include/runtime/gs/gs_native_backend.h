@@ -138,8 +138,8 @@ private:
     // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
     int m_blendOut = 0;
     // One PCRTC read circuit's picture (RGBA8, alpha as the GS stores it), from its render target or else GS memory.
-    bool readCircuit(uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels, uint32_t &width,
-                     uint32_t &height, uint32_t &fbp);
+    bool readCircuit(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels,
+                     uint32_t &width, uint32_t &height, uint32_t &fbp);
 
     GLFWwindow *m_sharedContext = nullptr;
     bool m_contextReady = false;
@@ -174,7 +174,7 @@ private:
         bool ready[2] = {false, false};
         int next = 0;
     };
-    std::unordered_map<uint32_t, ReadbackBuffers> m_readbacks; // per displayed buffer (readCircuit)
+    std::unordered_map<uint32_t, ReadbackBuffers> m_readbacks; // per read circuit, 1 or 2 (readCircuit)
     std::unordered_map<uint64_t, UploadedTexture> m_uploaded;
     struct LastLookup
     {

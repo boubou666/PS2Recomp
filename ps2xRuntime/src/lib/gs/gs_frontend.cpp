@@ -472,7 +472,9 @@ void GS::workerLoop()
             if (!recorder.started && now >= recorder.startAt && m_backend)
             {
                 const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
-                if (transfer.direction == 3u || transfer.totalPixels == 0u)
+                // No image transfer in flight: none set up, or the last one complete (a game uploading every frame
+                // never goes back to "none").
+                if (transfer.direction == 3u || transfer.totalPixels == 0u || transfer.copiedPixels >= transfer.totalPixels)
                 {
                     GsTraceHeader header;
                     m_backend->SnapshotVram(header.vram);
