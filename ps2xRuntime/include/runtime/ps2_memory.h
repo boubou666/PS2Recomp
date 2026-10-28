@@ -267,6 +267,10 @@ public:
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     uint32_t processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
+    // A GIF channel transfer (normal mode, PATH3) of a packet the host built, as if the EE had started it: in order
+    // with the rest of the GIF stream, and the channel ends with its DMAC interrupt. For HLE calls that send GS
+    // packets (sceGsExecLoadImage) without taking guest memory for them.
+    void submitHostGifTransfer(const uint8_t *data, uint32_t size);
     // A SIGNAL that reaches the GS while CSR.SIGNAL is set stops the GS until the CPU clears the bit. The GIF and
     // VIF1 DMA channels stop at such a SIGNAL (CHCR.STR stays set, MADR/QWC/TADR point at it) and continue from
     // memory once CSR.SIGNAL is acknowledged. PS2X_GS_SIGNAL_STALL=0 disables it.

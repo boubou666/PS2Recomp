@@ -2772,6 +2772,20 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
+void PS2Memory::submitHostGifTransfer(const uint8_t *data, uint32_t size)
+{
+    static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
+    if (!data || size < 16u)
+        return;
+    noteGifEvent('S', 0x101u, 0u, size / 16u);
+    PendingTransfer pt;
+    pt.chainData.assign(data, data + (size & ~15u));
+    m_pendingGifTransfers.push_back(std::move(pt));
+    m_ioRegisters[GIF_CHANNEL + 0x00u] = 0x101u;
+    m_ioRegisters[GIF_CHANNEL + 0x20u] = 0u;
+    processPendingTransfers();
+}
+
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 {
     if (cause == 2u)

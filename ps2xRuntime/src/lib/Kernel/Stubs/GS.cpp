@@ -550,6 +550,8 @@ namespace ps2_stubs
         GsImageMem img{};
         if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img, false))
         {
+            if (runtime)
+                runtime->memory().noteGifEvent('L', 1u, imgAddr);
             setReturnS32(ctx, -1);
             return;
         }
@@ -557,6 +559,7 @@ namespace ps2_stubs
         const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
         if (rowBytes == 0)
         {
+            runtime->memory().noteGifEvent('L', 2u, img.psm);
             setReturnS32(ctx, -1);
             return;
         }
@@ -567,18 +570,13 @@ namespace ps2_stubs
         const uint32_t imageQwc = (totalImageBytes + 15u) / 16u;
         const uint32_t totalQwc = headerQwc + imageQwc;
 
-        uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
-        if (pktAddr == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint8_t *pkt = getMemPtr(rdram, pktAddr);
+        // The packet is built on the host: the guest heap may have no room for a big image.
+        std::vector<uint8_t> packet(static_cast<size_t>(totalQwc) * 16u, 0u);
+        uint8_t *pkt = packet.data();
         const uint8_t *src = getConstMemPtr(rdram, srcAddr);
-        if (!pkt || !src)
+        if (!src || (srcAddr & PS2_RAM_MASK) + totalImageBytes > PS2_RAM_SIZE)
         {
-            runtime->guestFree(pktAddr);
+            runtime->memory().noteGifEvent('L', 3u, srcAddr);
             setReturnS32(ctx, -1);
             return;
         }
@@ -608,14 +606,7 @@ namespace ps2_stubs
 
         std::memcpy(pkt + headerQwc * 16u, src, totalImageBytes);
 
-        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
-        auto &mem = runtime->memory();
-        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-        mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
-        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-        mem.processPendingTransfers();
-        runtime->guestFree(pktAddr);
+        runtime->memory().submitHostGifTransfer(pkt, totalQwc * 16u);
 
         setReturnS32(ctx, 0);
     }
