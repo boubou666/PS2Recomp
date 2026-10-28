@@ -430,7 +430,19 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     }
 
     if (port == 0)
-        recordPhysicalButtons(static_cast<uint16_t>(~btns));
+    {
+        // The left stick is recorded as directions when pushed past half way (a replay pushes it fully).
+        uint16_t recorded = static_cast<uint16_t>(~btns);
+        if (data[6] < 0x40)
+            recorded |= PAD_LEFT;
+        else if (data[6] > 0xC0)
+            recorded |= PAD_RIGHT;
+        if (data[7] < 0x40)
+            recorded |= PAD_UP;
+        else if (data[7] > 0xC0)
+            recorded |= PAD_DOWN;
+        recordPhysicalButtons(recorded);
+    }
     const uint16_t scripted = port == 1 ? pad2ScriptedButtonsDown() : scriptedButtonsDown();
     btns &= static_cast<uint16_t>(~scripted);
     // Scripted directions push the left stick too, as the movement keys do: a recorded keyboard session moved
