@@ -150,11 +150,14 @@ namespace
         return 0u;
     }
 
-    // Caller holds g_gsEventMutex.
+    // Caller holds g_gsEventMutex. Only a SIGNAL that finds the previous one not yet acknowledged (CSR.SIGNAL
+    // still set) holds the GS, and what follows it, as on the console: a FINISH or LABEL after an acknowledged-or-
+    // first SIGNAL still comes (VP2's menu masks SIGNAL, never clears it, and waits for FINISH).
     uint32_t drainGsEvents(GSRegisters &regs, uint64_t now)
     {
         uint32_t raised = 0u;
-        while (!g_gsPendingEvents.empty() && g_gsPendingEvents.front().due <= now && (regs.csr.load() & 0x1ull) == 0u)
+        while (!g_gsPendingEvents.empty() && g_gsPendingEvents.front().due <= now &&
+               !(g_gsPendingEvents.front().event == GsCpuEvent::Signal && (regs.csr.load() & 0x1ull) != 0u))
         {
             raised |= applyGsEvent(regs, g_gsPendingEvents.front());
             g_gsPendingEvents.pop_front();
@@ -1499,6 +1502,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10008000u && address < 0x1000F000u && (address & 0xFFu) <= 0x50u &&
         dmaChannelSignalStalled(address & ~0xFFu))
     {
+        if (address == 0x1000A000u && (value & 0x100u) != 0u)
+            noteGifEvent('X', value);
         if ((address & 0xFFu) != 0u || (value & 0x100u) != 0u)
             return true;
         m_signalStalls.erase(std::remove_if(m_signalStalls.begin(), m_signalStalls.end(),
