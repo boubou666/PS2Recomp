@@ -983,11 +983,36 @@ bool GSNativeBackend::readCircuit(uint64_t dispfb, uint64_t display, bool fieldM
         height = std::min(lines, target.height - std::min(read.y, target.height));
         if (width == 0u || height == 0u)
             return false;
-        pixels.resize(static_cast<size_t>(width) * height * 4u);
+        const size_t bytes = static_cast<size_t>(width) * height * 4u;
+        pixels.resize(bytes);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        // Asynchronous read back through two pixel buffers per displayed buffer: this frame's read is queued and the
+        // previous one is copied out, so the GS thread does not wait for the GPU to finish the frame (one frame of
+        // latency). A size change, or the first frame, reads synchronously.
+        ReadbackBuffers &buffers = m_readbacks[read.fbp];
+        if (!buffers.pbo[0])
+            glGenBuffers(2, buffers.pbo);
+        const int current = buffers.next;
+        const int previous = current ^ 1;
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, buffers.pbo[current]);
+        if (buffers.bytes[current] != bytes)
+        {
+            glBufferData(GL_PIXEL_PACK_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_READ);
+            buffers.bytes[current] = bytes;
+        }
         glReadPixels(static_cast<GLint>(read.x), static_cast<GLint>(read.y), static_cast<GLsizei>(width),
-                     static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+                     static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        const int source = buffers.ready[previous] && buffers.bytes[previous] == bytes ? previous : current;
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, buffers.pbo[source]);
+        if (const void *mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT))
+        {
+            std::memcpy(pixels.data(), mapped, bytes);
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        buffers.ready[current] = true;
+        buffers.next = previous;
         return true;
     }
     // Not drawn by us (an image the game uploaded straight into the displayed buffer): read GS memory, CT32 / CT24.

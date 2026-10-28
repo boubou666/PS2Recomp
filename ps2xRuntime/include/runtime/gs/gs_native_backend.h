@@ -129,6 +129,14 @@ private:
     } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
+    struct ReadbackBuffers
+    {
+        uint32_t pbo[2] = {0, 0};
+        size_t bytes[2] = {0, 0};
+        bool ready[2] = {false, false};
+        int next = 0;
+    };
+    std::unordered_map<uint32_t, ReadbackBuffers> m_readbacks; // per displayed buffer (readCircuit)
     std::unordered_map<uint64_t, UploadedTexture> m_uploaded;
 
     // The batch being collected: draws whose state draws the same way (sameDrawState).
