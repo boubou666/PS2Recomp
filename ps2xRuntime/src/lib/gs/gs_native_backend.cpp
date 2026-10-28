@@ -203,6 +203,63 @@ void main()
 }
 )";
 
+    // Writing a render target into the GPU copy of GS memory: one fragment per 32-bit word of the target's pages,
+    // finding the pixel(s) stored there through the inverse swizzle table, so no read back to the CPU.
+    constexpr const char *kResolveVertexShader = R"(#version 330 core
+void main()
+{
+    gl_Position = vec4((gl_VertexID & 1) != 0 ? 1.0 : -1.0, (gl_VertexID & 2) != 0 ? 1.0 : -1.0, 0.0, 1.0);
+}
+)";
+
+    constexpr const char *kResolveFragmentShader = R"(#version 330 core
+layout(location = 0) out uint outWord;
+uniform sampler2D uTarget;   // the render target's colour, GL row 0 = GS row 0, alpha as the GS stores it
+uniform usampler2D uInverse; // page pixel offset -> x | y << 16
+uniform int uFbp;
+uniform int uFbw;
+uniform int uKind;           // 0 CT32, 1 CT16, 2 CT16S
+uniform int uUsedHeight;     // rows drawn: words of pixels below them keep what GS memory holds
+
+uvec4 bytes(ivec2 p)
+{
+    return uvec4(round(texelFetch(uTarget, p, 0) * 255.0));
+}
+
+uint pack16(uvec4 c)
+{
+    return (c.r >> 3u) | ((c.g >> 3u) << 5u) | ((c.b >> 3u) << 10u) | (c.a >= 128u ? 0x8000u : 0u);
+}
+
+void main()
+{
+    ivec2 f = ivec2(gl_FragCoord.xy);
+    int word = f.y * 1024 + f.x;
+    int rel = word / 2048 - uFbp;
+    int inPage = word % 2048;
+    int prow = rel / uFbw, pcol = rel % uFbw;
+    if (uKind == 0)
+    {
+        uint e = texelFetch(uInverse, ivec2(inPage % 128, inPage / 128), 0).r;
+        ivec2 p = ivec2(pcol * 64 + int(e & 0xFFFFu), prow * 32 + int(e >> 16u));
+        if (p.y >= uUsedHeight)
+            discard;
+        uvec4 c = bytes(p);
+        outWord = c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+        return;
+    }
+    int row = uKind == 1 ? 16 : 48;
+    int i0 = inPage * 2, i1 = inPage * 2 + 1;
+    uint e0 = texelFetch(uInverse, ivec2(i0 % 128, row + i0 / 128), 0).r;
+    uint e1 = texelFetch(uInverse, ivec2(i1 % 128, row + i1 / 128), 0).r;
+    ivec2 p0 = ivec2(pcol * 64 + int(e0 & 0xFFFFu), prow * 64 + int(e0 >> 16u));
+    ivec2 p1 = ivec2(pcol * 64 + int(e1 & 0xFFFFu), prow * 64 + int(e1 >> 16u));
+    if (p0.y >= uUsedHeight && p1.y >= uUsedHeight)
+        discard;
+    outWord = pack16(bytes(p0)) | (pack16(bytes(p1)) << 16u);
+}
+)";
+
     GLuint compileShader(GLenum type, const char *source)
     {
         const GLuint shader = glCreateShader(type);
@@ -229,13 +286,18 @@ void main()
         kLayoutP8{160, 128, 64, 8}, kLayoutP4{224, 128, 128, 4}, kLayoutZ32{352, 64, 32, 32}, kLayoutZ16{384, 64, 64, 16},
         kLayoutZ16S{448, 64, 64, 16};
     constexpr uint32_t kSwizzleWidth = 128u, kSwizzleHeight = 512u;
+    // The other way, for writing render targets into GS memory: page pixel offset -> x | y << 16, for the colour
+    // layouts a render target can have (rows: CT32 0-15, CT16 16-47, CT16S 48-79).
+    constexpr uint32_t kInverseHeight = 80u;
+    constexpr int kInverseRowC32 = 0, kInverseRowC16 = 16, kInverseRowC16S = 48;
 
     // Each layout's page: the pixel offset (in its own pixels) where page pixel (x, y) is stored, found by writing
     // every pixel's index through GSMem and reading back where it landed (a few bits at a time for 8- and 4-bit).
-    std::vector<uint32_t> buildSwizzleTables()
+    std::vector<uint32_t> buildSwizzleTables(std::vector<uint32_t> &inverse)
     {
         GSMem::InitLookupTables();
         std::vector<uint32_t> table(kSwizzleWidth * kSwizzleHeight, 0u);
+        inverse.assign(kSwizzleWidth * kInverseHeight, 0u);
         std::vector<uint8_t> scratch(4u * 1024u * 1024u, 0u);
         using Write = void (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
         const std::pair<Write, GpuLayout> layouts[] = {
@@ -264,10 +326,16 @@ void main()
                 if (bits >= 16u)
                     break;
             }
+            const int inverseRow = layout.row == kLayoutC32.row    ? kInverseRowC32
+                                   : layout.row == kLayoutC16.row  ? kInverseRowC16
+                                   : layout.row == kLayoutC16S.row ? kInverseRowC16S
+                                                                   : -1;
             for (uint32_t address = 0; address < pixels; ++address)
             {
                 const uint32_t index = owner[address];
                 table[(layout.row + index / pw) * kSwizzleWidth + index % pw] = address;
+                if (inverseRow >= 0)
+                    inverse[static_cast<size_t>(inverseRow) * kSwizzleWidth + address] = (index % pw) | (index / pw) << 16;
             }
         }
         return table;
@@ -641,6 +709,128 @@ void GSNativeBackend::appendPrimitive(const GSPrimitiveBatch &batch)
     }
 }
 
+void GSNativeBackend::ensureVram()
+{
+    if (m_vramTexture)
+        return;
+    glGenTextures(1, &m_vramTexture);
+    glBindTexture(GL_TEXTURE_2D, m_vramTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    std::vector<uint32_t> inverse;
+    const std::vector<uint32_t> swizzle = buildSwizzleTables(inverse);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glGenTextures(1, &m_swizzleTexture);
+    glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, kSwizzleWidth, kSwizzleHeight, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                 swizzle.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenTextures(1, &m_inverseTexture);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, kSwizzleWidth, kInverseHeight, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                 inverse.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenFramebuffers(1, &m_vramFramebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_vramFramebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_vramTexture, 0);
+    const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+    const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kResolveFragmentShader);
+    m_resolveProgram = glCreateProgram();
+    glAttachShader(m_resolveProgram, vertex);
+    glAttachShader(m_resolveProgram, fragment);
+    glLinkProgram(m_resolveProgram);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    GLint linked = GL_FALSE;
+    glGetProgramiv(m_resolveProgram, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE)
+    {
+        std::fprintf(stderr, "[gs:native] resolve program link failed: resolves read back to the CPU\n");
+        glDeleteProgram(m_resolveProgram);
+        m_resolveProgram = 0;
+    }
+}
+
+void GSNativeBackend::syncVramToGpu()
+{
+    // The pages transfers changed since the last draw: 8 KiB, two rows of the texture.
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, m_vramTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    if (m_vram)
+        for (uint32_t page = 0; page < m_dirtyPages.size(); ++page)
+            if (m_dirtyPages[page])
+            {
+                m_dirtyPages[page] = 0u;
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER,
+                                GL_UNSIGNED_INT, m_vram + static_cast<size_t>(page) * 8192u);
+            }
+    glActiveTexture(GL_TEXTURE0);
+}
+
+void GSNativeBackend::pullGpuPages()
+{
+    if (!m_anyGpuNewer || !m_vram || !m_vramFramebuffer || !ensureContext())
+        return;
+    m_anyGpuNewer = false;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    for (uint32_t page = 0; page < m_gpuNewer.size(); ++page)
+        if (m_gpuNewer[page])
+        {
+            m_gpuNewer[page] = 0u;
+            glReadPixels(0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                         m_vram + static_cast<size_t>(page) * 8192u);
+        }
+}
+
+bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
+{
+    const int kind = target.psm == 0x00u ? 0 : target.psm == 0x02u ? 1 : target.psm == 0x0Au ? 2 : -1;
+    if (kind < 0 || !m_vram)
+        return false;
+    ensureVram();
+    if (!m_resolveProgram)
+        return false;
+    // Transfers before this resolve land first, then the target's pixels over them, all on the GPU copy.
+    syncVramToGpu();
+    const uint32_t pageRows = kind == 0 ? 32u : 64u;
+    const uint32_t first = target.fbp;
+    const uint32_t end = std::min<uint32_t>(
+        512u, target.fbp + std::max<uint32_t>(target.fbw, 1u) * ((target.usedHeight + pageRows - 1u) / pageRows));
+    if (end <= first)
+        return true;
+    glBindFramebuffer(GL_FRAMEBUFFER, m_vramFramebuffer);
+    glViewport(0, 0, 1024, 1024);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, static_cast<GLint>(first * 2u), 1024, static_cast<GLsizei>((end - first) * 2u));
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_resolveProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, target.color);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uTarget"), 0);
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uInverse"), 4);
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbp"), static_cast<GLint>(target.fbp));
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uKind"), kind);
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.usedHeight));
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    for (uint32_t page = first; page < end; ++page)
+        m_gpuNewer[page] = 1u;
+    m_anyGpuNewer = true;
+    return true;
+}
+
 void GSNativeBackend::resolveTarget(RenderTarget &target)
 {
     const uint32_t width = target.fbw * 64u;
@@ -650,6 +840,10 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     static const bool noResolve = std::getenv("PS2X_GS_NATIVE_NORESOLVE") != nullptr;
     if (noResolve || width == 0u || height == 0u || width > target.width)
         return;
+    static const bool cpuDecode = std::getenv("PS2X_GS_NATIVE_CPUDECODE") != nullptr;
+    if (!cpuDecode && resolveTargetGpu(target))
+        return;
+    pullGpuPages();
     // The pixels as a host-to-local CT32 transfer at the frame's base: rows top first (GL row 0 is GS row 0), alpha
     // as the GS stores it.
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
@@ -751,6 +945,7 @@ void GSNativeBackend::resolveAllTargets()
     for (auto &[fbp, target] : m_targets)
         if (target.dirty && target.usedHeight != 0u)
             resolveTarget(target);
+    pullGpuPages();
 }
 
 void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
@@ -833,34 +1028,8 @@ bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
     case 0x3Au: layout = kLayoutZ16S, bitsKept = 16, kind = 2; break;
     default: return false;
     }
-    if (!m_vramTexture)
-    {
-        glGenTextures(1, &m_vramTexture);
-        glBindTexture(GL_TEXTURE_2D, m_vramTexture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        const std::vector<uint32_t> swizzle = buildSwizzleTables();
-        glGenTextures(1, &m_swizzleTexture);
-        glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, kSwizzleWidth, kSwizzleHeight, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
-                     swizzle.data());
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    }
-    // The pages uploads (and render target resolves) changed since the last draw: 8 KiB, two rows of the texture.
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, m_vramTexture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    if (m_vram)
-        for (uint32_t page = 0; page < m_dirtyPages.size(); ++page)
-            if (m_dirtyPages[page])
-            {
-                m_dirtyPages[page] = 0u;
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER,
-                                GL_UNSIGNED_INT, m_vram + static_cast<size_t>(page) * 8192u);
-            }
+    ensureVram();
+    syncVramToGpu();
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
     glActiveTexture(GL_TEXTURE0);
@@ -1407,6 +1576,7 @@ void GSNativeBackend::markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t
 void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
 {
     flushBatch();
+    pullGpuPages(); // the transfer rewrites or reads GS memory on the CPU side: it must hold the resolved pixels
     if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
     {
         static uint32_t s_logged = 0, s_copies = 0;
@@ -1535,6 +1705,7 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
     // Not drawn by us (an image the game uploaded straight into the displayed buffer): read GS memory, CT32 / CT24.
     if (!m_vram)
         return false;
+    pullGpuPages();
     const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
     const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
     width = std::min<uint32_t>(read.width, 2048u);
@@ -1659,6 +1830,7 @@ bool GSNativeBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 
 uint32_t GSNativeBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    pullGpuPages();
     return m_memory->ConsumeLocalToHostBytes(dst, maxBytes);
 }
 
@@ -1669,6 +1841,7 @@ uint32_t GSNativeBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uin
 
 void GSNativeBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
+    pullGpuPages();
     markDirty(psm, base, bw, x, y, 1u, 1u);
     m_memory->WriteVram(psm, base, bw, x, y, value);
 }

@@ -497,8 +497,7 @@ int main(int argc, char **argv)
             if (native && !dumps.empty())
                 if (auto *backend = dynamic_cast<GSNativeBackend *>(gs.rasterBackend()))
                 {
-                    backend->resolveAllTargets();
-                    g_dumpNative = true;
+                    backend->resolveAllTargets(); // into GS memory, read below as with the CPU GS
                 }
 #endif
             for (const DumpRequest &dump : dumps)
