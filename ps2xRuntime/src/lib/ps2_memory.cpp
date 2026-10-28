@@ -1,6 +1,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/native/native_vif1.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <cstdlib>
@@ -1657,6 +1658,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 if (mode == 0 && qwc > 0 && !stallable)
                 {
+                    if (channelBase == kVif1Channel && ps2x::native::vif1Observed() && !isScratchpad(madr))
+                        ps2x::native::observeVif1(m_rdram + (madr & PS2_RAM_MASK), std::min<size_t>(size_t{qwc} * 16u, PS2_RAM_SIZE - (madr & PS2_RAM_MASK)));
                     enqueueTransfer(madr, qwc);
                 }
                 else if (mode == 1 || (mode == 0 && qwc > 0))
@@ -1664,6 +1667,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     std::vector<DmaSegment> segments;
                     std::vector<uint8_t> chainBuf = readDmaSourceChain(channelBase, chcr, stallable ? &segments : nullptr,
                                                                        mode == 0 ? qwc : 0u, mode == 0);
+                    if (channelBase == kVif1Channel)
+                        ps2x::native::observeVif1(chainBuf.data(), chainBuf.size());
 
                     if (!chainBuf.empty())
                     {
