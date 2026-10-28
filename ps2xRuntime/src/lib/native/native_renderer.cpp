@@ -4,7 +4,9 @@
 #include "rlgl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 
 namespace ps2x::native
@@ -245,6 +247,30 @@ void main()
         rlEnableColorBlend();
         rlSetBlendMode(RL_BLEND_ALPHA);
         EndTextureMode();
+
+        // PS2X_NATIVE_CAPTURE_DIR=<dir>: the native frame as native_<n>.png every PS2X_NATIVE_CAPTURE_INTERVAL seconds
+        // (default 5), at the window's resolution, to look at it without the GS frame.
+        static const char *s_captureDir = std::getenv("PS2X_NATIVE_CAPTURE_DIR");
+        if (s_captureDir && *s_captureDir)
+        {
+            static const double s_interval = []
+            {
+                const char *value = std::getenv("PS2X_NATIVE_CAPTURE_INTERVAL");
+                return value && *value ? std::atof(value) : 5.0;
+            }();
+            static double s_next = 0.0;
+            static int s_count = 0;
+            const double now = GetTime();
+            if (now >= s_next)
+            {
+                s_next = now + s_interval;
+                Image image = LoadImageFromTexture(gpu.target.texture);
+                ImageFlipVertical(&image);
+                const std::string path = std::string(s_captureDir) + "/native_" + std::to_string(++s_count) + ".png";
+                ExportImage(image, path.c_str());
+                UnloadImage(image);
+            }
+        }
 
         // Render textures are stored bottom-up.
         DrawTexturePro(gpu.target.texture, Rectangle{0, 0, static_cast<float>(w), -static_cast<float>(h)},
