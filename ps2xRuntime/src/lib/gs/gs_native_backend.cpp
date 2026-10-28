@@ -566,7 +566,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
             width = static_cast<float>(source->width);
             height = static_cast<float>(source->height);
             texture = source->color;
-            if (source->fbp == target.fbp)
+            if (source->fbp == target.fbp && !std::getenv("PS2X_GS_NATIVE_NOFEEDBACKCOPY"))
             {
                 if (!m_feedbackTexture || m_feedbackWidth != source->width || m_feedbackHeight != source->height)
                 {
