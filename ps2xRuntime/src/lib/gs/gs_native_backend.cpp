@@ -805,6 +805,16 @@ void GSNativeBackend::flushBatch()
                                  "fbo=%x\n",
                          target.fbp, m_batch.size(), state.prim.tme ? 1 : 0, textured ? 1 : 0, context.tex0.tbp0,
                          pixel[0], pixel[1], pixel[2], pixel[3], glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+            float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, s0 = 1e9f, s1 = -1e9f, t0 = 1e9f, t1 = -1e9f, z0 = 1e9f;
+            for (const Vertex &v : m_batch)
+            {
+                x0 = std::min(x0, v.x), x1 = std::max(x1, v.x), y0 = std::min(y0, v.y), y1 = std::max(y1, v.y);
+                s0 = std::min(s0, v.s), s1 = std::max(s1, v.s), t0 = std::min(t0, v.t), t1 = std::max(t1, v.t);
+                z0 = std::min(z0, v.z);
+            }
+            std::fprintf(stderr, "[gs:probe]   extent x %.1f..%.1f y %.1f..%.1f s %.1f..%.1f t %.1f..%.1f z %.6f "
+                                 "tex %.0fx%.0f\n",
+                         x0, x1, y0, y1, s0, s1, t0, t1, z0, texWidth, texHeight);
         }
     }
     glBindVertexArray(0);
