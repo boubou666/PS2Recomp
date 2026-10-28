@@ -145,6 +145,8 @@ private:
     // the GPU copy has not received yet.
     std::vector<uint8_t> m_dirtyBlocks = std::vector<uint8_t>(16384u, 1u);
     bool m_anyDirty = true;
+    GSTransferCommand m_transfer{}; // the current transfer, whose data UploadImage brings
+    uint32_t m_transferDirect = 3u;
     void markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     uint32_t m_destTexture = 0; // copy of the render target for DATE
     uint32_t m_destWidth = 0;

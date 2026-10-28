@@ -1609,6 +1609,8 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
                          command.trxpos.dsax, command.trxpos.dsay, command.bitbltbuf.sbp, command.trxreg.rrw,
                          command.trxreg.rrh);
     }
+    m_transfer = command;
+    m_transferDirect = command.direction;
     if (command.direction == 0u || command.direction == 2u)
         markDirty(command.bitbltbuf.dpsm, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.trxpos.dsax,
                   command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
@@ -1656,6 +1658,10 @@ bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
 void GSNativeBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     m_memory->UploadImage(data, sizeBytes);
+    // The transfer's data may come in pieces, with draws (and a send of the dirty blocks) in between.
+    if (m_transferDirect == 0u)
+        markDirty(m_transfer.bitbltbuf.dpsm, m_transfer.bitbltbuf.dbp, m_transfer.bitbltbuf.dbw, m_transfer.trxpos.dsax,
+                  m_transfer.trxpos.dsay, m_transfer.trxreg.rrw, m_transfer.trxreg.rrh);
 }
 
 void GSNativeBackend::Flush()
