@@ -3508,14 +3508,16 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        // PS2X_NATIVE_VIEW=only: the native renderer's frame alone, without the GS frame under it (to compare).
+        // PS2X_NATIVE_VIEW=only: the native renderer's frame alone, without the GS frame under it (to compare); the GS
+        // frame still shows while the native one is empty (menus, movies the native port does not draw yet).
         static const bool s_nativeOnly = []
         {
             const char *value = std::getenv("PS2X_NATIVE_VIEW");
             return value && std::string_view(value) == "only";
         }();
-        if (!(s_nativeOnly && ps2x::native::Renderer::instance().enabled()))
+        if (!(s_nativeOnly && ps2x::native::Renderer::instance().enabled() && ps2x::native::Renderer::instance().hasDraws()))
             DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        ps2x::native::Renderer::instance().setGsFrame(frameTex.id, frameTex.width, frameTex.height, frameTex.format);
         ps2x::native::Renderer::instance().present(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
         DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), eeScheduler().currentCycle(), screenWidth, screenHeight);
         if (m_debugUiInitialized && m_debugUiDrawCallback)

@@ -68,7 +68,17 @@ namespace ps2x::native
 
         // Present thread: draws the latest frame into the given window rectangle; false when there is none yet.
         bool present(float x, float y, float width, float height);
+        // The GS frame shown with the native one (a GL texture): PS2X_NATIVE_CAPTURE_DIR saves it with each capture.
+        void setGsFrame(unsigned int textureId, int width, int height, int format)
+        {
+            m_gsFrame[0] = static_cast<int>(textureId);
+            m_gsFrame[1] = width;
+            m_gsFrame[2] = height;
+            m_gsFrame[3] = format;
+        }
         bool enabled() const { return m_enabled; }
+        // The latest published frame has something to draw (not a menu or a movie the native port does not draw yet).
+        bool hasDraws();
         void setEnabled(bool on)
         {
             m_enabled = on;
@@ -97,6 +107,7 @@ namespace ps2x::native
         Frame m_building;
         std::mutex m_mutex;
         std::shared_ptr<Frame> m_published;
+        int m_gsFrame[4] = {}; // id, width, height, pixel format
         std::unique_ptr<Gpu> m_gpu; // present thread only
         bool m_enabled = false;
     };

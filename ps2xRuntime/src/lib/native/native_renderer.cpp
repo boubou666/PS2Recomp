@@ -158,6 +158,12 @@ void main()
         m_published = std::move(frame);
     }
 
+    bool Renderer::hasDraws()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_published && !m_published->batches.empty();
+    }
+
     bool Renderer::present(float x, float y, float width, float height)
     {
         std::shared_ptr<Frame> frame;
@@ -272,7 +278,8 @@ void main()
                          s_presents, frame->batches.size(), frame->vertices.size(), gpu.shader, rlGetShaderIdDefault(), w, h);
 
         // PS2X_NATIVE_CAPTURE_DIR=<dir>: the native frame as native_<n>.png every PS2X_NATIVE_CAPTURE_INTERVAL seconds
-        // (default 5), at the window's resolution, to look at it without the GS frame.
+        // (default 5), at the window's resolution, to look at it without the GS frame; with gs_<n>.png, the GS frame of
+        // the same moment (a reference to compare to, when the game still runs on VU1 what the native port draws).
         static const char *s_captureDir = std::getenv("PS2X_NATIVE_CAPTURE_DIR");
         if (s_captureDir && *s_captureDir)
         {
@@ -292,6 +299,14 @@ void main()
                 const std::string path = std::string(s_captureDir) + "/native_" + std::to_string(++s_count) + ".png";
                 ExportImage(image, path.c_str());
                 UnloadImage(image);
+                if (m_gsFrame[0] != 0)
+                {
+                    const Texture2D gs{static_cast<unsigned int>(m_gsFrame[0]), m_gsFrame[1], m_gsFrame[2], 1, m_gsFrame[3]};
+                    Image gsImage = LoadImageFromTexture(gs);
+                    const std::string gsPath = std::string(s_captureDir) + "/gs_" + std::to_string(s_count) + ".png";
+                    ExportImage(gsImage, gsPath.c_str());
+                    UnloadImage(gsImage);
+                }
             }
         }
 
