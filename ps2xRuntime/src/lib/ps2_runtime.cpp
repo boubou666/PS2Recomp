@@ -23,6 +23,7 @@
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
+#include "runtime/native/native_vu1_hle.h"
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
@@ -1327,6 +1328,26 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled = (vu0Fbrst & (1u << 11)) != 0u;
                                      g_vu1MscalCount.fetch_add(1u, std::memory_order_relaxed);
                                      g_gsDumpVu1ProgramPc.store(startPC, std::memory_order_relaxed);
+                                     // The port's native version of this microprogram, if it has one (VU1 then does
+                                     // not run): runtime/native/native_vu1_hle.h.
+                                     if (const ps2x::native::Vu1Hle hle = ps2x::native::vu1Hle())
+                                     {
+                                         ps2x::native::Vu1HleRun run;
+                                         run.code = m_memory.getVU1Code();
+                                         run.data = m_memory.getVU1Data();
+                                         run.state = &m_vu1.state();
+                                         run.startPc = startPC;
+                                         run.top = top;
+                                         run.itop = itop;
+                                         run.user = &m_memory;
+                                         run.kick = [](void *user, const uint8_t *packet, uint32_t bytes)
+                                         { static_cast<PS2Memory *>(user)->submitGifPacket(GifPathId::Path1, packet, bytes); };
+                                         if (hle(run))
+                                         {
+                                             g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
+                                             return;
+                                         }
+                                     }
                                      const uint64_t cyclesBefore = m_vu1.state().cycles;
                                      Vu1Recorder::instance().run(m_vu1, m_memory, false, startPC, top, itop, kVu1ProgramCycleLimit, [&]
                                                                  { m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
