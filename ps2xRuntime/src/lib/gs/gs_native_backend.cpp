@@ -798,6 +798,15 @@ void GSNativeBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclu
 void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
 {
     flushBatch();
+    if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
+    {
+        static uint32_t s_logged = 0;
+        if (s_logged++ < 400u)
+            std::fprintf(stderr, "[gs:native] transfer dir=%u dbp=%u dbw=%u dpsm=0x%x dst=%u,%u sbp=%u size=%ux%u\n",
+                         command.direction, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm,
+                         command.trxpos.dsax, command.trxpos.dsay, command.bitbltbuf.sbp, command.trxreg.rrw,
+                         command.trxreg.rrh);
+    }
     if (command.direction == 0u || command.direction == 2u)
         dropTargetsUnder(command);
     m_memory->BeginTransfer(command);
