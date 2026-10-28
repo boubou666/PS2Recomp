@@ -1427,7 +1427,11 @@ bool PS2Runtime::initialize(const char *title)
         if (const char *renderer = std::getenv("PS2X_GS_RENDERER"); renderer && std::string_view(renderer) == "native")
         {
             if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
+            {
+                // The front end then feeds the shared texture cache every upload (native/native_renderer.h).
+                ps2x::native::Renderer::instance().setEnabled(true);
                 m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+            }
         }
 #endif
         if (m_debugUiInitCallback)

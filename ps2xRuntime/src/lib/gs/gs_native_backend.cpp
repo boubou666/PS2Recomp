@@ -1,6 +1,7 @@
 #include "runtime/gs/gs_native_backend.h"
 
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/native/native_renderer.h"
 #include "runtime/native/native_texture_cache.h"
 
 // raylib's OpenGL 3.3 loader: its function pointers are loaded by raylib for the window context and stay valid on a
@@ -122,23 +123,6 @@ void main()
         }
     }
 
-    uint32_t bitsPerPixel(uint32_t psm)
-    {
-        switch (psm)
-        {
-        case 0x00: return 32; // CT32
-        case 0x01: return 24; // CT24
-        case 0x02:
-        case 0x0A: return 16; // CT16, CT16S
-        case 0x13:
-        case 0x1B: return 8; // T8, T8H
-        case 0x14:
-        case 0x24:
-        case 0x2C: return 4; // T4, T4HL, T4HH
-        default: return 32;
-        }
-    }
-
     bool colorFormat(uint32_t psm)
     {
         return psm == 0x00u || psm == 0x01u || psm == 0x02u || psm == 0x0Au;
@@ -220,8 +204,7 @@ GLFWwindow *GSNativeBackend::createSharedContext()
 }
 
 GSNativeBackend::GSNativeBackend(GLFWwindow *sharedContext)
-    : m_sharedContext(sharedContext), m_memory(std::make_unique<GSCpuBackend>()),
-      m_textures(std::make_unique<ps2x::native::TextureCache>())
+    : m_sharedContext(sharedContext), m_memory(std::make_unique<GSCpuBackend>())
 {
 }
 
@@ -527,28 +510,27 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     {
         const uint64_t tex0 = rawTex0(context.tex0);
         const uint64_t texa = rawTexa(state.texa);
-        const ps2x::native::TextureCache::Texture &decoded = m_textures->texture(tex0, texa);
-        if (decoded.width == 0u || decoded.height == 0u || decoded.rgba.empty())
+        const std::shared_ptr<const ps2x::native::TextureCache::Texture> decoded =
+            ps2x::native::Renderer::instance().textures().texture(tex0, texa);
+        if (!decoded || decoded->width == 0u || decoded->height == 0u || decoded->rgba.empty())
             return false;
-        uint64_t version = 1469598103934665603ull;
-        for (const auto &[page, generation] : decoded.pages)
-            version = (version ^ (static_cast<uint64_t>(page) << 32 | generation)) * 1099511628211ull;
-        UploadedTexture &uploaded = m_uploaded[decoded.key ^ (texa << 1)];
+        const uint64_t version = decoded->version;
+        UploadedTexture &uploaded = m_uploaded[decoded->key ^ (texa << 1)];
         if (!uploaded.texture)
             glGenTextures(1, &uploaded.texture);
         glBindTexture(GL_TEXTURE_2D, uploaded.texture);
-        if (uploaded.version != version || uploaded.width != decoded.width || uploaded.height != decoded.height)
+        if (uploaded.version != version || uploaded.width != decoded->width || uploaded.height != decoded->height)
         {
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, decoded.width, decoded.height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                         decoded.rgba.data());
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, decoded->width, decoded->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                         decoded->rgba.data());
             uploaded.version = version;
-            uploaded.width = decoded.width;
-            uploaded.height = decoded.height;
+            uploaded.width = decoded->width;
+            uploaded.height = decoded->height;
         }
         texture = uploaded.texture;
-        width = static_cast<float>(decoded.width);
-        height = static_cast<float>(decoded.height);
+        width = static_cast<float>(decoded->width);
+        height = static_cast<float>(decoded->height);
     }
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture);
@@ -707,38 +689,11 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
 {
     flushBatch();
     m_memory->BeginTransfer(command);
-    m_transfer = command;
-    m_transferData.clear();
-    m_transferBytes = 0;
-    if (command.direction == 0u)
-    {
-        // Host to local: collect the image, the texture cache takes it whole.
-        const uint64_t pixels = static_cast<uint64_t>(command.trxreg.rrw) * command.trxreg.rrh;
-        m_transferBytes = static_cast<size_t>((pixels * bitsPerPixel(command.bitbltbuf.dpsm) + 7u) / 8u);
-        m_transferData.reserve(m_transferBytes);
-    }
 }
 
 void GSNativeBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     m_memory->UploadImage(data, sizeBytes);
-    if (m_transferBytes == 0u || m_transferData.size() >= m_transferBytes)
-        return;
-    const size_t take = std::min<size_t>(sizeBytes, m_transferBytes - m_transferData.size());
-    m_transferData.insert(m_transferData.end(), data, data + take);
-    if (m_transferData.size() < m_transferBytes)
-        return;
-    const GSBitBltBuf &b = m_transfer.bitbltbuf;
-    const uint64_t bitbltbuf = static_cast<uint64_t>(b.sbp) | static_cast<uint64_t>(b.sbw) << 16 |
-                               static_cast<uint64_t>(b.spsm) << 24 | static_cast<uint64_t>(b.dbp) << 32 |
-                               static_cast<uint64_t>(b.dbw) << 48 | static_cast<uint64_t>(b.dpsm) << 56;
-    const GSTrxPos &p = m_transfer.trxpos;
-    const uint64_t trxpos = static_cast<uint64_t>(p.ssax) | static_cast<uint64_t>(p.ssay) << 16 |
-                            static_cast<uint64_t>(p.dsax) << 32 | static_cast<uint64_t>(p.dsay) << 48 |
-                            static_cast<uint64_t>(p.dir) << 59;
-    const uint64_t trxreg = static_cast<uint64_t>(m_transfer.trxreg.rrw) | static_cast<uint64_t>(m_transfer.trxreg.rrh) << 32;
-    m_textures->upload(bitbltbuf, trxpos, trxreg, m_transferData.data(), m_transferData.size());
-    m_transferBytes = 0;
 }
 
 void GSNativeBackend::Flush()

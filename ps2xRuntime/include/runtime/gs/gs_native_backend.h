@@ -11,17 +11,12 @@
 class GSCpuBackend;
 struct GLFWwindow;
 
-namespace ps2x::native
-{
-    class TextureCache;
-}
-
 // Native renderer (PS2X_GS_RENDERER=native): translates the primitives the GS frontend decodes into OpenGL draws
 // into GPU render targets, instead of reproducing the GS. See docs/native.md, layer 3.
 //
 // It runs on the GS thread, on an OpenGL context shared with the window's (createSharedContext, called on the main
-// thread after the window exists). Textures come from the shared ps2x::native::TextureCache (fed with the game's
-// image uploads), or from a render target when a draw samples one (feedback effects). GS local memory also stays on
+// thread after the window exists). Textures come from the shared ps2x::native::TextureCache (the GS front end feeds
+// it every upload while native rendering is on), or from a render target when a draw samples one (feedback effects). GS local memory also stays on
 // the CPU for what is not translated yet: transfers, CLUT loads, readbacks and VRAM access go to an internal CPU
 // backend used as memory only (it never draws).
 class GSNativeBackend final : public GSRasterBackend
@@ -102,7 +97,6 @@ private:
     std::thread::id m_glThread{};
     std::thread::id m_submitThread{}; // the thread that draws: the only one that may bind our context
     std::unique_ptr<GSCpuBackend> m_memory;
-    std::unique_ptr<ps2x::native::TextureCache> m_textures;
 
     uint32_t m_program = 0;
     uint32_t m_vertexArray = 0;
@@ -118,11 +112,6 @@ private:
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
     std::unordered_map<uint64_t, UploadedTexture> m_uploaded;
-
-    // The image transfer being received (host to local), handed to the texture cache once complete.
-    GSTransferCommand m_transfer{};
-    std::vector<uint8_t> m_transferData;
-    size_t m_transferBytes = 0;
 
     // The batch being collected: draws whose state draws the same way (sameDrawState).
     std::vector<Vertex> m_batch;
