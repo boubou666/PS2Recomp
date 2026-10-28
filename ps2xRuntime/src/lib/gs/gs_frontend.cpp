@@ -580,6 +580,8 @@ void GS::workerLoop()
                     writeGsTraceCommand(recorder.out, static_cast<uint8_t>(command.kind), command.registers, data, size);
             }
         }
+        if (queueTraceActive())
+            traceQueuedCommand(command);
         if (m_parallel)
             processWithParallel(command);
         else
@@ -701,6 +703,92 @@ void GS::processWithParallel(const QueuedCommand &command)
     }
 }
 
+// PS2X_GS_QUEUE_TRACE=<seconds>[:<commands>]: from that time after start, the GS thread logs the commands it runs (GIF
+// packets by their first tag, A+D registers named by id, native markers), to see what draws in which order.
+namespace
+{
+    std::atomic<int> g_queueTraceLeft{-1};
+}
+
+bool GS::queueTraceActive()
+{
+    static const auto start = std::chrono::steady_clock::now();
+    static const char *env = std::getenv("PS2X_GS_QUEUE_TRACE");
+    if (!env)
+        return false;
+    int left = g_queueTraceLeft.load(std::memory_order_relaxed);
+    if (left == -1)
+    {
+        const double at = std::atof(env);
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < at)
+            return false;
+        const char *colon = std::strchr(env, ':');
+        left = colon ? std::atoi(colon + 1) : 4000;
+        g_queueTraceLeft.store(left, std::memory_order_relaxed);
+    }
+    return left > 0;
+}
+
+void GS::traceQueuedCommand(const QueuedCommand &command)
+{
+    g_queueTraceLeft.fetch_sub(1, std::memory_order_relaxed);
+    const uint8_t *data = command.bytes.data();
+    const size_t size = command.bytes.size();
+    switch (command.kind)
+    {
+    case QueuedCommand::Kind::GifPacket:
+    {
+        std::string line = "[gs-queue] gif " + std::to_string(size) + " B:";
+        size_t offset = 0;
+        for (int tags = 0; offset + 16u <= size && tags < 8; ++tags)
+        {
+            uint64_t lo = 0, hi = 0;
+            std::memcpy(&lo, data + offset, 8u);
+            std::memcpy(&hi, data + offset + 8u, 8u);
+            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
+            uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            char buffer[96];
+            if ((lo >> 46) & 1u)
+                std::snprintf(buffer, sizeof(buffer), " [prim %u ctxt %u abe %u n%u]", static_cast<unsigned>((lo >> 47) & 7u),
+                              static_cast<unsigned>((lo >> 56) & 1u), static_cast<unsigned>((lo >> 53) & 1u), nloop);
+            else
+                std::snprintf(buffer, sizeof(buffer), " [flg %u n%u]", flg, nloop);
+            line += buffer;
+            if (flg == 0u && nreg == 1u && (hi & 0xFu) == 0xEu) // A+D: the registers written
+            {
+                line += " ad";
+                for (uint32_t i = 0; i < nloop && offset + 16u + i * 16u + 16u <= size && i < 12u; ++i)
+                {
+                    uint64_t value = 0, reg = 0;
+                    std::memcpy(&value, data + offset + 16u + i * 16u, 8u);
+                    std::memcpy(&reg, data + offset + 24u + i * 16u, 8u);
+                    std::snprintf(buffer, sizeof(buffer), " %02x=%llx", static_cast<unsigned>(reg & 0xFFu),
+                                  static_cast<unsigned long long>(value));
+                    line += buffer;
+                }
+            }
+            const size_t loopBytes = flg == 0u ? nreg * 16u : flg == 1u ? nreg * 8u : 16u;
+            const size_t dataBytes = flg == 1u ? ((static_cast<size_t>(nloop) * nreg + 1u) & ~size_t{1}) * 8u : nloop * loopBytes;
+            offset += 16u + dataBytes;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        break;
+    }
+    case QueuedCommand::Kind::Call:
+        std::fprintf(stderr, "[gs-queue] call (native marker or worker task)\n");
+        break;
+    case QueuedCommand::Kind::PresentationLatch:
+        std::fprintf(stderr, "[gs-queue] presentation latch\n");
+        break;
+    default:
+        std::fprintf(stderr, "[gs-queue] command %d, %zu B\n", static_cast<int>(command.kind), size);
+        break;
+    }
+}
+
 void GS::queueNativeDraw(uint64_t group, int context)
 {
     const int index = context != 0 ? 1 : 0;
@@ -739,6 +827,9 @@ void GS::queueNativeDraw(uint64_t group, int context)
         // Objects whose material is the GS state here go to this renderer as triangles under that state (textures
         // decoded where the GS keeps them, the same blending and tests as GS primitives); the rest to the hook.
         // (The hook's target flushes this renderer's batch: only for groups that still have batches for it.)
+        if (g_queueTraceLeft.load(std::memory_order_relaxed) > 0)
+            std::fprintf(stderr, "[gs-queue]   native group %llu ctx %d test %#llx zbuf %u\n", static_cast<unsigned long long>(group), index,
+                         static_cast<unsigned long long>(m_ctx[index].test), m_ctx[index].zbuf.zbp);
         if (!m_parallel && !ps2x::native::Renderer::instance().takeGsContextBatches(group, &GS::submitNativeBatch, this))
             return;
         m_backend->NativeDraw(group, context);

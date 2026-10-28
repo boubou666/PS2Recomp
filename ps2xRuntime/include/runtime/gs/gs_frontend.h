@@ -272,6 +272,8 @@ private:
     void processImageData(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
+    static bool queueTraceActive();
+    static void traceQueuedCommand(const QueuedCommand &command);
     // Renderer::takeGsContextBatches's visitor: a native object's triangles drawn under this GS state.
     static void submitNativeBatch(void *user, const ps2x::native::Material &material, const float matrix[16], float gsZScale,
                                   const ps2x::native::Vertex *vertices, uint32_t count);
