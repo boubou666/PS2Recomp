@@ -8,6 +8,7 @@
 //   --until N  replay commands 0..N-1 only
 //   --native   draw with the native renderer (GSNativeBackend, OpenGL on a hidden window) instead of the CPU GS
 //   --present FILE  after the replay, write the displayed picture (as the game's window shows it) as a PPM
+//   --display PMODE,SMODE2,DISPFB1,DISPLAY1,DISPFB2,DISPLAY2  the display registers to present with (hex; traces lack them)
 //   --dump     after the replay, write a buffer as NAME.ppm: FBP in 2048-word pages, FBW in 64-pixel units, PSM as
 //              in the GS registers (0 CT32, 1 CT24, 2 CT16, 10 CT16S, 19 T8, 20 T4, 48-58 Z formats, as grey)
 // PS2X_GS_REPLAY_COMMANDS=<n> replays only the first n commands.
@@ -207,13 +208,45 @@ namespace
 }
 
     // The displayed picture, through the same presentation path as the game's window, as a binary PPM.
+    // Traces do not carry the privileged display registers: --display gives them (hex PMODE,SMODE2,DISPFB1,DISPLAY1,
+    // DISPFB2,DISPLAY2), and the backend presents them directly.
+    GSPresentationRequest g_display{};
+    bool g_haveDisplay = false;
+
+    bool parseDisplay(const char *text)
+    {
+        unsigned long long v[6] = {};
+        if (std::sscanf(text, "%llx,%llx,%llx,%llx,%llx,%llx", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+            return false;
+        g_display.pmode = v[0];
+        g_display.smode2 = v[1];
+        g_display.dispfb1 = v[2];
+        g_display.display1 = v[3];
+        g_display.dispfb2 = v[4];
+        g_display.display2 = v[5];
+        g_haveDisplay = true;
+        return true;
+    }
+
     bool writePresent(GS &gs, const char *path)
     {
-        gs.latchHostPresentationFrame();
         std::vector<uint8_t> pixels;
         uint32_t width = 0, height = 0;
-        if (!gs.copyLatchedHostPresentationFrame(pixels, width, height) || width == 0u || height == 0u)
-            return false;
+        if (g_haveDisplay)
+        {
+            PresentationFrame frame = gs.rasterBackend()->Present(g_display);
+            if (!frame)
+                return false;
+            pixels = std::move(frame.pixels);
+            width = frame.width;
+            height = frame.height;
+        }
+        else
+        {
+            gs.latchHostPresentationFrame();
+            if (!gs.copyLatchedHostPresentationFrame(pixels, width, height) || width == 0u || height == 0u)
+                return false;
+        }
         FILE *out = std::fopen(path, "wb");
         if (!out)
             return false;
@@ -276,6 +309,14 @@ int main(int argc, char **argv)
             native = true;
         else if (arg == "--present" && i + 1 < argc)
             presentPath = argv[++i];
+        else if (arg == "--display" && i + 1 < argc)
+        {
+            if (!parseDisplay(argv[++i]))
+            {
+                std::fprintf(stderr, "bad --display %s (hex PMODE,SMODE2,DISPFB1,DISPLAY1,DISPFB2,DISPLAY2)\n", argv[i]);
+                return 2;
+            }
+        }
         else if (arg == "--until" && i + 1 < argc)
             until = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--dump" && i + 1 < argc)
