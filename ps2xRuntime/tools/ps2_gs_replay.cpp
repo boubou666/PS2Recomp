@@ -175,6 +175,11 @@ namespace
         switch (command.kind)
         {
         case GsTraceCommand::GifPacket:
+#if defined(PS2X_HAVE_NATIVE_GS)
+            // The game's packets reach the native texture cache through GS::submitGIFPacket; this replays below it.
+            if (ps2x::native::uploadsWanted())
+                ps2x::native::textures().scanGifPacket(data, size);
+#endif
             gs.processGIFPacket(data, size);
             break;
         case GsTraceCommand::NativePackedGifPacket:
