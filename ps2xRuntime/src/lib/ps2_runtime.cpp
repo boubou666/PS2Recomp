@@ -2352,7 +2352,10 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
-    for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+    const std::vector<uint32_t> causes = m_memory.consumeCompletedDmacCauses();
+    if (const auto gifEnds = std::count(causes.begin(), causes.end(), 2u))
+        m_memory.noteGifEvent('C', static_cast<uint32_t>(gifEnds), 0u);
+    for (uint32_t cause : causes)
     {
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
     }

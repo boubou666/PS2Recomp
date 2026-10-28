@@ -1385,6 +1385,8 @@ namespace
         mem.processPendingTransfers();
 
         std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
+        if (const auto gifEnds = std::count(completedCauses.begin(), completedCauses.end(), 2u))
+            mem.noteGifEvent('C', static_cast<uint32_t>(gifEnds), 1u);
         if (completedCauses.empty() && (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)
         {
             if (channelBase == 0x10008000u)

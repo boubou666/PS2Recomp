@@ -139,17 +139,23 @@ public:
     uint8_t *getScratchpad() { return m_scratchpad; }
     uint8_t *getIOPRAM() { return iop_ram; }
     uint64_t dmaStartCount() const { return m_dmaStartCount.load(std::memory_order_relaxed); }
-    // The last GIF channel starts (CHCR writes with STR), for diagnostics: outcome 0 = DMAC off, 1 = scratchpad
-    // path, 2 = queued, 3 = nothing to move (ended at once).
-    struct DmaStartRecord
+    // The last GIF channel events, for diagnostics: 'S' start (CHCR with STR: chcr, madr, qwc), 'Q' end interrupt
+    // queued, 'C' end interrupts consumed (count, 1 = by a sceDmaSend stub), 'D' dispatched (handlers started,
+    // 1 = held because the cause is disabled).
+    struct GifEvent
     {
-        uint32_t chcr = 0, madr = 0, qwc = 0, tadr = 0, outcome = 0;
+        uint32_t kind = 0, a = 0, b = 0, c = 0;
     };
-    static constexpr uint32_t kGifStartRecords = 8u;
-    std::array<DmaStartRecord, kGifStartRecords> gifStarts(uint32_t &next) const
+    static constexpr uint32_t kGifEvents = 32u;
+    void noteGifEvent(uint32_t kind, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0)
     {
-        next = m_gifStartNext.load(std::memory_order_relaxed);
-        return m_gifStartRecords;
+        const uint32_t slot = m_gifEventNext.fetch_add(1, std::memory_order_relaxed) % kGifEvents;
+        m_gifEvents[slot] = {kind, a, b, c};
+    }
+    std::array<GifEvent, kGifEvents> gifEvents(uint32_t &next) const
+    {
+        next = m_gifEventNext.load(std::memory_order_relaxed);
+        return m_gifEvents;
     }
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
@@ -342,8 +348,8 @@ public:
 
     bool m_seenGifCopy;
     std::atomic<uint64_t> m_dmaStartCount{0};
-    std::array<DmaStartRecord, kGifStartRecords> m_gifStartRecords{};
-    std::atomic<uint32_t> m_gifStartNext{0};
+    std::array<GifEvent, kGifEvents> m_gifEvents{};
+    std::atomic<uint32_t> m_gifEventNext{0};
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};
