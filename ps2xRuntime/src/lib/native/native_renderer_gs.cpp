@@ -230,6 +230,27 @@ void main()
         setGsDrawHook(on ? &Renderer::gsDraw : nullptr);
     }
 
+    void Renderer::takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user)
+    {
+        std::vector<StreamBatch> taken;
+        {
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            for (auto it = m_stream.begin(); it != m_stream.end() && it->group <= group;)
+            {
+                if (it->batch.material.fromGsContext)
+                {
+                    taken.push_back(std::move(*it));
+                    it = m_stream.erase(it);
+                }
+                else
+                    ++it;
+            }
+        }
+        for (const StreamBatch &entry : taken)
+            visit(user, entry.batch.material, entry.batch.matrix, entry.gsZScale, entry.vertices.data(),
+                  static_cast<uint32_t>(entry.vertices.size()));
+    }
+
     bool Renderer::hasGroup(uint64_t group)
     {
         std::lock_guard<std::mutex> lock(m_streamMutex);

@@ -1,4 +1,5 @@
 #include "runtime/native/native_texture_cache.h"
+#include "runtime/native/native_renderer.h"
 #include "ThreadNaming.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
@@ -407,6 +408,55 @@ void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+void GS::submitNativeBatch(void *user, const ps2x::native::Material &material, const float m[16], float gsZScale,
+                           const ps2x::native::Vertex *vertices, uint32_t count)
+{
+    GS &gs = *static_cast<GS *>(user);
+    if (!gs.m_backend)
+        return;
+    GSPrimReg prim{};
+    prim.type = GS_PRIM_TRIANGLE;
+    prim.iip = true;
+    prim.tme = material.textured;
+    prim.fge = material.fog;
+    prim.abe = material.alphaBlend;
+    const int ctxt = material.context != 0 ? 1 : 0;
+    prim.ctxt = ctxt != 0;
+    const GSPrimReg saved = gs.m_prim;
+    gs.m_prim = prim;
+    GSPrimitiveBatch batch = gs.buildDrawBatch(0);
+    gs.m_prim = saved;
+    batch.vertexCount = 3;
+    for (uint32_t i = 0; i + 2u < count; i += 3u)
+    {
+        bool behind = false;
+        for (uint32_t k = 0; k < 3u; ++k)
+        {
+            const ps2x::native::Vertex &v = vertices[i + k];
+            const float cx = m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12];
+            const float cy = m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13];
+            const float cz = m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14];
+            const float cw = m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15];
+            behind |= !(cw > 0.0f);
+            const float q = cw != 0.0f ? 1.0f / cw : 0.0f;
+            GSVertex &g = batch.vertices[k];
+            g.x = cx * q;
+            g.y = cy * q;
+            g.z = std::clamp(static_cast<double>(cz) * q * gsZScale, 0.0, 4294967295.0);
+            g.q = q;
+            g.s = v.u * q;
+            g.t = v.v * q;
+            g.r = static_cast<uint8_t>(v.rgba & 0xFFu);
+            g.g = static_cast<uint8_t>((v.rgba >> 8) & 0xFFu);
+            g.b = static_cast<uint8_t>((v.rgba >> 16) & 0xFFu);
+            g.a = static_cast<uint8_t>((v.rgba >> 24) & 0xFFu);
+            g.fog = static_cast<uint8_t>(std::clamp(v.fog * 255.0f + 0.5f, 0.0f, 255.0f));
+        }
+        if (!behind)
+            gs.m_backend->Submit(batch);
+    }
+}
+
 uint64_t GS::enqueue(QueuedCommand &&command)
 {
     std::unique_lock<std::mutex> lock(m_queueMutex);
@@ -662,6 +712,10 @@ void GS::queueNativeDraw(uint64_t group, int context)
             context.scissor.y0 = static_cast<uint16_t>((scissor >> 32) & 0x7FFu);
             context.scissor.y1 = static_cast<uint16_t>((scissor >> 48) & 0x7FFu);
         }
+        // Objects whose material is the GS state here go to this renderer as triangles under that state (textures
+        // decoded where the GS keeps them, the same blending and tests as GS primitives); the rest to the hook.
+        if (!m_parallel)
+            ps2x::native::Renderer::instance().takeGsContextBatches(group, &GS::submitNativeBatch, this);
         m_backend->NativeDraw(group, context);
     };
     if (!shouldQueue())

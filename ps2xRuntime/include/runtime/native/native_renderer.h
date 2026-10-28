@@ -54,6 +54,7 @@ namespace ps2x::native
         // GS packets around them; textured, fog and alphaBlend (PRIM.ABE) stay the draw's own.
         bool fromGsContext = false;
         bool alphaBlend = true;
+        uint8_t context = 0; // PRIM.CTXT of a fromGsContext draw
     };
 
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size
@@ -90,6 +91,12 @@ namespace ps2x::native
         // A group has batches waiting (its GS marker is worth queueing): the VIF1 interpreter reaches a program after
         // the native port has drawn it (at the transfer's start), so a group without batches by then has none.
         bool hasGroup(uint64_t group);
+        // GS thread, at a group's marker: hands the GS front end the fromGsContext batches of the groups up to
+        // `group` (the others stay for the hook), for a front end that draws them itself with the GS state it has
+        // there (its own renderer, textures decoded where the GS keeps them) instead of this renderer's pass.
+        using StreamVisitor = void (*)(void *user, const Material &material, const float matrix[16], float gsZScale,
+                                       const Vertex *vertices, uint32_t count);
+        void takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user);
         // Frames faster than the game's (PS2X_NATIVE_INTERPOLATE=1): the native port keys each object's batches by
         // something stable from one game frame to the next (its own data, not its place in the stream); present()
         // then draws a key found in the previous frame too with its matrix between the two, by how far the window's
