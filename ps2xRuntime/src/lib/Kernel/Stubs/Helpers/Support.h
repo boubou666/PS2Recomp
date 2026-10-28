@@ -434,6 +434,9 @@ namespace
 
     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
     {
+        static const bool logReads = std::getenv("PS2X_CD_LOG") != nullptr; // every EE read (PS2X_CD_LOG=1)
+        if (logReads)
+            std::cerr << "[cd] EE read lbn=0x" << std::hex << lbn << " sectors=0x" << sectors << std::dec << std::endl;
         for (const auto &[key, entry] : g_cdFilesByKey)
         {
             const uint32_t endLbn = entry.baseLbn + entry.sectors;
