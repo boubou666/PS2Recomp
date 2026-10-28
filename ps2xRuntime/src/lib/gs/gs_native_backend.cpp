@@ -347,6 +347,7 @@ void GSNativeBackend::appendPrimitive(const GSPrimitiveBatch &batch)
         out.t = t;
         out.q = q;
         out.fog = static_cast<float>(v.fog) / 255.0f;
+        m_batchMaxY = std::max(m_batchMaxY, out.y);
         m_batch.push_back(out);
     };
     // Texel coordinates of a vertex: UV are texels (12.4 fixed point), S and T scale to the texture's size.
@@ -656,7 +657,9 @@ void GSNativeBackend::flushBatch()
     const GSContext &context = state.context;
     RenderTarget &target = renderTarget(context.frame);
     target.dirty = true;
-    target.usedHeight = std::min(target.height, std::max<uint32_t>(target.usedHeight, context.scissor.y1 + 1u));
+    // Rows reached: the lowest vertex, clipped by the scissor (a full-screen scissor says nothing about the buffer).
+    const uint32_t lowest = std::min<uint32_t>(context.scissor.y1 + 1u, static_cast<uint32_t>(std::max(0.0f, std::ceil(m_batchMaxY))));
+    target.usedHeight = std::min(target.height, std::max(target.usedHeight, lowest));
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glViewport(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height));
     glEnable(GL_SCISSOR_TEST);
@@ -705,6 +708,7 @@ void GSNativeBackend::flushBatch()
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
     glBindVertexArray(0);
     m_batch.clear();
+    m_batchMaxY = 0.0f;
 }
 
 void GSNativeBackend::Initialize(uint8_t *vram, uint32_t vramSize)

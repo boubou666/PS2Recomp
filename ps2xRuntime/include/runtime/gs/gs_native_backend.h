@@ -61,7 +61,7 @@ private:
         uint32_t framebuffer = 0;
         uint32_t color = 0;
         uint32_t depth = 0;
-        uint32_t usedHeight = 0; // rows drawn so far (the scissor's bottom), what a resolve reads back
+        uint32_t usedHeight = 0; // rows drawn so far (the lowest vertex, within the scissor), what a resolve reads back
         bool dirty = false;      // drawn since its pixels were last written to GS memory (resolveTarget)
     };
 
@@ -125,5 +125,6 @@ private:
 
     // The batch being collected: draws whose state draws the same way (sameDrawState).
     std::vector<Vertex> m_batch;
+    float m_batchMaxY = 0.0f; // the batch's lowest row, for its render target's usedHeight
     GSDrawState m_batchState{};
 };
