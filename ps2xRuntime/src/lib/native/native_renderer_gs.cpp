@@ -237,9 +237,12 @@ void main()
             const GLsizei count = static_cast<GLsizei>(entry.vertices.size());
             glUniform1f(pass.locDepthScale, static_cast<float>(entry.gsZScale * target.zScale));
             glUniform4fv(pass.locM, 4, entry.batch.matrix);
-            const bool textured = m.textured && entry.batch.texture;
+            std::shared_ptr<const TextureCache::Texture> texture = entry.batch.texture;
+            if (m.textured && !texture)
+                texture = ps2x::native::textures().texture(m.tex0, m.texa);
+            const bool textured = m.textured && texture;
             if (textured)
-                glBindTexture(GL_TEXTURE_2D, pass.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), entry.batch.texture));
+                glBindTexture(GL_TEXTURE_2D, pass.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), texture));
             glUniform1i(pass.locTextured, textured ? 1 : 0);
             glUniform1i(pass.locAlphaTest, m.alphaTest ? 1 : 0);
             glUniform1f(pass.locAlphaRef, m.alphaRef / 128.0f);

@@ -274,7 +274,10 @@ void main()
             rlSetUniform(gpu.locDepthMax, &screen.depthMax, RL_SHADER_UNIFORM_FLOAT, 1);
             rlSetUniform(gpu.locTex, &slot, RL_SHADER_UNIFORM_INT, 1);
             rlSetUniform(gpu.locM, batch.matrix, RL_SHADER_UNIFORM_VEC4, 4);
-            const int textured = m.textured && batch.texture ? 1 : 0, alphaTest = m.alphaTest ? 1 : 0;
+            std::shared_ptr<const TextureCache::Texture> texture = batch.texture;
+            if (m.textured && !texture)
+                texture = ps2x::native::textures().texture(m.tex0, m.texa);
+            const int textured = m.textured && texture ? 1 : 0, alphaTest = m.alphaTest ? 1 : 0;
             const int opaque = m.blend == Material::Blend::Opaque ? 1 : 0;
             rlSetUniform(gpu.locOpaque, &opaque, RL_SHADER_UNIFORM_INT, 1);
             const int fog = m.fog ? 1 : 0;
@@ -286,10 +289,10 @@ void main()
             rlSetUniform(gpu.locTextured, &textured, RL_SHADER_UNIFORM_INT, 1);
             rlSetUniform(gpu.locAlphaTest, &alphaTest, RL_SHADER_UNIFORM_INT, 1);
             rlSetUniform(gpu.locAlphaRef, &alphaRef, RL_SHADER_UNIFORM_FLOAT, 1);
-            if (m.textured && batch.texture)
+            if (textured)
             {
                 rlActiveTextureSlot(0);
-                rlEnableTexture(gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), batch.texture));
+                rlEnableTexture(gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), texture));
             }
             rlDrawVertexArray(static_cast<int>(batch.first), static_cast<int>(batch.count));
         }

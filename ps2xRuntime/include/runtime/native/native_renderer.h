@@ -110,7 +110,9 @@ namespace ps2x::native
             float matrix[16];
             uint32_t first = 0, count = 0;
             // Taken from the texture cache when the batch is drawn (the game's thread, in stream order): games reuse
-            // texture memory before the frame is presented.
+            // texture memory before the frame is presented. Null when its upload was not there yet (an upload in the
+            // same VIF1 transfer reaches the cache when VIF1 gets to it): looked up again where the batch is drawn,
+            // in the GS stream (after the upload) or at present.
             std::shared_ptr<const TextureCache::Texture> texture;
         };
         struct Frame
