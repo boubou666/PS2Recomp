@@ -255,12 +255,52 @@ namespace
     }
 }
 
+namespace
+{
+    // The host gamepad for a pad port: the first available of the 4 raylib slots for port 0, the second for port 1
+    // (a controller is not always in slot 0: a virtual pad or a DualShock 4 seen through DirectInput may take
+    // another). Loads SDL-format mappings from PS2X_GAMEPAD_DB or gamecontrollerdb.txt next to the runner once, for
+    // controllers raylib does not map by itself, and logs the controllers whenever they change.
+    int gamepadForPort(int port)
+    {
+        static const bool s_mappings = []
+        {
+            const char *path = std::getenv("PS2X_GAMEPAD_DB");
+            if (char *text = LoadFileText(path ? path : "gamecontrollerdb.txt"))
+            {
+                const int added = SetGamepadMappings(text);
+                UnloadFileText(text);
+                std::fprintf(stderr, "[pad] %d gamepad mappings loaded\n", added);
+            }
+            return true;
+        }();
+        (void)s_mappings;
+        int found[4] = {-1, -1, -1, -1}, count = 0;
+        for (int i = 0; i < 4; ++i)
+            if (IsGamepadAvailable(i))
+                found[count++] = i;
+        static int s_lastMask = 0;
+        int mask = 0;
+        for (int i = 0; i < count; ++i)
+            mask |= 1 << found[i];
+        if (mask != s_lastMask)
+        {
+            s_lastMask = mask;
+            for (int i = 0; i < count; ++i)
+                std::fprintf(stderr, "[pad] gamepad slot %d: %s (pad port %d)\n", found[i], GetGamepadName(found[i]), i);
+            if (count == 0)
+                std::fprintf(stderr, "[pad] no gamepad: keyboard on pad port 0\n");
+        }
+        return port < count ? found[port] : -1;
+    }
+}
+
 bool PSPadBackend::connected(int port) const
 {
     if (port == 0)
         return true;
     static const bool pad2Script = std::getenv("PS2X_PAD2_SCRIPT") != nullptr;
-    return port == 1 && (pad2Script || IsGamepadAvailable(1));
+    return port == 1 && (pad2Script || gamepadForPort(1) >= 0);
 }
 
 bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
@@ -278,15 +318,9 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    const int kGamepad = port == 1 ? 1 : 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
-    static bool s_wasAvailable[2] = {};
-    if (useGamepad != s_wasAvailable[kGamepad])
-    {
-        s_wasAvailable[kGamepad] = useGamepad;
-        std::fprintf(stderr, "[pad] gamepad %d %s%s\n", kGamepad, useGamepad ? "connected: " : "disconnected",
-                     useGamepad ? GetGamepadName(kGamepad) : "");
-    }
+    const int hostPad = gamepadForPort(port);
+    const bool useGamepad = hostPad >= 0;
+    const int kGamepad = useGamepad ? hostPad : 0;
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
