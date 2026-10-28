@@ -21,7 +21,7 @@ the hardware model and its checks unchanged. Early native layers may regress a g
 | 2 | Audio on wall time | IOP time paid by EE cycles, SPU2 output following emulation speed | proposed |
 | 3 | Translating renderer | GS emulation: GS state and primitives become GPU draws with GPU render targets | proposed |
 | 4 | Hardware waits | modelled latencies of GS/VIF/DMA status, readbacks served from host state | proposed |
-| 5 | Native VU output | VU1 microprograms feed the GPU directly instead of the simulated VIF/GIF path | later |
+| 5 | Native VU output | VU1 microprograms feed the GPU directly instead of the simulated VIF/GIF path | mesh API and first adapter (TMB) on `native/renderer` |
 
 Long-term goals that shape the layers: a frame cap chosen by the player (30 to 60, or unlimited), higher internal
 resolution, post-process passes on the final frame, and texture replacement (modding).
@@ -86,3 +86,32 @@ talks to the GS through the same GIF/register interface, so nothing here is game
 Order: state tracker, geometry and untextured draws into one render target at 1x; textures and CLUTs; blending
 and tests; render target cache and feedback textures; transfers and readbacks; PCRTC presentation; scale factor;
 post-process hook.
+
+## Layer 5: native VU output (mesh API, on `native/renderer`)
+
+Instead of running a game's VU1 microprograms and rasterizing what they send the GS, a per-game adapter reads the
+game's own 3D data (meshes, matrices, lights, materials) and submits it as meshes; the GPU transforms, lights and
+draws them. The PS2 is no limit there: any resolution, any frame rate (by interpolating the game's transforms), no
+VU1, VIF1 or GS work per vertex.
+
+Generic part (`ps2xRuntime/include/runtime/native/`):
+
+- `TextureCache` (`native_texture_cache.h`), one per process: `ps2x::native::textures()`. A copy of GS memory that
+  the GS front end feeds every host-to-local upload once a consumer calls `setUploadsWanted(true)`; `texture(tex0,
+  texa)` decodes and caches a texture as RGBA8 (CT32/24/16, T8/T4 and their H/HL/HH variants, CSM1 CT32/CT16
+  palettes), and decodes it again when an upload overlaps its pages. Shared with the translating renderer (layer 3).
+- `Renderer` (`native_renderer.h`): `beginFrame(Screen)`, `draw(Material, matrix, vertices, count)` per batch,
+  `endFrame()` publishes the frame; `present()` draws the latest one from the window loop. Vertices are in the
+  object's space with the matrix to PS2 screen space (GS window x/y, Z, w), so a game's own matrices go in unchanged;
+  colours as the GS modulates (0x80 = 1.0). `Material` is the GS ALPHA/TEST/ZBUF state reduced to what a PC GPU does.
+- Switches: `PS2X_NATIVE_VIEW=only` (the native frame without the GS frame under it), `PS2X_NATIVE_CAPTURE_DIR`
+  (+ `_INTERVAL`), `PS2X_NATIVE_STATS=1`.
+
+Per-game part (the adapter, in the game's port): find where the engine hands its objects to VU1 (a display list, a
+VIF1 chain), read the data from there, and apply what the microprogram would (its shading formula, its strip
+format), checked against VU1's real GS output on traces before it replaces it. First adapter: TMB
+(`runtime/tmb_native.cpp`, `TMB_NATIVE=1`): the hier renderer's VIF1 chains read at `hierFlushObjQ`, four shading
+modes, per-strip texture and blending.
+
+Order: the adapter draws over the GS frame; once a scene's objects are all native, their VU1/GS path is skipped;
+then interpolation for frame rates above the game's, and the game's 2D (HUD, menus) through the same API.
