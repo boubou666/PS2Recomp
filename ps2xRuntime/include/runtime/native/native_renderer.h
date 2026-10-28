@@ -24,6 +24,7 @@ namespace ps2x::native
         float x = 0, y = 0, z = 0; // the object's space: the draw's matrix takes it to PS2 screen space
         float u = 0, v = 0;        // texture coordinates, 0..1 across the texture (the GS's S / Q, T / Q)
         uint32_t rgba = 0;         // lit colour, R in the low byte; 0x80 per channel is 1.0, as the GS modulates
+        float fog = 1.0f;          // the GS's F / 255: 1 keeps the colour, 0 is all fog colour (Material::fog)
     };
 
     // How a draw blends and tests, from the GS registers a game sets (ALPHA, TEST) reduced to what a PC GPU does.
@@ -42,6 +43,8 @@ namespace ps2x::native
         bool alphaTest = false;
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
         bool depthWrite = true;
+        bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
+        uint32_t fogColour = 0;     // FOGCOL, R in the low byte
     };
 
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size
@@ -91,6 +94,9 @@ namespace ps2x::native
             Material material;
             float matrix[16];
             uint32_t first = 0, count = 0;
+            // Taken from the texture cache when the batch is drawn (the game's thread, in stream order): games reuse
+            // texture memory before the frame is presented.
+            std::shared_ptr<const TextureCache::Texture> texture;
         };
         struct Frame
         {
