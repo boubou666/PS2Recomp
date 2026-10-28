@@ -756,18 +756,29 @@ void GSNativeBackend::ensureVram()
 
 void GSNativeBackend::syncVramToGpu()
 {
-    // The pages transfers changed since the last draw: 8 KiB, two rows of the texture.
+    // The blocks transfers changed since the last draw: 64 words each, 16 to a row of the texture, sent as runs.
+    if (!m_anyDirty || !m_vram)
+        return;
+    m_anyDirty = false;
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, m_vramTexture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    if (m_vram)
-        for (uint32_t page = 0; page < m_dirtyPages.size(); ++page)
-            if (m_dirtyPages[page])
-            {
-                m_dirtyPages[page] = 0u;
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER,
-                                GL_UNSIGNED_INT, m_vram + static_cast<size_t>(page) * 8192u);
-            }
+    const uint32_t blocks = static_cast<uint32_t>(m_dirtyBlocks.size());
+    for (uint32_t block = 0; block < blocks;)
+    {
+        if (!m_dirtyBlocks[block])
+        {
+            ++block;
+            continue;
+        }
+        uint32_t end = block;
+        while (end < blocks && m_dirtyBlocks[end] && (end == block || end % 16u != 0u))
+            m_dirtyBlocks[end++] = 0u;
+        glTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>((block % 16u) * 64u), static_cast<GLint>(block / 16u),
+                        static_cast<GLsizei>((end - block) * 64u), 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                        m_vram + static_cast<size_t>(block) * 256u);
+        block = end;
+    }
     glActiveTexture(GL_TEXTURE0);
 }
 
@@ -776,6 +787,7 @@ void GSNativeBackend::pullGpuPages()
     if (!m_anyGpuNewer || !m_vram || !m_vramFramebuffer || !ensureContext())
         return;
     m_anyGpuNewer = false;
+    syncVramToGpu();
     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     for (uint32_t page = 0; page < m_gpuNewer.size(); ++page)
@@ -1558,25 +1570,30 @@ void GSNativeBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclu
 
 void GSNativeBackend::markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    // The pages a rectangle of the buffer touches, every 8 pixels (no block is smaller) and at its far edges.
+    // The 256-byte blocks a rectangle of the buffer touches: every 8 pixels of a row lie in one block, and no block
+    // is less than 4 rows high; the far edges too.
     const uint32_t x1 = x + std::max<uint32_t>(w, 1u), y1 = y + std::max<uint32_t>(h, 1u);
-    for (uint32_t yy = y;; yy = std::min(yy + 8u, y1 - 1u))
+    for (uint32_t yy = y;; yy = std::min(yy + 4u, y1 - 1u))
     {
         for (uint32_t xx = x;; xx = std::min(xx + 8u, x1 - 1u))
         {
-            m_dirtyPages[GSMem::PageOf(psm, bp, std::max<uint32_t>(bw, 1u), xx, yy) % m_dirtyPages.size()] = 1u;
+            m_dirtyBlocks[GSMem::BlockOf(psm, bp, std::max<uint32_t>(bw, 1u), xx, yy) % m_dirtyBlocks.size()] = 1u;
             if (xx == x1 - 1u)
                 break;
         }
         if (yy == y1 - 1u)
             break;
     }
+    m_anyDirty = true;
 }
 
 void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
 {
     flushBatch();
-    pullGpuPages(); // the transfer rewrites or reads GS memory on the CPU side: it must hold the resolved pixels
+    // A transfer that reads GS memory on the CPU side (local to host, local to local) needs the resolved pixels
+    // there; one into GS memory only replaces blocks, which reach the GPU copy by themselves.
+    if (command.direction == 1u || command.direction == 2u)
+        pullGpuPages();
     if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
     {
         static uint32_t s_logged = 0, s_copies = 0;
