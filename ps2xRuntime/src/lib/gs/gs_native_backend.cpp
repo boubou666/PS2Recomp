@@ -482,6 +482,42 @@ void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
     }
 }
 
+void GSNativeBackend::dropTargetsUnder(const GSTransferCommand &command)
+{
+    // The transfer's pages: rows TRXPOS.DSAY to + TRXREG.RRH at the destination format's page size.
+    const uint32_t psm = command.bitbltbuf.dpsm;
+    const bool fourBit = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
+    const bool eightBit = psm == 0x13u || psm == 0x1Bu;
+    const bool sixteen = psm == 0x02u || psm == 0x0Au;
+    const uint32_t pageWidth = (fourBit || eightBit) && psm != 0x1Bu && psm != 0x24u && psm != 0x2Cu ? 128u : 64u;
+    const uint32_t pageHeight = psm == 0x14u ? 128u : (psm == 0x13u || sixteen) ? 64u : 32u;
+    const uint32_t width = std::max<uint32_t>(command.bitbltbuf.dbw, 1u) * 64u;
+    const uint32_t pagesPerRow = std::max<uint32_t>(width / pageWidth, 1u);
+    const uint32_t y0 = command.trxpos.dsay, y1 = y0 + std::max<uint32_t>(command.trxreg.rrh, 1u);
+    const uint64_t first = command.bitbltbuf.dbp / 32u + static_cast<uint64_t>(y0 / pageHeight) * pagesPerRow;
+    const uint64_t last = command.bitbltbuf.dbp / 32u + static_cast<uint64_t>((y1 + pageHeight - 1u) / pageHeight) * pagesPerRow;
+    for (auto it = m_targets.begin(); it != m_targets.end();)
+    {
+        const RenderTarget &target = it->second;
+        const uint64_t begin = target.fbp;
+        const uint64_t end = begin + static_cast<uint64_t>(target.fbw) * std::max<uint32_t>((target.usedHeight + 31u) / 32u, 1u);
+        if (target.usedHeight != 0u && first < end && begin < last)
+        {
+            if (ensureContext())
+            {
+                glDeleteFramebuffers(1, &target.framebuffer);
+                glDeleteTextures(1, &target.color);
+                glDeleteTextures(1, &target.depth);
+            }
+            it = m_targets.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
 bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height)
 {
     const GSContext &context = state.context;
@@ -762,6 +798,8 @@ void GSNativeBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclu
 void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
 {
     flushBatch();
+    if (command.direction == 0u || command.direction == 2u)
+        dropTargetsUnder(command);
     m_memory->BeginTransfer(command);
 }
 
