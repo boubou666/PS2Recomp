@@ -442,7 +442,11 @@ void GS::submitNativeBatch(void *user, const ps2x::native::Material &material, c
             GSVertex &g = batch.vertices[k];
             g.x = cx * q;
             g.y = cy * q;
-            g.z = std::clamp(static_cast<double>(cz) * q * gsZScale, 0.0, 4294967295.0);
+            // Z as a VU program hands it to the GS (FTOI into XYZ): saturated to a signed 32-bit integer, whose bits
+            // the GS takes as unsigned (a negative Z wraps high), the same depth as the program's own packets.
+            const double zs = static_cast<double>(cz) * q * gsZScale;
+            const double zf = zs == zs ? std::clamp(zs, -2147483648.0, 2147483647.0) : 0.0;
+            g.z = static_cast<double>(static_cast<uint32_t>(static_cast<int32_t>(zf)));
             g.q = q;
             g.s = v.u * q;
             g.t = v.v * q;
