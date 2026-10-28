@@ -61,6 +61,8 @@ uniform vec3 uFogColor;
 uniform int uAlphaTest;
 uniform float uAlphaRef;
 uniform int uBlendOut;
+uniform sampler2D uDest; // a copy of the render target, for the destination alpha test
+uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
 uniform int uBlendFactor;
 uniform float uBlendFix;
 void main()
@@ -93,6 +95,12 @@ void main()
     else if (uAlphaTest == 7) pass = a != uAlphaRef;
     if (!pass)
         discard;
+    if (uDate != 0)
+    {
+        bool set = texelFetch(uDest, ivec2(gl_FragCoord.xy), 0).a * 255.0 >= 127.5;
+        if (set != (uDate == 2))
+            discard;
+    }
     // The GS blend's C: the source alpha or FIX (0x80 is 1.0). Blends that fixed-function GL cannot express take
     // part of the work here: the factor as colour (Cd * (1 + C) through DST_COLOR, ONE), or Cs * (1 + C).
     float factor = uBlendFactor == 2 ? uBlendFix : clamp(c.a, 0.0, 2.0);
@@ -269,6 +277,8 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.blendFactor = glGetUniformLocation(m_program, "uBlendFactor");
     m_uniforms.blendFix = glGetUniformLocation(m_program, "uBlendFix");
     m_uniforms.fst = glGetUniformLocation(m_program, "uTexAlphaScale");
+    m_uniforms.dest = glGetUniformLocation(m_program, "uDest");
+    m_uniforms.date = glGetUniformLocation(m_program, "uDate");
 
     glGenVertexArrays(1, &m_vertexArray);
     glGenBuffers(1, &m_vertexBuffer);
@@ -928,9 +938,52 @@ void GSNativeBackend::flushBatch()
     glUniform1i(m_uniforms.fog, state.prim.fge ? 1 : 0);
     glUniform3f(m_uniforms.fogColor, state.fogR / 255.0f, state.fogG / 255.0f, state.fogB / 255.0f);
     // TEST: ATE, ATST, AREF. A failed test keeps the pixel unwritten (AFAIL other than KEEP is not translated yet).
-    const bool alphaTest = !offAlpha && (context.test & 0x1u) != 0u;
+    bool alphaTest = !offAlpha && (context.test & 0x1u) != 0u;
+    // ATST NEVER with AFAIL other than KEEP: every pixel fails, and AFAIL says what is written anyway. That is a
+    // write mask (FB_ONLY colour without Z, ZB_ONLY Z alone, RGB_ONLY colour without alpha or Z), not a test.
+    if (alphaTest && (context.test >> 1 & 0x7u) == 0u && (context.test >> 12 & 0x3u) != 0u)
+    {
+        alphaTest = false;
+        switch (context.test >> 12 & 0x3u)
+        {
+        case 1u:
+            glDepthMask(GL_FALSE);
+            break;
+        case 2u:
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            break;
+        default:
+            glDepthMask(GL_FALSE);
+            glColorMask((fbmsk & 0xFFu) != 0xFFu, (fbmsk >> 8 & 0xFFu) != 0xFFu, (fbmsk >> 16 & 0xFFu) != 0xFFu,
+                        GL_FALSE);
+            break;
+        }
+    }
     glUniform1i(m_uniforms.alphaTest, alphaTest ? static_cast<int>(context.test >> 1 & 0x7u) : 1);
     glUniform1f(m_uniforms.alphaRef, static_cast<float>(context.test >> 4 & 0xFFu));
+    // DATE: the destination alpha's top bit (DATM picks which value passes), read from a copy of the target.
+    const bool date = (context.test >> 14 & 0x1u) != 0u;
+    glUniform1i(m_uniforms.date, date ? ((context.test >> 15 & 0x1u) ? 2 : 1) : 0);
+    glUniform1i(m_uniforms.dest, 1);
+    if (date)
+    {
+        if (!m_destTexture || m_destWidth != target.width || m_destHeight != target.height)
+        {
+            if (!m_destTexture)
+                glGenTextures(1, &m_destTexture);
+            glBindTexture(GL_TEXTURE_2D, m_destTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width, target.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            m_destWidth = target.width;
+            m_destHeight = target.height;
+        }
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, m_destTexture);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, target.width, target.height);
+        glActiveTexture(GL_TEXTURE0);
+    }
 
     glBindVertexArray(m_vertexArray);
     glBindBuffer(GL_ARRAY_BUFFER, m_vertexBuffer);

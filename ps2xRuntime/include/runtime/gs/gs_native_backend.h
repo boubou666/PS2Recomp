@@ -108,6 +108,9 @@ private:
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
     uint32_t m_depthTexture = 0;
+    uint32_t m_destTexture = 0; // copy of the render target for DATE
+    uint32_t m_destWidth = 0;
+    uint32_t m_destHeight = 0;
     void applyBlend(const GSDrawState &state);
     // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
     int m_blendOut = 0;
@@ -135,6 +138,7 @@ private:
     {
         int targetSize = -1, texSize = -1, textured = -1, fst = -1, tfx = -1, tcc = -1, fog = -1, fogColor = -1;
         int alphaTest = -1, alphaRef = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
+        int dest = -1, date = -1;
     } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
