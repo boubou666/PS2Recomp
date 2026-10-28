@@ -141,6 +141,10 @@ static std::atomic<PS2Runtime *> g_gsCsrEdgeRuntime{nullptr};
 static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
+// The host texture the picture is uploaded to: room for a doubled scanout (paraLLEl's super-sampled
+// high_resolution_scanout, PS2X_GS_SSAA >= 4).
+static constexpr int FB_MAX_WIDTH = FB_WIDTH * 2;
+static constexpr int FB_MAX_HEIGHT = FB_HEIGHT * 2;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 #if defined(PLATFORM_VITA)
@@ -537,7 +541,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    static std::vector<uint8_t> s_uploadBuffer(static_cast<size_t>(FB_MAX_WIDTH) * FB_MAX_HEIGHT * 4u, 0u);
 
     s_scratch.clear();
     uint32_t overrideWidth = 0u;
@@ -582,7 +586,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(FB_MAX_WIDTH, FB_MAX_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -645,10 +649,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, FB_MAX_WIDTH);
+        const uint32_t copyHeight = std::min<uint32_t>(height, FB_MAX_HEIGHT);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(FB_MAX_WIDTH) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -687,8 +691,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             s_nextCapture += s_captureInterval;
             Image image{};
             image.data = s_uploadBuffer.data();
-            image.width = FB_WIDTH;
-            image.height = static_cast<int>(std::min<uint32_t>(height, FB_HEIGHT));
+            image.width = FB_MAX_WIDTH;
+            image.height = static_cast<int>(std::min<uint32_t>(height, FB_MAX_HEIGHT));
             image.mipmaps = 1;
             image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             char path[1024];
@@ -3448,7 +3452,7 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+    Image blank = GenImageColor(FB_MAX_WIDTH, FB_MAX_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
     // The picture is scaled to the window bilinearly (raylib's default is nearest, which draws each PS2 pixel as a
