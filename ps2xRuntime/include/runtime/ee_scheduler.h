@@ -230,6 +230,9 @@ struct EeKernelSnapshot
     int runningThreadId = 0;
     uint32_t enabledIntcMask = 0;
     uint32_t pendingIntcMask = 0;   // causes raised while disabled
+    uint32_t enabledDmacMask = 0;
+    uint32_t pendingDmacMask = 0;
+    std::vector<EeIrqHandler> dmacHandlers;
     uint32_t pendingInvocations = 0; // queued handlers not started yet
     bool heldUntilEi = false;        // ... or a thread switch, because the running thread executed DI
     std::vector<EeThreadSnapshot> threads;

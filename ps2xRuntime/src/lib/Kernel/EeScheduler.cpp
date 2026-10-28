@@ -1815,6 +1815,10 @@ void EeScheduler::publishSnapshot()
     next.runningThreadId = m_currentThreadId;
     next.enabledIntcMask = m_enabledIntcMask;
     next.pendingIntcMask = m_pendingIntcMask;
+    next.enabledDmacMask = m_enabledDmacMask;
+    next.pendingDmacMask = m_pendingDmacMask;
+    for (const auto &[id, handler] : m_dmacHandlers)
+        next.dmacHandlers.push_back(handler);
     next.pendingInvocations = static_cast<uint32_t>(m_pendingInvocations.size());
     next.heldUntilEi = m_heldUntilEi;
     next.threads.reserve(m_threads.size());
