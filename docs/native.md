@@ -86,3 +86,33 @@ talks to the GS through the same GIF/register interface, so nothing here is game
 Order: state tracker, geometry and untextured draws into one render target at 1x; textures and CLUTs; blending
 and tests; render target cache and feedback textures; transfers and readbacks; PCRTC presentation; scale factor;
 post-process hook.
+
+## IOP modules recompiled (native/renderer)
+
+The IOP's own code (IRX modules: sound drivers, streaming, the game's helpers) runs as native C++ instead of being
+interpreted, the way the EE's code is recompiled.
+
+- `PS2X_IOP_DUMP_MODULES=<dir>`: each module as the IOP loaded it, relocated at its base and before its start
+  routine, as `<name>_<base>.bin` plus `.json` (base, size, entry, gp, the file's FNV-1a 64 hash).
+- `tools/iop_recomp.py <module>.json --out <dir>` writes `<module>_iop.cpp`: functions from the entry, the export
+  tables and the JAL targets; branch delay slots inline; resume points at the entry, after each call and at loop
+  heads. SYSCALL, BREAK (gcc's divide-by-zero trap), COP0 writes, RFE and unknown words hand back to the
+  interpreter at that instruction; a load whose register the next instruction reads (an R3000 load delay) leaves
+  its function interpreted. `--list` shows functions, exports, imports and what stays interpreted.
+- Compile the `.cpp` into the game (it registers itself: `ps2x/iop/iop_native.h`); `PS2X_IOP_NATIVE=1` runs it
+  for a loaded module with the same file hash at the same base, everything else interpreted as before.
+- Native code reads RAM directly and goes through the IOP for writes and hardware, keeping the IOP clock up to date
+  (each instruction counts one, as interpreted, so timers, the SPU2 and the scheduler see the same time). Calls run
+  native functions and import stubs (the existing HLE dispatch); a blocking import or the end of the time slice
+  stops at a resume point and the IOP resumes the thread there later.
+- TMB: 989snd (282 functions) and libsd (54) all native; match at 49.8 fps, sound identical to the interpreter
+  where the runs are the same.
+
+## Sound on the wall clock (native/renderer)
+
+`PS2X_SPU2_WALLCLOCK=1`: the SPU2 mixes when the host's audio callback asks for frames, at 48 kHz of real time, as
+the console's SPU2 runs on its own clock whatever the CPUs do. Voices, envelopes, the AutoDMA input and reverb
+advance by the frames played, not by IOP cycles or the game's frame rate; transfers that are not AutoDMA still end
+on the IOP clock (`PS2X_SPU2_DMA_CYCLES_PER_2BYTES`), and the interrupts the mixing raises reach the IOP at its next
+advance (within 1 ms of IOP time). Register and DMA accesses and the mixing share a lock. Without the switch the
+SPU2 mixes a sample per 768 IOP cycles and the host stretches the output to its rate, as before.
