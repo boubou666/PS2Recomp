@@ -1,6 +1,8 @@
 #include "runtime/native/native_gif.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2x::native
@@ -342,6 +344,14 @@ namespace ps2x::native
 
     void GifToNative::flush()
     {
+        // PS2X_NATIVE_LOG_GIF=1: now and then, a batch's size and first vertex.
+        static const bool s_log = std::getenv("PS2X_NATIVE_LOG_GIF") != nullptr;
+        static uint32_t s_batches = 0;
+        if (s_log && !m_triangles.empty() && ++s_batches % 500u == 1u)
+            std::fprintf(stderr, "[native] gif batch %u: %zu vertices, first (%.1f %.1f %.1f) uv (%.3f %.3f) rgba %08x, tex0 %#llx textured %d blend %d\n",
+                         s_batches, m_triangles.size(), m_triangles[0].x, m_triangles[0].y, m_triangles[0].z, m_triangles[0].u, m_triangles[0].v,
+                         m_triangles[0].rgba, static_cast<unsigned long long>(m_batchMaterial.tex0), m_batchMaterial.textured ? 1 : 0,
+                         static_cast<int>(m_batchMaterial.blend));
         if (!m_triangles.empty())
             Renderer::instance().draw(m_batchMaterial, kScreenSpace, m_triangles.data(), static_cast<uint32_t>(m_triangles.size()));
         m_triangles.clear();
