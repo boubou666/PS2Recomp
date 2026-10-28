@@ -293,7 +293,20 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
 {
     auto it = m_targets.find(frame.fbp);
     if (it != m_targets.end())
-        return it->second;
+    {
+        RenderTarget &existing = it->second;
+        const bool sameLayout = existing.psm == frame.psm || ((existing.psm | frame.psm) & ~0x1u) == 0u;
+        if (sameLayout && existing.fbw == frame.fbw)
+            return existing;
+        // The same memory drawn in another format or width (a CT32 buffer reused as CT16): its pixels go to GS
+        // memory first, where the new target's readers will find them, and the target starts over.
+        if (existing.dirty && existing.usedHeight != 0u)
+            resolveTarget(existing);
+        glDeleteFramebuffers(1, &existing.framebuffer);
+        glDeleteTextures(1, &existing.color);
+        glDeleteTextures(1, &existing.depth);
+        m_targets.erase(it);
+    }
 
     RenderTarget target;
     target.fbp = frame.fbp;
@@ -469,8 +482,22 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE,
                  pixels.data());
+    uint32_t dpsm = 0x00u;
+    if (target.psm == 0x02u || target.psm == 0x0Au)
+    {
+        // A 16-bit target: RGB5A1 (alpha bit from the GS alpha's top bit, 0x80), written in its own format.
+        dpsm = target.psm;
+        for (size_t i = 0, n = static_cast<size_t>(width) * height; i < n; ++i)
+        {
+            const uint8_t *p = &pixels[i * 4u];
+            const uint16_t v = static_cast<uint16_t>((p[0] >> 3) | (p[1] >> 3) << 5 | (p[2] >> 3) << 10 |
+                                                     ((p[3] & 0x80u) ? 0x8000u : 0u));
+            std::memcpy(&pixels[i * 2u], &v, 2u);
+        }
+        pixels.resize(static_cast<size_t>(width) * height * 2u);
+    }
     const uint64_t bitbltbuf = static_cast<uint64_t>(target.fbp * 32u) << 32 | static_cast<uint64_t>(target.fbw) << 48 |
-                               static_cast<uint64_t>(0x00u) << 56;
+                               static_cast<uint64_t>(dpsm) << 56;
     const uint64_t trxreg = static_cast<uint64_t>(width) | static_cast<uint64_t>(height) << 32;
     ps2x::native::textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
 }
@@ -488,8 +515,9 @@ void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
         if (!target.dirty || target.usedHeight == 0u)
             continue;
         const uint64_t base = static_cast<uint64_t>(fbp) * 32u;
-        // CT32 pages are 64 x 32 pixels, 32 blocks each.
-        const uint64_t blocks = static_cast<uint64_t>(target.fbw) * ((target.usedHeight + 31u) / 32u) * 32u;
+        // Pages of 32 blocks: 64 x 32 pixels in CT32/CT24, 64 x 64 in CT16.
+        const uint32_t pageRows = (target.psm == 0x02u || target.psm == 0x0Au) ? 64u : 32u;
+        const uint64_t blocks = static_cast<uint64_t>(target.fbw) * ((target.usedHeight + pageRows - 1u) / pageRows) * 32u;
         if (tex0.tbp0 < base + blocks && base < tex0.tbp0 + texBlocks)
             resolveTarget(target);
     }
@@ -614,7 +642,13 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     }
     else if (colorFormat(context.tex0.psm))
     {
-        if (RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0))
+        // Only a read in the target's own layout samples it directly (CT24 reads CT32 pixels as they are); another
+        // format (a CT32 buffer read as CT16 to split its channels) sees GS memory, through resolveTargetsUnder.
+        RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0);
+        const auto sameLayout = [](uint32_t a, uint32_t b) { return a == b || ((a | b) & ~0x1u) == 0u; };
+        if (source && !sameLayout(source->psm, context.tex0.psm))
+            source = nullptr;
+        if (source)
         {
             // A render target sampled as a texture (copies, blurs, depth of field). When the draw also writes it,
             // sample a copy of it as it was before the draw.
