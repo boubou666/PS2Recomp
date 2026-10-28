@@ -203,6 +203,7 @@ namespace ps2x::native
 
         Texture texture;
         texture.key = key;
+        texture.version = ++m_decodes;
         const uint32_t tbp = tex0 & 0x3fffu;
         const uint32_t tbw = (tex0 >> 14) & 0x3fu;
         texture.width = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu);

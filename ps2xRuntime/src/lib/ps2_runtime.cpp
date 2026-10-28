@@ -1,3 +1,4 @@
+#include "runtime/native/native_renderer.h"
 #include "ps2_runtime.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
@@ -3507,7 +3508,15 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        // PS2X_NATIVE_VIEW=only: the native renderer's frame alone, without the GS frame under it (to compare).
+        static const bool s_nativeOnly = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_VIEW");
+            return value && std::string_view(value) == "only";
+        }();
+        if (!(s_nativeOnly && ps2x::native::Renderer::instance().enabled()))
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        ps2x::native::Renderer::instance().present(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
         DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), eeScheduler().currentCycle(), screenWidth, screenHeight);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {

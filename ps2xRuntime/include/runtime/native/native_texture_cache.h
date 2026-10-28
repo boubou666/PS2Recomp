@@ -26,6 +26,7 @@ namespace ps2x::native
             uint32_t height = 0;
             std::vector<uint32_t> rgba; // R in the low byte; alpha scaled from the GS's 0x80 = opaque to 255
             uint64_t key = 0;
+            uint64_t version = 0; // new for every decode: a renderer re-sends the image to its GPU when it changes
             std::vector<std::pair<uint32_t, uint32_t>> pages; // (page, generation) the texture was decoded from
         };
 
@@ -53,6 +54,7 @@ namespace ps2x::native
         std::vector<uint32_t> m_pageGeneration;
         std::unordered_map<uint64_t, Texture> m_textures;
         uint64_t m_uploads = 0;
+        uint64_t m_decodes = 0;
     };
 
     // Index of palette entry `index` in a CSM1 palette stored as a 16-pixel-wide CT32 / CT16 image: (x, y).
