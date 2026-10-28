@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace ps2x::native
@@ -28,6 +29,8 @@ namespace ps2x::native
         void registers(const uint8_t *data, size_t bytes);
         // Submits the batch being built (a draw call per material change otherwise).
         void flush();
+        // What the next packets come from (a microprogram's address, for PS2X_NATIVE_LOG_GIF=2's statistics).
+        void setSource(uint32_t source) { m_source = source; }
 
     private:
         struct Kick
@@ -53,6 +56,7 @@ namespace ps2x::native
         Material m_batchMaterial;
         bool m_batchOpen = false;
         std::vector<Vertex> m_triangles;
+        uint32_t m_source = 0;
     };
 }
 

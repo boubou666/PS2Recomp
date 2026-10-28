@@ -1,5 +1,6 @@
 #include "runtime/native/native_gif.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -266,6 +267,51 @@ namespace ps2x::native
 
     void GifToNative::emit(const Kick *kicks, int count)
     {
+        // PS2X_NATIVE_LOG_GIF=2: per source and primitive type, how many and their average size on screen (pixels),
+        // every 20000 primitives.
+        static const bool s_stats = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_LOG_GIF");
+            return value && *value == '2';
+        }();
+        if (s_stats)
+        {
+            struct Stat
+            {
+                uint64_t count = 0;
+                double width = 0, height = 0;
+            };
+            static std::unordered_map<uint64_t, Stat> s_byKind;
+            static uint64_t s_total = 0;
+            float x0 = kicks[0].x, x1 = x0, y0 = kicks[0].y, y1 = y0;
+            for (int i = 1; i < count; ++i)
+            {
+                x0 = std::min(x0, kicks[i].x), x1 = std::max(x1, kicks[i].x);
+                y0 = std::min(y0, kicks[i].y), y1 = std::max(y1, kicks[i].y);
+            }
+            static int s_dumps = 0;
+            if ((m_source & 0xffffu) == 0u && s_dumps < 12)
+            {
+                ++s_dumps;
+                std::fprintf(stderr, "[native] gif source %#x prim %#llx:", m_source, static_cast<unsigned long long>(m_prim));
+                for (int i = 0; i < count; ++i)
+                    std::fprintf(stderr, " (%.2f %.2f %.1f uv %.3f %.3f %08x)", kicks[i].x, kicks[i].y, kicks[i].z, kicks[i].u, kicks[i].v, kicks[i].rgba);
+                std::fprintf(stderr, "\n");
+            }
+            Stat &stat = s_byKind[(static_cast<uint64_t>(m_source) << 8) | (m_prim & 0x7fu)];
+            ++stat.count;
+            stat.width += x1 - x0;
+            stat.height += y1 - y0;
+            if (++s_total % 20000u == 0u)
+            {
+                for (const auto &[key, value] : s_byKind)
+                    std::fprintf(stderr, "[native] gif source %#llx prim %#llx (type %llu, abe %llu): %llu, average %.1f x %.1f\n",
+                                 static_cast<unsigned long long>(key >> 8), static_cast<unsigned long long>(key & 0xffu),
+                                 static_cast<unsigned long long>(key & 7u), static_cast<unsigned long long>((key >> 6) & 1u),
+                                 static_cast<unsigned long long>(value.count), value.width / value.count, value.height / value.count);
+                s_byKind.clear();
+            }
+        }
         const uint64_t attributes = m_prmodecont ? m_prim : m_prmode;
         const int context = (attributes >> 9) & 1u;
         const uint64_t test = m_test[context];
