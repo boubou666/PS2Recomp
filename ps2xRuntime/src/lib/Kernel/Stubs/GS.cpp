@@ -1059,10 +1059,13 @@ namespace ps2_stubs
         uint32_t fbw = (w + 63) / 64;
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
         // PMODE: read circuit 2 on, CRTMD=1, alpha from ALP, output alpha from
-        // circuit 1 (SCE_GS_SET_PMODE(0, 1, 1, 1, 0, 0)). SMODE2 keeps the
-        // interlace/field mode programmed by sceGsResetGraph.
+        // circuit 1 (SCE_GS_SET_PMODE(0, 1, 1, 1, 0, 0)). The interlace/field mode comes from libgraph's
+        // parameters (sceGsGetGParam), as in libgraph, not from SMODE2: a game may set its display before
+        // sceGsResetGraph, and the parameters then hold libgraph's defaults (interlaced NTSC, frame mode).
+        // Jade Cocoon 2 does: with SMODE2 still 0 its 224-line display got DH 223 instead of 447, and the
+        // presenter showed the top 112 lines at twice the height.
         constexpr uint64_t kDefaultPmode = 0x66u;
-        const uint64_t smode2 = runtime ? (runtime->memory().gs().smode2 & 0x3u) : 0x1u;
+        const uint64_t smode2 = (g_gparam.interlace & 0x1u) | ((g_gparam.ffmode & 0x1u) << 1u);
         // Like libgraph: scale to the 2560-clock line (MAGH) and offset from the standard origin (NTSC DX 652,
         // DY 50; PAL DX 656, DY 72, as in VP2's libgraph; half DY without interlace).
         constexpr uint32_t kGsModePal = 3u;
