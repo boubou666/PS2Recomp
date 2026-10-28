@@ -414,6 +414,12 @@ namespace
     }
 }
 
+uint32_t ps2x::native::vifUnpack(VIFRegisters &regs, uint8_t *vuData, uint32_t vuDataSize, uint32_t cmd, const uint8_t *payload,
+                                 uint32_t available)
+{
+    return executeVifUnpack(regs, vuData, vuDataSize, vuDataSize / 16u - 1u, cmd, payload, available);
+}
+
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)

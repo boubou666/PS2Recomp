@@ -852,7 +852,11 @@ void VU1Interpreter::finishXgkick()
 
     if (m_packetObserver)
         m_packetObserver(m_xgkick.packet.data(), m_xgkick.totalBytes);
-    if (m_activeMemory)
+    if (m_packetsToObserverOnly)
+    {
+        // the observer has it
+    }
+    else if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);

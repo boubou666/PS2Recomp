@@ -1,0 +1,350 @@
+#include "runtime/native/native_gif.h"
+
+#include <cmath>
+#include <cstring>
+
+namespace ps2x::native
+{
+    namespace
+    {
+        constexpr float kScreenSpace[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+        float asFloat(uint32_t bits)
+        {
+            float value;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        }
+
+        bool sameMaterial(const Material &a, const Material &b)
+        {
+            return a.tex0 == b.tex0 && a.texa == b.texa && a.textured == b.textured && a.blend == b.blend && a.alphaRef == b.alphaRef &&
+                   a.alphaTest == b.alphaTest && a.depthTest == b.depthTest && a.depthWrite == b.depthWrite && a.fog == b.fog &&
+                   a.fogColour == b.fogColour;
+        }
+    }
+
+    void GifToNative::packet(const uint8_t *data, size_t bytes) { parse(data, bytes, true); }
+
+    void GifToNative::registers(const uint8_t *data, size_t bytes) { parse(data, bytes, false); }
+
+    void GifToNative::parse(const uint8_t *data, size_t bytes, bool draw)
+    {
+        const size_t qwords = bytes / 16u;
+        size_t q = 0;
+        while (q < qwords)
+        {
+            uint64_t tag, regs;
+            std::memcpy(&tag, data + q * 16u, 8);
+            std::memcpy(&regs, data + q * 16u + 8u, 8);
+            ++q;
+            const uint32_t nloop = tag & 0x7fffu, flg = (tag >> 58) & 3u;
+            const uint32_t nreg = ((tag >> 60) & 0xfu) ? static_cast<uint32_t>((tag >> 60) & 0xfu) : 16u;
+            const bool eop = (tag >> 15) & 1u;
+            if (((tag >> 46) & 1u) && flg != 2u) // PRE: the tag's PRIM field
+                write(0x00, (tag >> 47) & 0x7ffu, draw);
+            if (flg == 0u) // PACKED
+            {
+                for (uint32_t loop = 0; loop < nloop; ++loop)
+                    for (uint32_t r = 0; r < nreg; ++r, ++q)
+                    {
+                        if (q >= qwords)
+                            return;
+                        uint32_t w[4];
+                        std::memcpy(w, data + q * 16u, 16);
+                        const uint64_t lo = w[0] | (static_cast<uint64_t>(w[1]) << 32);
+                        switch ((regs >> (4u * r)) & 0xfu)
+                        {
+                        case 0x0: write(0x00, w[0] & 0x7ffu, draw); break;
+                        case 0x1: // RGBAQ: Q from the last ST
+                            m_rgbaq = (w[0] & 0xffu) | ((w[1] & 0xffu) << 8) | ((w[2] & 0xffu) << 16) | (static_cast<uint64_t>(w[3] & 0xffu) << 24) |
+                                      (m_rgbaq & 0xffffffff00000000ull);
+                            break;
+                        case 0x2: // ST, and Q
+                            m_s = asFloat(w[0]);
+                            m_t = asFloat(w[1]);
+                            m_rgbaq = (m_rgbaq & 0xffffffffull) | (static_cast<uint64_t>(w[2]) << 32);
+                            break;
+                        case 0x3: m_uv = (w[0] & 0x3fffu) | ((w[1] & 0x3fffu) << 16); break;
+                        case 0x4: // XYZF2
+                        case 0xc: // XYZF3
+                        {
+                            const uint64_t value = (w[0] & 0xffffu) | ((w[1] & 0xffffu) << 16) | (static_cast<uint64_t>((w[2] >> 4) & 0xffffffu) << 32) |
+                                                   (static_cast<uint64_t>((w[3] >> 4) & 0xffu) << 56);
+                            const bool adc = (w[3] >> 15) & 1u;
+                            vertex(value, true, !adc && ((regs >> (4u * r)) & 0xfu) == 0x4, draw);
+                            break;
+                        }
+                        case 0x5: // XYZ2
+                        case 0xd: // XYZ3
+                        {
+                            const uint64_t value = (w[0] & 0xffffu) | ((w[1] & 0xffffu) << 16) | (static_cast<uint64_t>(w[2]) << 32);
+                            const bool adc = (w[3] >> 15) & 1u;
+                            vertex(value, false, !adc && ((regs >> (4u * r)) & 0xfu) == 0x5, draw);
+                            break;
+                        }
+                        case 0x6: write(0x06, lo, draw); break;
+                        case 0x7: write(0x07, lo, draw); break;
+                        case 0xa: m_fog = (w[3] >> 4) & 0xffu; break;
+                        case 0xe: write(w[2] & 0xffu, lo, draw); break; // A+D
+                        default: break; // CLAMP, NOP
+                        }
+                    }
+            }
+            else if (flg == 1u) // REGLIST: 64-bit register values, two per quadword
+            {
+                const size_t words = static_cast<size_t>(nloop) * nreg;
+                for (size_t i = 0; i < words; ++i)
+                {
+                    if (q * 16u + i * 8u + 8u > bytes)
+                        return;
+                    uint64_t value;
+                    std::memcpy(&value, data + q * 16u + i * 8u, 8);
+                    const uint32_t reg = (regs >> (4u * (i % nreg))) & 0xfu;
+                    if (reg == 0xeu || reg == 0xfu)
+                        continue;
+                    write(reg == 0xau ? 0x0au : reg, value, draw);
+                }
+                q += (words + 1u) / 2u;
+            }
+            else // IMAGE (a texture upload: the texture cache has it from the GS front end)
+                q += nloop;
+            if (eop)
+                break;
+        }
+    }
+
+    void GifToNative::write(uint32_t reg, uint64_t value, bool draw)
+    {
+        switch (reg)
+        {
+        case 0x00: // PRIM: a new primitive
+            m_prim = value & 0x7ffu;
+            m_queued = 0;
+            m_strip = 0;
+            break;
+        case 0x01: m_rgbaq = value; break;
+        case 0x02:
+            m_s = asFloat(static_cast<uint32_t>(value));
+            m_t = asFloat(static_cast<uint32_t>(value >> 32));
+            break;
+        case 0x03: m_uv = value; break;
+        case 0x04: vertex(value, true, true, draw); break;
+        case 0x05: vertex(value, false, true, draw); break;
+        case 0x0c: vertex(value, true, false, draw); break;
+        case 0x0d: vertex(value, false, false, draw); break;
+        case 0x06: m_tex0[0] = value; break;
+        case 0x07: m_tex0[1] = value; break;
+        case 0x0a: m_fog = (value >> 56) & 0xffu; break;
+        case 0x1a: m_prmodecont = value & 1u; break;
+        case 0x1b: m_prmode = value; break;
+        case 0x3b: m_texa = value; break;
+        case 0x3d: m_fogcol = value; break;
+        case 0x42: m_alpha[0] = value; break;
+        case 0x43: m_alpha[1] = value; break;
+        case 0x47: m_test[0] = value; break;
+        case 0x48: m_test[1] = value; break;
+        case 0x4e: m_zbuf[0] = value; break;
+        case 0x4f: m_zbuf[1] = value; break;
+        default: break;
+        }
+    }
+
+    void GifToNative::vertex(uint64_t xyz, bool withFog, bool kick, bool draw)
+    {
+        if (!draw)
+            return; // the GS draws it
+        const uint64_t attributes = m_prmodecont ? m_prim : m_prmode;
+        const int context = (attributes >> 9) & 1u;
+        Kick k;
+        k.x = static_cast<float>(xyz & 0xffffu) / 16.0f;
+        k.y = static_cast<float>((xyz >> 16) & 0xffffu) / 16.0f;
+        const uint32_t z = withFog ? static_cast<uint32_t>((xyz >> 32) & 0xffffffu) : static_cast<uint32_t>(xyz >> 32);
+        k.z = static_cast<float>(z) / Renderer::instance().gsZScale();
+        k.fog = static_cast<float>(withFog ? (xyz >> 56) & 0xffu : m_fog) / 255.0f;
+        k.rgba = static_cast<uint32_t>(m_rgbaq);
+        const uint64_t tex0 = m_tex0[context];
+        if ((attributes >> 8) & 1u) // FST: UV in texels (10.4)
+        {
+            const float tw = static_cast<float>(1u << ((tex0 >> 26) & 0xfu)), th = static_cast<float>(1u << ((tex0 >> 30) & 0xfu));
+            k.u = static_cast<float>(m_uv & 0x3fffu) / 16.0f / tw;
+            k.v = static_cast<float>((m_uv >> 16) & 0x3fffu) / 16.0f / th;
+        }
+        else
+        {
+            const float q = asFloat(static_cast<uint32_t>(m_rgbaq >> 32));
+            k.u = q != 0.0f ? m_s / q : m_s;
+            k.v = q != 0.0f ? m_t / q : m_t;
+        }
+
+        const uint32_t type = m_prim & 7u;
+        switch (type)
+        {
+        case 0: // point
+            if (kick)
+                emit(&k, 1);
+            break;
+        case 1: // line
+        case 3: // triangle
+        case 6: // sprite
+        {
+            const int needed = type == 3 ? 3 : 2;
+            m_queue[m_queued++] = k;
+            if (m_queued == needed)
+            {
+                if (kick)
+                    emit(m_queue, needed);
+                m_queued = 0;
+            }
+            break;
+        }
+        case 2: // line strip
+            if (m_queued == 1 && kick)
+            {
+                const Kick pair[2] = {m_queue[0], k};
+                emit(pair, 2);
+            }
+            m_queue[0] = k;
+            m_queued = 1;
+            break;
+        case 4: // triangle strip
+        case 5: // triangle fan
+            if (m_strip >= 2 && kick)
+            {
+                const Kick triangle[3] = {m_queue[0], m_queue[1], k};
+                emit(triangle, 3);
+            }
+            if (m_strip < 2)
+                m_queue[m_strip] = k;
+            else if (type == 4)
+            {
+                m_queue[0] = m_queue[1];
+                m_queue[1] = k;
+            }
+            else
+                m_queue[1] = k;
+            ++m_strip;
+            break;
+        default: break;
+        }
+    }
+
+    Material GifToNative::material() const
+    {
+        const uint64_t attributes = m_prmodecont ? m_prim : m_prmode;
+        const int context = (attributes >> 9) & 1u;
+        Material m;
+        m.textured = (attributes >> 4) & 1u;
+        m.tex0 = m.textured ? m_tex0[context] : 0u;
+        m.texa = m_texa;
+        m.blend = Material::Blend::Opaque;
+        if ((attributes >> 6) & 1u) // ABE
+        {
+            const uint64_t alpha = m_alpha[context];
+            const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
+            m.blend = a == 0u && b == 2u && d == 1u ? Material::Blend::Additive : Material::Blend::Alpha;
+        }
+        const uint64_t test = m_test[context];
+        const bool alphaTest = test & 1u;
+        const uint32_t atst = (test >> 1) & 7u, aref = (test >> 4) & 0xffu, afail = (test >> 12) & 3u;
+        m.depthWrite = !((m_zbuf[context] >> 32) & 1u);
+        if (alphaTest && atst == 0u && afail == 1u) // never passes, the colour still written (FB_ONLY): no depth
+            m.depthWrite = false;
+        else if (alphaTest && (atst == 5u || atst == 6u)) // GEQUAL, GREATER
+        {
+            m.alphaTest = atst == 6u || aref > 0u;
+            m.alphaRef = static_cast<uint8_t>(atst == 6u ? aref : aref - 1u);
+        }
+        const uint32_t ztst = (test >> 17) & 3u;
+        m.depthTest = ((test >> 16) & 1u) && ztst != 1u;
+        m.fog = (attributes >> 5) & 1u;
+        m.fogColour = static_cast<uint32_t>(m_fogcol & 0xffffffu);
+        return m;
+    }
+
+    void GifToNative::emit(const Kick *kicks, int count)
+    {
+        const uint64_t attributes = m_prmodecont ? m_prim : m_prmode;
+        const int context = (attributes >> 9) & 1u;
+        const uint64_t test = m_test[context];
+        if ((test & 1u) && ((test >> 1) & 7u) == 0u && ((test >> 12) & 3u) != 1u)
+            return; // the alpha test never passes and nothing is written (KEEP), or only depth (ZB_ONLY)
+        if (((test >> 16) & 1u) && ((test >> 17) & 3u) == 0u)
+            return; // depth test NEVER
+        const Material m = material();
+        if (!m_batchOpen || !sameMaterial(m, m_batchMaterial))
+        {
+            flush();
+            m_batchMaterial = m;
+            m_batchOpen = true;
+        }
+        // A constant alpha (ALPHA.C = FIX) stands in for the source alpha.
+        const uint64_t alpha = m_alpha[context];
+        const bool fixedAlpha = m.blend != Material::Blend::Opaque && ((alpha >> 4) & 3u) == 2u;
+        const bool flat = !((attributes >> 3) & 1u); // IIP = 0: the last vertex's colour
+        auto out = [&](const Kick &k, uint32_t rgba)
+        {
+            Vertex v;
+            v.x = k.x;
+            v.y = k.y;
+            v.z = k.z;
+            v.u = k.u;
+            v.v = k.v;
+            v.fog = k.fog;
+            v.rgba = fixedAlpha ? (rgba & 0x00ffffffu) | (static_cast<uint32_t>((alpha >> 32) & 0xffu) << 24) : rgba;
+            m_triangles.push_back(v);
+        };
+        const uint32_t last = kicks[count - 1].rgba;
+        if (count == 3)
+        {
+            for (int i = 0; i < 3; ++i)
+                out(kicks[i], flat ? last : kicks[i].rgba);
+            return;
+        }
+        // Quads: a sprite's two corners, a line one pixel wide, a point one pixel square.
+        Kick corner[4];
+        const uint32_t type = m_prim & 7u;
+        if (count == 2 && type == 6)
+        {
+            const Kick &a = kicks[0], &b = kicks[1];
+            corner[0] = b;
+            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = a.u, corner[0].v = a.v;
+            corner[1] = b;
+            corner[1].y = a.y, corner[1].v = a.v;
+            corner[2] = b;
+            corner[2].x = a.x, corner[2].u = a.u;
+            corner[3] = b;
+            for (Kick &c : corner)
+                c.rgba = last;
+        }
+        else if (count == 2)
+        {
+            const Kick &a = kicks[0], &b = kicks[1];
+            const float dx = b.x - a.x, dy = b.y - a.y, length = std::sqrt(dx * dx + dy * dy);
+            const float nx = length > 0.0f ? -dy / length * 0.5f : 0.5f, ny = length > 0.0f ? dx / length * 0.5f : 0.0f;
+            corner[0] = a, corner[1] = a, corner[2] = b, corner[3] = b;
+            corner[0].x += nx, corner[0].y += ny, corner[1].x -= nx, corner[1].y -= ny;
+            corner[2].x += nx, corner[2].y += ny, corner[3].x -= nx, corner[3].y -= ny;
+            if (flat)
+                for (Kick &c : corner)
+                    c.rgba = last;
+        }
+        else
+        {
+            for (Kick &c : corner)
+                c = kicks[0];
+            corner[1].x += 1.0f, corner[2].y += 1.0f, corner[3].x += 1.0f, corner[3].y += 1.0f;
+        }
+        const int order[6] = {0, 1, 2, 1, 2, 3};
+        for (int i : order)
+            out(corner[i], corner[i].rgba);
+    }
+
+    void GifToNative::flush()
+    {
+        if (!m_triangles.empty())
+            Renderer::instance().draw(m_batchMaterial, kScreenSpace, m_triangles.data(), static_cast<uint32_t>(m_triangles.size()));
+        m_triangles.clear();
+        m_batchOpen = false;
+    }
+}

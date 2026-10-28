@@ -71,6 +71,8 @@ namespace ps2x::native
         // point = M * (x, y, z, 1), then divided by w (as a VU's projection).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count);
         void endFrame();
+        // The frame being built's GS Z per unit of z / w (screen-space draws give GS Z over it).
+        float gsZScale() const { return m_building.screen.gsZScale; }
         TextureCache &textures() { return ps2x::native::textures(); }
         // Drawing inside the GS stream (runtime/native/native_gs_hook.h). The native port numbers the VU1 programs it
         // draws instead of VU1, in stream order (1, 2, ...: the VIF1 interpreter numbers the programs it skips the

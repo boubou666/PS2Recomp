@@ -279,6 +279,8 @@ public:
     // Called with every PATH1 packet an XGKICK completes (recording and replay tooling).
     using PacketObserver = std::function<void(const uint8_t *data, uint32_t size)>;
     void setPacketObserver(PacketObserver observer) { m_packetObserver = std::move(observer); }
+    // The packets go to the observer only, not to the GS (a VU1 run on a copy of VU memory: ps2x::native::Vu1Sandbox).
+    void setPacketsToObserverOnly(bool only) { m_packetsToObserverOnly = only; }
     // For callers running code that PS2Memory does not track: drop decoded instructions after changing it.
     void invalidateDecodedCode() { ++m_externalCodeGeneration; }
 
@@ -416,6 +418,7 @@ private:
     uint8_t *m_activeVuData = nullptr;
     uint32_t m_activeVuDataSize = 0;
     GS *m_activeGs = nullptr;
+    bool m_packetsToObserverOnly = false;
     PS2Memory *m_activeMemory = nullptr;
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
