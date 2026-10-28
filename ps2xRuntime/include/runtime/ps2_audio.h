@@ -33,6 +33,10 @@ public:
     // emulated time. Called on the thread that pushes SPU2 frames.
     using Spu2Mixer = std::function<void(int16_t *frames, size_t count)>;
     void setSpu2Mixer(Spu2Mixer mixer);
+    // The SPU2 on the wall clock: the stream's callback takes its frames from source as it plays them (no time
+    // stretching: nothing to catch up with).
+    using Spu2Source = std::function<void(int16_t *frames, size_t count)>;
+    void setSpu2Source(Spu2Source source);
     // Before CloseAudioDevice.
     void closeSpu2Stream();
     struct Spu2Stream;

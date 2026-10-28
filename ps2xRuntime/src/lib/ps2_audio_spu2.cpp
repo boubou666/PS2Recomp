@@ -60,6 +60,7 @@ struct PS2AudioBackend::Spu2Stream
     uint64_t pushedFrames = 0;
     uint64_t pulledFrames = 0;
     std::chrono::steady_clock::time_point nextStats = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    PS2AudioBackend::Spu2Source source; // the SPU2 on the wall clock (setSpu2Source)
 
     void reportStats()
     {
@@ -93,7 +94,17 @@ struct PS2AudioBackend::Spu2Stream
     void pull(int16_t *out, unsigned int frames)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        stretcher.pull(out, frames);
+        if (source)
+        {
+            source(out, frames);
+            if (wav.is_open())
+            {
+                wav.write(reinterpret_cast<const char *>(out), static_cast<std::streamsize>(frames * 4u));
+                wavBytes += static_cast<uint32_t>(frames * 4u);
+            }
+        }
+        else
+            stretcher.pull(out, frames);
         pulledFrames += frames;
     }
 
@@ -166,6 +177,20 @@ void PS2AudioBackend::pushSpu2Frames(const int16_t *frames, size_t count)
         }
     }
     m_spu2->push(frames, count);
+}
+
+void PS2AudioBackend::setSpu2Source(Spu2Source source)
+{
+    if (source && !m_spu2)
+    {
+        const int16_t silence[2] = {0, 0};
+        pushSpu2Frames(silence, 1u); // opens the stream (and PS2X_SPU2_WAV) as the first pushed frames would
+    }
+    if (m_spu2)
+    {
+        std::lock_guard<std::mutex> lock(m_spu2->mutex);
+        m_spu2->source = std::move(source);
+    }
 }
 
 void PS2AudioBackend::setSpu2Mixer(Spu2Mixer mixer)

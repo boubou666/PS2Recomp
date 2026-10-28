@@ -2,7 +2,9 @@
 
 #include <array>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <functional>
 #include <string>
 #include <vector>
@@ -79,6 +81,14 @@ namespace ps2x::iop::detail
         // Hands the frames mixed so far to the output sink (otherwise sent 256 at a time).
         void flush();
 
+        // On the wall clock (PS2X_SPU2_WALLCLOCK=1), as the console's SPU2 runs on its own 48 kHz clock: the host's
+        // audio callback pulls the frames it plays (pull, any thread) and the mixing (voices, envelopes, the AutoDMA
+        // input, reverb) advances by them, whatever the game's frame rate or the IOP's clock. advanceTo then only
+        // completes the transfers that are not AutoDMA (on the IOP clock, as before) and hands the IOP the interrupts
+        // the mixing raised. Register and DMA accesses and the mixing take a lock.
+        [[nodiscard]] bool wallClock() const noexcept { return m_wallClock; }
+        void pull(int16_t *frames, size_t count);
+
         [[nodiscard]] const Stats &stats() const noexcept { return m_stats; }
         // The last DMA events (start, AutoDMA start, finish, stop by software), printed when an IOP thread is found
         // waiting for a transfer that does not end.
@@ -89,6 +99,13 @@ namespace ps2x::iop::detail
         void setRamWord(uint32_t address, uint16_t value) noexcept { m_ram[address & (RamWords - 1u)] = value; }
 
     private:
+        // The interrupts the mixing raised on the wall clock, for the IOP's thread (deliverDeferred).
+        void raise(int irq);
+        void deliverDeferred();
+        bool m_wallClock = false;
+        std::recursive_mutex m_mutex;
+        std::atomic<uint32_t> m_deferredIrqs{0};
+
         struct Envelope
         {
             enum class Phase : uint8_t

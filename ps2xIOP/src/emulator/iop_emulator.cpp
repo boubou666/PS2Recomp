@@ -242,6 +242,8 @@ namespace ps2x::iop::detail
             spu2.setClock(&totalCycles);
             spu2.setInterruptSink([this](int irq)
                                   { pendingDmaInterrupts[irq] = totalCycles; });
+            if (spu2.wallClock())
+                host.setAudioSource([this](int16_t *frames, size_t count) { spu2.pull(frames, count); });
             spu2.setOutputSink([this](const int16_t *frames, size_t count)
                                { host.submitAudio(frames, count); });
             for (int port = 0; port < 2; ++port)
@@ -339,6 +341,13 @@ namespace ps2x::iop::detail
                                  activeCpu ? activeCpu->pc : 0u);
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
             }
+        }
+
+        ~Impl()
+        {
+            // The host's audio callback must not call into a SPU2 that is gone.
+            if (spu2.wallClock())
+                host.setAudioSource({});
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const

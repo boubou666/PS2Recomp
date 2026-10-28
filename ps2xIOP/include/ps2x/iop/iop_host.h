@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -181,6 +182,13 @@ namespace ps2x::iop
         {
             (void)frames;
             (void)count;
+        }
+
+        // SPU2 output on the wall clock (PS2X_SPU2_WALLCLOCK=1): the host's audio callback calls source for the frames
+        // it plays (interleaved 16-bit stereo, 48 kHz), instead of the SPU2 submitting them; an empty source stops.
+        virtual void setAudioSource(std::function<void(int16_t *frames, size_t count)> source)
+        {
+            (void)source;
         }
 
         virtual void log(LogLevel level, std::string_view message) = 0;
