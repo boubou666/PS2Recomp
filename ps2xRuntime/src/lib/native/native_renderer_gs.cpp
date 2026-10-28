@@ -248,6 +248,17 @@ void main()
                 m_stream.pop_front();
             }
         }
+        // PS2X_NATIVE_GS_LOG=1: the first markers, their batches and the target they draw into.
+        static const bool s_log = [] { const char *v = std::getenv("PS2X_NATIVE_GS_LOG"); return v && *v == '1'; }();
+        static int s_logged = 0;
+        if (s_log && s_logged < 40)
+        {
+            ++s_logged;
+            std::fprintf(stderr, "[native-gs] group %llu: %zu batch(es), target fb %u %ux%u off %u,%u scissor %u,%u-%u,%u tex0 %#llx\n",
+                         static_cast<unsigned long long>(group), batches.size(), target.framebuffer, target.width, target.height,
+                         target.xOffset, target.yOffset, target.scissorX0, target.scissorY0, target.scissorX1, target.scissorY1,
+                         static_cast<unsigned long long>(target.tex0));
+        }
         if (target.framebuffer == 0u)
         {
             // A GS renderer without GL targets (CPU, paraLLEl): present() draws these groups, clipped as the GS has
