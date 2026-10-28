@@ -3,7 +3,6 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/gs_texture_page_cache.h"
-#include "runtime/native/native_renderer.h"
 #include "runtime/native/native_texture_cache.h"
 
 // raylib's OpenGL 3.3 loader: its function pointers are loaded by raylib for the window context and stay valid on a
@@ -473,7 +472,7 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     const uint64_t bitbltbuf = static_cast<uint64_t>(target.fbp * 32u) << 32 | static_cast<uint64_t>(target.fbw) << 48 |
                                static_cast<uint64_t>(0x00u) << 56;
     const uint64_t trxreg = static_cast<uint64_t>(width) | static_cast<uint64_t>(height) << 32;
-    ps2x::native::Renderer::instance().textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
+    ps2x::native::textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
 }
 
 void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
@@ -607,7 +606,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
         const uint64_t tex0 = rawTex0(context.tex0);
         const uint64_t texa = rawTexa(state.texa);
         const std::shared_ptr<const ps2x::native::TextureCache::Texture> decoded =
-            ps2x::native::Renderer::instance().textures().texture(tex0, texa);
+            ps2x::native::textures().texture(tex0, texa);
         if (!decoded || decoded->width == 0u || decoded->height == 0u || decoded->rgba.empty())
             return false;
         const uint64_t version = decoded->version;

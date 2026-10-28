@@ -1428,8 +1428,8 @@ bool PS2Runtime::initialize(const char *title)
         {
             if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
             {
-                // The front end then feeds the shared texture cache every upload (native/native_renderer.h).
-                ps2x::native::Renderer::instance().setEnabled(true);
+                // The front end then feeds the shared texture cache every upload (native/native_texture_cache.h).
+                ps2x::native::setUploadsWanted(true);
                 m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
             }
         }

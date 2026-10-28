@@ -21,7 +21,7 @@
 #include "runtime/gs/gs_native_backend.h"
 #include "runtime/gs/gs_texture_page_cache.h"
 #include "runtime/gs/ps2_gs_memory.h"
-#include "runtime/native/native_renderer.h"
+#include "runtime/native/native_texture_cache.h"
 #include "raylib.h"
 #endif
 
@@ -270,7 +270,7 @@ namespace
             InitWindow(64, 64, "ps2_gs_replay");
             shared = GSNativeBackend::createSharedContext();
         }
-        ps2x::native::Renderer::instance().setEnabled(true);
+        ps2x::native::setUploadsWanted(true);
         std::vector<uint8_t> linear(1024u * 1024u * 4u);
         GSMem::TexturePageCache cache;
         cache.Invalidate();
@@ -280,7 +280,7 @@ namespace
                 const uint32_t c = GSMem::ReadTexture(cache, vram.data(), 0x00u, 0u, 16u, x, y);
                 std::memcpy(&linear[(static_cast<size_t>(y) * 1024u + x) * 4u], &c, 4u);
             }
-        ps2x::native::Renderer::instance().textures().upload(16ull << 48, 0u, 1024ull | (1024ull << 32), linear.data(),
+        ps2x::native::textures().upload(16ull << 48, 0u, 1024ull | (1024ull << 32), linear.data(),
                                                              linear.size());
         gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
     }
