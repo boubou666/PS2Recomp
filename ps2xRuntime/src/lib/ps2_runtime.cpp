@@ -138,6 +138,8 @@ namespace ps2_stubs
 // Runtime that receives GS SIGNAL/FINISH edge notifications (see ps2NotifyGsCsrEdge).
 static std::atomic<PS2Runtime *> g_gsCsrEdgeRuntime{nullptr};
 
+void ps2GsRequestRecording(); // gs_frontend.cpp
+
 static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
@@ -3547,6 +3549,8 @@ void PS2Runtime::run()
         }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        if (IsKeyPressed(KEY_F10)) // F10: start the GS recording (PS2X_GS_RECORD with PS2X_GS_RECORD_AT=key)
+            ps2GsRequestRecording();
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();

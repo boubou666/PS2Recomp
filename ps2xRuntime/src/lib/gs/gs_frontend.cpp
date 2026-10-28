@@ -185,7 +185,7 @@ namespace
 {
     // PS2X_GS_RECORD=<file> (+ PS2X_GS_RECORD_AT=<sec> from process start, PS2X_GS_RECORD_SECONDS=<sec>, default 10):
     // records the commands the GS thread processes, with VRAM and the drawing state at the start, for
-    // ps2_gs_replay.
+    // ps2_gs_replay. PS2X_GS_RECORD_AT=key starts it when ps2GsRequestRecording() is called (F10 in the runner).
     struct GsRecorder
     {
         FILE *out = nullptr;
@@ -210,7 +210,7 @@ namespace
                 return;
             }
             if (const char *at = std::getenv("PS2X_GS_RECORD_AT"))
-                startAt = std::atof(at);
+                startAt = std::strcmp(at, "key") == 0 ? -1.0 : std::atof(at);
             if (const char *duration = std::getenv("PS2X_GS_RECORD_SECONDS"))
                 seconds = std::atof(duration);
             out = std::fopen(path, "wb");
@@ -225,6 +225,12 @@ namespace
         }
     };
     [[maybe_unused]] const double g_gsRecorderClock = GsRecorder::sinceProcessStart();
+    std::atomic<bool> g_gsRecordRequested{false};
+}
+
+void ps2GsRequestRecording()
+{
+    g_gsRecordRequested.store(true, std::memory_order_relaxed);
 }
 
 bool GS::shouldQueue() const
@@ -469,7 +475,8 @@ void GS::workerLoop()
         if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow && !m_parallel)
         {
             const double now = GsRecorder::sinceProcessStart();
-            if (!recorder.started && now >= recorder.startAt && m_backend)
+            const bool due = recorder.startAt < 0.0 ? g_gsRecordRequested.load(std::memory_order_relaxed) : now >= recorder.startAt;
+            if (!recorder.started && due && m_backend)
             {
                 const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
                 // No image transfer in flight: none set up, or the last one complete (a game uploading every frame
