@@ -454,6 +454,25 @@ void GS::submitNativeBatch(void *user, const ps2x::native::Material &material, c
         }
         if (!behind)
             gs.m_backend->Submit(batch);
+        // PS2X_NATIVE_GS_STATS=1: every 2 s, the triangles submitted, those behind the camera, and the last target.
+        static const bool s_stats = [] { const char *v = std::getenv("PS2X_NATIVE_GS_STATS"); return v && *v == '1'; }();
+        if (s_stats)
+        {
+            static uint64_t s_sent = 0, s_behind = 0;
+            static auto s_since = std::chrono::steady_clock::now();
+            ++(behind ? s_behind : s_sent);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_since >= std::chrono::seconds(2))
+            {
+                const GSContext &c = batch.state.context;
+                std::fprintf(stderr, "[native-gs] 2 s: %llu triangles to the back end, %llu behind; last fbp %u psm %u zbp %u test %#llx prim tme %d fge %d abe %d ctxt %d\n",
+                             static_cast<unsigned long long>(s_sent), static_cast<unsigned long long>(s_behind),
+                             c.frame.fbp, c.frame.psm, c.zbuf.zbp, static_cast<unsigned long long>(c.test),
+                             prim.tme, prim.fge, prim.abe, prim.ctxt);
+                s_sent = s_behind = 0;
+                s_since = now;
+            }
+        }
     }
 }
 
