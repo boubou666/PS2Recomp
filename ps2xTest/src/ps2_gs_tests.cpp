@@ -616,6 +616,39 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
         });
 
+        tc.Run("sceGsSetDefDBuff takes ztest, zpsm and clear from $t0-$t2, not from the stack", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x4000u;
+            constexpr uint32_t kZbuf1Offset = 0x60u + 0x10u;
+            constexpr uint32_t kZtestGequal = 2u;
+            constexpr uint32_t kPsmz24 = 0x31u;
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 640u);
+            setRegU32(ctx, 7, 448u);
+            setRegU32(ctx, 8, kZtestGequal);
+            setRegU32(ctx, 9, kPsmz24);
+            setRegU32(ctx, 10, 1u);
+            setRegU32(ctx, 29, 0x8000u);
+            ps2_stubs::sceGsSetDefDBuff(rdram.data(), &ctx, &runtime);
+
+            uint64_t zbuf1 = 0u;
+            std::memcpy(&zbuf1, rdram.data() + kEnvAddr + kZbuf1Offset, sizeof(zbuf1));
+            t.Equals((zbuf1 >> 24) & 0xFull, 1ull, "ZBUF PSM should be PSMZ24 from $t1");
+            t.Equals((zbuf1 >> 32) & 0x1ull, 0ull, "ZBUF ZMSK should stay clear when $t0 enables the depth test");
+
+            constexpr uint32_t kClear0RgbaqRegOffset = 0xE0u + 0x28u;
+            uint64_t clearRgbaqReg = 0u;
+            std::memcpy(&clearRgbaqReg, rdram.data() + kEnvAddr + kClear0RgbaqRegOffset, sizeof(clearRgbaqReg));
+            t.Equals(clearRgbaqReg, 0x01ull, "a non-zero clear in $t2 should seed the clear packet (RGBAQ register pair)");
+        });
+
         tc.Run("sceGsSetDefDispEnv counts DH in frame lines: twice the buffer height in interlaced FRAME mode", [](TestCase &t)
         {
             PS2Runtime runtime;
