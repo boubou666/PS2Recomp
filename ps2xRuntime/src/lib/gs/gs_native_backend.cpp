@@ -646,7 +646,9 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     const uint32_t width = target.fbw * 64u;
     const uint32_t height = target.usedHeight;
     target.dirty = false;
-    if (width == 0u || height == 0u || width > target.width)
+    // PS2X_GS_NATIVE_NORESOLVE=1: skip resolves (wrong pictures), to time what they cost.
+    static const bool noResolve = std::getenv("PS2X_GS_NATIVE_NORESOLVE") != nullptr;
+    if (noResolve || width == 0u || height == 0u || width > target.width)
         return;
     // The pixels as a host-to-local CT32 transfer at the frame's base: rows top first (GL row 0 is GS row 0), alpha
     // as the GS stores it.
