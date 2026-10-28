@@ -974,7 +974,12 @@ void GSNativeBackend::resolveAllTargets()
                 continue;
             if (std::memcmp(gpu.data() + block * 64u, m_vram + static_cast<size_t>(block) * 256u, 256u) != 0 &&
                 differing++ < 40u)
-                std::fprintf(stderr, "[gs:native] vram check: block %u (page %u) differs\n", block, block / 32u);
+            {
+                uint32_t cpu = 0;
+                std::memcpy(&cpu, m_vram + static_cast<size_t>(block) * 256u, 4u);
+                std::fprintf(stderr, "[gs:native] vram check: block %u (page %u) differs: gpu %08x cpu %08x dirty %u\n",
+                             block, block / 32u, gpu[block * 64u], cpu, m_dirtyBlocks[block]);
+            }
         }
         std::fprintf(stderr, "[gs:native] vram check: %u blocks differ\n", differing);
     }
