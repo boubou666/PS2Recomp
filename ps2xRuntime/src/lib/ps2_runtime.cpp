@@ -896,6 +896,28 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    // PS2X_IOP_WALLCLOCK=1: the IOP's time follows the host's clock (in EE cycles, the IOP running at an eighth),
+    // not the EE cycles the game ran: its timers, vblank interrupts and scheduler, and so the sound drivers' ticks,
+    // keep real time whatever the frame rate. A gap longer than 50 ms (a pause, a debugger) counts as 50 ms.
+    static const bool s_wallClock = []
+    {
+        const char *value = std::getenv("PS2X_IOP_WALLCLOCK");
+        return value && *value == '1';
+    }();
+    if (s_wallClock)
+    {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point s_last = Clock::now();
+        static double s_carry = 0.0;
+        const Clock::time_point now = Clock::now();
+        const double seconds = std::min(std::chrono::duration<double>(now - s_last).count(), 0.05);
+        s_last = now;
+        const double cycles = seconds * 294912000.0 + s_carry;
+        eeCycles = static_cast<uint64_t>(cycles);
+        s_carry = cycles - static_cast<double>(eeCycles);
+        if (eeCycles == 0u)
+            return;
+    }
     if (!m_iopThreaded.load(std::memory_order_relaxed))
     {
         m_iopSubsystem->runEeCycles(eeCycles);

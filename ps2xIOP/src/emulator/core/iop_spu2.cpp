@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -499,6 +500,25 @@ namespace ps2x::iop::detail
 
     void IopSpu2::keyOn(int coreIndex, uint32_t mask)
     {
+        // PS2X_SPU2_KEYON_LOG=1: the key-ons so far every 10 s of wall time (how many sounds start per real second,
+        // to compare the sound drivers' tempo between runs at different frame rates).
+        static const bool s_log = []
+        {
+            const char *value = std::getenv("PS2X_SPU2_KEYON_LOG");
+            return value && *value == '1';
+        }();
+        if (s_log)
+        {
+            using Clock = std::chrono::steady_clock;
+            static const Clock::time_point s_start = Clock::now();
+            static double s_next = 10.0;
+            const double elapsed = std::chrono::duration<double>(Clock::now() - s_start).count();
+            if (elapsed >= s_next)
+            {
+                s_next += 10.0;
+                std::fprintf(stderr, "[spu2:keyon] %.0f s: %llu key-ons\n", elapsed, static_cast<unsigned long long>(m_stats.keyOns));
+            }
+        }
         Core &core = m_cores[coreIndex];
         for (int index = 0; index < 24; ++index)
         {
