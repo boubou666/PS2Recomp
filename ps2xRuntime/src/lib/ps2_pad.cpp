@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+uint64_t ps2CurrentEeCycle(); // ps2_runtime.cpp
+
 namespace
 {
     constexpr uint8_t kPadAnalogMarker = 0x73;
@@ -42,6 +44,17 @@ namespace
     };
 
     const auto g_processStart = std::chrono::steady_clock::now();
+
+    // The pad scripts' clock, in seconds: wall time since the process started, or with PS2X_PAD_CLOCK=ee the EE's
+    // own emulated time (cycles / 294.912 MHz), which a replay follows far more closely than wall time when loads
+    // or the frame rate differ from the recorded session. Recording (PS2X_PAD_RECORD) uses the same clock.
+    double padClockSeconds()
+    {
+        static const bool ee = [] { const char *v = std::getenv("PS2X_PAD_CLOCK"); return v && std::strcmp(v, "ee") == 0; }();
+        if (ee)
+            return static_cast<double>(ps2CurrentEeCycle()) / 294912000.0;
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+    }
 
     uint16_t scriptButton(const std::string &name)
     {
@@ -199,7 +212,7 @@ namespace
             return;
         static const char *const kNames[16] = {"SELECT", "L3", "R3", "START", "UP", "RIGHT", "DOWN", "LEFT",
                                                "L2", "R2", "L1", "R1", "TRIANGLE", "CIRCLE", "CROSS", "SQUARE"};
-        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+        const double now = padClockSeconds();
         for (int bit = 0; bit < 16; ++bit)
         {
             const uint16_t mask = static_cast<uint16_t>(1u << bit);
@@ -220,7 +233,7 @@ namespace
         static const char *const liveInput = std::getenv("PS2X_PAD_INPUT");
         if (script.empty() && !liveInput)
             return 0;
-        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+        const double now = padClockSeconds();
         uint16_t down = buttonsDownAt(script, now);
         if (liveInput)
         {
@@ -251,7 +264,7 @@ namespace
         static const std::vector<ScriptedPress> script = parsePadScript(std::getenv("PS2X_PAD2_SCRIPT"));
         if (script.empty())
             return 0;
-        return buttonsDownAt(script, std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count());
+        return buttonsDownAt(script, padClockSeconds());
     }
 }
 
