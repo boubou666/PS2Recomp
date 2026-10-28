@@ -1577,12 +1577,19 @@ void GSNativeBackend::flushBatch()
 void GSNativeBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
     m_vram = vram;
+    // New GS memory (or the same, reloaded): the GPU copy takes all of it again.
+    std::fill(m_dirtyBlocks.begin(), m_dirtyBlocks.end(), uint8_t{1});
+    m_anyDirty = true;
+    std::fill(m_gpuNewer.begin(), m_gpuNewer.end(), uint8_t{0});
+    m_anyGpuNewer = false;
     m_memory->Initialize(vram, vramSize);
 }
 
 void GSNativeBackend::Reset()
 {
     m_batch.clear();
+    std::fill(m_dirtyBlocks.begin(), m_dirtyBlocks.end(), uint8_t{1});
+    m_anyDirty = true;
     m_memory->Reset();
 }
 
