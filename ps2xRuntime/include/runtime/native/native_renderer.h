@@ -24,6 +24,7 @@ namespace ps2x::native
         float x = 0, y = 0, z = 0; // the object's space: the draw's matrix takes it to PS2 screen space
         float u = 0, v = 0;        // texture coordinates, 0..1 across the texture (the GS's S / Q, T / Q)
         uint32_t rgba = 0;         // lit colour, R in the low byte; 0x80 per channel is 1.0, as the GS modulates
+        float fog = 1.0f;          // the GS's F / 255: 1 keeps the colour, 0 is all fog colour (Material::fog)
     };
 
     // How a draw blends and tests, from the GS registers a game sets (ALPHA, TEST) reduced to what a PC GPU does.
@@ -42,6 +43,8 @@ namespace ps2x::native
         bool alphaTest = false;
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
         bool depthWrite = true;
+        bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
+        uint32_t fogColour = 0;     // FOGCOL, R in the low byte
     };
 
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size
@@ -68,7 +71,17 @@ namespace ps2x::native
 
         // Present thread: draws the latest frame into the given window rectangle; false when there is none yet.
         bool present(float x, float y, float width, float height);
+        // The GS frame shown with the native one (a GL texture): PS2X_NATIVE_CAPTURE_DIR saves it with each capture.
+        void setGsFrame(unsigned int textureId, int width, int height, int format)
+        {
+            m_gsFrame[0] = static_cast<int>(textureId);
+            m_gsFrame[1] = width;
+            m_gsFrame[2] = height;
+            m_gsFrame[3] = format;
+        }
         bool enabled() const { return m_enabled; }
+        // The latest published frame has something to draw (not a menu or a movie the native port does not draw yet).
+        bool hasDraws();
         void setEnabled(bool on)
         {
             m_enabled = on;
@@ -81,6 +94,9 @@ namespace ps2x::native
             Material material;
             float matrix[16];
             uint32_t first = 0, count = 0;
+            // Taken from the texture cache when the batch is drawn (the game's thread, in stream order): games reuse
+            // texture memory before the frame is presented.
+            std::shared_ptr<const TextureCache::Texture> texture;
         };
         struct Frame
         {
@@ -97,6 +113,7 @@ namespace ps2x::native
         Frame m_building;
         std::mutex m_mutex;
         std::shared_ptr<Frame> m_published;
+        int m_gsFrame[4] = {}; // id, width, height, pixel format
         std::unique_ptr<Gpu> m_gpu; // present thread only
         bool m_enabled = false;
     };
