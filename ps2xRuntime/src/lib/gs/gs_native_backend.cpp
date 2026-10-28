@@ -260,6 +260,43 @@ void main()
 }
 )";
 
+    // GL state a helper changes while flushBatch has the draw set up (a resolve or the GPU copy's set-up from inside
+    // bindTexture): saved on construction, put back on destruction.
+    struct GlStateRestore
+    {
+        GLint drawFramebuffer = 0, readFramebuffer = 0, program = 0, vertexArray = 0, activeTexture = 0;
+        GLint viewport[4] = {}, scissorBox[4] = {};
+        GLboolean scissor = GL_FALSE, depth = GL_FALSE, blend = GL_FALSE, colorMask[4] = {};
+        GlStateRestore()
+        {
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+            glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+            glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vertexArray);
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+            glGetIntegerv(GL_VIEWPORT, viewport);
+            glGetIntegerv(GL_SCISSOR_BOX, scissorBox);
+            scissor = glIsEnabled(GL_SCISSOR_TEST);
+            depth = glIsEnabled(GL_DEPTH_TEST);
+            blend = glIsEnabled(GL_BLEND);
+            glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+        }
+        ~GlStateRestore()
+        {
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFramebuffer));
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFramebuffer));
+            glUseProgram(static_cast<GLuint>(program));
+            glBindVertexArray(static_cast<GLuint>(vertexArray));
+            glActiveTexture(static_cast<GLenum>(activeTexture));
+            glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            glScissor(scissorBox[0], scissorBox[1], scissorBox[2], scissorBox[3]);
+            (scissor ? glEnable : glDisable)(GL_SCISSOR_TEST);
+            (depth ? glEnable : glDisable)(GL_DEPTH_TEST);
+            (blend ? glEnable : glDisable)(GL_BLEND);
+            glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+        }
+    };
+
     GLuint compileShader(GLenum type, const char *source)
     {
         const GLuint shader = glCreateShader(type);
@@ -713,6 +750,7 @@ void GSNativeBackend::ensureVram()
 {
     if (m_vramTexture)
         return;
+    const GlStateRestore restore;
     glGenTextures(1, &m_vramTexture);
     glBindTexture(GL_TEXTURE_2D, m_vramTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
@@ -786,6 +824,7 @@ void GSNativeBackend::pullGpuPages()
 {
     if (!m_anyGpuNewer || !m_vram || !m_vramFramebuffer || !ensureContext())
         return;
+    const GlStateRestore restore;
     m_anyGpuNewer = false;
     syncVramToGpu();
     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
@@ -808,6 +847,7 @@ bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
     ensureVram();
     if (!m_resolveProgram)
         return false;
+    const GlStateRestore restore;
     // Transfers before this resolve land first, then the target's pixels over them, all on the GPU copy.
     syncVramToGpu();
     const uint32_t pageRows = kind == 0 ? 32u : 64u;
