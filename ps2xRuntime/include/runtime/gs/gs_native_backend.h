@@ -82,6 +82,7 @@ private:
         bool dirty = false;      // drawn since its pixels were last written to GS memory (resolveTarget)
         uint32_t zbp = ~0u;      // the ZBUF its depth buffer was last written as (pages), for depth read as a texture
         uint8_t zpsm = 0;
+        bool alphaWritten = false; // a draw wrote its alpha (else GS memory's top bytes stay what they were)
     };
 
     struct Vertex

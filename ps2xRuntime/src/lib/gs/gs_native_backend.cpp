@@ -802,7 +802,8 @@ void GSNativeBackend::pullGpuPages()
 bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
 {
     const int kind = target.psm == 0x00u ? 0 : target.psm == 0x02u ? 1 : target.psm == 0x0Au ? 2 : -1;
-    if (kind < 0 || !m_vram)
+    // A CT32 target whose alpha was never drawn (FBMSK kept it): GS memory's top bytes must stay, the CPU path does.
+    if (kind < 0 || !m_vram || (kind == 0 && !target.alphaWritten))
         return false;
     ensureVram();
     if (!m_resolveProgram)
@@ -891,7 +892,8 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
                     uint32_t v = 0;
                     std::memcpy(&v, &pixels[i * 4u], 4u);
                     // CT24 leaves the top byte alone (where a game keeps T8H / T4HL / T4HH textures, the GS too).
-                    (target.psm == 0x01u ? GSMem::WriteCT24 : GSMem::WriteCT32)(m_vram, bp, bw, x, y, v);
+                    (target.psm == 0x01u || !target.alphaWritten ? GSMem::WriteCT24 : GSMem::WriteCT32)(m_vram, bp, bw, x,
+                                                                                                         y, v);
                 }
                 else
                 {
@@ -917,6 +919,7 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     RenderTarget &target = renderTarget(frame);
     target.dirty = true;
     target.usedHeight = target.height; // what another renderer draws is not tracked: resolve it whole
+    target.alphaWritten = true;
     target.zbp = zbuf.zbp;
     target.zpsm = zbuf.psm;
     out.framebuffer = target.framebuffer;
@@ -1400,6 +1403,7 @@ void GSNativeBackend::flushBatch()
     const uint32_t fbmsk = context.frame.fbmsk;
     const bool keepAlpha = (fbmsk >> 24) == 0xFFu || context.frame.psm == 0x01u;
     glColorMask((fbmsk & 0xFFu) != 0xFFu, (fbmsk >> 8 & 0xFFu) != 0xFFu, (fbmsk >> 16 & 0xFFu) != 0xFFu, !keepAlpha);
+    target.alphaWritten = target.alphaWritten || !keepAlpha;
     glDisable(GL_CULL_FACE);
     if (offBlend)
         glDisable(GL_BLEND);
@@ -1843,6 +1847,8 @@ bool GSNativeBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     glClearColor(static_cast<float>(rgba & 0xFFu) / 255.0f, static_cast<float>(rgba >> 8 & 0xFFu) / 255.0f,
                  static_cast<float>(rgba >> 16 & 0xFFu) / 255.0f, static_cast<float>(rgba >> 24 & 0xFFu) / 255.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    target.dirty = true;
+    target.alphaWritten = true;
     return true;
 }
 
