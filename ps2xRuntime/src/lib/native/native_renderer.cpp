@@ -161,6 +161,18 @@ void main()
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
         m_building.vertices.insert(m_building.vertices.end(), vertices, vertices + count);
+        if (m_streamDraws)
+        {
+            StreamBatch entry;
+            entry.group = m_group;
+            entry.gsZScale = m_building.screen.gsZScale;
+            entry.batch = batch;
+            entry.vertices.assign(vertices, vertices + count);
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            m_stream.push_back(std::move(entry));
+            if (m_stream.size() > 65536u) // nobody drains them (no GS markers): keep the latest frames' worth
+                m_stream.pop_front();
+        }
         m_building.batches.push_back(batch);
     }
 
@@ -174,6 +186,8 @@ void main()
 
     bool Renderer::hasDraws()
     {
+        if (m_drewIntoGs.load(std::memory_order_relaxed))
+            return false;
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_published && !m_published->batches.empty();
     }
@@ -185,8 +199,8 @@ void main()
             std::lock_guard<std::mutex> lock(m_mutex);
             frame = m_published;
         }
-        if (!frame || !m_enabled)
-            return false;
+        if (!frame || !m_enabled || m_drewIntoGs.load(std::memory_order_relaxed))
+            return false; // or the GS frame has the native draws already (drawn into it in the GS stream)
         if (!m_gpu)
         {
             m_gpu = std::make_unique<Gpu>();

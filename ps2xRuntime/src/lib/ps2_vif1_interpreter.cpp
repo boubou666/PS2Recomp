@@ -732,6 +732,8 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
             m_vu1ProgramSkipped = ps2x::native::vu1Skipped(m_vu1Code, startPC);
+            if (m_vu1ProgramSkipped && m_vu1SkipCallback)
+                m_vu1SkipCallback(startPC);
             if (m_vu1MscalCallback && !m_vu1ProgramSkipped)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;

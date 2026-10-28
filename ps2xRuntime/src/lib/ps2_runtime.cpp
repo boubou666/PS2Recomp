@@ -1317,6 +1317,13 @@ bool PS2Runtime::syncCoreSubsystems()
     // completion. A cap of 65536 cycles cut long batches (VP2 transforms hundreds of vertices per
     // call) in the middle, leaving VU memory half written and the next program working on it.
     constexpr uint32_t kVu1ProgramCycleLimit = 1u << 24;
+    // A program VU1 skips for the native port: its draws go in the GS stream where its PATH1 output would have
+    // (numbered as the native port numbers them: 1, 2, ... in stream order).
+    m_memory.setVu1SkipCallback([this](uint32_t)
+                                {
+                                    static uint64_t s_group = 0;
+                                    m_gs.queueNativeDraw(++s_group, 0);
+                                });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      // On the VIF1 worker the EE has moved on: use its FBRST from when the transfer was
