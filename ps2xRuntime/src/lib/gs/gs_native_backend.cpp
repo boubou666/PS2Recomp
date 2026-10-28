@@ -669,6 +669,30 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
         }
         pixels.resize(static_cast<size_t>(width) * height * 2u);
     }
+    // Into GS memory (where draws in another format and the GPU copy of it read), and into the texture cache for the
+    // CPU decoding path.
+    if (m_vram)
+    {
+        const uint32_t bp = target.fbp * 32u, bw = std::max<uint32_t>(target.fbw, 1u);
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * width + x;
+                if (dpsm == 0x00u)
+                {
+                    uint32_t v = 0;
+                    std::memcpy(&v, &pixels[i * 4u], 4u);
+                    GSMem::WriteCT32(m_vram, bp, bw, x, y, v);
+                }
+                else
+                {
+                    uint16_t v = 0;
+                    std::memcpy(&v, &pixels[i * 2u], 2u);
+                    (dpsm == 0x0Au ? GSMem::WriteCT16S : GSMem::WriteCT16)(m_vram, bp, bw, x, y, v);
+                }
+            }
+        markDirty(dpsm, bp, bw, 0u, 0u, width, height);
+    }
     const uint64_t bitbltbuf = static_cast<uint64_t>(target.fbp * 32u) << 32 | static_cast<uint64_t>(target.fbw) << 48 |
                                static_cast<uint64_t>(dpsm) << 56;
     const uint64_t trxreg = static_cast<uint64_t>(width) | static_cast<uint64_t>(height) << 32;
@@ -785,10 +809,14 @@ bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, m_vramTexture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    ps2x::native::textures().changedPages(m_vramGenerations, [](uint32_t page, const uint8_t *bytes) {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
-                        bytes);
-    });
+    if (m_vram)
+        for (uint32_t page = 0; page < m_dirtyPages.size(); ++page)
+            if (m_dirtyPages[page])
+            {
+                m_dirtyPages[page] = 0u;
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER,
+                                GL_UNSIGNED_INT, m_vram + static_cast<size_t>(page) * 8192u);
+            }
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
     glActiveTexture(GL_TEXTURE0);
@@ -1315,6 +1343,23 @@ void GSNativeBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclu
     m_memory->LoadClut(tex0, texclut);
 }
 
+void GSNativeBackend::markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    // The pages a rectangle of the buffer touches, every 8 pixels (no block is smaller) and at its far edges.
+    const uint32_t x1 = x + std::max<uint32_t>(w, 1u), y1 = y + std::max<uint32_t>(h, 1u);
+    for (uint32_t yy = y;; yy = std::min(yy + 8u, y1 - 1u))
+    {
+        for (uint32_t xx = x;; xx = std::min(xx + 8u, x1 - 1u))
+        {
+            m_dirtyPages[GSMem::PageOf(psm, bp, std::max<uint32_t>(bw, 1u), xx, yy) % m_dirtyPages.size()] = 1u;
+            if (xx == x1 - 1u)
+                break;
+        }
+        if (yy == y1 - 1u)
+            break;
+    }
+}
+
 void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
 {
     flushBatch();
@@ -1327,6 +1372,9 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
                          command.trxpos.dsax, command.trxpos.dsay, command.bitbltbuf.sbp, command.trxreg.rrw,
                          command.trxreg.rrh);
     }
+    if (command.direction == 0u || command.direction == 2u)
+        markDirty(command.bitbltbuf.dpsm, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.trxpos.dsax,
+                  command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
     if (command.direction == 2u && copyBetweenTargets(command))
     {
         m_memory->BeginTransfer(command);
@@ -1573,6 +1621,7 @@ uint32_t GSNativeBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uin
 
 void GSNativeBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
+    markDirty(psm, base, bw, x, y, 1u, 1u);
     m_memory->WriteVram(psm, base, bw, x, y, value);
 }
 

@@ -110,11 +110,14 @@ private:
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
     uint32_t m_depthTexture = 0;
     // The GPU decoding path (default; PS2X_GS_NATIVE_CPUDECODE=1 uses the texture cache's images): GS memory on the
-    // GPU, brought up to date page by page from the texture cache, and the formats' swizzle tables.
+    // GPU, brought up to date page by page from m_vram, and the formats' swizzle tables.
     bool bindDecodedTexture(const GSDrawState &state);
     uint32_t m_vramTexture = 0;
     uint32_t m_swizzleTexture = 0;
-    std::vector<uint32_t> m_vramGenerations;
+    // Pages of GS memory (m_vram, written in stream order by the transfers, CLUT loads and resolves) the GPU copy
+    // has not received yet.
+    std::vector<uint8_t> m_dirtyPages = std::vector<uint8_t>(512u, 1u);
+    void markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     uint32_t m_destTexture = 0; // copy of the render target for DATE
     uint32_t m_destWidth = 0;
     uint32_t m_destHeight = 0;
