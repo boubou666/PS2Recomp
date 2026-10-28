@@ -719,7 +719,11 @@ void GSNativeBackend::flushBatch()
     glScissor(context.scissor.x0, context.scissor.y0, context.scissor.x1 - context.scissor.x0 + 1,
               context.scissor.y1 - context.scissor.y0 + 1);
 
-    const bool depthTest = (context.test >> 16 & 0x1u) != 0u;
+    // PS2X_GS_NATIVE_OFF=depth|alpha|blend|color (any of them): diagnostics that turn one stage off.
+    static const char *s_off = std::getenv("PS2X_GS_NATIVE_OFF");
+    const bool offDepth = s_off && std::strstr(s_off, "depth"), offAlpha = s_off && std::strstr(s_off, "alpha");
+    const bool offBlend = s_off && std::strstr(s_off, "blend"), offColor = s_off && std::strstr(s_off, "color");
+    const bool depthTest = !offDepth && (context.test >> 16 & 0x1u) != 0u;
     if (depthTest)
     {
         static constexpr GLenum kDepthFunc[4] = {GL_NEVER, GL_ALWAYS, GL_GEQUAL, GL_GREATER};
@@ -736,7 +740,12 @@ void GSNativeBackend::flushBatch()
     const bool keepAlpha = (fbmsk >> 24) == 0xFFu || context.frame.psm == 0x01u;
     glColorMask((fbmsk & 0xFFu) != 0xFFu, (fbmsk >> 8 & 0xFFu) != 0xFFu, (fbmsk >> 16 & 0xFFu) != 0xFFu, !keepAlpha);
     glDisable(GL_CULL_FACE);
-    applyBlend(state);
+    if (offBlend)
+        glDisable(GL_BLEND);
+    else
+        applyBlend(state);
+    if (offColor)
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     glUseProgram(m_program);
     glUniform2f(m_uniforms.targetSize, static_cast<float>(target.width), static_cast<float>(target.height));
@@ -773,7 +782,7 @@ void GSNativeBackend::flushBatch()
     glUniform1i(m_uniforms.fog, state.prim.fge ? 1 : 0);
     glUniform3f(m_uniforms.fogColor, state.fogR / 255.0f, state.fogG / 255.0f, state.fogB / 255.0f);
     // TEST: ATE, ATST, AREF. A failed test keeps the pixel unwritten (AFAIL other than KEEP is not translated yet).
-    const bool alphaTest = (context.test & 0x1u) != 0u;
+    const bool alphaTest = !offAlpha && (context.test & 0x1u) != 0u;
     glUniform1i(m_uniforms.alphaTest, alphaTest ? static_cast<int>(context.test >> 1 & 0x7u) : 1);
     glUniform1f(m_uniforms.alphaRef, static_cast<float>(context.test >> 4 & 0xFFu));
 
