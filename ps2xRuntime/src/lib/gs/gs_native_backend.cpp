@@ -977,6 +977,11 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
     if (!hook)
         return;
+    // The GS thread, as Submit records it: a game whose every draw is native (all its VU1 programs on the sandbox)
+    // reaches a marker before any GS primitive, and the GL context was then never created (null targets, the
+    // frame left magenta).
+    if (m_submitThread == std::thread::id{})
+        m_submitThread = std::this_thread::get_id();
     const FrameTarget frame = frameTarget(context.frame, context.zbuf);
     ps2x::native::GsDrawTarget target;
     fillNativeRegisters(target, context);
