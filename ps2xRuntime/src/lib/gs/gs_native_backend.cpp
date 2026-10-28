@@ -690,6 +690,29 @@ void GSNativeBackend::flushBatch()
     glUniform2f(m_uniforms.targetSize, static_cast<float>(target.width), static_cast<float>(target.height));
     float texWidth = 1.0f, texHeight = 1.0f;
     const bool textured = state.prim.tme && bindTexture(state, target, texWidth, texHeight);
+    // PS2X_GS_NATIVE_DRAWLOG=<first batch>,<count>: what each batch draws, to compare a broken screen with the GS's.
+    if (static const char *drawLog = std::getenv("PS2X_GS_NATIVE_DRAWLOG"); drawLog)
+    {
+        static uint64_t s_batches = 0;
+        static const uint64_t s_first = std::strtoull(drawLog, nullptr, 10);
+        static const uint64_t s_count = [] {
+            const char *comma = std::strchr(std::getenv("PS2X_GS_NATIVE_DRAWLOG"), ',');
+            return comma ? std::strtoull(comma + 1, nullptr, 10) : 400ull;
+        }();
+        const uint64_t index = s_batches++;
+        if (index >= s_first && index < s_first + s_count)
+            std::fprintf(stderr,
+                         "[gs:draw] #%llu fbp=%u psm=0x%x fbmsk=0x%x prim=%d tme=%d textured=%d tex0 psm=0x%x tbp=%u tbw=%u "
+                         "tw=%u th=%u tfx=%u tcc=%u cbp=%u abe=%d alpha=0x%llx test=0x%llx fst=%d verts=%zu "
+                         "v0=(%.1f,%.1f a=%u) scissor=%u-%u,%u-%u\n",
+                         static_cast<unsigned long long>(index), context.frame.fbp, context.frame.psm,
+                         context.frame.fbmsk, static_cast<int>(state.prim.type), state.prim.tme ? 1 : 0,
+                         textured ? 1 : 0, context.tex0.psm, context.tex0.tbp0, context.tex0.tbw, context.tex0.tw,
+                         context.tex0.th, context.tex0.tfx, context.tex0.tcc, context.tex0.cbp, state.prim.abe ? 1 : 0,
+                         static_cast<unsigned long long>(context.alpha), static_cast<unsigned long long>(context.test),
+                         state.prim.fst ? 1 : 0, m_batch.size(), m_batch[0].x, m_batch[0].y, m_batch[0].a,
+                         context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1);
+    }
     glUniform1i(m_uniforms.textured, textured ? 1 : 0);
     glUniform2f(m_uniforms.texSize, texWidth, texHeight);
     glUniform1i(m_uniforms.sampler, 0);
