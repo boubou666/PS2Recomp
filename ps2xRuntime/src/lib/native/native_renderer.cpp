@@ -16,7 +16,8 @@ namespace ps2x::native
     {
         // The object's matrix takes a vertex to PS2 screen space (x, y in GS window coordinates, z GS depth, w); the
         // PS2 divides by w. Here the same point goes to the window: NDC from the screen rectangle, depth from the Z
-        // range (larger is nearer on the GS), and w kept so texture coordinates interpolate in perspective.
+        // range (larger is nearer on the GS), and w kept so texture coordinates interpolate in perspective. The PS2
+        // divides by w whatever its sign (some of a game's matrices make it negative), so |w| goes to the GPU.
         const char *kVertexShader = R"(#version 330
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aUv;
@@ -29,16 +30,18 @@ out vec4 vCol;
 void main()
 {
     vec4 c = uM[0] * aPos.x + uM[1] * aPos.y + uM[2] * aPos.z + uM[3];
+    float w = abs(c.w);
     vec2 s = c.xy / c.w;
     vec2 ndc = vec2((s.x - uScreen.x) / uScreen.z * 2.0 - 1.0, 1.0 - (s.y - uScreen.y) / uScreen.w * 2.0);
     float z = clamp(c.z / c.w / uDepthMax, 0.0, 1.0);
-    gl_Position = vec4(ndc * c.w, (1.0 - 2.0 * z) * c.w, c.w);
+    gl_Position = vec4(ndc * w, (1.0 - 2.0 * z) * w, w);
     vUv = aUv;
     vCol = aCol;
 }
 )";
 
-        // GS modulate: texel * vertex colour, where a vertex colour of 0x80 is 1.0.
+        // GS modulate: texel * vertex colour, where a vertex colour of 0x80 is 1.0. The render target holds
+        // premultiplied colour and coverage (opaque draws cover fully), so present() composites it over the window.
         const char *kFragmentShader = R"(#version 330
 in vec2 vUv;
 in vec4 vCol;
@@ -46,6 +49,7 @@ uniform sampler2D uTex;
 uniform int uTextured;
 uniform int uAlphaTest;
 uniform float uAlphaRef;
+uniform int uOpaque;
 out vec4 fragColor;
 void main()
 {
@@ -54,6 +58,8 @@ void main()
     fragColor = clamp(texel * colour, 0.0, 1.0);
     if (uAlphaTest != 0 && fragColor.a <= uAlphaRef)
         discard;
+    if (uOpaque != 0)
+        fragColor.a = 1.0;
 }
 )";
 
@@ -68,7 +74,7 @@ void main()
     struct Renderer::Gpu
     {
         unsigned int shader = 0;
-        int locM = -1, locScreen = -1, locDepthMax = -1, locTex = -1, locTextured = -1, locAlphaTest = -1, locAlphaRef = -1;
+        int locM = -1, locScreen = -1, locDepthMax = -1, locTex = -1, locTextured = -1, locAlphaTest = -1, locAlphaRef = -1, locOpaque = -1;
         unsigned int vao = 0, vbo = 0;
         size_t vboBytes = 0;
         RenderTexture2D target{};
@@ -92,6 +98,7 @@ void main()
             locTextured = rlGetLocationUniform(shader, "uTextured");
             locAlphaTest = rlGetLocationUniform(shader, "uAlphaTest");
             locAlphaRef = rlGetLocationUniform(shader, "uAlphaRef");
+            locOpaque = rlGetLocationUniform(shader, "uOpaque");
             vao = rlLoadVertexArray();
             return true;
         }
@@ -217,8 +224,9 @@ void main()
             else
             {
                 rlEnableColorBlend();
-                rlSetBlendFactors(kGlSrcAlpha, m.blend == Material::Blend::Additive ? kGlOne : kGlOneMinusSrcAlpha, kGlFuncAdd);
-                rlSetBlendMode(RL_BLEND_CUSTOM);
+                rlSetBlendFactorsSeparate(kGlSrcAlpha, m.blend == Material::Blend::Additive ? kGlOne : kGlOneMinusSrcAlpha,
+                                          kGlOne, kGlOneMinusSrcAlpha, kGlFuncAdd, kGlFuncAdd);
+                rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
             }
             if (m.depthWrite)
                 rlEnableDepthMask();
@@ -231,6 +239,8 @@ void main()
             rlSetUniform(gpu.locTex, &slot, RL_SHADER_UNIFORM_INT, 1);
             rlSetUniform(gpu.locM, batch.matrix, RL_SHADER_UNIFORM_VEC4, 4);
             const int textured = m.textured ? 1 : 0, alphaTest = m.alphaTest ? 1 : 0;
+            const int opaque = m.blend == Material::Blend::Opaque ? 1 : 0;
+            rlSetUniform(gpu.locOpaque, &opaque, RL_SHADER_UNIFORM_INT, 1);
             const float alphaRef = m.alphaRef / 128.0f;
             rlSetUniform(gpu.locTextured, &textured, RL_SHADER_UNIFORM_INT, 1);
             rlSetUniform(gpu.locAlphaTest, &alphaTest, RL_SHADER_UNIFORM_INT, 1);
@@ -286,8 +296,10 @@ void main()
         }
 
         // Render textures are stored bottom-up.
+        BeginBlendMode(BLEND_ALPHA_PREMULTIPLY);
         DrawTexturePro(gpu.target.texture, Rectangle{0, 0, static_cast<float>(w), -static_cast<float>(h)},
                        Rectangle{x, y, width, height}, Vector2{0, 0}, 0.0f, WHITE);
+        EndBlendMode();
         return true;
     }
 }
