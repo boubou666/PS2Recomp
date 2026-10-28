@@ -596,6 +596,22 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
         if (!decoded || decoded->width == 0u || decoded->height == 0u || decoded->rgba.empty())
             return false;
         const uint64_t version = decoded->version;
+        if (static const bool logTextures = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTextures)
+        {
+            static std::unordered_map<uint64_t, uint64_t> s_seen;
+            if (s_seen.size() < 200u && s_seen.emplace(tex0 ^ (version << 1), 0u).second)
+            {
+                size_t nonZero = 0, opaque = 0;
+                for (const uint32_t texel : decoded->rgba)
+                {
+                    nonZero += (texel & 0x00FFFFFFu) != 0u;
+                    opaque += (texel >> 24) != 0u;
+                }
+                std::fprintf(stderr, "[gs:native] texture psm=0x%x tbp=%u cbp=%u %ux%u: %zu non-black, %zu with alpha\n",
+                             context.tex0.psm, context.tex0.tbp0, context.tex0.cbp, decoded->width, decoded->height,
+                             nonZero, opaque);
+            }
+        }
         UploadedTexture &uploaded = m_uploaded[decoded->key ^ (texa << 1)];
         if (!uploaded.texture)
             glGenTextures(1, &uploaded.texture);
