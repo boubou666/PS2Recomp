@@ -13,7 +13,7 @@ namespace ps2x::native
     // then its data), or a normal transfer's quadwords. The adapter reads the game's own 3D data from it (meshes,
     // matrices, lights) wherever in the game's code the send happens.
     // onVif1Thread: called on the VIF1 thread instead, with each transfer as VIF1 gets it, in pieces: up to each MSCAL /
-    // MSCNT before VIF1 asks the gate about it, then the rest after the transfer (for an adapter that reads only the
+    // MSCNT and to the end of each DIRECT before VIF1 asks a gate about it, then the rest after the transfer (for an adapter that reads only the
     // stream, not the EE memory it refers to: its programs then run beside the EE, between VIF1's own commands).
     using Vif1Observer = void (*)(const uint8_t *stream, size_t bytes);
 
@@ -21,6 +21,16 @@ namespace ps2x::native
     bool vif1Observed();
     bool vif1ObservedOnVif1Thread();
     void observeVif1(const uint8_t *stream, size_t bytes);
+
+    // VU1's own code and data memory, for an observer on the VIF1 thread: VIF1 has run the stream it was handed (its
+    // UNPACKs and MPGs are there, TOP / ITOP set for the MSCAL that ends it). Null elsewhere.
+    struct Vu1Memory
+    {
+        uint8_t *code = nullptr, *data = nullptr;
+        uint32_t codeSize = 0, dataSize = 0;
+    };
+    void setVu1Memory(const Vu1Memory &memory);
+    Vu1Memory vu1Memory();
 
     // Runs a job on the VIF1 thread after the transfers sent so far (at once without a VIF1 thread, or on it).
     using Vif1Runner = void (*)(void *user, std::function<void()> job);

@@ -15,6 +15,7 @@
 // PS2X_NATIVE_STREAM_LOG=1: per 250 frames, how many programs and DIRECTs were drawn natively, by start address.
 
 #include "runtime/native/native_renderer.h"
+#include "runtime/native/native_vif1.h"
 #include "runtime/ps2_memory.h"
 
 #include <cstddef>
@@ -72,9 +73,9 @@ namespace ps2x::native
 
         // For the port's hooks: VU1 memory as the stream filled it, the running program's TOP and ITOP, and how many
         // MPGs have changed the code so far (a port telling programs apart by their code hashes it again only then).
-        const uint8_t *code() const { return m_code; }
+        const uint8_t *code() const { return m_vu1.code ? m_vu1.code : m_code; }
         uint64_t codeVersion() const { return m_codeVersion; }
-        const uint32_t *data() const { return m_data; }
+        const uint32_t *data() const { return m_vu1.data ? reinterpret_cast<const uint32_t *>(m_vu1.data) : m_data; }
         uint32_t top() const { return m_top; }
         uint32_t itop() const { return m_itops; }
 
@@ -88,6 +89,7 @@ namespace ps2x::native
         void program(uint32_t cmd, uint32_t pc);
         void direct(const uint32_t *words, size_t qwords, size_t size);
         void publish();
+        void runSandbox(bool resumed, uint32_t pc);
 
         Config m_config;
         bool m_installed = false;
@@ -95,6 +97,7 @@ namespace ps2x::native
 
         uint8_t m_code[16 * 1024] = {};
         uint32_t m_data[1024 * 4] = {};
+        Vu1Memory m_vu1; // VU1's own memory while the VIF1 thread hands it (onVif1Thread): no copy kept
         uint32_t m_cl = 1, m_wl = 1, m_base = 0, m_offset = 0, m_tops = 0, m_top = 0, m_itops = 0;
         VIFRegisters m_vif{}; // STMOD, STMASK, STROW / STCOL (and STCYCL, TOPS) for vifUnpack
         bool m_sawMask = false, m_sawMode = false, m_sawRow = false, m_sawCol = false;
