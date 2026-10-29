@@ -230,7 +230,7 @@ bench_lock_take()
     BENCH_LOCK_START=$(date +%s)
     # A port that asked to pass holds the lock for the minutes it asked with, at most.
     local asked
-    asked=$(cut -d'|' -f1 "$(bench_lock_ask_dir)/$BENCH_LOCK_PORT.ask" 2> /dev/null)
+    asked=$(cut -d'|' -f1 "$(bench_lock_ask_dir)/$BENCH_LOCK_PORT.ask" 2> /dev/null || true) # no request: empty
     if [[ "$asked" =~ ^[0-9]+$ ]] && [ "$asked" -lt "$BENCH_LOCK_MINUTES" ]; then
         BENCH_LOCK_MINUTES=$asked
     fi
