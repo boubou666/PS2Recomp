@@ -8,7 +8,8 @@
 
 Functions come from the module's entry, its export tables (magic 0x41C00000), the targets of JALs, the addresses
 the code builds with LUI + ADDIU/ORI that land on a function prologue (ADDIU $sp, $sp, -n: SIF command handlers,
-thread entries and callbacks a module only passes as pointers), the --entry list, and the functions those reach. Import stubs (magic 0x41E00000: `jr ra; addiu $0, $0, ordinal`) stay calls into the IOP's
+thread entries and callbacks a module only passes as pointers), the data words that hold such an address, every
+prologue right after a function's end, the --entry list, and the functions those reach. Import stubs (magic 0x41E00000: `jr ra; addiu $0, $0, ordinal`) stay calls into the IOP's
 import dispatch. A function the tool cannot translate safely (an unknown instruction, a load whose register the next
 instruction reads: a load delay slot the R3000 would honour) is left to the interpreter.
 """
@@ -219,11 +220,28 @@ def explore(module, start, limit):
 
 def pointer_seeds(module):
     """Function starts the code only takes the address of: LUI rt, hi then, within the next few instructions,
-    ADDIU/ORI rt2, rt, lo giving an address in the module whose first instruction is ADDIU $sp, $sp, -n."""
+    ADDIU/ORI rt2, rt, lo giving an address in the module whose first instruction is ADDIU $sp, $sp, -n. Also the
+    data words that hold such an address (function tables, structures of callbacks), and every prologue right after
+    a function's end (JR $ra, its delay slot, nop padding): the functions only other unreached code or a jump table
+    leads to (Jade Cocoon 2's M2SOUND.IRX: 21 functions from the LUI pairs alone, 89 with these)."""
+    def is_prologue(target):
+        prologue = module.word(target) if module.contains(target) and target % 4 == 0 else None
+        return prologue is not None and prologue >> 16 == 0x27BD and prologue & 0x8000
+
     seeds = set()
     for addr in range(module.base, module.base + module.size, 4):
         insn = module.word(addr)
-        if insn is None or insn >> 26 != 0x0F:
+        if insn is None:
+            continue
+        if is_prologue(insn):
+            seeds.add(insn)
+        if is_prologue(addr):
+            back = addr - 8
+            while module.contains(back) and module.word(back) == 0 and module.word(back + 4) == 0:
+                back -= 4
+            if module.word(back) == 0x03E00008:
+                seeds.add(addr)
+        if insn >> 26 != 0x0F:
             continue
         rt, hi = (insn >> 16) & 31, insn & 0xFFFF
         for follow in range(addr + 4, addr + 36, 4):
