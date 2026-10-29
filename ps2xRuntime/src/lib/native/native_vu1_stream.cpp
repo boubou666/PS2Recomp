@@ -23,14 +23,15 @@ namespace ps2x::native
             uint32_t pc = 0; // an MSCAL's start, or a DIRECT's size in quadwords
             bool skipped = false;
             bool direct = false;
+            uint64_t cycles = 0; // a sandboxed program's VU1 cycles
         };
         std::mutex g_decisionsMutex;
         std::deque<Decision> g_decisions;
 
-        void noteDecision(uint32_t pc, bool skipped, bool direct)
+        void noteDecision(uint32_t pc, bool skipped, bool direct, uint64_t cycles = 0)
         {
             std::lock_guard<std::mutex> lock(g_decisionsMutex);
-            g_decisions.push_back({pc, skipped, direct});
+            g_decisions.push_back({pc, skipped, direct, cycles});
             if (g_decisions.size() > 65536u) // nobody takes them (no gate)
                 g_decisions.pop_front();
         }
@@ -38,15 +39,23 @@ namespace ps2x::native
         bool programGate(const uint8_t *vu1Code, uint32_t startPc)
         {
             (void)vu1Code;
-            std::lock_guard<std::mutex> lock(g_decisionsMutex);
-            while (!g_decisions.empty())
+            Decision found;
             {
-                const Decision decision = g_decisions.front();
-                g_decisions.pop_front();
-                if (!decision.direct && decision.pc == startPc)
-                    return decision.skipped;
+                std::lock_guard<std::mutex> lock(g_decisionsMutex);
+                while (!g_decisions.empty())
+                {
+                    const Decision decision = g_decisions.front();
+                    g_decisions.pop_front();
+                    if (!decision.direct && decision.pc == startPc)
+                    {
+                        found = decision;
+                        break;
+                    }
+                }
             }
-            return false; // a transfer the adapter did not see: VU1 draws it
+            if (found.skipped)
+                advanceVif1Clock(found.cycles);
+            return found.skipped; // not found: a transfer the adapter did not see, VU1 draws it
         }
 
         // A DIRECT the VIF1 interpreter does not ask about (cut, or finishing an image) leaves its entry for
@@ -247,10 +256,10 @@ namespace ps2x::native
             choice = m_config.choose ? m_config.choose(*this, pc) : Choice::Sandbox;
         if (choice == Choice::Port && !m_config.draw)
             choice = Choice::Sandbox;
-        noteDecision(pc, choice != Choice::Vu1, false);
         m_runningPc = pc;
         if (choice == Choice::Vu1)
         {
+            noteDecision(pc, false, false);
             m_running = Running::None;
             ++g_stats.onVu1[pc];
             return;
@@ -261,6 +270,7 @@ namespace ps2x::native
         renderer.setKey(0);
         if (choice == Choice::Port)
         {
+            noteDecision(pc, true, false);
             m_running = Running::Port;
             ++g_stats.port[pc];
             m_config.draw(*this, pc, false);
@@ -269,7 +279,9 @@ namespace ps2x::native
         m_running = Running::Sandbox;
         ++g_stats.sandboxed[pc];
         m_sandbox->gif().setSource(pc);
+        const uint64_t cyclesBefore = m_sandbox->cycles();
         m_sandbox->call(m_code, sizeof(m_code), reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), pc, m_top, m_itops);
+        noteDecision(pc, true, false, m_sandbox->cycles() - cyclesBefore);
     }
 
     void Vu1StreamAdapter::direct(const uint32_t *words, size_t qwords, size_t size)
