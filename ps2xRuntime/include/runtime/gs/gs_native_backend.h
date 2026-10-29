@@ -84,6 +84,7 @@ private:
         uint32_t zbp = ~0u;      // the ZBUF its depth buffer was last written as (pages), for depth read as a texture
         uint8_t zpsm = 0;
         bool alphaWritten = false; // a draw wrote its alpha (else GS memory's top bytes stay what they were)
+        uint64_t lastDraw = 0;     // m_drawSerial of its last batch: overlapping targets resolve oldest first
     };
 
     struct Vertex
@@ -122,6 +123,11 @@ private:
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
     // A target that replaces another at the same address (another format or width) starts with what GS memory holds.
     void fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows);
+    // Targets sharing GS memory (VP2 draws a blur level at FBP 402, inside FBP 400's pages): when another one drew
+    // there after this one, both go to GS memory in drawing order and this one is reloaded from it.
+    void ensureCoherent(RenderTarget &target);
+    void resolveInDrawOrder(std::vector<RenderTarget *> &targets);
+    uint64_t m_drawSerial = 0;
     // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);

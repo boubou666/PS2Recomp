@@ -619,6 +619,53 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     return created;
 }
 
+namespace
+{
+    // A target's blocks in GS memory, as far as it drew: pages of 64 x 32 pixels (64 x 64 in CT16).
+    std::pair<uint64_t, uint64_t> targetBlocks(uint32_t fbp, uint32_t fbw, uint8_t psm, uint32_t rows)
+    {
+        const uint32_t pageRows = (psm == 0x02u || psm == 0x0Au) ? 64u : 32u;
+        const uint64_t begin = static_cast<uint64_t>(fbp) * 32u;
+        return {begin, begin + static_cast<uint64_t>(std::max(fbw, 1u)) * ((rows + pageRows - 1u) / pageRows) * 32u};
+    }
+}
+
+void GSNativeBackend::resolveInDrawOrder(std::vector<RenderTarget *> &targets)
+{
+    std::sort(targets.begin(), targets.end(), [](const RenderTarget *a, const RenderTarget *b) { return a->lastDraw < b->lastDraw; });
+    for (RenderTarget *target : targets)
+        if (target->dirty && target->usedHeight != 0u)
+            resolveTarget(*target);
+}
+
+void GSNativeBackend::ensureCoherent(RenderTarget &target)
+{
+    if (m_fillingFromMemory || target.usedHeight == 0u)
+        return;
+    const auto [begin, end] = targetBlocks(target.fbp, target.fbw, target.psm, target.usedHeight);
+    std::vector<RenderTarget *> overlapping;
+    bool stale = false;
+    for (auto &[fbp, other] : m_targets)
+    {
+        if (&other == &target || other.usedHeight == 0u)
+            continue;
+        const auto [otherBegin, otherEnd] = targetBlocks(other.fbp, other.fbw, other.psm, other.usedHeight);
+        if (otherBegin >= end || begin >= otherEnd)
+            continue;
+        overlapping.push_back(&other);
+        stale |= other.lastDraw > target.lastDraw;
+    }
+    if (!stale)
+        return;
+    overlapping.push_back(&target);
+    resolveInDrawOrder(overlapping);
+    GSFrameReg frame{};
+    frame.fbp = target.fbp;
+    frame.fbw = target.fbw;
+    frame.psm = target.psm;
+    fillTargetFromMemory(frame, std::min(target.usedHeight, target.height));
+}
+
 void GSNativeBackend::fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows)
 {
     // The same memory read in its new format, as the GS would see it: a game alternating one buffer between CT16 and
@@ -1078,9 +1125,10 @@ void GSNativeBackend::resolveAllTargets()
         }
         std::fprintf(stderr, "[gs:native] vram check: %u blocks differ\n", differing);
     }
+    std::vector<RenderTarget *> all;
     for (auto &[fbp, target] : m_targets)
-        if (target.dirty && target.usedHeight != 0u)
-            resolveTarget(target);
+        all.push_back(&target);
+    resolveInDrawOrder(all);
     pullGpuPages();
 }
 
@@ -1092,6 +1140,7 @@ void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
     const uint32_t bits = kBits[tex0.psm & 0x3Fu] ? kBits[tex0.psm & 0x3Fu] : 32u;
     const uint64_t texRows = 1ull << std::min<uint32_t>(tex0.th, 10u);
     const uint64_t texBlocks = (std::max<uint32_t>(tex0.tbw, 1u) * 64ull * texRows * bits / 8u + 255u) / 256u;
+    std::vector<RenderTarget *> under;
     for (auto &[fbp, target] : m_targets)
     {
         if (!target.dirty || target.usedHeight == 0u)
@@ -1101,8 +1150,9 @@ void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
         const uint32_t pageRows = (target.psm == 0x02u || target.psm == 0x0Au) ? 64u : 32u;
         const uint64_t blocks = static_cast<uint64_t>(target.fbw) * ((target.usedHeight + pageRows - 1u) / pageRows) * 32u;
         if (tex0.tbp0 < base + blocks && base < tex0.tbp0 + texBlocks)
-            resolveTarget(target);
+            under.push_back(&target);
     }
+    resolveInDrawOrder(under);
 }
 
 void GSNativeBackend::dropTargetsUnder(const GSTransferCommand &command)
@@ -1505,7 +1555,16 @@ void GSNativeBackend::flushBatch()
     const GSDrawState &state = m_batchState;
     const GSContext &context = state.context;
     RenderTarget &target = renderTarget(context.frame);
+    // Shared memory: the target drawn into and a target sampled directly first get what overlapping ones drew since.
+    if (!m_fillingFromMemory)
+    {
+        if (state.prim.tme)
+            if (RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0); source && source != &target)
+                ensureCoherent(*source);
+        ensureCoherent(target);
+    }
     target.dirty = true;
+    target.lastDraw = ++m_drawSerial;
     // Rows reached: the lowest vertex, clipped by the scissor (a full-screen scissor says nothing about the buffer).
     const uint32_t lowest = std::min<uint32_t>(context.scissor.y1 + 1u, static_cast<uint32_t>(std::max(0.0f, std::ceil(m_batchMaxY))));
     target.usedHeight = std::min(target.height, std::max(target.usedHeight, lowest));
