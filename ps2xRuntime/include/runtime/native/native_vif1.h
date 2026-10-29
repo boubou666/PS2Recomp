@@ -22,6 +22,16 @@ namespace ps2x::native
     bool vif1ObservedOnVif1Thread();
     void observeVif1(const uint8_t *stream, size_t bytes);
 
+    // VU1's own code and data memory, for an observer on the VIF1 thread: VIF1 has run the stream it was handed (its
+    // UNPACKs and MPGs are there, TOP / ITOP set for the MSCAL that ends it). Null elsewhere.
+    struct Vu1Memory
+    {
+        uint8_t *code = nullptr, *data = nullptr;
+        uint32_t codeSize = 0, dataSize = 0;
+    };
+    void setVu1Memory(const Vu1Memory &memory);
+    Vu1Memory vu1Memory();
+
     // Runs a job on the VIF1 thread after the transfers sent so far (at once without a VIF1 thread, or on it).
     using Vif1Runner = void (*)(void *user, std::function<void()> job);
 

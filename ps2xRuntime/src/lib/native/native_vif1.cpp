@@ -9,6 +9,7 @@ namespace ps2x::native
         std::atomic<Vif1Observer> g_observer{nullptr};
         std::atomic<bool> g_observeOnVif1Thread{false};
         std::atomic<Vif1Runner> g_runner{nullptr};
+        Vu1Memory g_vu1Memory;
         std::atomic<void *> g_runnerUser{nullptr};
         std::atomic<Vu1Gate> g_gate{nullptr};
         std::atomic<DirectGate> g_directGate{nullptr};
@@ -32,6 +33,10 @@ namespace ps2x::native
     {
         return vif1Observed() && g_observeOnVif1Thread.load(std::memory_order_acquire);
     }
+
+    void setVu1Memory(const Vu1Memory &memory) { g_vu1Memory = memory; }
+
+    Vu1Memory vu1Memory() { return g_vu1Memory; }
 
     void setVif1Runner(Vif1Runner runner, void *user)
     {

@@ -611,7 +611,9 @@ void PS2Memory::observeVif1Until(const uint8_t *end)
 {
     if (!m_vif1ObservedTo || end <= m_vif1ObservedTo || end > m_vif1ObserveEnd)
         return;
+    ps2x::native::setVu1Memory({m_vu1Code, m_vu1Data, PS2_VU1_CODE_SIZE, PS2_VU1_DATA_SIZE});
     ps2x::native::observeVif1(m_vif1ObservedTo, static_cast<size_t>(end - m_vif1ObservedTo));
+    ps2x::native::setVu1Memory({});
     m_vif1ObservedTo = end;
 }
 
