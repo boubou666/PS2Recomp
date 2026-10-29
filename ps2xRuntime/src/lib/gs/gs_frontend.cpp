@@ -472,9 +472,9 @@ void GS::submitNativeBatch(void *user, const ps2x::native::Material &material, c
             const double zs = static_cast<double>(cz) * q * gsZScale;
             const double zf = zs == zs ? std::clamp(zs, -2147483648.0, 2147483647.0) : 0.0;
             g.z = static_cast<double>(static_cast<uint32_t>(static_cast<int32_t>(zf)));
-            g.q = q;
-            g.s = v.u * q;
-            g.t = v.v * q;
+            g.q = q * v.q;
+            g.s = v.u * g.q;
+            g.t = v.v * g.q;
             g.r = static_cast<uint8_t>(v.rgba & 0xFFu);
             g.g = static_cast<uint8_t>((v.rgba >> 8) & 0xFFu);
             g.b = static_cast<uint8_t>((v.rgba >> 16) & 0xFFu);
