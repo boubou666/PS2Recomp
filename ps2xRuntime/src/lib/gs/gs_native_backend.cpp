@@ -320,7 +320,8 @@ void main()
 
     // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment. Z
     // formats order a page's blocks unlike the colour ones: Z pixel (x, y) is the colour pixel stored in the word Z
-    // puts (x, y) in (uColorRow -1: pixel sizes differ, read in place).
+    // puts (x, y) in (uColorRow -1: pixel sizes differ, read in place). One Z per GS pixel, from its middle texel as a
+    // resolve takes it: a mask the GS drew at 1x leaves the texels a scaled sprite's half-pixel edges skip.
     constexpr const char *kDepthFromColorFragmentShader = R"(#version 330 core
 uniform sampler2D uColor;
 uniform usampler2D uSwizzle;
@@ -334,15 +335,15 @@ uniform uint uZMask;
 uniform float uZScale;
 void main()
 {
-    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 g = ivec2(gl_FragCoord.xy) / uScale;
     if (uColorRow >= 0)
     {
-        ivec2 g = p / uScale, inPage = g % uPage;
+        ivec2 inPage = g % uPage;
         uint address = texelFetch(uSwizzle, ivec2(inPage.x, uZRow + inPage.y), 0).r;
         uint e = texelFetch(uInverse, ivec2(int(address % 128u), uColorRow + int(address / 128u)), 0).r;
-        p = ((g - inPage) + ivec2(int(e & 0xFFFFu), int(e >> 16u))) * uScale + p % uScale;
+        g += ivec2(int(e & 0xFFFFu), int(e >> 16u)) - inPage;
     }
-    p = min(p, textureSize(uColor, 0) - 1);
+    ivec2 p = min(g * uScale + uScale / 2, textureSize(uColor, 0) - 1);
     uvec4 c = uvec4(round(texelFetch(uColor, p, 0) * 255.0));
     uint z = uSixteen != 0 ? (c.r >> 3u) | (c.g >> 3u) << 5u | (c.b >> 3u) << 10u | (c.a >> 7u) << 15u
                            : c.r | c.g << 8u | c.b << 16u | c.a << 24u;
