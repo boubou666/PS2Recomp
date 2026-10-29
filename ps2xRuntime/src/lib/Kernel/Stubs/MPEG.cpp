@@ -550,6 +550,7 @@ namespace ps2_stubs
             bool sawInput = false;
             // A sceMpegCbNodata callback (sceMpegAddCallback type 1) is running to feed sceMpegAddBs.
             bool nodataCallbackPending = false;
+            uint32_t addBsCalls = 0u; // sceMpegAddBs calls so far (did a Nodata callback feed anything?)
             bool sawSequenceEnd = false;
             bool streamEnded = false;
             bool decoderFailed = false;
@@ -1759,7 +1760,8 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 7, 0u);
             SET_GPR_U32(&invocation.context, 29, 0u);
             SET_GPR_U32(&invocation.context, 31, 0u);
-            invocation.onComplete = [runtime, cbDataAddr, mpegAddr](const R5900Context &, R5900Context &)
+            const uint32_t addBsBefore = playback.addBsCalls;
+            invocation.onComplete = [runtime, cbDataAddr, mpegAddr, addBsBefore](const R5900Context &done, R5900Context &)
             {
                 runtime->guestFree(cbDataAddr);
                 {
@@ -1769,6 +1771,15 @@ namespace ps2_stubs
                     if (playback == g_mpeg_stub_state.playbackByMpeg.end())
                         return;
                     playback->second.nodataCallbackPending = false;
+                    // A callback that fed nothing and returned 0 has no more data: the movie's input is over (The
+                    // Third Age's, 0x1BE698, calls sceMpegInit and returns 0 once its packet queue is empty). Without
+                    // this, GetPicture waits for a picture that never comes; with it, the pictures left are shown and
+                    // sceMpegIsEnd then reports the end.
+                    if (static_cast<int32_t>(getRegU32(&done, 2)) == 0 && playback->second.addBsCalls == addBsBefore)
+                    {
+                        playback->second.inputFinished = true;
+                        playback->second.streamEnded = true;
+                    }
                 }
                 runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
             };
@@ -2093,6 +2104,7 @@ namespace ps2_stubs
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            ++playback.addBsCalls;
             const size_t framesBefore = playback.decodedFrames.size();
             while (copied < byteCount)
             {
