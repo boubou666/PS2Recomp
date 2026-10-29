@@ -462,7 +462,10 @@ void main()
             {
                 glEnable(GL_BLEND);
                 glBlendEquation(GL_FUNC_ADD);
-                glBlendFuncSeparate(GL_SRC_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                if (m.blend == Material::Blend::AdditiveByDestination)
+                    glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+                else
+                    glBlendFuncSeparate(GL_SRC_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
             }
             if (m.depthTest)
             {
@@ -473,6 +476,8 @@ void main()
                 glDisable(GL_DEPTH_TEST);
             glDepthMask(m.depthWrite ? GL_TRUE : GL_FALSE);
             glDrawArrays(GL_TRIANGLES, first, count);
+            if (m.blend == Material::Blend::AdditiveByDestination) // DST_ALPHA is Ad / 255, half the GS's Ad / 128
+                glDrawArrays(GL_TRIANGLES, first, count);
             first += count;
         }
         glBindSampler(0, static_cast<GLuint>(sampler));

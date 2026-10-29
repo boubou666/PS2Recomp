@@ -41,6 +41,7 @@ namespace ps2x::native
             Opaque,   // no blending
             Alpha,    // (Cs - Cd) * As + Cd
             Additive, // Cs * As + Cd
+            AdditiveByDestination, // Cs * Ad + Cd, Ad the target's alpha (0x80 is 1.0)
         } blend = Blend::Alpha;
         uint8_t alphaRef = 0;   // texels at or below are discarded when alphaTest
         bool alphaTest = false;

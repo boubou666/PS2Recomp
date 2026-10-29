@@ -141,8 +141,10 @@ void main()
 
     Material::Blend blendOf(uint64_t alpha)
     {
-        const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
-        return a == 0u && b == 2u && d == 1u ? Material::Blend::Additive : Material::Blend::Alpha;
+        const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, c = (alpha >> 4) & 3u, d = (alpha >> 6) & 3u;
+        if (a == 0u && b == 2u && d == 1u)
+            return c == 1u ? Material::Blend::AdditiveByDestination : Material::Blend::Additive;
+        return Material::Blend::Alpha;
     }
 
     Renderer &Renderer::instance()
@@ -388,7 +390,7 @@ void main()
             else
             {
                 rlEnableColorBlend();
-                rlSetBlendFactorsSeparate(kGlSrcAlpha, m.blend == Material::Blend::Additive ? kGlOne : kGlOneMinusSrcAlpha,
+                rlSetBlendFactorsSeparate(kGlSrcAlpha, m.blend == Material::Blend::Alpha ? kGlOneMinusSrcAlpha : kGlOne,
                                           kGlOne, kGlOneMinusSrcAlpha, kGlFuncAdd, kGlFuncAdd);
                 rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
             }
