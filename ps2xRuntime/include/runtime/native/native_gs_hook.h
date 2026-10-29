@@ -16,7 +16,8 @@ namespace ps2x::native
         // GL objects on the GS thread's context, current while the hook runs. A null framebuffer means the GS
         // renderer in use is not the native one (CPU, paraLLEl-GS): nothing to draw into.
         uint32_t framebuffer = 0, color = 0, depth = 0;
-        uint32_t width = 0, height = 0;
+        uint32_t width = 0, height = 0; // GS pixels
+        uint32_t scale = 1;             // the target's texels per GS pixel (GSNativeBackend's internal scale)
         // Depth is GS Z times zScale (1/2^32 Z32, 1/2^24 Z24, 1/2^16 Z16), larger nearer, GEQUAL; colour keeps the
         // GS alpha as stored (0x80 = 1.0).
         double zScale = 0.0;

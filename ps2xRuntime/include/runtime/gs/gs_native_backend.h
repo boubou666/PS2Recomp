@@ -61,7 +61,8 @@ public:
     struct FrameTarget
     {
         uint32_t framebuffer = 0, color = 0, depth = 0;
-        uint32_t width = 0, height = 0;
+        uint32_t width = 0, height = 0; // in GS pixels; the GL textures are scale times that
+        uint32_t scale = 1;
         double zScale = 0.0;
     };
     // rows: how far down the native draw may write (its scissor), what the target then covers in GS memory.
@@ -184,11 +185,21 @@ private:
     struct CircuitSource
     {
         uint32_t texture = 0;
-        int x = 0, y = 0, width = 0, height = 0;
+        int x = 0, y = 0, width = 0, height = 0; // GS pixels
+        int scale = 1;                            // texels per GS pixel
         uint32_t fbp = 0;
         bool opaque = false; // CT24: no alpha (0x80)
     };
     bool circuitSource(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, CircuitSource &out);
+    // The internal scale (PS2X_GS_SCALE=<n>, 1 to 4, default 1): render targets are n times the GS's size each way,
+    // draws land on them with their viewport and scissor scaled, and whatever goes back to GS memory or the CPU
+    // (resolves, read backs, a Z buffer read as a texture) is read from a 1x copy (readFramebufferAt1x).
+    uint32_t m_scale = 1;
+    uint32_t m_downFramebuffer = 0, m_downColor = 0, m_downDepth = 0;
+    // A framebuffer to read a target's rectangle from at the GS's size: the target's own at scale 1, else a nearest
+    // copy of the rectangle into m_downFramebuffer (colour, or depth). Leaves the draw framebuffer as it was.
+    uint32_t readFramebufferAt1x(const RenderTarget &target, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+                                 bool depth = false);
     bool presentOnGpu(const GSPresentationRequest &request, PresentationFrame &frame);
     bool readCircuit(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels,
                      uint32_t &width, uint32_t &height, uint32_t &fbp);

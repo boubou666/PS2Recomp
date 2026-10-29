@@ -217,8 +217,11 @@ void main()
     constexpr const char *kPresentFragmentShader = R"(#version 330 core
 uniform sampler2D uTop;
 uniform sampler2D uBottom;
-uniform ivec4 uTopRect;
+uniform ivec4 uTopRect;      // GS pixels: x, y, width, height
 uniform ivec4 uBottomRect;
+uniform int uScale;          // the output's scale
+uniform int uTopScale;       // each source's: the targets', or 1 for GS memory read on the CPU
+uniform int uBottomScale;
 uniform int uHaveTop;
 uniform int uHaveBottom;
 uniform int uField;
@@ -230,15 +233,17 @@ uniform vec3 uBackground;
 out vec4 fragColor;
 void main()
 {
-    ivec2 p = ivec2(gl_FragCoord.xy);
-    int line = uField != 0 ? p.y / 2 : p.y;
+    // Where the output pixel falls in GS pixels (fractional at a scale), a field's line shown twice.
+    vec2 g = (gl_FragCoord.xy) / float(uScale);
+    if (uField != 0)
+        g.y *= 0.5;
     vec3 under = uBlackUnder != 0 ? vec3(0.0) : uBackground;
-    if (uHaveBottom != 0 && p.x < uBottomRect.z && line < uBottomRect.w)
-        under = texelFetch(uBottom, uBottomRect.xy + ivec2(p.x, line), 0).rgb;
+    if (uHaveBottom != 0 && g.x < float(uBottomRect.z) && g.y < float(uBottomRect.w))
+        under = texelFetch(uBottom, (uBottomRect.xy + ivec2(0)) * uBottomScale + ivec2(floor(g * float(uBottomScale))), 0).rgb;
     vec3 colour = under;
-    if (uHaveTop != 0 && p.x < uTopRect.z && line < uTopRect.w)
+    if (uHaveTop != 0 && g.x < float(uTopRect.z) && g.y < float(uTopRect.w))
     {
-        vec4 over = texelFetch(uTop, uTopRect.xy + ivec2(p.x, line), 0);
+        vec4 over = texelFetch(uTop, uTopRect.xy * uTopScale + ivec2(floor(g * float(uTopScale))), 0);
         // Circuit 1's alpha counts 0x80 as 1.0; with only circuit 1 shown it simply replaces the background.
         float a = uMode == 0 ? 1.0 : uMode == 1 ? uAlp : min(1.0, (uTopOpaque != 0 ? 128.0 / 255.0 : over.a) * (255.0 / 128.0));
         colour = over.rgb * a + under * (1.0 - a);
@@ -255,10 +260,11 @@ uniform int uFbp;
 uniform int uFbw;
 uniform int uKind;           // 0 CT32, 1 CT16, 2 CT16S
 uniform int uUsedHeight;     // rows drawn: words of pixels below them keep what GS memory holds
+uniform int uScale;          // the target's internal scale: a GS pixel is the middle texel of its block
 
 uvec4 bytes(ivec2 p)
 {
-    return uvec4(round(texelFetch(uTarget, p, 0) * 255.0));
+    return uvec4(round(texelFetch(uTarget, p * uScale + uScale / 2, 0) * 255.0));
 }
 
 uint pack16(uvec4 c)
@@ -527,6 +533,8 @@ bool GSNativeBackend::ensureContext(bool create)
     }
     glfwMakeContextCurrent(m_sharedContext);
     m_glThread = std::this_thread::get_id();
+    if (const char *scale = std::getenv("PS2X_GS_SCALE"); scale && *scale)
+        m_scale = static_cast<uint32_t>(std::clamp(std::atoi(scale), 1, 4));
 
     const GLuint vertex = compileShader(GL_VERTEX_SHADER, kVertexShader);
     const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
@@ -641,12 +649,14 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     target.height = kTargetHeight;
     glGenTextures(1, &target.color);
     glBindTexture(GL_TEXTURE_2D, target.color);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width, target.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width * m_scale, target.height * m_scale, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glGenTextures(1, &target.depth);
     glBindTexture(GL_TEXTURE_2D, target.depth);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, target.width, target.height, 0, GL_DEPTH_COMPONENT, GL_FLOAT,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, target.width * m_scale, target.height * m_scale, 0, GL_DEPTH_COMPONENT,
+                 GL_FLOAT,
                  nullptr);
     glGenFramebuffers(1, &target.framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
@@ -1036,6 +1046,7 @@ bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uKind"), kind);
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.usedHeight));
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uScale"), static_cast<GLint>(m_scale));
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     for (uint32_t page = first; page < end; ++page)
@@ -1070,7 +1081,7 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     // The pixels as a host-to-local CT32 transfer at the frame's base: rows top first (GL row 0 is GS row 0), alpha
     // as the GS stores it.
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(target, 0u, 0u, width, height));
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE,
                  pixels.data());
@@ -1143,6 +1154,7 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     out.depth = target.depth;
     out.width = target.width;
     out.height = target.height;
+    out.scale = m_scale;
     out.zScale = depthScale(zbuf.psm);
     return out;
 }
@@ -1160,6 +1172,7 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     target.depth = frame.depth;
     target.width = frame.width;
     target.height = frame.height;
+    target.scale = frame.scale;
     target.zScale = frame.zScale;
     target.xOffset = context.xyoffset.ofx;
     target.yOffset = context.xyoffset.ofy;
@@ -1327,7 +1340,7 @@ bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width,
         return false;
     const uint32_t w = source->width, h = source->usedHeight;
     std::vector<float> depth(static_cast<size_t>(w) * h);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(*source, 0u, 0u, w, h, true));
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
     // Back to GS Z in the Z buffer's range, then laid out as the texture format reads it: Z32 as CT32, Z24 as CT24
@@ -1441,19 +1454,20 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
             m_lastSourceFramebuffer = source->framebuffer;
             if (source->fbp == target.fbp && !std::getenv("PS2X_GS_NATIVE_NOFEEDBACKCOPY"))
             {
-                if (!m_feedbackTexture || m_feedbackWidth != source->width || m_feedbackHeight != source->height)
+                const uint32_t feedbackWidth = source->width * m_scale, feedbackHeight = source->height * m_scale;
+                if (!m_feedbackTexture || m_feedbackWidth != feedbackWidth || m_feedbackHeight != feedbackHeight)
                 {
                     if (!m_feedbackTexture)
                         glGenTextures(1, &m_feedbackTexture);
                     glBindTexture(GL_TEXTURE_2D, m_feedbackTexture);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, source->width, source->height, 0, GL_RGBA,
-                                 GL_UNSIGNED_BYTE, nullptr);
-                    m_feedbackWidth = source->width;
-                    m_feedbackHeight = source->height;
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, feedbackWidth, feedbackHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                                 nullptr);
+                    m_feedbackWidth = feedbackWidth;
+                    m_feedbackHeight = feedbackHeight;
                 }
                 glBindTexture(GL_TEXTURE_2D, m_feedbackTexture);
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
-                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, source->width, source->height);
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, feedbackWidth, feedbackHeight);
                 glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
                 texture = m_feedbackTexture;
             }
@@ -1643,10 +1657,11 @@ void GSNativeBackend::flushBatch()
     const uint32_t lowest = std::min<uint32_t>(context.scissor.y1 + 1u, static_cast<uint32_t>(std::max(0.0f, std::ceil(m_batchMaxY))));
     target.usedHeight = std::min(target.height, std::max(target.usedHeight, lowest));
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-    glViewport(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height));
+    glViewport(0, 0, static_cast<GLsizei>(target.width * m_scale), static_cast<GLsizei>(target.height * m_scale));
     glEnable(GL_SCISSOR_TEST);
-    glScissor(context.scissor.x0, context.scissor.y0, context.scissor.x1 - context.scissor.x0 + 1,
-              context.scissor.y1 - context.scissor.y0 + 1);
+    glScissor(static_cast<GLint>(context.scissor.x0 * m_scale), static_cast<GLint>(context.scissor.y0 * m_scale),
+              static_cast<GLsizei>((context.scissor.x1 - context.scissor.x0 + 1) * m_scale),
+              static_cast<GLsizei>((context.scissor.y1 - context.scissor.y0 + 1) * m_scale));
 
     // PS2X_GS_NATIVE_OFF=depth|alpha|blend|color (any of them): diagnostics that turn one stage off.
     static const char *s_off = std::getenv("PS2X_GS_NATIVE_OFF");
@@ -1752,21 +1767,22 @@ void GSNativeBackend::flushBatch()
     glUniform1i(m_uniforms.dest, 1);
     if (date)
     {
-        if (!m_destTexture || m_destWidth != target.width || m_destHeight != target.height)
+        const uint32_t destWidth = target.width * m_scale, destHeight = target.height * m_scale;
+        if (!m_destTexture || m_destWidth != destWidth || m_destHeight != destHeight)
         {
             if (!m_destTexture)
                 glGenTextures(1, &m_destTexture);
             glBindTexture(GL_TEXTURE_2D, m_destTexture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width, target.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, destWidth, destHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            m_destWidth = target.width;
-            m_destHeight = target.height;
+            m_destWidth = destWidth;
+            m_destHeight = destHeight;
         }
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, m_destTexture);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, target.width, target.height);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, destWidth, destHeight);
         glActiveTexture(GL_TEXTURE0);
     }
 
@@ -1930,11 +1946,13 @@ bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
     const GLint sx = command.trxpos.ssax, sy = command.trxpos.ssay;
     const GLint dx = command.trxpos.dsax, dy = command.trxpos.dsay;
     const GLint w = command.trxreg.rrw, h = command.trxreg.rrh;
+    const GLint s = static_cast<GLint>(m_scale);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination.framebuffer);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glBlitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBlitFramebuffer(sx * s, sy * s, (sx + w) * s, (sy + h) * s, dx * s, dy * s, (dx + w) * s, (dy + h) * s, GL_COLOR_BUFFER_BIT,
+                      GL_NEAREST);
     destination.dirty = true;
     destination.usedHeight = std::min(destination.height,
                                       std::max(destination.usedHeight, static_cast<uint32_t>(dy + h)));
@@ -1983,7 +2001,7 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
             return false;
         const size_t bytes = static_cast<size_t>(width) * height * 4u;
         pixels.resize(bytes);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(target, read.x, read.y, width, height));
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         // Asynchronous read back through two pixel buffers per read circuit: this frame's read is queued and the
         // previous presentation's is copied out, so the GS thread does not wait for the GPU to finish the frame (one
@@ -2041,6 +2059,44 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
     return true;
 }
 
+uint32_t GSNativeBackend::readFramebufferAt1x(const RenderTarget &target, uint32_t x, uint32_t y, uint32_t width,
+                                              uint32_t height, bool depth)
+{
+    if (m_scale == 1u)
+        return target.framebuffer;
+    if (m_downFramebuffer == 0u)
+    {
+        glGenTextures(1, &m_downColor);
+        glBindTexture(GL_TEXTURE_2D, m_downColor);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kMaxTargetWidth, kTargetHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glGenTextures(1, &m_downDepth);
+        glBindTexture(GL_TEXTURE_2D, m_downDepth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, kMaxTargetWidth, kTargetHeight, 0, GL_DEPTH_COMPONENT, GL_FLOAT,
+                     nullptr);
+        GLint draw = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+        glGenFramebuffers(1, &m_downFramebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_downFramebuffer);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_downColor, 0);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_downDepth, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+    }
+    GLint draw = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST); // a blit is scissored
+    const GLint s = static_cast<GLint>(m_scale), x0 = static_cast<GLint>(x), y0 = static_cast<GLint>(y);
+    const GLint x1 = x0 + static_cast<GLint>(width), y1 = y0 + static_cast<GLint>(height);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_downFramebuffer);
+    glBlitFramebuffer(x0 * s, y0 * s, x1 * s, y1 * s, x0, y0, x1, y1, depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT,
+                      GL_NEAREST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+    return m_downFramebuffer;
+}
+
 bool GSNativeBackend::circuitSource(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, CircuitSource &out)
 {
     const DisplayRead read = decodeDisplay(dispfb, display);
@@ -2057,6 +2113,7 @@ bool GSNativeBackend::circuitSource(int circuit, uint64_t dispfb, uint64_t displ
         out.texture = target.color;
         out.x = static_cast<int>(read.x);
         out.y = static_cast<int>(read.y);
+        out.scale = static_cast<int>(m_scale);
         out.opaque = target.psm == 0x01u;
         return true;
     }
@@ -2089,6 +2146,7 @@ bool GSNativeBackend::circuitSource(int circuit, uint64_t dispfb, uint64_t displ
     out.width = static_cast<int>(width);
     out.height = static_cast<int>(height);
     out.fbp = fbp;
+    out.scale = 1;
     out.opaque = false;
     return true;
 }
@@ -2148,7 +2206,8 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
     }
     const uint32_t width = static_cast<uint32_t>(std::max(haveTop ? top.width : 0, haveBottom ? bottom.width : 0));
     const uint32_t lines = static_cast<uint32_t>(std::max(haveTop ? top.height : 0, haveBottom ? bottom.height : 0));
-    const uint32_t height = fieldMode ? lines * 2u : lines;
+    const uint32_t height = (fieldMode ? lines * 2u : lines) * m_scale;
+    const uint32_t outWidth = width * m_scale;
 
     PresentSlot &slot = m_presentSlots[m_presentNext];
     if (slot.fence)
@@ -2156,7 +2215,7 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
         glDeleteSync(static_cast<GLsync>(slot.fence));
         slot.fence = nullptr;
     }
-    if (slot.texture == 0u || slot.width != width || slot.height != height)
+    if (slot.texture == 0u || slot.width != outWidth || slot.height != height)
     {
         if (slot.texture == 0u)
         {
@@ -2171,7 +2230,7 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
         }();
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, slot.texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(outWidth), static_cast<GLsizei>(height), 0, GL_RGBA,
                      GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
@@ -2179,11 +2238,11 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
-        slot.width = width;
+        slot.width = outWidth;
         slot.height = height;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
-    glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+    glViewport(0, 0, static_cast<GLsizei>(outWidth), static_cast<GLsizei>(height));
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
@@ -2198,6 +2257,9 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
     glUniform1i(uniform("uBottom"), 1);
     glUniform4i(uniform("uTopRect"), top.x, top.y, top.width, top.height);
     glUniform4i(uniform("uBottomRect"), bottom.x, bottom.y, bottom.width, bottom.height);
+    glUniform1i(uniform("uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(uniform("uTopScale"), top.scale);
+    glUniform1i(uniform("uBottomScale"), bottom.scale);
     glUniform1i(uniform("uHaveTop"), haveTop ? 1 : 0);
     glUniform1i(uniform("uHaveBottom"), haveBottom ? 1 : 0);
     glUniform1i(uniform("uField"), fieldMode ? 1 : 0);
