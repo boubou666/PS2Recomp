@@ -750,7 +750,7 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
                              frame.fbp, frame.psm, frame.fbw, existing.psm, existing.fbw);
         }
         syncMemoryPages(existing.fbp, existing.fbp + static_cast<uint32_t>(existing.pages.size()));
-        if (existing.zbp < kPages)
+        if (existing.zbp < 512u) // GS memory pages
             syncMemoryPages(existing.zbp, existing.zbp + static_cast<uint32_t>(existing.zpages.size()));
         glDeleteFramebuffers(1, &existing.framebuffer);
         glDeleteTextures(1, &existing.color);
