@@ -2650,8 +2650,7 @@ void GS::vertexKick(bool drawing)
             static const long long s_first = std::atoll(s_log);
             static const long long s_last = [] { const char *c = std::strchr(std::getenv("PS2X_GS_PRIMLOG"), ','); return c ? std::atoll(c + 1) : 0ll; }();
             if (s_prims >= s_first && s_prims <= s_last)
-                std::fprintf(stderr, "[gs:prim] %lld type=%u fbp=%u psm=0x%x fbmsk=0x%x test=0x%llx zbp=%u zpsm=0x%x zmsk=%d tme=%d tbp=%u tpsm=0x%x abe=%d alpha=0x%llx v0=(%.1f,%.1f z=%.0f a=%u) v1=(%.1f,%.1f z=%.0f)
-",
+                std::fprintf(stderr, "[gs:prim] %lld type=%u fbp=%u psm=0x%x fbmsk=0x%x test=0x%llx zbp=%u zpsm=0x%x zmsk=%d tme=%d tbp=%u tpsm=0x%x abe=%d alpha=0x%llx v0=(%.1f,%.1f z=%.0f a=%u) v1=(%.1f,%.1f z=%.0f)\n",
                              s_prims, static_cast<unsigned>(batch.state.prim.type), batch.state.context.frame.fbp, batch.state.context.frame.psm,
                              batch.state.context.frame.fbmsk, static_cast<unsigned long long>(batch.state.context.test), batch.state.context.zbuf.zbp,
                              batch.state.context.zbuf.psm, batch.state.context.zbuf.zmask ? 1 : 0, batch.state.prim.tme ? 1 : 0,
