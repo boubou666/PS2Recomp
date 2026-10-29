@@ -131,7 +131,7 @@ private:
     void syncTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages);
     void wroteTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages);
     void wroteMemoryPages(uint32_t firstPage, uint32_t endPage);
-    // A target's pages [first, end) written into GS memory: on the GPU copy, or through the CPU (CT24, diagnostics).
+    // A target's pages [first, end) written into GS memory: on the GPU copy, or through the CPU (diagnostics).
     void resolveTargetPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
     bool resolveTargetPagesGpu(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
     // The target's pages drawn again from what GS memory holds, in its format (a sprite per page sampling memory).
@@ -157,6 +157,7 @@ private:
     uint32_t m_vramTexture = 0;
     uint32_t m_inverseTexture = 0;
     uint32_t m_vramFramebuffer = 0;
+    uint32_t m_vramOld = 0, m_vramOldFramebuffer = 0; // CT24 resolves: GS memory's words before them
     uint32_t m_resolveProgram = 0;
     // A draw whose ZBUF is another render target's colour tests against that colour read as Z, in m_borrowedDepth,
     // attached to the draw's framebuffer for that draw. False when no colour target is there.
