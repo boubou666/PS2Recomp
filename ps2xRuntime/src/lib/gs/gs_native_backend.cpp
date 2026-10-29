@@ -63,6 +63,7 @@ uniform int uFog;
 uniform vec3 uFogColor;
 uniform int uAlphaTest;
 uniform float uAlphaRef;
+uniform int uAlphaFail; // 1: the AFAIL pass, which draws the pixels that fail the alpha test
 uniform int uBlendOut;
 uniform sampler2D uDest; // a copy of the render target, for the destination alpha test
 uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
@@ -188,6 +189,8 @@ void main()
     else if (uAlphaTest == 5) pass = a >= uAlphaRef;
     else if (uAlphaTest == 6) pass = a > uAlphaRef;
     else if (uAlphaTest == 7) pass = a != uAlphaRef;
+    if (uAlphaFail != 0)
+        pass = !pass;
     if (!pass)
         discard;
     if (uDate != 0)
@@ -561,6 +564,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.fogColor = glGetUniformLocation(m_program, "uFogColor");
     m_uniforms.alphaTest = glGetUniformLocation(m_program, "uAlphaTest");
     m_uniforms.alphaRef = glGetUniformLocation(m_program, "uAlphaRef");
+    m_uniforms.alphaFail = glGetUniformLocation(m_program, "uAlphaFail");
     m_uniforms.sampler = glGetUniformLocation(m_program, "uSampler");
     m_uniforms.blendOut = glGetUniformLocation(m_program, "uBlendOut");
     m_uniforms.blendFactor = glGetUniformLocation(m_program, "uBlendFactor");
@@ -1728,7 +1732,8 @@ void GSNativeBackend::flushBatch()
     glUniform1i(m_uniforms.tcc, context.tex0.tcc);
     glUniform1i(m_uniforms.fog, state.prim.fge ? 1 : 0);
     glUniform3f(m_uniforms.fogColor, state.fogR / 255.0f, state.fogG / 255.0f, state.fogB / 255.0f);
-    // TEST: ATE, ATST, AREF. A failed test keeps the pixel unwritten (AFAIL other than KEEP is not translated yet).
+    // TEST: ATE, ATST, AREF. A failed test keeps the pixel unwritten (AFAIL KEEP); the other AFAIL modes draw the
+    // batch a second time for the failing pixels under their write masks.
     bool alphaTest = !offAlpha && (context.test & 0x1u) != 0u;
     // ATST NEVER with AFAIL other than KEEP: every pixel fails, and AFAIL says what is written anyway. That is a
     // write mask (FB_ONLY colour without Z, ZB_ONLY Z alone, RGB_ONLY colour without alpha or Z), not a test.
@@ -1750,6 +1755,13 @@ void GSNativeBackend::flushBatch()
             break;
         }
     }
+    const uint32_t afail = context.test >> 12 & 0x3u;
+    const bool depthWrites = depthTest && !context.zbuf.zmask;
+    // FB_ONLY without Z writes, or RGB_ONLY without Z or alpha writes: failing pixels are written like passing ones.
+    if (alphaTest && !depthWrites && (afail == 1u || (afail == 3u && keepAlpha)))
+        alphaTest = false;
+    const bool alphaFailPass = alphaTest && afail != 0u && (afail != 2u || depthWrites);
+    glUniform1i(m_uniforms.alphaFail, 0);
     glUniform1i(m_uniforms.alphaTest, alphaTest ? static_cast<int>(context.test >> 1 & 0x7u) : 1);
     glUniform1f(m_uniforms.alphaRef, static_cast<float>(context.test >> 4 & 0xFFu));
     // DATE: the destination alpha's top bit (DATM picks which value passes), read from a copy of the target.
@@ -1781,6 +1793,21 @@ void GSNativeBackend::flushBatch()
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_batch.size() * sizeof(Vertex)), m_batch.data(),
                  GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
+    if (alphaFailPass)
+    {
+        const GLboolean r = offColor || (fbmsk & 0xFFu) != 0xFFu, g = offColor || (fbmsk >> 8 & 0xFFu) != 0xFFu;
+        const GLboolean b = offColor || (fbmsk >> 16 & 0xFFu) != 0xFFu, a = offColor || !keepAlpha;
+        glUniform1i(m_uniforms.alphaFail, 1);
+        glDepthMask(afail == 2u ? GL_TRUE : GL_FALSE);
+        if (afail == 2u)
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        else if (afail == 3u)
+            glColorMask(r, g, b, GL_FALSE);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
+        glUniform1i(m_uniforms.alphaFail, 0);
+        glDepthMask(depthWrites ? GL_TRUE : GL_FALSE);
+        glColorMask(r, g, b, a);
+    }
     // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
     if (static const char *probe = std::getenv("PS2X_GS_NATIVE_PROBE");
         probe && std::strtoul(probe, nullptr, 10) == target.fbp)
