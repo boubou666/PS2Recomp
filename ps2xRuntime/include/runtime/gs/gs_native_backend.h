@@ -177,10 +177,16 @@ private:
     // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
     int m_blendOut = 0;
     // COLCLAMP off with a blend that adds or subtracts colours: the GS keeps the low 8 bits of each result, which a
-    // clamping RGBA8 blend cannot. The draw blends into a float copy of the target (m_wrapTexture), wrapped back after.
-    bool m_blendWraps = false;
+    // clamping RGBA8 blend cannot. Such draws blend into a float copy of the target (m_wrapTexture), attached in its
+    // place while the next batches do the same into it; the first other batch writes it back modulo 256.
     void beginWrappedBlend(RenderTarget &target, const GSScissorReg &scissor);
-    void endWrappedBlend(RenderTarget &target, const GSScissorReg &scissor);
+    bool continuesWrappedBlend() const;
+    void closeWrappedBlend();
+    bool m_wrapOpen = false;
+    bool m_wrapDrawn = false;
+    uint32_t m_wrapFbp = 0;
+    GSScissorReg m_wrapScissor{};
+    GSScissorReg m_wrapArea{}; // what the batches drew since the copy, in GS pixels
     uint32_t m_wrapTexture = 0;
     uint32_t m_wrapFramebuffer = 0;
     uint32_t m_wrapWidth = 0;
