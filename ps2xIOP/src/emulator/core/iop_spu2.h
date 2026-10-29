@@ -45,8 +45,6 @@ namespace ps2x::iop::detail
             uint64_t admaBytes = 0;
             uint64_t admaUnderruns = 0;
             uint64_t lateFrames = 0;
-            uint64_t gapFrames = 0;
-            uint64_t droppedFrames = 0;
             uint64_t ioWrites = 0;
             uint64_t irqs = 0;
             uint64_t registerWrites = 0;
@@ -90,9 +88,6 @@ namespace ps2x::iop::detail
         // samples. The queue's depth paces the mixing to the frames the device takes: about one pull plus a margin
         // ahead, never more than one pull plus two margins (the SPU2 stops while the queue is full). What the queue
         // lacks at a pull the callback mixes itself (lateFrames), its interrupts reaching the IOP at its next advance.
-        // The SPU2 stays within a margin of the IOP clock either way, as the game's sound streams are filled on that
-        // clock: the callback plays silence for what it cannot mix that far ahead (gapFrames), and an SPU2 that a full
-        // queue held a margin behind mixes on, the queue dropping its oldest frames (droppedFrames).
         // Register and DMA accesses and the mixing take a lock.
         [[nodiscard]] bool wallClock() const noexcept { return m_wallClock; }
         void pull(int16_t *frames, size_t count);
@@ -111,10 +106,7 @@ namespace ps2x::iop::detail
         void raise(int irq);
         void deliverDeferred();
         [[nodiscard]] bool wallClockQueueFull() const noexcept;
-        [[nodiscard]] int64_t wallClockLead() const noexcept;
-        void mixWallClock();
         bool m_wallClock = false;
-        uint64_t m_mixedSamples = 0;
         size_t m_pullFrames = 0;
         uint64_t m_wallCyclesPerSample = CyclesPerSample;
         std::recursive_mutex m_mutex;

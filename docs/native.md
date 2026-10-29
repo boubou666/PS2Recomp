@@ -138,12 +138,7 @@ ahead (the IOP's advances can be ~10 ms apart in real time), the samples coming 
 IOP clock to keep it there, and the SPU2 stops while the queue holds a pull plus 1024 frames: the sound is about
 15 ms behind the IOP on average, 30 to 43 ms at most depending on the device's pull. Frames the queue lacks when the
 callback pulls (the IOP late or slower than real time) are mixed by the callback itself, their interrupts reaching
-the IOP at its next advance; the state dump's `late=` counts them. Either way the SPU2 stays within 512 samples
-(10.7 ms) of the IOP clock, since games fill their sound streams on that clock and a sound data input that runs
-further ahead plays what is not written yet (white noise on a movie's PCM): the callback plays silence for the frames
-it cannot mix that far ahead (`gap=`), and an SPU2 that a full queue held 512 samples behind mixes on while the queue
-drops its oldest frames (`drop=`). An IOP slower than real time is thus heard at its own pace with short silences.
-Transfers that are not AutoDMA end on the IOP
+the IOP at its next advance; the state dump's `late=` counts them. Transfers that are not AutoDMA end on the IOP
 clock (`PS2X_SPU2_DMA_CYCLES_PER_2BYTES`). Register and DMA accesses and the mixing share a lock. Best with
 `PS2X_IOP_WALLCLOCK=1`, which keeps the IOP's time on the host's. Without the switch the SPU2 mixes a sample per 768
 IOP cycles and the host stretches the output to its rate, as before.
