@@ -213,6 +213,32 @@ namespace
         runtime->requestStop();
     }
 
+    constexpr uint32_t kNativeAheadPc = 0x00271200u;
+    constexpr uint32_t kNativeAheadResumePc = 0x00271210u;
+    constexpr uint64_t kNativeAheadFields = 30u;
+    std::chrono::steady_clock::time_point g_nativeIdleStart{};
+    std::chrono::steady_clock::duration g_nativeIdleWait{};
+
+    void schedulerRunAheadThenWaitVSync(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        while (scheduler.currentVSyncTick() < kNativeAheadFields)
+        {
+            if (scheduler.checkpointDue(1'000'000u))
+                return;
+        }
+        g_nativeIdleStart = std::chrono::steady_clock::now();
+        ctx->pc = kNativeAheadResumePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerNativeAheadResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_nativeIdleWait = std::chrono::steady_clock::now() - g_nativeIdleStart;
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
@@ -1289,6 +1315,25 @@ void register_ps2_runtime_interrupt_tests()
 
             t.IsTrue(elapsed >= std::chrono::milliseconds(12),
                      "the field after a late vblank should still last about a field of host time");
+            cleanupRuntime(env);
+        });
+
+        tc.Run("native frames: an idle wait lasts the EE cycles to the next event, not the vblank timeline's lead", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.registerFunction(kNativeAheadPc, &schedulerRunAheadThenWaitVSync);
+            env.runtime.registerFunction(kNativeAheadResumePc, &schedulerNativeAheadResume);
+            R5900Context mainContext{};
+            mainContext.pc = kNativeAheadPc;
+            env.runtime.eeScheduler().setWallClockCatchUp(EeScheduler::WallClockCatchUp::Off);
+            env.runtime.eeScheduler().setNativeFrames(true);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            g_nativeIdleWait = std::chrono::hours(1);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_nativeIdleWait < std::chrono::milliseconds(150),
+                     "the vblank wait should take about one field, not the fields EE time ran ahead");
             cleanupRuntime(env);
         });
     });
