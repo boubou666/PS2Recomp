@@ -356,7 +356,8 @@ public:
 
     bool m_seenGifCopy;
     std::atomic<uint64_t> m_dmaStartCount{0};
-    static inline std::array<GifEvent, kGifEvents> s_gifEvents{};
+    // Defined after the class: GCC needs GifEvent's default member initializers complete before it initializes one.
+    static std::array<GifEvent, kGifEvents> s_gifEvents;
     static inline std::atomic<uint32_t> s_gifEventNext{0};
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
@@ -558,5 +559,7 @@ public:
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
 };
+
+inline std::array<PS2Memory::GifEvent, PS2Memory::kGifEvents> PS2Memory::s_gifEvents{};
 
 #endif // PS2_MEMORY_H
