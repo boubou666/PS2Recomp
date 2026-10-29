@@ -1280,7 +1280,9 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     {
         // Only a read in the target's own layout samples it directly (CT24 reads CT32 pixels as they are); another
         // format (a CT32 buffer read as CT16 to split its channels) sees GS memory, through resolveTargetsUnder.
-        RenderTarget *source = m_fillingFromMemory ? nullptr : renderTargetAtBlock(context.tex0.tbp0);
+        // PS2X_GS_NATIVE_MEMORY_READS=1: never sample a target directly, always GS memory (diagnosis).
+        static const bool s_memoryReads = std::getenv("PS2X_GS_NATIVE_MEMORY_READS") != nullptr;
+        RenderTarget *source = m_fillingFromMemory || s_memoryReads ? nullptr : renderTargetAtBlock(context.tex0.tbp0);
         const auto sameLayout = [](uint32_t a, uint32_t b) { return a == b || ((a | b) & ~0x1u) == 0u; };
         if (source && !sameLayout(source->psm, context.tex0.psm))
             source = nullptr;
