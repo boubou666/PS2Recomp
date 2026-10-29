@@ -902,14 +902,11 @@ namespace ps2_syscalls
         uint32_t sid = getRegU32(ctx, 5);
         uint32_t func = getRegU32(ctx, 6);
         uint32_t buf = getRegU32(ctx, 7);
-        // stack args: cfunc, cbuf, qd...
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t cfunc = 0;
-        uint32_t cbuf = 0;
-        uint32_t qd = 0;
-        readStackU32(rdram, sp, 0x10, cfunc);
-        readStackU32(rdram, sp, 0x14, cbuf);
-        readStackU32(rdram, sp, 0x18, qd);
+        // Arguments 5-7 (cfunc, cbuf, qd) are in t0-t2 (EE EABI), not on the stack: read from the stack, JC2's queue
+        // came out 0 and every IOP -> EE call to its server (stream chunk done, sid 0x10001) was refused.
+        const uint32_t cfunc = getRegU32(ctx, 8);
+        const uint32_t cbuf = getRegU32(ctx, 9);
+        const uint32_t qd = getRegU32(ctx, 10);
 
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
