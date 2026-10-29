@@ -197,9 +197,9 @@ namespace ps2x::native
         }
         uint32_t offset = 0, extent = 0;
         if (TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
-            k.u *= static_cast<float>(tw) / static_cast<float>(extent);
+            k.u = (k.u * static_cast<float>(tw) - static_cast<float>(offset)) / static_cast<float>(extent);
         if (TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
-            k.v *= static_cast<float>(th) / static_cast<float>(extent);
+            k.v = (k.v * static_cast<float>(th) - static_cast<float>(offset)) / static_cast<float>(extent);
 
         const uint32_t type = m_prim & 7u;
         switch (type)
@@ -264,7 +264,7 @@ namespace ps2x::native
         const uint32_t wms = m_clamp[context] & 3u, wmt = (m_clamp[context] >> 2) & 3u;
         m.clampU = wms == 1u || wms == 2u; // CLAMP, REGION_CLAMP (its region taken as the texture)
         m.clampV = wmt == 1u || wmt == 2u;
-        if (m.textured && (wms == 3u || wmt == 3u))
+        if (m.textured && (wms >= 2u || wmt >= 2u))
             m.region = m_clamp[context];
         m.blend = Material::Blend::Opaque;
         if ((attributes >> 6) & 1u) // ABE

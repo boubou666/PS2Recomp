@@ -44,10 +44,11 @@ namespace ps2x::native
 
         // The texture a draw selects: TEX0 (the CLD bits are ignored), and TEXA for the alpha of CT24 / CT16 texels.
         // Shared, never modified once decoded: uploads may arrive from the GS thread while another thread draws.
-        // With a CLAMP whose REGION_REPEAT is a window (regionWindow), only that window is decoded, as the texture.
+        // With a CLAMP whose region is a window (regionWindow), only that window is decoded, as the texture.
         std::shared_ptr<const Texture> texture(uint64_t tex0, uint64_t texa = 0, uint64_t clamp = 0);
-        // REGION_REPEAT on one axis that only masks (MINU 2^n - 1, MAXU an offset clear of it): the texels the GS
-        // reads are the window [offset, offset + extent) of a texture `size` texels wide, repeated.
+        // The texels the GS reads on one axis of a texture `size` texels wide, when they are the window
+        // [offset, offset + extent): REGION_CLAMP's [MINU, MAXU] (clamped to), or a REGION_REPEAT that only masks
+        // (MINU 2^n - 1, MAXU an offset clear of it; repeated).
         static bool regionWindow(uint64_t clamp, bool v, uint32_t size, uint32_t &offset, uint32_t &extent);
 
         const uint8_t *memory() const { return m_memory.data(); }
