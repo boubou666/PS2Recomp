@@ -607,6 +607,14 @@ void PS2Memory::submitPendingPath2Image(const uint8_t *data, uint32_t chunkQw, b
     }
 }
 
+void PS2Memory::observeVif1Until(const uint8_t *end)
+{
+    if (!m_vif1ObservedTo || end <= m_vif1ObservedTo || end > m_vif1ObserveEnd)
+        return;
+    ps2x::native::observeVif1(m_vif1ObservedTo, static_cast<size_t>(end - m_vif1ObservedTo));
+    m_vif1ObservedTo = end;
+}
+
 uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
@@ -737,6 +745,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            observeVif1Until(data + pos);
             m_vu1ProgramSkipped = ps2x::native::vu1Skipped(m_vu1Code, startPC);
             if (m_vu1ProgramSkipped && m_vu1SkipCallback)
                 m_vu1SkipCallback(startPC);
@@ -758,6 +767,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            observeVif1Until(data + pos);
             if (m_vu1ProgramSkipped && m_vu1SkipCallback) // the native port's next group (see Vu1StreamAdapter)
                 m_vu1SkipCallback(~0u);
             if (m_vu1MscntCallback && !m_vu1ProgramSkipped)
@@ -1128,9 +1138,11 @@ void PS2Memory::vif1WorkerMain()
         switch (job.kind)
         {
         case Vif1Job::Kind::Vif1:
-            if (job.observe)
-                ps2x::native::observeVif1(job.data.data(), job.data.size());
+            m_vif1ObservedTo = job.observe ? job.data.data() : nullptr;
+            m_vif1ObserveEnd = job.data.data() + job.data.size();
             processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
+            observeVif1Until(job.data.data() + job.data.size());
+            m_vif1ObservedTo = nullptr;
             break;
         case Vif1Job::Kind::Path3:
             submitGifPacket(GifPathId::Path3, job.data.data(), static_cast<uint32_t>(job.data.size()), false, false, true);
