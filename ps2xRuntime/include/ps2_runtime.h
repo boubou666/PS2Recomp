@@ -162,6 +162,9 @@ public:
     // counter (bit 1: PCR0 or PCR1). While PCCR.CTE (bit 31) is set the counters count EE cycles.
     uint32_t readCop0Perf(uint32_t select) const noexcept;
     void writeCop0Perf(uint32_t select, uint32_t value) noexcept;
+    // Count and the counters on the host's clock (in EE cycles) instead of the EE's accounted cycles: for games that
+    // time their frames with Count (native frame pacing). Off by default.
+    void setCop0WallClock(bool on) noexcept;
 
 public:
     void handleSyscall(uint8_t *rdram, R5900Context *ctx);
@@ -376,6 +379,8 @@ private:
     uint32_t m_guestHeapHardLimit = 0x01F00000u;
     bool m_guestHeapConfigured = false;
     bool m_guestHeapPinned = false;
+    uint64_t cop0Clock() const noexcept;
+    bool m_cop0WallClock = false;
     uint64_t m_cop0CountBase = 0; // EE cycle at which Count read 0 (MTC0 Count moves it)
     uint32_t m_cop0Pccr = 0;
     uint64_t m_cop0PcrBase[2] = {}; // EE cycle at which the counter read 0, while counting
