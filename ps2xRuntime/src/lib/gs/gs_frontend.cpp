@@ -239,6 +239,25 @@ bool GS::shouldQueue() const
     return m_asyncEnabled && !t_onGsWorker;
 }
 
+
+namespace
+{
+    // TEX0 / TEX2 PSM. A value the GS does not define is read as PSMCT32 (GSdx's format table defaults every entry
+    // to it; paraLLEl-GS shows such textures): The Third Age draws its movie pictures with PSM 0x20.
+    uint8_t textureFormat(uint64_t tex0)
+    {
+        const uint8_t psm = static_cast<uint8_t>((tex0 >> 20) & 0x3F);
+        switch (psm)
+        {
+        case 0x00: case 0x01: case 0x02: case 0x0A: case 0x13: case 0x14: case 0x1B: case 0x24: case 0x2C:
+        case 0x30: case 0x31: case 0x32: case 0x3A:
+            return psm;
+        default:
+            return 0x00;
+        }
+    }
+}
+
 void GS::postCpuEvent(GsCpuEvent event, uint64_t value, uint64_t delayCycles)
 {
     if (!m_privRegs)
@@ -2265,7 +2284,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         auto &t = m_ctx[ci].tex0;
         t.tbp0 = static_cast<uint32_t>(value & 0x3FFF);
         t.tbw = static_cast<uint8_t>((value >> 14) & 0x3F);
-        t.psm = static_cast<uint8_t>((value >> 20) & 0x3F);
+        t.psm = textureFormat(value);
         t.tw = static_cast<uint8_t>((value >> 26) & 0xF);
         t.th = static_cast<uint8_t>((value >> 30) & 0xF);
         t.tcc = static_cast<uint8_t>((value >> 34) & 0x1);
@@ -2300,7 +2319,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_TEX2_2) ? 1 : 0;
         auto &t = m_ctx[ci].tex0;
-        t.psm = static_cast<uint8_t>((value >> 20) & 0x3F);
+        t.psm = textureFormat(value);
         t.cbp = static_cast<uint32_t>((value >> 37) & 0x3FFF);
         t.cpsm = static_cast<uint8_t>((value >> 51) & 0xF);
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
