@@ -274,11 +274,19 @@ namespace ps2x::native
     bool TextureCache::regionWindow(uint64_t clamp, bool v, uint32_t size, uint32_t &offset, uint32_t &extent)
     {
         const uint32_t mode = (clamp >> (v ? 2u : 0u)) & 3u;
-        const uint32_t mask = (clamp >> (v ? 24u : 4u)) & 0x3ffu, base = (clamp >> (v ? 34u : 14u)) & 0x3ffu;
-        if (mode != 3u || ((mask + 1u) & mask) != 0u || (base & mask) != 0u || mask + 1u >= size)
+        const uint32_t min = (clamp >> (v ? 24u : 4u)) & 0x3ffu, max = (clamp >> (v ? 34u : 14u)) & 0x3ffu;
+        if (mode == 2u)
+        {
+            if (max < min || max >= size || (min == 0u && max + 1u == size))
+                return false;
+            offset = min;
+            extent = max - min + 1u;
+            return true;
+        }
+        if (mode != 3u || ((min + 1u) & min) != 0u || (max & min) != 0u || min + 1u >= size)
             return false;
-        offset = base & (size - 1u);
-        extent = mask + 1u;
+        offset = max & (size - 1u);
+        extent = min + 1u;
         return offset + extent <= size;
     }
 

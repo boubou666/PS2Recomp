@@ -112,6 +112,18 @@ void register_native_texture_cache_tests()
             t.IsFalse(TextureCache::regionWindow(overlapping, false, 1024, offset, extent), "MAXU inside the mask");
         });
 
+        tc.Run("a REGION_CLAMP is the window from MINU to MAXU, unless it is the whole texture", [](TestCase &t)
+        {
+            uint32_t offset = 0, extent = 0;
+            const uint64_t region = 2u | (16ull << 4) | (207ull << 14);
+            t.IsTrue(TextureCache::regionWindow(region, false, 1024, offset, extent) && offset == 16u && extent == 192u,
+                     "U: 192 texels from 16");
+            const uint64_t whole = 2u | (0ull << 4) | (255ull << 14);
+            t.IsFalse(TextureCache::regionWindow(whole, false, 256, offset, extent), "the whole texture");
+            const uint64_t reversed = 2u | (100ull << 4) | (50ull << 14);
+            t.IsFalse(TextureCache::regionWindow(reversed, false, 1024, offset, extent), "MAXU below MINU");
+        });
+
         tc.Run("a REGION_REPEAT window decodes only its texels", [](TestCase &t)
         {
             TextureCache cache;
