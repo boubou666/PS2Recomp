@@ -276,7 +276,8 @@ uniform sampler2D uTarget;   // the render target's colour, GL row 0 = GS row 0,
 uniform usampler2D uInverse; // page pixel offset -> x | y << 16
 uniform int uFbp;
 uniform int uFbw;
-uniform int uKind;           // 0 CT32, 1 CT16, 2 CT16S
+uniform int uKind;           // 0 CT32, 1 CT16, 2 CT16S, 3 CT24 (the top byte kept from uOld)
+uniform usampler2D uOld;     // CT24: a copy of GS memory's words before the resolve
 uniform int uUsedHeight;     // rows drawn: words of pixels below them keep what GS memory holds
 uniform int uScale;          // the target's internal scale: a GS pixel is the middle texel of its block
 
@@ -297,14 +298,15 @@ void main()
     int rel = word / 2048 - uFbp;
     int inPage = word % 2048;
     int prow = rel / uFbw, pcol = rel % uFbw;
-    if (uKind == 0)
+    if (uKind == 0 || uKind == 3)
     {
         uint e = texelFetch(uInverse, ivec2(inPage % 128, inPage / 128), 0).r;
         ivec2 p = ivec2(pcol * 64 + int(e & 0xFFFFu), prow * 32 + int(e >> 16u));
         if (p.y >= uUsedHeight)
             discard;
         uvec4 c = bytes(p);
-        outWord = c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+        uint top = uKind == 3 ? texelFetch(uOld, f, 0).r & 0xFF000000u : c.a << 24u;
+        outWord = c.r | (c.g << 8u) | (c.b << 16u) | top;
         return;
     }
     int row = uKind == 1 ? 16 : 48;
@@ -667,9 +669,7 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
                 std::fprintf(stderr, "[gs:native] target fbp=%u redrawn as psm=0x%x fbw=%u (was psm=0x%x fbw=%u)\n",
                              frame.fbp, frame.psm, frame.fbw, existing.psm, existing.fbw);
         }
-        for (uint32_t i = 0; i < existing.pages.size(); ++i)
-            if (holdsNewest(existing, existing.fbp + i))
-                syncMemoryPages(existing.fbp + i, existing.fbp + i + 1u);
+        syncMemoryPages(existing.fbp, existing.fbp + static_cast<uint32_t>(existing.pages.size()));
         glDeleteFramebuffers(1, &existing.framebuffer);
         glDeleteTextures(1, &existing.color);
         glDeleteTextures(1, &existing.depth);
@@ -859,8 +859,10 @@ void GSNativeBackend::reloadTargetPages(RenderTarget &target, const std::vector<
         for (int corner = 0; corner < 2; ++corner)
         {
             GSVertex &v = fill.vertices[corner];
-            v.x = static_cast<float>(x + (corner ? 64u : 0u));
-            v.y = static_cast<float>(y + (corner ? pageRows : 0u));
+            // The page's exact edges in host pixels (the vertex shader moves GS geometry by 31/64 of a pixel: without
+            // this, at an internal scale the first host column and row of each page were left out).
+            v.x = static_cast<float>(x + (corner ? 64u : 0u)) - 31.0f / 64.0f;
+            v.y = static_cast<float>(y + (corner ? pageRows : 0u)) - 31.0f / 64.0f;
             v.u = static_cast<uint16_t>(std::min<uint32_t>((x + (corner ? 64u : 0u)) * 16u, 0xFFFFu));
             v.v = static_cast<uint16_t>(std::min<uint32_t>((y + (corner ? pageRows : 0u)) * 16u, 0xFFFFu));
             v.r = v.g = v.b = v.a = 0x80u;
@@ -1201,7 +1203,7 @@ void GSNativeBackend::pullGpuPages(uint32_t firstPage, uint32_t endPage)
 
 bool GSNativeBackend::resolveTargetPagesGpu(RenderTarget &target, uint32_t firstPage, uint32_t endPage)
 {
-    const int kind = target.psm == 0x00u ? 0 : target.psm == 0x02u ? 1 : target.psm == 0x0Au ? 2 : -1;
+    const int kind = target.psm == 0x00u ? 0 : target.psm == 0x02u ? 1 : target.psm == 0x0Au ? 2 : target.psm == 0x01u ? 3 : -1;
     if (kind < 0 || !m_vram)
         return false;
     ensureVram();
@@ -1210,6 +1212,30 @@ bool GSNativeBackend::resolveTargetPagesGpu(RenderTarget &target, uint32_t first
     const GlStateRestore restore;
     // Transfers before this resolve land first, then the target's pixels over them, all on the GPU copy.
     syncVramToGpu();
+    if (kind == 3)
+    {
+        // CT24 keeps GS memory's top bytes (T8H / T4HL / T4HH textures): the shader reads them from a copy of the
+        // pages' words, which it cannot read from the texture it writes.
+        if (!m_vramOld)
+        {
+            glGenTextures(1, &m_vramOld);
+            glBindTexture(GL_TEXTURE_2D, m_vramOld);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glGenFramebuffers(1, &m_vramOldFramebuffer);
+            glBindFramebuffer(GL_FRAMEBUFFER, m_vramOldFramebuffer);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_vramOld, 0);
+        }
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_vramOldFramebuffer);
+        const GLint y0 = static_cast<GLint>(firstPage * 2u), y1 = static_cast<GLint>(endPage * 2u);
+        glBlitFramebuffer(0, y0, 1024, y1, 0, y0, 1024, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, m_vramOld);
+        glActiveTexture(GL_TEXTURE0);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, m_vramFramebuffer);
     glViewport(0, 0, 1024, 1024);
     glEnable(GL_SCISSOR_TEST);
@@ -1229,6 +1255,7 @@ bool GSNativeBackend::resolveTargetPagesGpu(RenderTarget &target, uint32_t first
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbp"), static_cast<GLint>(target.fbp));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uKind"), kind);
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uOld"), 5);
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.height));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uScale"), static_cast<GLint>(m_scale));
     glBindVertexArray(m_vertexArray);
@@ -1968,15 +1995,19 @@ void GSNativeBackend::flushBatch()
     // FBMSK keeping part of a channel (VP2 writes CT16 bits 14-15 alone with 0x3FFF to split channels, SCTPT2 the
     // top alpha bit with 0x7F000000): the kept bits come from a copy of the target, which such a draw never
     // changes, so one copy serves the batch. In CT16 only the stored bits count (3-7 of RGB, the alpha's top bit).
-    // After the blend: done in the shader only when the batch does not blend (else whole channels, as before).
-    const uint32_t kept = fbmsk & storedBits;
+    // The shader's output is the written value only for what is not blended: RGB when the batch does not blend, alpha
+    // always (the GS never blends alpha; GL's alpha factors are ONE, ZERO). A blended RGB channel kept in part is
+    // masked whole, as before.
+    uint32_t kept = fbmsk & storedBits;
+    if (state.prim.abe)
+        kept &= 0xFF000000u;
     bool partialMask = false;
     for (int channel = 0; channel < 4; ++channel)
     {
         const uint32_t bits = kept >> (8 * channel) & 0xFFu, all = storedBits >> (8 * channel) & 0xFFu;
         partialMask |= bits != 0u && bits != all;
     }
-    partialMask = partialMask && !state.prim.abe && !offColor;
+    partialMask = partialMask && !offColor;
     glUniform1i(m_uniforms.colorKeep, partialMask ? static_cast<int>(kept) : 0);
     glUniform1i(m_uniforms.dest, 1);
     if (date || partialMask || blendReadsDest)
