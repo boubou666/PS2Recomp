@@ -819,6 +819,15 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
+            // A whole packet the native port draws: the GS does not get it (numbered as a skipped program).
+            if (!truncated && m_vif1PendingPath2ImageQwc == 0u && ps2x::native::directSkipped(imm ? imm : 65536u))
+            {
+                if (m_vu1SkipCallback)
+                    m_vu1SkipCallback(~0u);
+                pos += qwCount * 16u;
+                continue;
+            }
+
             if (qwCount > 0 && m_vif1PendingPath2ImageQwc != 0u)
             {
                 const uint32_t chunkQw = std::min(m_vif1PendingPath2ImageQwc, qwCount);

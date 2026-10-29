@@ -191,6 +191,8 @@ public:
                                           uint32_t *outDisplayFbp = nullptr,
                                           uint32_t *outSourceFbp = nullptr,
                                           bool *outUsedPreferred = nullptr) const;
+    // The latched frame as a GL texture (PresentationFrame::glTexture), when the renderer handed one over.
+    bool latchedHostPresentationTexture(uint32_t &texture, uint32_t &width, uint32_t &height) const;
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -372,6 +374,7 @@ private:
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
     std::vector<uint8_t> m_hostPresentationFrame;
+    uint32_t m_hostPresentationTexture = 0;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
     uint32_t m_hostPresentationDisplayFbp = 0;

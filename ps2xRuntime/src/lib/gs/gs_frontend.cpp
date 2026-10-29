@@ -1462,6 +1462,7 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         {
             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
             m_hostPresentationFrame.clear();
+            m_hostPresentationTexture = 0u;
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
             return;
@@ -1523,6 +1524,7 @@ void GS::storePresentationFrame(PresentationFrame &&frame)
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationTexture = frame.glTexture;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
         m_hostPresentationDisplayFbp = displayFbp;
@@ -1536,6 +1538,17 @@ void GS::storePresentationFrame(PresentationFrame &&frame)
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
     }
+}
+
+bool GS::latchedHostPresentationTexture(uint32_t &texture, uint32_t &width, uint32_t &height) const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    if (!m_hasHostPresentationFrame || m_hostPresentationTexture == 0u)
+        return false;
+    texture = m_hostPresentationTexture;
+    width = m_hostPresentationWidth;
+    height = m_hostPresentationHeight;
+    return true;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,

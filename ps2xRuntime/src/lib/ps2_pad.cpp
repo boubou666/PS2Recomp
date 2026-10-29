@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include "runtime/ps2_input_bindings.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -330,103 +331,19 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
-    uint16_t btns = 0xFFFFu;
-    // PS2X_PAD_NO_HOST=1: neither keyboard nor gamepads, only the pad scripts (a replay nobody can disturb).
+    // The player's bindings (runtime/ps2_input_bindings.h: input.ini, the Controls window), on the port's gamepad
+    // among the connected ones unless the player chose one. PS2X_PAD_NO_HOST=1: neither keyboard nor gamepads, only
+    // the pad scripts (a replay nobody can disturb).
     static const bool s_noHost = [] { const char *v = std::getenv("PS2X_PAD_NO_HOST"); return v && v[0] == '1'; }();
-    const int hostPad = s_noHost ? -1 : gamepadForPort(port);
-    const bool useGamepad = hostPad >= 0;
-    const int kGamepad = useGamepad ? hostPad : 0;
-    auto clearBit = [&btns](uint16_t mask)
-    { btns &= ~mask; };
-
-    if (useGamepad)
+    uint16_t btns = 0xFFFFu;
+    if (!s_noHost)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
-
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
-    }
-    else if (port == 0 && !s_noHost)
-    {
-        // The movement keys also push the left stick fully, for games that move with it (sticks are read only in
-        // analog mode).
-        const bool up = IsKeyDown(KEY_UP) || IsKeyDown(KEY_W), down = IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S);
-        const bool left = IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A), right = IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D);
-        data[6] = static_cast<uint8_t>(left == right ? kPadStickCenter : left ? 0x00 : 0xFF);
-        data[7] = static_cast<uint8_t>(up == down ? kPadStickCenter : up ? 0x00 : 0xFF);
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
-        if (IsKeyDown(KEY_F))
-            clearBit(PAD_L3);
-        if (IsKeyDown(KEY_G))
-            clearBit(PAD_R3);
-        // Right stick on I/J/K/L (US layout positions).
-        const bool rUp = IsKeyDown(KEY_I), rDown = IsKeyDown(KEY_K), rLeft = IsKeyDown(KEY_J), rRight = IsKeyDown(KEY_L);
-        data[4] = static_cast<uint8_t>(rLeft == rRight ? kPadStickCenter : rLeft ? 0x00 : 0xFF);
-        data[5] = static_cast<uint8_t>(rUp == rDown ? kPadStickCenter : rUp ? 0x00 : 0xFF);
+        const ps2_input::PadState state = ps2_input::padState(port == 1 ? 1 : 0, gamepadForPort(port));
+        btns = state.buttons;
+        data[4] = state.rx;
+        data[5] = state.ry;
+        data[6] = state.lx;
+        data[7] = state.ly;
     }
 
     if (port == 0)

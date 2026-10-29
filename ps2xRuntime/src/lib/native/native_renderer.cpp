@@ -208,6 +208,33 @@ void main()
         return m_published && !m_published->batches.empty();
     }
 
+    // native_renderer_gs.cpp (raw GL): the bound framebuffer's depth, width x height floats, bottom-up rows, from the
+    // call before this one (false when there is none yet).
+    bool readFramebufferDepth(int width, int height, std::vector<float> &out);
+
+    namespace
+    {
+        double secondsNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    }
+
+    void Renderer::wantDepth() { m_depthWantedAt.store(secondsNow(), std::memory_order_relaxed); }
+
+    bool Renderer::depthAt(float gsX, float gsY, uint32_t &gsZ)
+    {
+        std::lock_guard<std::mutex> lock(m_depthMutex);
+        if (m_depth.empty() || m_depthScreen.width <= 0.0f || m_depthScreen.height <= 0.0f)
+            return false;
+        const int x = static_cast<int>((gsX - m_depthScreen.originX) / m_depthScreen.width * static_cast<float>(m_depthWidth));
+        const int y = static_cast<int>((gsY - m_depthScreen.originY) / m_depthScreen.height * static_cast<float>(m_depthHeight));
+        if (x < 0 || y < 0 || x >= m_depthWidth || y >= m_depthHeight)
+            return false;
+        // present()'s depth: window depth 1 - (z / w) / depthMax (cleared to 1, far), GS Z = z / w * gsZScale.
+        const float d = m_depth[static_cast<size_t>(m_depthHeight - 1 - y) * m_depthWidth + x];
+        const double z = (1.0 - static_cast<double>(d)) * m_depthScreen.depthMax * m_depthScreen.gsZScale;
+        gsZ = static_cast<uint32_t>(std::clamp(z, 0.0, 4294967295.0));
+        return true;
+    }
+
     bool Renderer::present(float x, float y, float width, float height)
     {
         std::shared_ptr<Frame> published, before;
@@ -425,6 +452,18 @@ void main()
             rlDrawVertexArray(static_cast<int>(batch.first), static_cast<int>(batch.count));
         }
         rlDisableScissorTest();
+        if (secondsNow() - m_depthWantedAt.load(std::memory_order_relaxed) < 1.0)
+        {
+            std::vector<float> depth;
+            if (readFramebufferDepth(w, h, depth))
+            {
+                std::lock_guard<std::mutex> lock(m_depthMutex);
+                m_depth.swap(depth);
+                m_depthWidth = w;
+                m_depthHeight = h;
+                m_depthScreen = screen;
+            }
+        }
         rlDisableVertexArray();
         rlDisableShader();
         rlDisableTexture();
