@@ -321,6 +321,81 @@ void main()
 }
 )";
 
+    // A render target's depth written into the GPU copy of GS memory as its ZBUF format stores it: each output word
+    // is a word of a Z buffer page, its depth (Z times the format's scale) found through the inverse swizzle.
+    constexpr const char *kDepthResolveFragmentShader = R"(#version 330 core
+layout(location = 0) out uint outWord;
+uniform sampler2D uDepth;    // the render target's depth, GL row 0 = GS row 0
+uniform usampler2D uInverse; // page pixel offset -> x | y << 16
+uniform int uZbp;
+uniform int uFbw;
+uniform int uKind;           // 0 Z32, 1 Z24, 2 Z16, 3 Z16S
+uniform int uScale;
+uniform float uRange;        // 2^32, 2^24 or 2^16: the Z of depth 1.0
+
+uint z(ivec2 p)
+{
+    float d = texelFetch(uDepth, p * uScale + uScale / 2, 0).r;
+    return uint(clamp(round(d * uRange), 0.0, uRange - 1.0));
+}
+
+void main()
+{
+    ivec2 f = ivec2(gl_FragCoord.xy);
+    int word = f.y * 1024 + f.x;
+    int rel = word / 2048 - uZbp;
+    int inPage = word % 2048;
+    int prow = rel / uFbw, pcol = rel % uFbw;
+    if (uKind < 2)
+    {
+        uint e = texelFetch(uInverse, ivec2(inPage % 128, 80 + inPage / 128), 0).r;
+        outWord = z(ivec2(pcol * 64 + int(e & 0xFFFFu), prow * 32 + int(e >> 16u)));
+        return;
+    }
+    int row = uKind == 2 ? 96 : 128;
+    int i0 = inPage * 2, i1 = inPage * 2 + 1;
+    uint e0 = texelFetch(uInverse, ivec2(i0 % 128, row + i0 / 128), 0).r;
+    uint e1 = texelFetch(uInverse, ivec2(i1 % 128, row + i1 / 128), 0).r;
+    outWord = z(ivec2(pcol * 64 + int(e0 & 0xFFFFu), prow * 64 + int(e0 >> 16u))) |
+              (z(ivec2(pcol * 64 + int(e1 & 0xFFFFu), prow * 64 + int(e1 >> 16u))) << 16u);
+}
+)";
+
+    // The other way: a Z buffer in GS memory into a render target's depth attachment (gl_FragDepth = Z times scale).
+    constexpr const char *kDepthLoadFragmentShader = R"(#version 330 core
+uniform usampler2D uVram;    // GS memory, 1024 words a row
+uniform usampler2D uSwizzle; // page pixel (x, y) -> pixel offset in the page, per layout row
+uniform int uZbp;
+uniform int uFbw;
+uniform int uKind;           // 0 Z32, 1 Z24, 2 Z16, 3 Z16S
+uniform int uScale;
+uniform float uZScale;
+
+void main()
+{
+    ivec2 g = ivec2(gl_FragCoord.xy) / uScale;
+    int pageRows = uKind < 2 ? 32 : 64;
+    int page = (uZbp + (g.y / pageRows) * uFbw + g.x / 64) % 512;
+    int row = uKind < 2 ? 352 : uKind == 2 ? 384 : 448;
+    uint offset = texelFetch(uSwizzle, ivec2(g.x % 64, row + g.y % pageRows), 0).r;
+    uint value;
+    if (uKind < 2)
+    {
+        int word = page * 2048 + int(offset);
+        value = texelFetch(uVram, ivec2(word % 1024, word / 1024), 0).r;
+        if (uKind == 1)
+            value &= 0xFFFFFFu;
+    }
+    else
+    {
+        int word = page * 2048 + int(offset) / 2;
+        uint w = texelFetch(uVram, ivec2(word % 1024, word / 1024), 0).r;
+        value = (offset & 1u) != 0u ? w >> 16u : w & 0xFFFFu;
+    }
+    gl_FragDepth = clamp(float(value) * uZScale, 0.0, 1.0);
+}
+)";
+
     // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment.
     constexpr const char *kDepthFromColorFragmentShader = R"(#version 330 core
 uniform sampler2D uColor;
@@ -401,9 +476,11 @@ void main()
         kLayoutZ16S{448, 64, 64, 16};
     constexpr uint32_t kSwizzleWidth = 128u, kSwizzleHeight = 512u;
     // The other way, for writing render targets into GS memory: page pixel offset -> x | y << 16, for the colour
-    // layouts a render target can have (rows: CT32 0-15, CT16 16-47, CT16S 48-79).
-    constexpr uint32_t kInverseHeight = 80u;
-    constexpr int kInverseRowC32 = 0, kInverseRowC16 = 16, kInverseRowC16S = 48;
+    // layouts a render target can have (rows: CT32 0-15, CT16 16-47, CT16S 48-79), and its depth's (Z32 80-95, Z16
+    // 96-127, Z16S 128-159).
+    constexpr uint32_t kInverseHeight = 160u;
+    constexpr int kInverseRowC32 = 0, kInverseRowC16 = 16, kInverseRowC16S = 48, kInverseRowZ32 = 80, kInverseRowZ16 = 96,
+                  kInverseRowZ16S = 128;
 
     // Each layout's page: the pixel offset (in its own pixels) where page pixel (x, y) is stored, found by writing
     // every pixel's index through GSMem and reading back where it landed (a few bits at a time for 8- and 4-bit).
@@ -443,6 +520,9 @@ void main()
             const int inverseRow = layout.row == kLayoutC32.row    ? kInverseRowC32
                                    : layout.row == kLayoutC16.row  ? kInverseRowC16
                                    : layout.row == kLayoutC16S.row ? kInverseRowC16S
+                                   : layout.row == kLayoutZ32.row  ? kInverseRowZ32
+                                   : layout.row == kLayoutZ16.row  ? kInverseRowZ16
+                                   : layout.row == kLayoutZ16S.row ? kInverseRowZ16S
                                                                    : -1;
             for (uint32_t address = 0; address < pixels; ++address)
             {
@@ -670,6 +750,8 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
                              frame.fbp, frame.psm, frame.fbw, existing.psm, existing.fbw);
         }
         syncMemoryPages(existing.fbp, existing.fbp + static_cast<uint32_t>(existing.pages.size()));
+        if (existing.zbp < kPages)
+            syncMemoryPages(existing.zbp, existing.zbp + static_cast<uint32_t>(existing.zpages.size()));
         glDeleteFramebuffers(1, &existing.framebuffer);
         glDeleteTextures(1, &existing.color);
         glDeleteTextures(1, &existing.depth);
@@ -760,26 +842,226 @@ void GSNativeBackend::syncMemoryPages(uint32_t firstPage, uint32_t endPage)
     {
         if (m_memoryVersion[page] == m_pageVersion[page])
             continue;
+        // The target whose colour or depth holds the page's newest version.
         RenderTarget *owner = nullptr;
+        bool depth = false;
         for (auto &[fbp, target] : m_targets)
+        {
             if (holdsNewest(target, page))
-            {
                 owner = &target;
+            else if (holdsNewestDepth(target, page))
+                owner = &target, depth = true;
+            if (owner)
                 break;
-            }
+        }
         if (!owner)
         {
             m_memoryVersion[page] = m_pageVersion[page]; // not expected: no target has it, memory is all there is
             continue;
         }
-        // The run of following pages the same target holds newest, in one resolve.
+        // The run of following pages the same buffer holds newest, in one resolve.
         uint32_t end = page + 1u;
-        while (end < endPage && m_memoryVersion[end] != m_pageVersion[end] && holdsNewest(*owner, end))
+        while (end < endPage && m_memoryVersion[end] != m_pageVersion[end] &&
+               (depth ? holdsNewestDepth(*owner, end) : holdsNewest(*owner, end)))
             ++end;
-        resolveTargetPages(*owner, page, end);
+        if (depth)
+            resolveDepthPages(*owner, page, end);
+        else
+            resolveTargetPages(*owner, page, end);
         for (uint32_t p = page; p < end; ++p)
             m_memoryVersion[p] = m_pageVersion[p];
         page = end - 1u;
+    }
+}
+
+namespace
+{
+    uint32_t depthPageRows(uint8_t zpsm) { return (zpsm & 0x0Fu) >= 2u ? 64u : 32u; }
+    // The resolve and load shaders' kind: 0 Z32, 1 Z24, 2 Z16, 3 Z16S.
+    int depthKind(uint8_t zpsm) { return (zpsm & 0x0Fu) == 0x0u ? 0 : (zpsm & 0x0Fu) == 0x1u ? 1 : (zpsm & 0x0Fu) == 0xAu ? 3 : 2; }
+
+    GLuint linkFullScreenProgram(const char *fragmentSource)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, fragmentSource);
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glLinkProgram(program);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE)
+        {
+            std::fprintf(stderr, "[gs:native] depth program link failed\n");
+            glDeleteProgram(program);
+            return 0;
+        }
+        return program;
+    }
+}
+
+uint32_t GSNativeBackend::depthPageCount(const RenderTarget &target) const
+{
+    if (target.zbp >= kPages)
+        return 0u;
+    const uint32_t columns = std::min(std::max(target.fbw, 1u), target.width / 64u);
+    return std::min(columns * (target.height / depthPageRows(target.zpsm)), kPages - target.zbp);
+}
+
+bool GSNativeBackend::holdsNewestDepth(const RenderTarget &target, uint32_t page) const
+{
+    return target.zbp < kPages && page >= target.zbp && page - target.zbp < target.zpages.size() &&
+           target.zpages[page - target.zbp] == m_pageVersion[page];
+}
+
+void GSNativeBackend::depthPagesIn(const RenderTarget &target, int x0, int y0, int x1, int y1, std::vector<uint32_t> &pages) const
+{
+    pages.clear();
+    if (target.zbp >= kPages)
+        return;
+    const int columns = static_cast<int>(std::min(std::max(target.fbw, 1u), target.width / 64u));
+    const int pageRows = static_cast<int>(depthPageRows(target.zpsm));
+    x0 = std::max(x0, 0), y0 = std::max(y0, 0);
+    x1 = std::min(x1, columns * 64), y1 = std::min(y1, static_cast<int>(target.height));
+    if (x1 <= x0 || y1 <= y0)
+        return;
+    const uint32_t fbw = std::max(target.fbw, 1u);
+    for (int row = y0 / pageRows; row <= (y1 - 1) / pageRows; ++row)
+        for (int column = x0 / 64; column <= (x1 - 1) / 64; ++column)
+        {
+            const uint32_t local = static_cast<uint32_t>(row) * fbw + static_cast<uint32_t>(column);
+            if (local < target.zpages.size())
+                pages.push_back(target.zbp + local);
+        }
+}
+
+void GSNativeBackend::useDepthBuffer(RenderTarget &target, uint32_t zbp, uint8_t zpsm)
+{
+    if (target.zbp == zbp && depthKind(target.zpsm) == depthKind(zpsm))
+        return;
+    // What the depth held newest goes to GS memory first: its pages reload when the old ZBUF is used again.
+    for (uint32_t i = 0; i < target.zpages.size(); ++i)
+        if (holdsNewestDepth(target, target.zbp + i))
+            syncMemoryPages(target.zbp + i, target.zbp + i + 1u);
+    target.zbp = zbp;
+    target.zpsm = zpsm;
+    target.zpages.assign(depthPageCount(target), 0u);
+}
+
+void GSNativeBackend::syncDepthPages(RenderTarget &target, const std::vector<uint32_t> &pages)
+{
+    std::vector<uint32_t> stale;
+    for (const uint32_t page : pages)
+        if (!holdsNewestDepth(target, page))
+        {
+            syncMemoryPages(page, page + 1u);
+            stale.push_back(page);
+        }
+    if (!stale.empty())
+        reloadDepthPages(target, stale);
+}
+
+void GSNativeBackend::wroteDepthPages(RenderTarget &target, const std::vector<uint32_t> &pages)
+{
+    const uint64_t version = ++m_version;
+    for (const uint32_t page : pages)
+    {
+        m_pageVersion[page] = version;
+        target.zpages[page - target.zbp] = version;
+    }
+}
+
+void GSNativeBackend::resolveDepthPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage)
+{
+    if (logTargetPages())
+        std::fprintf(stderr, "[gs:native] resolve depth of fbp=%u zbp=%u zpsm=0x%x pages %u-%u\n", target.fbp, target.zbp,
+                     target.zpsm, firstPage, endPage - 1u);
+    if (!m_vram || endPage <= firstPage)
+        return;
+    ensureVram();
+    if (!m_depthResolveProgram)
+        m_depthResolveProgram = linkFullScreenProgram(kDepthResolveFragmentShader);
+    if (!m_depthResolveProgram)
+        return;
+    const GlStateRestore restore;
+    syncVramToGpu();
+    glBindFramebuffer(GL_FRAMEBUFFER, m_vramFramebuffer);
+    glViewport(0, 0, 1024, 1024);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, static_cast<GLint>(firstPage * 2u), 1024, static_cast<GLsizei>((endPage - firstPage) * 2u));
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_depthResolveProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, target.depth);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glActiveTexture(GL_TEXTURE0);
+    const int kind = depthKind(target.zpsm);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uDepth"), 0);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uInverse"), 4);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uZbp"), static_cast<GLint>(target.zbp));
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uKind"), kind);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1f(glGetUniformLocation(m_depthResolveProgram, "uRange"), static_cast<float>(1.0 / depthScale(target.zpsm)));
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    for (uint32_t page = firstPage; page < endPage; ++page)
+        m_gpuNewer[page] = 1u;
+    m_anyGpuNewer = true;
+}
+
+void GSNativeBackend::reloadDepthPages(RenderTarget &target, const std::vector<uint32_t> &pages)
+{
+    if (logTargetPages())
+        std::fprintf(stderr, "[gs:native] reload depth of fbp=%u zbp=%u zpsm=0x%x pages=%zu (first %u)\n", target.fbp, target.zbp,
+                     target.zpsm, pages.size(), pages.front());
+    ensureVram();
+    if (!m_depthLoadProgram)
+        m_depthLoadProgram = linkFullScreenProgram(kDepthLoadFragmentShader);
+    if (!m_depthLoadProgram)
+        return;
+    const GlStateRestore restore;
+    syncVramToGpu();
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glViewport(0, 0, static_cast<GLsizei>(target.width * m_scale), static_cast<GLsizei>(target.height * m_scale));
+    glEnable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_TRUE);
+    glUseProgram(m_depthLoadProgram);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, m_vramTexture);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(m_depthLoadProgram, "uVram"), 2);
+    glUniform1i(glGetUniformLocation(m_depthLoadProgram, "uSwizzle"), 3);
+    glUniform1i(glGetUniformLocation(m_depthLoadProgram, "uZbp"), static_cast<GLint>(target.zbp));
+    glUniform1i(glGetUniformLocation(m_depthLoadProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
+    glUniform1i(glGetUniformLocation(m_depthLoadProgram, "uKind"), depthKind(target.zpsm));
+    glUniform1i(glGetUniformLocation(m_depthLoadProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1f(glGetUniformLocation(m_depthLoadProgram, "uZScale"), static_cast<float>(depthScale(target.zpsm)));
+    glBindVertexArray(m_vertexArray);
+    const uint32_t fbw = std::max(target.fbw, 1u), pageRows = depthPageRows(target.zpsm);
+    for (const uint32_t page : pages)
+    {
+        const uint32_t x = (page - target.zbp) % fbw * 64u, y = (page - target.zbp) / fbw * pageRows;
+        glScissor(static_cast<GLint>(x * m_scale), static_cast<GLint>(y * m_scale), static_cast<GLsizei>(64u * m_scale),
+                  static_cast<GLsizei>(pageRows * m_scale));
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        target.zpages[page - target.zbp] = m_pageVersion[page];
     }
 }
 
@@ -1346,8 +1628,13 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     const std::vector<uint32_t> pages = m_scratchPages;
     syncTargetPages(target, pages);
     wroteTargetPages(target, pages);
-    target.zbp = zbuf.zbp;
-    target.zpsm = zbuf.psm;
+    // The native renderer tests and writes the depth as this ZBUF.
+    useDepthBuffer(target, zbuf.zbp, zbuf.psm);
+    std::vector<uint32_t> depthPages;
+    depthPagesIn(target, 0, 0, static_cast<int>(target.width), static_cast<int>(rows), depthPages);
+    syncDepthPages(target, depthPages);
+    if (!zbuf.zmask)
+        wroteDepthPages(target, depthPages);
     out.framebuffer = target.framebuffer;
     out.color = target.color;
     out.depth = target.depth;
@@ -1496,56 +1783,6 @@ bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
     return true;
 }
 
-bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width, float &height)
-{
-    const GSTex0Reg &tex0 = state.context.tex0;
-    RenderTarget *source = nullptr;
-    for (auto &[fbp, target] : m_targets)
-        if (target.zbp != ~0u && target.zbp * 32u == tex0.tbp0 && target.usedHeight != 0u)
-            source = &target;
-    if (!source)
-        return false;
-    const uint32_t w = source->width, h = source->usedHeight;
-    std::vector<float> depth(static_cast<size_t>(w) * h);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(*source, 0u, 0u, w, h, true));
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
-    // Back to GS Z in the Z buffer's range, then laid out as the texture format reads it: Z32 as CT32, Z24 as CT24
-    // (alpha from TEXA), Z16 as CT16.
-    const double range = 1.0 / depthScale(source->zpsm);
-    const uint8_t ta0 = static_cast<uint8_t>(state.texa.ta0), ta1 = static_cast<uint8_t>(state.texa.ta1);
-    std::vector<uint8_t> texels(depth.size() * 4u);
-    for (size_t i = 0; i < depth.size(); ++i)
-    {
-        const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(depth[i]) * range, range - 1.0));
-        uint8_t *t = &texels[i * 4u];
-        switch (tex0.psm)
-        {
-        case 0x30u:
-            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu, t[3] = z >> 24 & 0xFFu;
-            break;
-        case 0x31u:
-            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu;
-            t[3] = state.texa.aem && (z & 0xFFFFFFu) == 0u ? 0u : ta0;
-            break;
-        default:
-            t[0] = static_cast<uint8_t>((z & 0x1Fu) << 3), t[1] = static_cast<uint8_t>((z >> 5 & 0x1Fu) << 3);
-            t[2] = static_cast<uint8_t>((z >> 10 & 0x1Fu) << 3);
-            t[3] = (z & 0x8000u) ? ta1 : (state.texa.aem && (z & 0x7FFFu) == 0u ? 0u : ta0);
-            break;
-        }
-    }
-    if (!m_depthTexture)
-        glGenTextures(1, &m_depthTexture);
-    glBindTexture(GL_TEXTURE_2D, m_depthTexture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, texels.data());
-    width = static_cast<float>(w);
-    height = static_cast<float>(h);
-    return true;
-}
-
 bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height)
 {
     const GSContext &context = state.context;
@@ -1573,14 +1810,9 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
                              context.tex0.tw, context.tex0.th, target.fbp);
         }
     }
-    if ((context.tex0.psm & 0x30u) == 0x30u && bindDepthAsTexture(state, width, height))
-    {
-        fromTarget = true;
-        texture = m_depthTexture;
-        drawnWidth = static_cast<uint32_t>(width);
-        drawnHeight = static_cast<uint32_t>(height);
-    }
-    else if (colorFormat(context.tex0.psm))
+    // A Z-format texture (depth of field, fog from depth) reads GS memory like another format: the depth buffers over
+    // it resolve there first (syncMemoryPages).
+    if (colorFormat(context.tex0.psm))
     {
         // A read in the target's own layout and width samples it (directSource); flushBatch brought the pages it
         // covers up to date. Another format sees GS memory.
@@ -1817,7 +2049,8 @@ void GSNativeBackend::flushBatch()
     // Shared memory: the pages the batch draws over, and those of a target it samples directly, first get what was
     // written there since (other targets, transfers), through GS memory. A read in another format resolves into GS
     // memory in bindTexture.
-    std::vector<uint32_t> drawnPages;
+    std::vector<uint32_t> drawnPages, depthPages;
+    RenderTarget *depthTarget = nullptr;
     if (!m_fillingFromMemory)
     {
         if (state.prim.tme)
@@ -1845,6 +2078,23 @@ void GSNativeBackend::flushBatch()
             }
         targetPagesIn(target, left, top, right, bottom, drawnPages);
         syncTargetPages(target, drawnPages);
+        // The Z buffer the draw tests (VP2's depth of field tests the scene's Z, drawn 512 wide, from a 640-wide copy):
+        // another target's depth when it holds that ZBUF in the same layout (depthOwner, below), else this target's,
+        // pointed at it; its pages under the draw reload from GS memory when not the newest.
+        if ((context.test >> 16 & 0x1u) != 0u)
+        {
+            RenderTarget *owner = context.zbuf.zbp != target.zbp ? depthOwner(target, context.zbuf) : nullptr;
+            const bool colourAsZ = !owner && context.zbuf.zbp != target.zbp && context.zbuf.zmask &&
+                                   m_targets.count(context.zbuf.zbp) != 0u && colorFormat(m_targets.find(context.zbuf.zbp)->second.psm);
+            if (!colourAsZ)
+            {
+                depthTarget = owner ? owner : &target;
+                if (!owner)
+                    useDepthBuffer(target, context.zbuf.zbp, context.zbuf.psm);
+                depthPagesIn(*depthTarget, left, top, right, bottom, depthPages);
+                syncDepthPages(*depthTarget, depthPages);
+            }
+        }
     }
     target.dirty = true;
     target.lastDraw = ++m_drawSerial;
@@ -1882,11 +2132,6 @@ void GSNativeBackend::flushBatch()
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(kDepthFunc[context.test >> 17 & 0x3u]);
         glDepthMask(context.zbuf.zmask ? GL_FALSE : GL_TRUE);
-        if (!context.zbuf.zmask && !borrowedDepth)
-        {
-            target.zbp = context.zbuf.zbp;
-            target.zpsm = context.zbuf.psm;
-        }
     }
     else
     {
@@ -2095,6 +2340,8 @@ void GSNativeBackend::flushBatch()
     glBindVertexArray(0);
     if (!drawnPages.empty())
         wroteTargetPages(target, drawnPages);
+    if (depthTarget && !depthPages.empty() && !context.zbuf.zmask && !offDepth)
+        wroteDepthPages(*depthTarget, depthPages);
     m_batch.clear();
     m_batchMaxY = 0.0f;
 }

@@ -83,11 +83,12 @@ private:
         uint32_t depth = 0;
         uint32_t usedHeight = 0; // rows drawn so far (the lowest vertex, within the scissor), what a resolve reads back
         bool dirty = false;      // drawn since its pixels were last written to GS memory (resolveTarget)
-        uint32_t zbp = ~0u;      // the ZBUF its depth buffer was last written as (pages), for depth read as a texture
+        uint32_t zbp = ~0u;      // the ZBUF its depth buffer holds (pages; with the target's FBW, as the GS addresses it)
         uint8_t zpsm = 0;
         uint64_t lastDraw = 0;     // m_drawSerial of its last batch
         // Per GS memory page it covers (fbp + i, m_pageVersion's numbering): the version its texture holds.
         std::vector<uint64_t> pages;
+        std::vector<uint64_t> zpages; // the same for its depth buffer's pages (zbp + i)
     };
 
     struct Vertex
@@ -136,6 +137,18 @@ private:
     bool resolveTargetPagesGpu(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
     // The target's pages drawn again from what GS memory holds, in its format (a sprite per page sampling memory).
     void reloadTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages);
+    // The same for render targets' depth buffers (Z32 / Z24 / Z16 / Z16S at their ZBUF, with the target's FBW).
+    uint32_t depthPageCount(const RenderTarget &target) const;
+    bool holdsNewestDepth(const RenderTarget &target, uint32_t page) const;
+    void depthPagesIn(const RenderTarget &target, int x0, int y0, int x1, int y1, std::vector<uint32_t> &pages) const;
+    // Points the target's depth at a ZBUF (its pages then reload from GS memory when used).
+    void useDepthBuffer(RenderTarget &target, uint32_t zbp, uint8_t zpsm);
+    void syncDepthPages(RenderTarget &target, const std::vector<uint32_t> &pages);
+    void wroteDepthPages(RenderTarget &target, const std::vector<uint32_t> &pages);
+    void resolveDepthPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
+    void reloadDepthPages(RenderTarget &target, const std::vector<uint32_t> &pages);
+    uint32_t m_depthResolveProgram = 0;
+    uint32_t m_depthLoadProgram = 0;
     // A texture sampled straight from a render target (its base, format layout and width); null when the read goes
     // through GS memory.
     RenderTarget *directSource(const GSDrawState &state);
@@ -147,10 +160,6 @@ private:
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
     uint64_t m_drawSerial = 0;
-    // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
-    // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
-    bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
-    uint32_t m_depthTexture = 0;
     // The GPU decoding path (default; PS2X_GS_NATIVE_CPUDECODE=1 uses the texture cache's images): GS memory on the
     // GPU, brought up to date page by page from m_vram, and the formats' swizzle tables.
     bool bindDecodedTexture(const GSDrawState &state);
