@@ -141,6 +141,15 @@ private:
     uint32_t m_inverseTexture = 0;
     uint32_t m_vramFramebuffer = 0;
     uint32_t m_resolveProgram = 0;
+    // A draw whose ZBUF is another render target's colour tests against that colour read as Z, in m_borrowedDepth,
+    // attached to the draw's framebuffer for that draw. False when no colour target is there.
+    bool depthFromColorTarget(const RenderTarget &target, const GSZbufReg &zbuf);
+    // The other target whose depth attachment holds that Z buffer (it last drew Z there), the same size as this one.
+    RenderTarget *depthOwner(const RenderTarget &target, const GSZbufReg &zbuf);
+    uint32_t m_depthFromColorProgram = 0;
+    uint32_t m_borrowedDepth = 0;
+    uint32_t m_borrowedDepthWidth = 0;
+    uint32_t m_borrowedDepthHeight = 0;
     void ensureVram();
     void syncVramToGpu();
     // A render target written into the GPU copy of GS memory (CT32 / CT16 / CT16S); false for what only the CPU
@@ -226,7 +235,7 @@ private:
         int alphaTest = -1, alphaRef = -1, alphaFail = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
         int dest = -1, date = -1;
         int vram = -1, swizzle = -1, decode = -1, texFmt = -1, texSel = -1, texKind = -1, clutFmt = -1, cbp = -1;
-        int texa = -1, wrapU = -1, wrapV = -1, linear = -1, targetWrap = -1;
+        int texa = -1, wrapU = -1, wrapV = -1, linear = -1, targetWrap = -1, sampleShift = -1;
     } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
