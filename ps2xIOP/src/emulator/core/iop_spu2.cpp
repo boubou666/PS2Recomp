@@ -158,6 +158,7 @@ namespace ps2x::iop::detail
         m_reverbPhase = false;
         m_pending.clear();
         m_pullFrames = 0u;
+        m_mixedSamples = 0u;
         m_wallCyclesPerSample = CyclesPerSample;
         m_stats = Stats{};
         updateNextEvent();
@@ -1012,6 +1013,7 @@ namespace ps2x::iop::detail
         m_pending.push_back(static_cast<int16_t>(out.right));
         m_stats.peak = std::max({m_stats.peak, std::abs(out.left), std::abs(out.right)});
         ++m_stats.samples;
+        ++m_mixedSamples;
         if (!m_wallClock && m_pending.size() >= kOutputChunk * 2u)
             flush();
     }
@@ -1048,11 +1050,14 @@ namespace ps2x::iop::detail
         m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(ready * 2u));
         if (ready < count)
         {
-            for (size_t i = ready; i < count; ++i)
+            size_t mixed = ready;
+            for (; mixed < count && wallClockLead() < static_cast<int64_t>(kWallClockMargin); ++mixed)
                 renderSample();
-            std::copy_n(m_pending.begin(), (count - ready) * 2u, frames + ready * 2u);
+            std::copy_n(m_pending.begin(), (mixed - ready) * 2u, frames + ready * 2u);
+            std::fill(frames + mixed * 2u, frames + count * 2u, int16_t{0});
             m_pending.clear();
-            m_stats.lateFrames += count - ready;
+            m_stats.lateFrames += mixed - ready;
+            m_stats.gapFrames += count - mixed;
         }
         m_pullFrames = count;
         const int64_t base = static_cast<int64_t>(CyclesPerSample);
@@ -1064,6 +1069,26 @@ namespace ps2x::iop::detail
     bool IopSpu2::wallClockQueueFull() const noexcept
     {
         return m_pending.size() / 2u >= m_pullFrames + 2u * kWallClockMargin;
+    }
+
+    int64_t IopSpu2::wallClockLead() const noexcept
+    {
+        return static_cast<int64_t>(m_mixedSamples) - static_cast<int64_t>(m_cycle / CyclesPerSample);
+    }
+
+    void IopSpu2::mixWallClock()
+    {
+        constexpr int64_t margin = static_cast<int64_t>(kWallClockMargin);
+        if (wallClockLead() < margin && !wallClockQueueFull())
+            renderSample();
+        while (wallClockLead() < -margin)
+            renderSample();
+        const size_t full = m_pullFrames + 2u * kWallClockMargin;
+        if (m_pending.size() / 2u >= full + kOutputChunk)
+        {
+            m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(kOutputChunk * 2u));
+            m_stats.droppedFrames += kOutputChunk;
+        }
     }
 
     void IopSpu2::flush()
@@ -1091,7 +1116,9 @@ namespace ps2x::iop::detail
             }
             if (m_cycle >= m_nextSampleCycle)
             {
-                if (!m_wallClock || !wallClockQueueFull())
+                if (m_wallClock)
+                    mixWallClock();
+                else
                     renderSample();
                 m_nextSampleCycle += m_wallClock ? m_wallCyclesPerSample : CyclesPerSample;
             }
@@ -1138,7 +1165,7 @@ namespace ps2x::iop::detail
             << " adma=" << m_stats.admaTransfers << " (" << m_stats.admaBytes << " B, underruns "
             << m_stats.admaUnderruns << ")";
         if (m_wallClock)
-            out << " late=" << m_stats.lateFrames;
+            out << " late=" << m_stats.lateFrames << " gap=" << m_stats.gapFrames << " drop=" << m_stats.droppedFrames;
         out << " io=" << m_stats.ioWrites << " irq=" << m_stats.irqs
             << " regW=" << m_stats.registerWrites << " peak=" << m_stats.peak;
         lines.push_back(out.str());
