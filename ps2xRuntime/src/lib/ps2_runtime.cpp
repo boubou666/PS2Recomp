@@ -595,11 +595,21 @@ static bool frameCaptureDue(char (&path)[1024])
     return true;
 }
 
-static void writeFrameCapture(const char *path, uint8_t *pixels, int rowPixels, int height)
+static void writeFrameCapture(const char *path, uint8_t *pixels, int rowPixels, int width, int height)
 {
+    std::vector<uint8_t> packed;
+    if (width < rowPixels)
+    {
+        const size_t rowBytes = static_cast<size_t>(width) * 4u;
+        packed.resize(rowBytes * static_cast<size_t>(height));
+        for (int y = 0; y < height; ++y)
+            std::memcpy(packed.data() + static_cast<size_t>(y) * rowBytes,
+                        pixels + static_cast<size_t>(y) * static_cast<size_t>(rowPixels) * 4u, rowBytes);
+        pixels = packed.data();
+    }
     Image image{};
     image.data = pixels;
-    image.width = rowPixels;
+    image.width = width;
     image.height = height;
     image.mipmaps = 1;
     image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
@@ -623,7 +633,7 @@ static void dumpPresentedTexture(uint32_t texture, uint32_t width, uint32_t heig
     if (dump)
         writeFrameDump(pixels, static_cast<size_t>(width) * height * 4u, width, height);
     if (capture)
-        writeFrameCapture(path, pixels, static_cast<int>(width), static_cast<int>(height));
+        writeFrameCapture(path, pixels, static_cast<int>(width), static_cast<int>(width), static_cast<int>(height));
     RL_FREE(pixels);
 }
 
@@ -764,7 +774,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_hasUploadedFrame = true;
 
     if (char path[1024]; width != 0u && height != 0u && frameCaptureDue(path))
-        writeFrameCapture(path, s_uploadBuffer.data(), FB_MAX_WIDTH, static_cast<int>(std::min<uint32_t>(height, FB_MAX_HEIGHT)));
+        writeFrameCapture(path, s_uploadBuffer.data(), FB_MAX_WIDTH, static_cast<int>(std::min<uint32_t>(width, FB_MAX_WIDTH)),
+                          static_cast<int>(std::min<uint32_t>(height, FB_MAX_HEIGHT)));
 }
 
 PS2Runtime::PS2Runtime()
