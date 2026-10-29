@@ -60,18 +60,28 @@ uniform float uAlphaRef;
 uniform int uFog;
 uniform vec3 uFogColour;
 uniform int uDebug;
+uniform int uTfx;
+uniform int uTcc;
 layout(location = 0, index = 0) out vec4 fragColor;
 layout(location = 0, index = 1) out vec4 fragFactor;
 void main()
 {
     vec4 colour = vCol * (255.0 / 128.0);
-    vec4 texel = uTextured != 0 ? texture(uTex, vUv) : vec4(1.0);
-    vec4 c = clamp(texel * colour, 0.0, 1.0);
+    vec4 c = colour;
+    if (uTextured != 0)
+    {
+        vec4 texel = texture(uTex, vUv);
+        float highlight = uTfx >= 2 ? vCol.a : 0.0;
+        c.rgb = uTfx == 1 ? texel.rgb : texel.rgb * colour.rgb + highlight;
+        if (uTcc != 0)
+            c.a = uTfx == 0 ? texel.a * colour.a : uTfx == 2 ? texel.a + colour.a : texel.a;
+    }
+    c = clamp(c, vec4(0.0), vec4(1.0, 1.0, 1.0, 255.0 / 128.0));
     if (uAlphaTest != 0 && c.a <= uAlphaRef)
         discard;
     if (uFog != 0)
         c.rgb = mix(uFogColour, c.rgb, clamp(vFog, 0.0, 1.0));
-    fragFactor = vec4(c.a);
+    fragFactor = vec4(min(c.a, 1.0));
     c.a *= 128.0 / 255.0;
     if (uDebug != 0)
         c = vec4(1.0, 0.0, 1.0, 128.0 / 255.0);
@@ -102,6 +112,7 @@ void main()
     {
         GLuint program = 0, vao = 0, vbo = 0;
         GLint locM = -1, locOffset = -1, locTargetSize = -1, locDepthScale = -1, locTex = -1, locTextured = -1;
+        GLint locTfx = -1, locTcc = -1;
         GLint locAlphaTest = -1, locAlphaRef = -1, locFog = -1, locFogColour = -1;
         bool failed = false;
         struct GpuTexture
@@ -132,6 +143,8 @@ void main()
             locDepthScale = glGetUniformLocation(program, "uDepthScale");
             locTex = glGetUniformLocation(program, "uTex");
             locTextured = glGetUniformLocation(program, "uTextured");
+            locTfx = glGetUniformLocation(program, "uTfx");
+            locTcc = glGetUniformLocation(program, "uTcc");
             locAlphaTest = glGetUniformLocation(program, "uAlphaTest");
             locAlphaRef = glGetUniformLocation(program, "uAlphaRef");
             locFog = glGetUniformLocation(program, "uFog");
@@ -448,6 +461,8 @@ void main()
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
             }
             glUniform1i(pass.locTextured, textured ? 1 : 0);
+            glUniform1i(pass.locTfx, static_cast<GLint>((m.tex0 >> 35) & 3u));
+            glUniform1i(pass.locTcc, static_cast<GLint>((m.tex0 >> 34) & 1u));
             glUniform1i(pass.locAlphaTest, m.alphaTest ? 1 : 0);
             glUniform1f(pass.locAlphaRef, m.alphaRef / 128.0f);
             glUniform1i(pass.locFog, m.fog ? 1 : 0);
