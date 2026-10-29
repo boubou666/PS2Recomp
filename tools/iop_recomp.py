@@ -4,12 +4,12 @@
 
   tools/iop_recomp.py <module>.json [--out <dir>]    writes <module>.cpp (and prints what it found)
   tools/iop_recomp.py <module>.json --list           functions, exports, imports, what is left to the interpreter
-  --scan-pointers   also take the functions the module only reaches through a pointer (thread entries, RPC
-                    servers, function tables): lui+addiu/ori targets and data words that start with a prologue,
-                    and every prologue right after a function's end (jr ra, delay slot, nop padding)
+  tools/iop_recomp.py <module>.json --entry 0x...,0x...   more function starts (only reached through pointers)
 
-Functions come from the module's entry, its export tables (magic 0x41C00000), the targets of JALs, and the
-functions those reach. Import stubs (magic 0x41E00000: `jr ra; addiu $0, $0, ordinal`) stay calls into the IOP's
+Functions come from the module's entry, its export tables (magic 0x41C00000), the targets of JALs, the addresses
+the code builds with LUI + ADDIU/ORI that land on a function prologue (ADDIU $sp, $sp, -n: SIF command handlers,
+thread entries and callbacks a module only passes as pointers), the data words that hold such an address, every
+prologue right after a function's end, the --entry list, and the functions those reach. Import stubs (magic 0x41E00000: `jr ra; addiu $0, $0, ordinal`) stay calls into the IOP's
 import dispatch. A function the tool cannot translate safely (an unknown instruction, a load whose register the next
 instruction reads: a load delay slot the R3000 would honour) is left to the interpreter.
 """
@@ -218,42 +218,52 @@ def explore(module, start, limit):
     return fn
 
 
-def pointer_seeds(module, imports):
-    """Code addresses a module only reaches through a pointer (thread entries for CreateThread, RPC server and
-    callback functions, function tables): the targets of lui+addiu/ori pairs and of data words, kept only where a
-    function starts there (addiu sp, sp, -N), so an interior address is not taken for a function."""
-    def is_prologue(addr):
-        word = module.word(addr)
-        return word is not None and (word >> 16) == 0x27BD and (word & 0x8000) != 0
+def pointer_seeds(module):
+    """Function starts the code only takes the address of: LUI rt, hi then, within the next few instructions,
+    ADDIU/ORI rt2, rt, lo giving an address in the module whose first instruction is ADDIU $sp, $sp, -n. Also the
+    data words that hold such an address (function tables, structures of callbacks), and every prologue right after
+    a function's end (JR $ra, its delay slot, nop padding): the functions only other unreached code or a jump table
+    leads to (Jade Cocoon 2's M2SOUND.IRX: 21 functions from the LUI pairs alone, 89 with these)."""
+    def is_prologue(target):
+        prologue = module.word(target) if module.contains(target) and target % 4 == 0 else None
+        return prologue is not None and prologue >> 16 == 0x27BD and prologue & 0x8000
 
-    targets = set()
-    hi = {}
-    for off in range(0, len(module.image) - 3, 4):
-        addr = module.base + off
-        word = module.word(addr)
-        op, rs, rt, imm = word >> 26, (word >> 21) & 31, (word >> 16) & 31, word & 0xFFFF
-        if op == 0x0F:  # lui rt, imm
-            hi[rt] = (imm << 16, addr)
+    seeds = set()
+    for addr in range(module.base, module.base + module.size, 4):
+        insn = module.word(addr)
+        if insn is None:
             continue
-        if op in (0x09, 0x0D) and rs in hi and addr - hi[rs][1] <= 64:  # addiu / ori rt, rs, imm
-            value = hi[rs][0] + (imm - 0x10000 if op == 0x09 and imm & 0x8000 else imm)
-            targets.add(value & 0xFFFFFFFF)
-        if module.contains(word):
-            targets.add(word)
-        # A prologue right after a function's end (jr ra and its delay slot, then nop padding) starts a function
-        # too: the ones only other unreached code or a jump table leads to.
+        if is_prologue(insn):
+            seeds.add(insn)
         if is_prologue(addr):
             back = addr - 8
-            while module.contains(back) and module.word(back + 4) == 0 and module.word(back) == 0:
+            while module.contains(back) and module.word(back) == 0 and module.word(back + 4) == 0:
                 back -= 4
             if module.word(back) == 0x03E00008:
-                targets.add(addr)
-    return {t for t in targets if t % 4 == 0 and module.contains(t) and t not in imports and is_prologue(t)}
+                seeds.add(addr)
+        if insn >> 26 != 0x0F:
+            continue
+        rt, hi = (insn >> 16) & 31, insn & 0xFFFF
+        for follow in range(addr + 4, addr + 36, 4):
+            low_insn = module.word(follow)
+            if low_insn is None:
+                break
+            op, rs = low_insn >> 26, (low_insn >> 21) & 31
+            if op in (0x09, 0x0D) and rs == rt:
+                lo = low_insn & 0xFFFF
+                target = ((hi << 16) + (lo - 0x10000 if op == 0x09 and lo & 0x8000 else lo)) & 0xFFFFFFFF
+                prologue = module.word(target) if module.contains(target) and target % 4 == 0 else None
+                if prologue is not None and prologue >> 16 == 0x27BD and prologue & 0x8000:
+                    seeds.add(target)
+                break
+            if (low_insn >> 16) & 31 == rt and op not in (0x2B, 0x29, 0x28):  # rt written again (not a store)
+                break
+    return seeds
 
 
-def find_functions(module, exports, imports, extra_seeds=()):
+def find_functions(module, exports, imports, extra=()):
     code_end = module.base + module.size
-    seeds = {module.entry} | set(exports) | set(extra_seeds)
+    seeds = {module.entry} | set(exports) | pointer_seeds(module) | set(extra)
     functions = {}
     while True:
         bounds = sorted(seeds)
@@ -457,9 +467,9 @@ def main():
     print(f'{module.name}: base {module.base:#x} size {module.size:#x} entry {module.entry:#x} gp {module.gp:#x}')
     print(f'  {len(exports)} exported functions, {len(imports)} import stubs '
           f'({len(set(lib for lib, _ in imports.values()))} libraries)')
-    extra = pointer_seeds(module, imports) if '--scan-pointers' in args else set()
-    if extra:
-        print(f'  {len(extra)} functions reached through pointers (--scan-pointers)')
+    extra = []
+    if '--entry' in args:
+        extra = [int(value, 16) for value in args[args.index('--entry') + 1].split(',') if value]
     functions = find_functions(module, exports, imports, extra)
     native = [fn for fn in functions.values() if not fn.unsafe]
     print(f'  {len(functions)} functions, {len(native)} recompiled, {len(functions) - len(native)} left to the interpreter')
