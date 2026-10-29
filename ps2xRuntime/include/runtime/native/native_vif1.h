@@ -32,6 +32,12 @@ namespace ps2x::native
     void setDirectGate(DirectGate gate);
     bool directSkipped(uint32_t qwords);
 
+    // An MSCNT continuing a skipped program counts as a group of its own in the GS stream (its draws land after what
+    // the stream sent since the MSCAL). Off by default: an adapter that turns it on numbers its groups the same way
+    // (Vu1StreamAdapter does); the others keep one group per skipped MSCAL / DIRECT.
+    void setMscntGroups(bool on);
+    bool mscntGroups();
+
     // VIF1's own registers (the VIF1 thread's, read without a lock): STMASK / STROW / STCOL / STMOD a game set in a
     // transfer the adapter did not see (at boot) are there. Null before the runtime registers them.
     void setVif1Registers(const VIFRegisters *registers);
