@@ -65,7 +65,7 @@ uniform int uAlphaTest;
 uniform float uAlphaRef;
 uniform int uAlphaFail; // 1: the AFAIL pass, which draws the pixels that fail the alpha test
 uniform int uBlendOut;
-uniform sampler2D uDest; // a copy of the render target, for the destination alpha test
+uniform sampler2D uDest; // a copy of the render target: the destination alpha test, the blend's Ad
 uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
 uniform int uBlendFactor;
 uniform float uBlendFix;
@@ -197,9 +197,11 @@ void main()
         if (set != (uDate == 2))
             discard;
     }
-    // The GS blend's C: the source alpha or FIX (0x80 is 1.0). Blends that fixed-function GL cannot express take
-    // part of the work here: the factor as colour (Cd * (1 + C) through DST_COLOR, ONE), or Cs * (1 + C).
-    float factor = uBlendFactor == 2 ? uBlendFix : clamp(c.a, 0.0, 2.0);
+    // The GS blend's C: the source alpha, the destination's or FIX (0x80 is 1.0). Blends that fixed-function GL cannot
+    // express take part of the work here: the factor as colour (Cd * (1 + C) through DST_COLOR, ONE), or Cs * (1 + C).
+    float factor = uBlendFactor == 2 ? uBlendFix
+                 : uBlendFactor == 1 ? texelFetch(uDest, ivec2(gl_FragCoord.xy), 0).a * (255.0 / 128.0)
+                                     : clamp(c.a, 0.0, 2.0);
     vec3 rgb = c.rgb;
     if (uBlendOut == 1)
         rgb = vec3(factor);
@@ -459,6 +461,15 @@ void main()
     {
         return static_cast<uint64_t>(texa.ta0) | static_cast<uint64_t>(texa.aem ? 1u : 0u) << 15 |
                static_cast<uint64_t>(texa.ta1) << 32;
+    }
+
+    // A CT24 target has no alpha: the GS blends with Ad as 0x80 there, which is FIX 0x80.
+    uint64_t effectiveAlpha(const GSContext &context)
+    {
+        uint64_t alpha = context.alpha;
+        if ((alpha >> 4 & 0x3u) == 1u && context.frame.psm == 0x01u)
+            alpha = (alpha & ~(0x3ull << 4 | 0xFFull << 32)) | 2ull << 4 | 0x80ull << 32;
+        return alpha;
     }
 
     // Everything in a draw's state that changes how it is drawn, compared to decide when a batch ends.
@@ -1581,12 +1592,12 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
         return;
     }
     // GS blending: (A - B) * C >> 7 + D, A/B/D from Cs, Cd, 0 and C from As, Ad, FIX. Mapped onto fixed-function
-    // blending, with As as the shader's second output (dual-source) and FIX as the constant alpha.
-    const uint64_t alpha = state.context.alpha;
+    // blending, with As or Ad (0x80 is 1.0, so not GL's DST_ALPHA) as the shader's second output (dual-source) and FIX
+    // as the constant alpha.
+    const uint64_t alpha = effectiveAlpha(state.context);
     const uint32_t a = alpha & 0x3u, b = alpha >> 2 & 0x3u, c = alpha >> 4 & 0x3u, d = alpha >> 6 & 0x3u;
-    const GLenum factor = c == 0u ? GL_SRC1_ALPHA : c == 1u ? GL_DST_ALPHA : GL_CONSTANT_ALPHA;
-    const GLenum inverse = c == 0u ? GL_ONE_MINUS_SRC1_ALPHA : c == 1u ? GL_ONE_MINUS_DST_ALPHA
-                                                                       : GL_ONE_MINUS_CONSTANT_ALPHA;
+    const GLenum factor = c == 2u ? GL_CONSTANT_ALPHA : GL_SRC1_ALPHA;
+    const GLenum inverse = c == 2u ? GL_ONE_MINUS_CONSTANT_ALPHA : GL_ONE_MINUS_SRC1_ALPHA;
     if (c == 2u)
         glBlendColor(0.0f, 0.0f, 0.0f, std::min(1.0f, static_cast<float>(alpha >> 32 & 0xFFu) / 128.0f));
     enum { Cs = 0, Cd = 1, Zero = 2 };
@@ -1613,7 +1624,7 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
         equation = GL_FUNC_SUBTRACT, source = GL_ONE, destination = factor;
     else if (a == Cd && b == Zero && d == Zero)
         source = GL_ZERO, destination = factor;
-    else if (a == Cd && b == Zero && d == Cd && c != 1u)
+    else if (a == Cd && b == Zero && d == Cd)
         m_blendOut = 1, source = GL_DST_COLOR, destination = GL_ONE; // Cd * C + Cd: brightening
     else if (a == Cs && b == Zero && d == Cs)
         m_blendOut = 2, source = GL_ONE, destination = GL_ZERO; // Cs * (1 + C)
@@ -1708,8 +1719,9 @@ void GSNativeBackend::flushBatch()
 
     glUseProgram(m_program);
     glUniform1i(m_uniforms.blendOut, state.prim.abe ? m_blendOut : 0);
-    glUniform1i(m_uniforms.blendFactor, static_cast<int>(context.alpha >> 4 & 0x3u));
-    glUniform1f(m_uniforms.blendFix, static_cast<float>(context.alpha >> 32 & 0xFFu) / 128.0f);
+    const uint64_t alpha = effectiveAlpha(context);
+    glUniform1i(m_uniforms.blendFactor, static_cast<int>(alpha >> 4 & 0x3u));
+    glUniform1f(m_uniforms.blendFix, static_cast<float>(alpha >> 32 & 0xFFu) / 128.0f);
     glUniform2f(m_uniforms.targetSize, static_cast<float>(target.width), static_cast<float>(target.height));
     float texWidth = 1.0f, texHeight = 1.0f;
     const bool textured = state.prim.tme && bindTexture(state, target, texWidth, texHeight);
@@ -1782,9 +1794,10 @@ void GSNativeBackend::flushBatch()
     glUniform1f(m_uniforms.alphaRef, static_cast<float>(context.test >> 4 & 0xFFu));
     // DATE: the destination alpha's top bit (DATM picks which value passes), read from a copy of the target.
     const bool date = (context.test >> 14 & 0x1u) != 0u;
+    const bool blendReadsDest = state.prim.abe && (alpha >> 4 & 0x3u) == 1u;
     glUniform1i(m_uniforms.date, date ? ((context.test >> 15 & 0x1u) ? 2 : 1) : 0);
     glUniform1i(m_uniforms.dest, 1);
-    if (date)
+    if (date || blendReadsDest)
     {
         const uint32_t destWidth = target.width * m_scale, destHeight = target.height * m_scale;
         if (!m_destTexture || m_destWidth != destWidth || m_destHeight != destHeight)
