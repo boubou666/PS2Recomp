@@ -318,15 +318,31 @@ void main()
 }
 )";
 
-    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment.
+    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment. Z
+    // formats order a page's blocks unlike the colour ones: Z pixel (x, y) is the colour pixel stored in the word Z
+    // puts (x, y) in (uColorRow -1: pixel sizes differ, read in place).
     constexpr const char *kDepthFromColorFragmentShader = R"(#version 330 core
 uniform sampler2D uColor;
+uniform usampler2D uSwizzle;
+uniform usampler2D uInverse;
+uniform int uZRow;
+uniform int uColorRow;
+uniform ivec2 uPage;
+uniform int uScale;
 uniform int uSixteen;
 uniform uint uZMask;
 uniform float uZScale;
 void main()
 {
-    ivec2 p = min(ivec2(gl_FragCoord.xy), textureSize(uColor, 0) - 1);
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    if (uColorRow >= 0)
+    {
+        ivec2 g = p / uScale, inPage = g % uPage;
+        uint address = texelFetch(uSwizzle, ivec2(inPage.x, uZRow + inPage.y), 0).r;
+        uint e = texelFetch(uInverse, ivec2(int(address % 128u), uColorRow + int(address / 128u)), 0).r;
+        p = ((g - inPage) + ivec2(int(e & 0xFFFFu), int(e >> 16u))) * uScale + p % uScale;
+    }
+    p = min(p, textureSize(uColor, 0) - 1);
     uvec4 c = uvec4(round(texelFetch(uColor, p, 0) * 255.0));
     uint z = uSixteen != 0 ? (c.r >> 3u) | (c.g >> 3u) << 5u | (c.b >> 3u) << 10u | (c.a >> 7u) << 15u
                            : c.r | c.g << 8u | c.b << 16u | c.a << 24u;
@@ -1041,6 +1057,13 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
         m_borrowedDepthWidth = width;
         m_borrowedDepthHeight = height;
     }
+    ensureVram();
+    const bool sixteen = (source.psm & 0x2u) != 0u;
+    const GpuLayout zLayout = (zbuf.psm & 0x0Fu) == 0x2u ? kLayoutZ16 : (zbuf.psm & 0x0Fu) == 0xAu ? kLayoutZ16S : kLayoutZ32;
+    const int colorRow = (zLayout.bits == 16) != sixteen ? -1
+                         : !sixteen                      ? kInverseRowC32
+                         : source.psm == 0x0Au           ? kInverseRowC16S
+                                                         : kInverseRowC16;
     GlStateRestore restore;
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_borrowedDepth, 0);
@@ -1054,9 +1077,20 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
     glUseProgram(m_depthFromColorProgram);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, source.color);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glActiveTexture(GL_TEXTURE0);
     const uint32_t zMask = (zbuf.psm & 0x0Fu) == 0x0u ? 0xFFFFFFFFu : (zbuf.psm & 0x0Fu) == 0x1u ? 0xFFFFFFu : 0xFFFFu;
     glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColor"), 0);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), (source.psm & 0x2u) != 0u ? 1 : 0);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSwizzle"), 3);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uInverse"), 4);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uZRow"), zLayout.row);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColorRow"), colorRow);
+    glUniform2i(glGetUniformLocation(m_depthFromColorProgram, "uPage"), zLayout.pageWidth, zLayout.pageHeight);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), sixteen ? 1 : 0);
     glUniform1ui(glGetUniformLocation(m_depthFromColorProgram, "uZMask"), zMask);
     glUniform1f(glGetUniformLocation(m_depthFromColorProgram, "uZScale"), static_cast<float>(depthScale(zbuf.psm)));
     glBindVertexArray(m_vertexArray);
