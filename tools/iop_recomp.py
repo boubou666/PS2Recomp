@@ -410,8 +410,7 @@ def emit_function(module, fn, native):
                     out.append(f'      if (taken) goto L_{target:x}; }}')
             else:
                 out.append(f'      if (taken) {{ c.pc = {target:#x}u; return; }} }}')
-            continue
-        if i.kind == 'j':
+        elif i.kind == 'j':
             out.append(f'    e.tick(2); {slot_code}')
             if i.target in fn.insns:
                 if i.target <= addr:
@@ -419,20 +418,19 @@ def emit_function(module, fn, native):
                 out.append(f'    goto L_{i.target:x};')
             else:
                 out.append(f'    c.pc = {i.target:#x}u; return; // a jump out: the caller goes on there')
-            continue
-        if i.kind == 'jal':
+        elif i.kind == 'jal':
             out.append(f'    e.tick(2); c.gpr[31] = {addr + 8:#x}u; {slot_code}')
             out.append(f'    if (!e.call({i.target:#x}u, {addr + 8:#x}u)) return;')
-            continue
-        if i.kind == 'jalr':
+        elif i.kind == 'jalr':
             link = w(i.rd, f'{addr + 8:#x}u')
             out.append(f'    {{ e.tick(2); const uint32_t target = {r(i.rs)}; {link} {slot_code}')
             out.append(f'      if (!e.call(target, {addr + 8:#x}u)) return; }}')
-            continue
-        if i.kind == 'jr':
+        elif i.kind == 'jr':
             out.append(f'    {{ e.tick(2); const uint32_t target = {r(i.rs)}; {slot_code}')
             out.append('      c.pc = target; return; }')
-            continue
+        if addr + 4 in fn.labels or addr + 4 in fn.resume:
+            # A branch into this delay slot (gcc's loops do it): the slot alone, then on at addr + 8.
+            out += ['    if (false)', '    {', f'L_{addr + 4:x}:', f'    e.tick(1); {slot_code}'.rstrip(), '    }']
     out += ['    c.pc = %#xu; // past the end' % (order[-1] + 4), '}', '']
     return out
 
