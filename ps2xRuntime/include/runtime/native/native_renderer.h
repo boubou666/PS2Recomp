@@ -48,6 +48,7 @@ namespace ps2x::native
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
         bool depthWrite = true;
         bool clampU = false, clampV = false; // CLAMP's WMS / WMT: the texture's edge past 0..1 (else it repeats)
+        uint64_t region = 0; // CLAMP, for a REGION_REPEAT window (TextureCache::regionWindow): the texture is that window
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
         // The GS state where the draw's group sits in the stream (a stream draw, beginGroup) gives tex0, texa, blend,
