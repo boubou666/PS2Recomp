@@ -2313,6 +2313,17 @@ void GSNativeBackend::flushBatch()
             uint8_t pixel[4] = {};
             glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
             glReadPixels(20, 100, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+            {
+                GLint attached = 0;
+                glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                                      GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &attached);
+                float depths[2] = {};
+                glReadPixels(20, 100, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depths[0]);
+                glReadPixels(450, 200, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depths[1]);
+                std::fprintf(stderr, "[gs:probe]   depth (20,100)=%.0f (450,200)=%.0f (Z units) attachment=%d own=%u zbp=%u\n",
+                             depths[0] / depthScale(target.zpsm), depths[1] / depthScale(target.zpsm), attached, target.depth,
+                             target.zbp);
+            }
             std::fprintf(stderr, "[gs:probe] fbp=%u after %zu verts tme=%d textured=%d tbp=%u: (20,100)=%u,%u,%u,%u "
                                  "fbo=%x\n",
                          target.fbp, m_batch.size(), state.prim.tme ? 1 : 0, textured ? 1 : 0, context.tex0.tbp0,
