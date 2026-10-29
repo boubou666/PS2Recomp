@@ -97,6 +97,44 @@ void register_native_texture_cache_tests()
             t.IsTrue(same, "texel i shows entry CSA * 16 + i");
         });
 
+        tc.Run("a REGION_REPEAT that masks is a window of the texture, other regions are not", [](TestCase &t)
+        {
+            uint32_t offset = 0, extent = 0;
+            const uint64_t masked = 3u | (3u << 2) | (255ull << 4) | (256ull << 14) | (63ull << 24) | (512ull << 34);
+            t.IsTrue(TextureCache::regionWindow(masked, false, 1024, offset, extent) && offset == 256u && extent == 256u,
+                     "U: 256 texels from 256");
+            t.IsTrue(TextureCache::regionWindow(masked, true, 1024, offset, extent) && offset == 512u && extent == 64u,
+                     "V: 64 texels from 512");
+            t.IsFalse(TextureCache::regionWindow(masked & ~3ull, false, 1024, offset, extent), "REPEAT: no window");
+            const uint64_t notMask = 3u | (200ull << 4);
+            t.IsFalse(TextureCache::regionWindow(notMask, false, 1024, offset, extent), "MINU not 2^n - 1");
+            const uint64_t overlapping = 3u | (255ull << 4) | (300ull << 14);
+            t.IsFalse(TextureCache::regionWindow(overlapping, false, 1024, offset, extent), "MAXU inside the mask");
+        });
+
+        tc.Run("a REGION_REPEAT window decodes only its texels", [](TestCase &t)
+        {
+            TextureCache cache;
+            std::vector<uint8_t> pixels(16 * 16 * 4);
+            for (uint32_t y = 0; y < 16; ++y)
+                for (uint32_t x = 0; x < 16; ++x)
+                {
+                    uint8_t *p = &pixels[(y * 16 + x) * 4];
+                    p[0] = static_cast<uint8_t>(x);
+                    p[1] = static_cast<uint8_t>(y);
+                    p[2] = 0;
+                    p[3] = 0x80;
+                }
+            cache.upload(bitbltbuf(0, 1, 0x00), 0, trxreg(16, 16), pixels.data(), pixels.size());
+            const uint64_t clamp = 3u | (3u << 2) | (3ull << 4) | (8ull << 14) | (7ull << 24) | (8ull << 34);
+            const TextureCache::Texture &window = *cache.texture(tex0(0, 1, 0x00, 4, 4), 0, clamp);
+            t.Equals(window.width, 4u, "4 texels wide");
+            t.Equals(window.height, 8u, "8 texels high");
+            t.Equals(window.rgba[0] & 0xffffu, 8u | (8u << 8), "starts at (8, 8)");
+            t.Equals(window.rgba[7 * 4 + 3] & 0xffffu, 11u | (15u << 8), "ends at (11, 15)");
+            t.Equals(cache.texture(tex0(0, 1, 0x00, 4, 4))->width, 16u, "without CLAMP: the whole texture");
+        });
+
         tc.Run("an upload over a cached texture's pages decodes it again", [](TestCase &t)
         {
             TextureCache cache;

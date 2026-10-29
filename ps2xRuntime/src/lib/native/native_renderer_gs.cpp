@@ -440,11 +440,11 @@ void main()
             glUniform4fv(pass.locM, 4, entry.batch.matrix);
             std::shared_ptr<const TextureCache::Texture> texture = entry.batch.texture;
             if (m.textured && !texture)
-                texture = ps2x::native::textures().texture(m.tex0, m.texa);
+                texture = ps2x::native::textures().texture(m.tex0, m.texa, m.region);
             const bool textured = m.textured && texture;
             if (textured)
             {
-                glBindTexture(GL_TEXTURE_2D, pass.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), texture));
+                glBindTexture(GL_TEXTURE_2D, pass.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull) ^ (m.region * 0xc2b2ae3d27d4eb4full), texture));
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, m.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
             }
