@@ -2380,6 +2380,29 @@ void GSNativeBackend::flushBatch()
     glBindVertexArray(0);
     if (!drawnPages.empty())
         wroteTargetPages(target, drawnPages);
+    // PS2X_GS_NATIVE_GLDUMP=<fbp>,<serial>,<w>,<h>: that target's GL texture (RGBA, 1x) after that batch, gldump.raw.
+    if (static const char *gd = std::getenv("PS2X_GS_NATIVE_GLDUMP"); gd)
+    {
+        unsigned gf = 0, gserial = 0, gw = 0, gh = 0;
+        std::sscanf(gd, "%u,%u,%u,%u", &gf, &gserial, &gw, &gh);
+        if (m_drawSerial == gserial)
+            if (auto w = m_targets.find(gf); w != m_targets.end())
+            {
+                std::vector<uint8_t> px(static_cast<size_t>(gw) * gh * 4u);
+                GLint drawFb = 0;
+                glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFb);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(w->second, 0u, 0u, gw, gh));
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glReadPixels(0, 0, static_cast<GLsizei>(gw), static_cast<GLsizei>(gh), GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                if (FILE *f = std::fopen("gldump.raw", "wb"))
+                {
+                    std::fwrite(px.data(), 1, px.size(), f);
+                    std::fclose(f);
+                }
+                std::fprintf(stderr, "[gs:gldump] fbp=%u psm=0x%x after #%u\n", gf, w->second.psm, gserial);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFb));
+            }
+    }
     // PS2X_GS_NATIVE_WATCH=<fbp>,<x>,<y>: that target's pixel after every batch from the 1600th (diagnostics).
     if (static const char *watch = std::getenv("PS2X_GS_NATIVE_WATCH"); watch && m_drawSerial >= 1600u)
     {
