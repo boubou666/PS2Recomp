@@ -285,7 +285,10 @@ namespace ps2x::native
         m_sandbox->gif().setSource(pc);
         const uint64_t cyclesBefore = m_sandbox->cycles();
         m_sandbox->call(m_code, sizeof(m_code), reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), pc, m_top, m_itops);
-        noteDecision(pc, true, false, m_sandbox->cycles() - cyclesBefore);
+        const uint64_t cycles = m_sandbox->cycles() - cyclesBefore;
+        if (m_config.onVif1Thread)
+            advanceVif1Clock(cycles);
+        noteDecision(pc, true, false, m_config.onVif1Thread ? 0u : cycles);
     }
 
     void Vu1StreamAdapter::direct(const uint32_t *words, size_t qwords, size_t size)
