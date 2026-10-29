@@ -126,7 +126,6 @@ namespace ps2_input
             for (int player = 0; player < 2; ++player)
             {
                 Profile &p = config.players[player];
-                p.gamepad = player;
                 const struct { int action; int button; } kPad[] = {
                     {Up, GAMEPAD_BUTTON_LEFT_FACE_UP}, {Down, GAMEPAD_BUTTON_LEFT_FACE_DOWN},
                     {Left, GAMEPAD_BUTTON_LEFT_FACE_LEFT}, {Right, GAMEPAD_BUTTON_LEFT_FACE_RIGHT},
@@ -153,7 +152,12 @@ namespace ps2_input
                 {Up, {KEY_UP, KEY_W}}, {Down, {KEY_DOWN, KEY_S}}, {Left, {KEY_LEFT, KEY_A}}, {Right, {KEY_RIGHT, KEY_D}},
                 {Cross, {KEY_X, KEY_SPACE}}, {Circle, {KEY_C, KEY_ESCAPE}}, {Square, {KEY_Z, KEY_KP_0}},
                 {Triangle, {KEY_V, KEY_KP_1}}, {L1, {KEY_Q, 0}}, {R1, {KEY_E, 0}}, {L2, {KEY_LEFT_SHIFT, 0}},
-                {R2, {KEY_RIGHT_SHIFT, 0}}, {Start, {KEY_ENTER, 0}}, {Select, {KEY_TAB, 0}}};
+                {R2, {KEY_RIGHT_SHIFT, 0}}, {Start, {KEY_ENTER, 0}}, {Select, {KEY_TAB, 0}}, {L3, {KEY_F, 0}},
+                {R3, {KEY_G, 0}},
+                // The movement keys push the left stick fully too (games that move with it), the right stick on I/J/K/L.
+                {LeftStickUp, {KEY_UP, KEY_W}}, {LeftStickDown, {KEY_DOWN, KEY_S}}, {LeftStickLeft, {KEY_LEFT, KEY_A}},
+                {LeftStickRight, {KEY_RIGHT, KEY_D}}, {RightStickUp, {KEY_I, 0}}, {RightStickDown, {KEY_K, 0}},
+                {RightStickLeft, {KEY_J, 0}}, {RightStickRight, {KEY_L, 0}}};
             for (const auto &entry : kKeyboard)
                 for (int code : entry.keys)
                     if (code)
@@ -209,7 +213,7 @@ namespace ps2_input
                 Profile &profile = g_config.players[player];
                 if (name == "gamepad")
                 {
-                    profile.gamepad = std::atoi(value.c_str());
+                    profile.gamepad = value == "auto" ? -1 : std::clamp(std::atoi(value.c_str()), -1, 3);
                     continue;
                 }
                 for (int action = 0; action < ActionCount; ++action)
@@ -254,10 +258,10 @@ namespace ps2_input
             case Source::Key:
                 return IsKeyDown(binding.code) ? 1.0f : 0.0f;
             case Source::GamepadButton:
-                return IsGamepadAvailable(gamepad) && IsGamepadButtonDown(gamepad, binding.code) ? 1.0f : 0.0f;
+                return gamepad >= 0 && IsGamepadAvailable(gamepad) && IsGamepadButtonDown(gamepad, binding.code) ? 1.0f : 0.0f;
             case Source::GamepadAxis:
             {
-                if (!IsGamepadAvailable(gamepad))
+                if (gamepad < 0 || !IsGamepadAvailable(gamepad))
                     return 0.0f;
                 float value = GetGamepadAxisMovement(gamepad, binding.code);
                 if (isTrigger(binding.code))
@@ -315,7 +319,8 @@ namespace ps2_input
         for (int player = 0; player < 2; ++player)
         {
             const Profile &profile = g_config.players[player];
-            file << "\n[player" << (player + 1) << "]\ngamepad = " << profile.gamepad << "\n";
+            file << "\n[player" << (player + 1) << "]\ngamepad = "
+                 << (profile.gamepad < 0 ? std::string("auto") : std::to_string(profile.gamepad)) << "\n";
             for (int action = 0; action < ActionCount; ++action)
             {
                 file << kActionNames[action] << " =";
@@ -329,16 +334,17 @@ namespace ps2_input
         return static_cast<bool>(file);
     }
 
-    PadState padState(int player)
+    PadState padState(int player, int autoGamepad)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         ensureLoaded();
         const Profile &profile = g_config.players[player != 0 ? 1 : 0];
+        const int gamepad = profile.gamepad >= 0 ? profile.gamepad : autoGamepad;
         const double now = seconds();
         float value[ActionCount] = {};
         for (int action = 0; action < ActionCount; ++action)
             for (const Binding &binding : profile.actions[action])
-                value[action] = std::max(value[action], strength(binding, profile.gamepad, now));
+                value[action] = std::max(value[action], strength(binding, gamepad, now));
         PadState state;
         for (int button = 0; button < 16; ++button)
             if (value[button] > 0.5f)
@@ -526,17 +532,19 @@ namespace ps2_input
             binding = {Source::MouseMove, x ? 0 : 1, v > 0.0f ? 1 : -1};
             return true;
         }
-        if (IsGamepadAvailable(gamepad))
+        for (int slot = gamepad < 0 ? 0 : gamepad; slot <= (gamepad < 0 ? 3 : gamepad); ++slot)
         {
+            if (!IsGamepadAvailable(slot))
+                continue;
             for (const Name &button : kPadButtons)
-                if (IsGamepadButtonPressed(gamepad, button.code))
+                if (IsGamepadButtonPressed(slot, button.code))
                 {
                     binding = pad(button.code);
                     return true;
                 }
             for (const Name &a : kPadAxes)
             {
-                float value = GetGamepadAxisMovement(gamepad, a.code);
+                float value = GetGamepadAxisMovement(slot, a.code);
                 if (isTrigger(a.code))
                     value = (value + 1.0f) * 0.5f;
                 if (std::fabs(value) > 0.6f)

@@ -331,13 +331,14 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
-    // The player's bindings (runtime/ps2_input_bindings.h: input.ini, the Controls window).
-    // PS2X_PAD_NO_HOST=1: neither keyboard nor gamepads, only the pad scripts (a replay nobody can disturb).
+    // The player's bindings (runtime/ps2_input_bindings.h: input.ini, the Controls window), on the port's gamepad
+    // among the connected ones unless the player chose one. PS2X_PAD_NO_HOST=1: neither keyboard nor gamepads, only
+    // the pad scripts (a replay nobody can disturb).
     static const bool s_noHost = [] { const char *v = std::getenv("PS2X_PAD_NO_HOST"); return v && v[0] == '1'; }();
     uint16_t btns = 0xFFFFu;
     if (!s_noHost)
     {
-        const ps2_input::PadState state = ps2_input::padState(port == 1 ? 1 : 0);
+        const ps2_input::PadState state = ps2_input::padState(port == 1 ? 1 : 0, gamepadForPort(port));
         btns = state.buttons;
         data[4] = state.rx;
         data[5] = state.ry;

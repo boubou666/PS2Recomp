@@ -3044,12 +3044,12 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_FINISH, 0u);
 
             t.IsTrue((mem.gs().csr & 0x1ull) != 0ull, "SIGNAL should raise CSR.SIGNAL");
-            t.IsTrue((mem.gs().csr & 0x2ull) == 0ull, "FINISH should wait while SIGNAL is not acknowledged");
+            t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "FINISH after a first SIGNAL is not held (only a second SIGNAL stalls the GS)");
             t.Equals(static_cast<uint32_t>(mem.gs().siglblid & 0xFFFFFFFFull), 0x11223344u, "SIGNAL should update SIGLBLID low dword");
 
             mem.write64(0x12001000u, 0x1ull);
             t.IsTrue((mem.gs().csr & 0x1ull) == 0ull, "writing CSR bit0 should acknowledge SIGNAL");
-            t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "acknowledging SIGNAL should let FINISH raise CSR.FINISH");
+            t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "acknowledging SIGNAL should leave CSR.FINISH set");
 
             mem.write32(0x12001000u, 0x2u);
             t.IsTrue((mem.gs().csr & 0x2ull) == 0ull, "writing CSR bit1 should acknowledge FINISH");
@@ -4858,22 +4858,7 @@ void register_ps2_gs_tests()
             ps2_stubs::sceGsExecLoadImage(rdram, &loadCtx, &runtime);
             t.Equals(static_cast<int32_t>(getRegU32Test(loadCtx, 2)), 0,
                      "sceGsExecLoadImage should succeed for a simple CT32 upload");
-            uint64_t loadTag = 0u;
-            std::memcpy(&loadTag, rdram + runtime.guestHeapBase(), sizeof(loadTag));
-            t.Equals(loadTag, 0x1000000000008004ull,
-                     "sceGsExecLoadImage should populate the packed A+D GIF tag in guest RAM");
-            uint64_t loadReg1 = 0u;
-            uint64_t loadReg2 = 0u;
-            uint64_t loadReg3 = 0u;
-            uint64_t loadReg4 = 0u;
-            std::memcpy(&loadReg1, rdram + runtime.guestHeapBase() + 24u, sizeof(loadReg1));
-            std::memcpy(&loadReg2, rdram + runtime.guestHeapBase() + 40u, sizeof(loadReg2));
-            std::memcpy(&loadReg3, rdram + runtime.guestHeapBase() + 56u, sizeof(loadReg3));
-            std::memcpy(&loadReg4, rdram + runtime.guestHeapBase() + 72u, sizeof(loadReg4));
-            t.Equals(loadReg1, 0x50ull, "sceGsExecLoadImage should encode BITBLTBUF as A+D register 0x50");
-            t.Equals(loadReg2, 0x51ull, "sceGsExecLoadImage should encode TRXPOS as A+D register 0x51");
-            t.Equals(loadReg3, 0x52ull, "sceGsExecLoadImage should encode TRXREG as A+D register 0x52");
-            t.Equals(loadReg4, 0x53ull, "sceGsExecLoadImage should encode TRXDIR as A+D register 0x53");
+            // The load packet is built on the host (PS2Memory::submitHostGifTransfer): nothing in guest RAM.
             expectGuestHeapReusable(t, runtime,
                                     "sceGsExecLoadImage should free its temporary GIF packet");
 

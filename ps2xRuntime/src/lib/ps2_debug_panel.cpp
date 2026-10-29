@@ -2224,8 +2224,8 @@ void PS2DebugPanel::drawControlsWindow()
         std::lock_guard<std::mutex> lock(mutex);
         ImGui::SameLine(0.0f, 30.0f);
         ImGui::SetNextItemWidth(90.0f);
-        ImGui::InputInt("Gamepad", &profile.gamepad);
-        profile.gamepad = std::clamp(profile.gamepad, 0, 3);
+        ImGui::InputInt("Gamepad (-1: auto)", &profile.gamepad);
+        profile.gamepad = std::clamp(profile.gamepad, -1, 3);
     }
     ImGui::TextWrapped("Add: then press a key or a gamepad button, push a stick or trigger, or click, roll the wheel or "
                        "move the mouse over the game picture. Click a binding to remove it.");
