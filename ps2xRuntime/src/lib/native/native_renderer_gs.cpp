@@ -407,12 +407,13 @@ void main()
         s_window.batches += batches.size();
         s_window.vertices += vertices.size();
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-        glViewport(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height));
+        const uint32_t scale = std::max(target.scale, 1u);
+        glViewport(0, 0, static_cast<GLsizei>(target.width * scale), static_cast<GLsizei>(target.height * scale));
         glEnable(GL_SCISSOR_TEST);
         const uint32_t x0 = std::min(target.scissorX0, target.width), y0 = std::min(target.scissorY0, target.height);
         const uint32_t x1 = std::min(target.scissorX1 + 1u, target.width), y1 = std::min(target.scissorY1 + 1u, target.height);
-        glScissor(static_cast<GLint>(x0), static_cast<GLint>(y0), static_cast<GLsizei>(x1 > x0 ? x1 - x0 : 0u),
-                  static_cast<GLsizei>(y1 > y0 ? y1 - y0 : 0u));
+        glScissor(static_cast<GLint>(x0 * scale), static_cast<GLint>(y0 * scale),
+                  static_cast<GLsizei>((x1 > x0 ? x1 - x0 : 0u) * scale), static_cast<GLsizei>((y1 > y0 ? y1 - y0 : 0u) * scale));
         glDisable(GL_CULL_FACE);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glUseProgram(pass.program);

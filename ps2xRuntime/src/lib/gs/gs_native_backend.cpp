@@ -60,9 +60,11 @@ uniform int uFog;
 uniform vec3 uFogColor;
 uniform int uAlphaTest;
 uniform float uAlphaRef;
+uniform int uAlphaFail; // 1: the AFAIL pass, which draws the pixels that fail the alpha test
 uniform int uBlendOut;
 uniform sampler2D uDest; // a copy of the render target, for the destination alpha test
 uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
+uniform int uAlphaKeep;  // FBMSK's alpha bits when it keeps only some: those come from uDest
 uniform int uBlendFactor;
 uniform float uBlendFix;
 
@@ -182,6 +184,8 @@ void main()
     else if (uAlphaTest == 5) pass = a >= uAlphaRef;
     else if (uAlphaTest == 6) pass = a > uAlphaRef;
     else if (uAlphaTest == 7) pass = a != uAlphaRef;
+    if (uAlphaFail != 0)
+        pass = !pass;
     if (!pass)
         discard;
     if (uDate != 0)
@@ -199,6 +203,13 @@ void main()
     else if (uBlendOut == 2)
         rgb = c.rgb * (1.0 + factor);
     outColor = vec4(clamp(rgb, 0.0, 1.0), clamp(c.a, 0.0, 2.0) * (128.0 / 255.0));
+    if (uAlphaKeep != 0)
+    {
+        uint source = uint(min(floor(clamp(c.a, 0.0, 2.0) * 128.0 + 0.5), 255.0));
+        uint stored = uint(texelFetch(uDest, ivec2(gl_FragCoord.xy), 0).a * 255.0 + 0.5);
+        uint keep = uint(uAlphaKeep);
+        outColor.a = float((source & ~keep) | (stored & keep)) / 255.0;
+    }
     outFactor = vec4(clamp(factor, 0.0, 1.0));
 }
 )";
@@ -212,6 +223,46 @@ void main()
 }
 )";
 
+    // PCRTC: circuit 1 (top) over circuit 2 (bottom) or the background colour, per PMODE; in field mode each line of
+    // the field shows twice. Output rows top first (row 0 is the picture's first line, as GS rows are in targets).
+    constexpr const char *kPresentFragmentShader = R"(#version 330 core
+uniform sampler2D uTop;
+uniform sampler2D uBottom;
+uniform ivec4 uTopRect;      // GS pixels: x, y, width, height
+uniform ivec4 uBottomRect;
+uniform int uScale;          // the output's scale
+uniform int uTopScale;       // each source's: the targets', or 1 for GS memory read on the CPU
+uniform int uBottomScale;
+uniform int uHaveTop;
+uniform int uHaveBottom;
+uniform int uField;
+uniform int uTopOpaque;
+uniform int uMode;
+uniform int uBlackUnder;
+uniform float uAlp;
+uniform vec3 uBackground;
+out vec4 fragColor;
+void main()
+{
+    // Where the output pixel falls in GS pixels (fractional at a scale), a field's line shown twice.
+    vec2 g = (gl_FragCoord.xy) / float(uScale);
+    if (uField != 0)
+        g.y *= 0.5;
+    vec3 under = uBlackUnder != 0 ? vec3(0.0) : uBackground;
+    if (uHaveBottom != 0 && g.x < float(uBottomRect.z) && g.y < float(uBottomRect.w))
+        under = texelFetch(uBottom, (uBottomRect.xy + ivec2(0)) * uBottomScale + ivec2(floor(g * float(uBottomScale))), 0).rgb;
+    vec3 colour = under;
+    if (uHaveTop != 0 && g.x < float(uTopRect.z) && g.y < float(uTopRect.w))
+    {
+        vec4 over = texelFetch(uTop, uTopRect.xy * uTopScale + ivec2(floor(g * float(uTopScale))), 0);
+        // Circuit 1's alpha counts 0x80 as 1.0; with only circuit 1 shown it simply replaces the background.
+        float a = uMode == 0 ? 1.0 : uMode == 1 ? uAlp : min(1.0, (uTopOpaque != 0 ? 128.0 / 255.0 : over.a) * (255.0 / 128.0));
+        colour = over.rgb * a + under * (1.0 - a);
+    }
+    fragColor = vec4(colour, 1.0);
+}
+)";
+
     constexpr const char *kResolveFragmentShader = R"(#version 330 core
 layout(location = 0) out uint outWord;
 uniform sampler2D uTarget;   // the render target's colour, GL row 0 = GS row 0, alpha as the GS stores it
@@ -220,10 +271,11 @@ uniform int uFbp;
 uniform int uFbw;
 uniform int uKind;           // 0 CT32, 1 CT16, 2 CT16S
 uniform int uUsedHeight;     // rows drawn: words of pixels below them keep what GS memory holds
+uniform int uScale;          // the target's internal scale: a GS pixel is the middle texel of its block
 
 uvec4 bytes(ivec2 p)
 {
-    return uvec4(round(texelFetch(uTarget, p, 0) * 255.0));
+    return uvec4(round(texelFetch(uTarget, p * uScale + uScale / 2, 0) * 255.0));
 }
 
 uint pack16(uvec4 c)
@@ -492,6 +544,8 @@ bool GSNativeBackend::ensureContext(bool create)
     }
     glfwMakeContextCurrent(m_sharedContext);
     m_glThread = std::this_thread::get_id();
+    if (const char *scale = std::getenv("PS2X_GS_SCALE"); scale && *scale)
+        m_scale = static_cast<uint32_t>(std::clamp(std::atoi(scale), 1, 4));
 
     const GLuint vertex = compileShader(GL_VERTEX_SHADER, kVertexShader);
     const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
@@ -520,6 +574,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.fogColor = glGetUniformLocation(m_program, "uFogColor");
     m_uniforms.alphaTest = glGetUniformLocation(m_program, "uAlphaTest");
     m_uniforms.alphaRef = glGetUniformLocation(m_program, "uAlphaRef");
+    m_uniforms.alphaFail = glGetUniformLocation(m_program, "uAlphaFail");
     m_uniforms.sampler = glGetUniformLocation(m_program, "uSampler");
     m_uniforms.blendOut = glGetUniformLocation(m_program, "uBlendOut");
     m_uniforms.blendFactor = glGetUniformLocation(m_program, "uBlendFactor");
@@ -527,6 +582,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.fst = glGetUniformLocation(m_program, "uTexAlphaScale");
     m_uniforms.dest = glGetUniformLocation(m_program, "uDest");
     m_uniforms.date = glGetUniformLocation(m_program, "uDate");
+    m_uniforms.alphaKeep = glGetUniformLocation(m_program, "uAlphaKeep");
     m_uniforms.vram = glGetUniformLocation(m_program, "uVram");
     m_uniforms.swizzle = glGetUniformLocation(m_program, "uSwizzle");
     m_uniforms.decode = glGetUniformLocation(m_program, "uDecode");
@@ -560,8 +616,19 @@ bool GSNativeBackend::ensureContext(bool create)
     return true;
 }
 
+namespace
+{
+    // PS2X_GS_NATIVE_NOCOHERENCE=1: no reload of targets from GS memory (format changes, overlapping targets).
+    bool coherenceOff()
+    {
+        static const bool off = std::getenv("PS2X_GS_NATIVE_NOCOHERENCE") != nullptr;
+        return off;
+    }
+}
+
 GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &frame)
 {
+    uint32_t refillRows = 0; // a target replacing another at the same address: the rows that one held
     auto it = m_targets.find(frame.fbp);
     if (it != m_targets.end())
     {
@@ -580,6 +647,7 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
         }
         if (existing.dirty && existing.usedHeight != 0u)
             resolveTarget(existing);
+        refillRows = existing.usedHeight;
         glDeleteFramebuffers(1, &existing.framebuffer);
         glDeleteTextures(1, &existing.color);
         glDeleteTextures(1, &existing.depth);
@@ -594,12 +662,14 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     target.height = kTargetHeight;
     glGenTextures(1, &target.color);
     glBindTexture(GL_TEXTURE_2D, target.color);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width, target.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width * m_scale, target.height * m_scale, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glGenTextures(1, &target.depth);
     glBindTexture(GL_TEXTURE_2D, target.depth);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, target.width, target.height, 0, GL_DEPTH_COMPONENT, GL_FLOAT,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, target.width * m_scale, target.height * m_scale, 0, GL_DEPTH_COMPONENT,
+                 GL_FLOAT,
                  nullptr);
     glGenFramebuffers(1, &target.framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
@@ -611,7 +681,107 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    return m_targets.emplace(frame.fbp, target).first->second;
+    RenderTarget &created = m_targets.emplace(frame.fbp, target).first->second;
+    if (refillRows != 0u && !coherenceOff())
+        fillTargetFromMemory(frame, std::min(refillRows, created.height));
+    return created;
+}
+
+namespace
+{
+    // A target's blocks in GS memory, as far as it drew: pages of 64 x 32 pixels (64 x 64 in CT16).
+    std::pair<uint64_t, uint64_t> targetBlocks(uint32_t fbp, uint32_t fbw, uint8_t psm, uint32_t rows)
+    {
+        const uint32_t pageRows = (psm == 0x02u || psm == 0x0Au) ? 64u : 32u;
+        const uint64_t begin = static_cast<uint64_t>(fbp) * 32u;
+        return {begin, begin + static_cast<uint64_t>(std::max(fbw, 1u)) * ((rows + pageRows - 1u) / pageRows) * 32u};
+    }
+}
+
+void GSNativeBackend::resolveInDrawOrder(std::vector<RenderTarget *> &targets)
+{
+    std::sort(targets.begin(), targets.end(), [](const RenderTarget *a, const RenderTarget *b) { return a->lastDraw < b->lastDraw; });
+    for (RenderTarget *target : targets)
+        if (target->dirty && target->usedHeight != 0u)
+            resolveTarget(*target);
+}
+
+
+void GSNativeBackend::ensureCoherent(RenderTarget &target)
+{
+    if (m_fillingFromMemory || target.usedHeight == 0u || coherenceOff())
+        return;
+    const auto [begin, end] = targetBlocks(target.fbp, target.fbw, target.psm, target.usedHeight);
+    std::vector<RenderTarget *> overlapping;
+    bool stale = false;
+    for (auto &[fbp, other] : m_targets)
+    {
+        if (&other == &target || other.usedHeight == 0u)
+            continue;
+        const auto [otherBegin, otherEnd] = targetBlocks(other.fbp, other.fbw, other.psm, other.usedHeight);
+        if (otherBegin >= end || begin >= otherEnd)
+            continue;
+        overlapping.push_back(&other);
+        stale |= other.lastDraw > target.lastDraw;
+    }
+    if (!stale)
+        return;
+    overlapping.push_back(&target);
+    resolveInDrawOrder(overlapping);
+    GSFrameReg frame{};
+    frame.fbp = target.fbp;
+    frame.fbw = target.fbw;
+    frame.psm = target.psm;
+    fillTargetFromMemory(frame, std::min(target.usedHeight, target.height));
+}
+
+void GSNativeBackend::fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows)
+{
+    // The same memory read in its new format, as the GS would see it: a game alternating one buffer between CT16 and
+    // CT32 (VP2's blur levels) reads back rows it did not redraw since. Runs inside flushBatch (its renderTarget call):
+    // the pending batch is set aside, this one goes through the same path, sampling GS memory, not the new target.
+    if (const char *v = std::getenv("PS2X_GS_NATIVE_TARGETLOG"); v && std::atoi(v) > 0)
+        std::fprintf(stderr, "[gs:native] reload fbp=%u fbw=%u psm=0x%x rows=%u serial=%llu\n", frame.fbp, frame.fbw, frame.psm,
+                     rows, static_cast<unsigned long long>(m_drawSerial));
+    std::vector<Vertex> pending;
+    pending.swap(m_batch);
+    const GSDrawState pendingState = m_batchState;
+    const float pendingMaxY = m_batchMaxY;
+    const uint32_t width = std::clamp<uint32_t>(frame.fbw * 64u, 64u, kMaxTargetWidth);
+    GSPrimitiveBatch fill{};
+    GSContext &context = fill.state.context;
+    context.frame = frame;
+    context.frame.fbmsk = 0u;
+    context.scissor.x1 = static_cast<uint16_t>(width - 1u);
+    context.scissor.y1 = static_cast<uint16_t>(rows - 1u);
+    context.tex0.tbp0 = frame.fbp * 32u;
+    context.tex0.tbw = static_cast<uint8_t>(frame.fbw);
+    context.tex0.psm = frame.psm;
+    const auto log2Ceil = [](uint32_t n) { uint8_t b = 0; while ((1u << b) < n && b < 10u) ++b; return b; };
+    context.tex0.tw = log2Ceil(width);
+    context.tex0.th = log2Ceil(rows);
+    context.tex0.tcc = 1u;
+    context.tex0.tfx = 1u; // decal
+    context.clamp = 0x5u;  // clamp, nearest (TEX1 0)
+    fill.state.prim.type = GS_PRIM_SPRITE;
+    fill.state.prim.tme = true;
+    fill.state.prim.fst = true;
+    fill.state.texa.ta0 = 0x80u;
+    fill.state.texa.ta1 = 0x80u;
+    fill.vertexCount = 2u;
+    fill.vertices[1].x = static_cast<float>(width);
+    fill.vertices[1].y = static_cast<float>(rows);
+    fill.vertices[1].u = static_cast<uint16_t>(std::min<uint32_t>(width * 16u, 0xFFFFu));
+    fill.vertices[1].v = static_cast<uint16_t>(std::min<uint32_t>(rows * 16u, 0xFFFFu));
+    fill.vertices[1].r = fill.vertices[1].g = fill.vertices[1].b = fill.vertices[1].a = 0x80u;
+    m_batchMaxY = 0.0f;
+    m_fillingFromMemory = true;
+    appendPrimitive(fill);
+    flushBatch();
+    m_fillingFromMemory = false;
+    m_batch.swap(pending);
+    m_batchState = pendingState;
+    m_batchMaxY = pendingMaxY;
 }
 
 GSNativeBackend::RenderTarget *GSNativeBackend::renderTargetAtBlock(uint32_t block)
@@ -822,20 +992,33 @@ void GSNativeBackend::syncVramToGpu()
 
 void GSNativeBackend::pullGpuPages()
 {
+    pullGpuPages(0u, static_cast<uint32_t>(m_gpuNewer.size()));
+}
+
+void GSNativeBackend::pullGpuPages(uint32_t firstPage, uint32_t endPage)
+{
     if (!m_anyGpuNewer || !m_vram || !m_vramFramebuffer || !ensureContext())
         return;
     const GlStateRestore restore;
-    m_anyGpuNewer = false;
     syncVramToGpu();
     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    endPage = std::min<uint32_t>(endPage, static_cast<uint32_t>(m_gpuNewer.size()));
+    bool left = false;
     for (uint32_t page = 0; page < m_gpuNewer.size(); ++page)
-        if (m_gpuNewer[page])
+    {
+        if (!m_gpuNewer[page])
+            continue;
+        if (page < firstPage || page >= endPage)
         {
-            m_gpuNewer[page] = 0u;
-            glReadPixels(0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
-                         m_vram + static_cast<size_t>(page) * 8192u);
+            left = true; // another range's reader pulls it
+            continue;
         }
+        m_gpuNewer[page] = 0u;
+        glReadPixels(0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                     m_vram + static_cast<size_t>(page) * 8192u);
+    }
+    m_anyGpuNewer = left;
 }
 
 bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
@@ -876,6 +1059,7 @@ bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uKind"), kind);
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.usedHeight));
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uScale"), static_cast<GLint>(m_scale));
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     for (uint32_t page = first; page < end; ++page)
@@ -889,6 +1073,15 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     const uint32_t width = target.fbw * 64u;
     const uint32_t height = target.usedHeight;
     target.dirty = false;
+    // PS2X_GS_NATIVE_TARGETLOG=<n>: the first n resolves and reloads (fbp, width, format, rows, draw serial).
+    static const int s_targetLog = [] { const char *v = std::getenv("PS2X_GS_NATIVE_TARGETLOG"); return v ? std::atoi(v) : 0; }();
+    static int s_targetLogged = 0;
+    if (s_targetLogged < s_targetLog)
+    {
+        ++s_targetLogged;
+        std::fprintf(stderr, "[gs:native] resolve fbp=%u fbw=%u psm=0x%x rows=%u last=%llu serial=%llu\n", target.fbp, target.fbw,
+                     target.psm, height, static_cast<unsigned long long>(target.lastDraw), static_cast<unsigned long long>(m_drawSerial));
+    }
     // PS2X_GS_NATIVE_NORESOLVE=1: skip resolves (wrong pictures), to time what they cost.
     static const bool noResolve = std::getenv("PS2X_GS_NATIVE_NORESOLVE") != nullptr;
     if (noResolve || width == 0u || height == 0u || width > target.width)
@@ -901,7 +1094,7 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     // The pixels as a host-to-local CT32 transfer at the frame's base: rows top first (GL row 0 is GS row 0), alpha
     // as the GS stores it.
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(target, 0u, 0u, width, height));
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE,
                  pixels.data());
@@ -951,7 +1144,7 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     ps2x::native::textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
 }
 
-GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf)
+GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf, uint32_t rows)
 {
     FrameTarget out;
     // A game whose first draws are all native submits no GS primitive before this: the GS thread is the submit thread.
@@ -962,7 +1155,10 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
         return out;
     RenderTarget &target = renderTarget(frame);
     target.dirty = true;
-    target.usedHeight = target.height; // what another renderer draws is not tracked: resolve it whole
+    // Down to the scissor's last row, as a GS draw counts the rows it reaches: the whole target would also cover the
+    // GS memory below the picture, where a game uploads its textures, and each upload there dropped the target with
+    // the native draws in it (TMB's 3D frame came out black).
+    target.usedHeight = std::min(target.height, std::max(target.usedHeight, rows));
     target.alphaWritten = true;
     target.zbp = zbuf.zbp;
     target.zpsm = zbuf.psm;
@@ -971,6 +1167,7 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     out.depth = target.depth;
     out.width = target.width;
     out.height = target.height;
+    out.scale = m_scale;
     out.zScale = depthScale(zbuf.psm);
     return out;
 }
@@ -980,12 +1177,7 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
     if (!hook)
         return;
-    // The GS thread, as Submit records it: a game whose every draw is native (all its VU1 programs on the sandbox)
-    // reaches a marker before any GS primitive, and the GL context was then never created (null targets, the
-    // frame left magenta).
-    if (m_submitThread == std::thread::id{})
-        m_submitThread = std::this_thread::get_id();
-    const FrameTarget frame = frameTarget(context.frame, context.zbuf);
+    const FrameTarget frame = frameTarget(context.frame, context.zbuf, context.scissor.y1 + 1u);
     ps2x::native::GsDrawTarget target;
     fillNativeRegisters(target, context);
     target.framebuffer = frame.framebuffer;
@@ -993,6 +1185,7 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     target.depth = frame.depth;
     target.width = frame.width;
     target.height = frame.height;
+    target.scale = frame.scale;
     target.zScale = frame.zScale;
     target.xOffset = context.xyoffset.ofx;
     target.yOffset = context.xyoffset.ofy;
@@ -1032,9 +1225,10 @@ void GSNativeBackend::resolveAllTargets()
         }
         std::fprintf(stderr, "[gs:native] vram check: %u blocks differ\n", differing);
     }
+    std::vector<RenderTarget *> all;
     for (auto &[fbp, target] : m_targets)
-        if (target.dirty && target.usedHeight != 0u)
-            resolveTarget(target);
+        all.push_back(&target);
+    resolveInDrawOrder(all);
     pullGpuPages();
 }
 
@@ -1046,6 +1240,7 @@ void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
     const uint32_t bits = kBits[tex0.psm & 0x3Fu] ? kBits[tex0.psm & 0x3Fu] : 32u;
     const uint64_t texRows = 1ull << std::min<uint32_t>(tex0.th, 10u);
     const uint64_t texBlocks = (std::max<uint32_t>(tex0.tbw, 1u) * 64ull * texRows * bits / 8u + 255u) / 256u;
+    std::vector<RenderTarget *> under;
     for (auto &[fbp, target] : m_targets)
     {
         if (!target.dirty || target.usedHeight == 0u)
@@ -1055,8 +1250,9 @@ void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
         const uint32_t pageRows = (target.psm == 0x02u || target.psm == 0x0Au) ? 64u : 32u;
         const uint64_t blocks = static_cast<uint64_t>(target.fbw) * ((target.usedHeight + pageRows - 1u) / pageRows) * 32u;
         if (tex0.tbp0 < base + blocks && base < tex0.tbp0 + texBlocks)
-            resolveTarget(target);
+            under.push_back(&target);
     }
+    resolveInDrawOrder(under);
 }
 
 void GSNativeBackend::dropTargetsUnder(const GSTransferCommand &command)
@@ -1157,7 +1353,7 @@ bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width,
         return false;
     const uint32_t w = source->width, h = source->usedHeight;
     std::vector<float> depth(static_cast<size_t>(w) * h);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(*source, 0u, 0u, w, h, true));
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
     // Back to GS Z in the Z buffer's range, then laid out as the texture format reads it: Z32 as CT32, Z24 as CT24
@@ -1201,6 +1397,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     const GSContext &context = state.context;
     GLuint texture = 0;
     bool fromTarget = false;
+    uint32_t drawnWidth = 0, drawnHeight = 0; // a render target sampled directly: the texels it drew
     // PS2X_GS_NATIVE_LOG: each distinct texture read that overlaps a render target's pages, as (render target, texture
     // format and base, offset in pages): what still falls back to the texture cache, which has no drawn pixels.
     if (static const bool logOverlaps = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logOverlaps)
@@ -1226,12 +1423,16 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     {
         fromTarget = true;
         texture = m_depthTexture;
+        drawnWidth = static_cast<uint32_t>(width);
+        drawnHeight = static_cast<uint32_t>(height);
     }
     else if (colorFormat(context.tex0.psm))
     {
         // Only a read in the target's own layout samples it directly (CT24 reads CT32 pixels as they are); another
         // format (a CT32 buffer read as CT16 to split its channels) sees GS memory, through resolveTargetsUnder.
-        RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0);
+        // PS2X_GS_NATIVE_MEMORY_READS=1: never sample a target directly, always GS memory (diagnosis).
+        static const bool s_memoryReads = std::getenv("PS2X_GS_NATIVE_MEMORY_READS") != nullptr;
+        RenderTarget *source = m_fillingFromMemory || s_memoryReads ? nullptr : renderTargetAtBlock(context.tex0.tbp0);
         const auto sameLayout = [](uint32_t a, uint32_t b) { return a == b || ((a | b) & ~0x1u) == 0u; };
         if (source && !sameLayout(source->psm, context.tex0.psm))
             source = nullptr;
@@ -1252,25 +1453,34 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
                              source->fbp == target.fbp ? 1 : 0);
             }
             fromTarget = true;
+            drawnWidth = source->width;
+            drawnHeight = std::max(source->usedHeight, 1u);
+            // Its rows stop where the next buffer in GS memory starts (VP2's 512x480 scene at FBP 200 ends at the
+            // display buffer at FBP 320), whatever a taller pass once drew into the GL texture.
+            // (Only a buffer a whole row of pages lower: VP2's blur levels share page rows, side by side.)
+            for (const auto &[fbp, other] : m_targets)
+                if (source->fbw != 0u && fbp >= source->fbp + source->fbw)
+                    drawnHeight = std::min(drawnHeight, (fbp - source->fbp) / source->fbw * 32u);
             width = static_cast<float>(source->width);
             height = static_cast<float>(source->height);
             texture = source->color;
             m_lastSourceFramebuffer = source->framebuffer;
             if (source->fbp == target.fbp && !std::getenv("PS2X_GS_NATIVE_NOFEEDBACKCOPY"))
             {
-                if (!m_feedbackTexture || m_feedbackWidth != source->width || m_feedbackHeight != source->height)
+                const uint32_t feedbackWidth = source->width * m_scale, feedbackHeight = source->height * m_scale;
+                if (!m_feedbackTexture || m_feedbackWidth != feedbackWidth || m_feedbackHeight != feedbackHeight)
                 {
                     if (!m_feedbackTexture)
                         glGenTextures(1, &m_feedbackTexture);
                     glBindTexture(GL_TEXTURE_2D, m_feedbackTexture);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, source->width, source->height, 0, GL_RGBA,
-                                 GL_UNSIGNED_BYTE, nullptr);
-                    m_feedbackWidth = source->width;
-                    m_feedbackHeight = source->height;
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, feedbackWidth, feedbackHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                                 nullptr);
+                    m_feedbackWidth = feedbackWidth;
+                    m_feedbackHeight = feedbackHeight;
                 }
                 glBindTexture(GL_TEXTURE_2D, m_feedbackTexture);
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
-                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, source->width, source->height);
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, feedbackWidth, feedbackHeight);
                 glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
                 texture = m_feedbackTexture;
             }
@@ -1349,12 +1559,16 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     if (fromTarget)
     {
         const uint64_t clamp = context.clamp;
-        const int maxU = (1 << std::min<uint32_t>(context.tex0.tw, 10u)) - 1;
-        const int maxV = (1 << std::min<uint32_t>(context.tex0.th, 10u)) - 1;
+        // Clamping stops at the last texel the target drew: past it the GS reads the memory after the buffer
+        // (another buffer, nearly the same picture), the GL texture rows nobody drew (VP2 copies its 512x480 scene
+        // with v up to 480: bilinear's second texel drew a coloured line along the bottom and right edges).
+        const int lastU = static_cast<int>(drawnWidth) - 1, lastV = static_cast<int>(drawnHeight) - 1;
+        const int maxU = std::min((1 << std::min<uint32_t>(context.tex0.tw, 10u)) - 1, lastU);
+        const int maxV = std::min((1 << std::min<uint32_t>(context.tex0.th, 10u)) - 1, lastV);
         glUniform4i(m_uniforms.wrapU, static_cast<int>(clamp & 0x3u), maxU, static_cast<int>(clamp >> 4 & 0x3FFu),
-                    static_cast<int>(clamp >> 14 & 0x3FFu));
+                    std::min(static_cast<int>(clamp >> 14 & 0x3FFu), lastU));
         glUniform4i(m_uniforms.wrapV, static_cast<int>(clamp >> 2 & 0x3u), maxV, static_cast<int>(clamp >> 24 & 0x3FFu),
-                    static_cast<int>(clamp >> 34 & 0x3FFu));
+                    std::min(static_cast<int>(clamp >> 34 & 0x3FFu), lastV));
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
@@ -1442,15 +1656,25 @@ void GSNativeBackend::flushBatch()
     const GSDrawState &state = m_batchState;
     const GSContext &context = state.context;
     RenderTarget &target = renderTarget(context.frame);
+    // Shared memory: the target drawn into and a target sampled directly first get what overlapping ones drew since.
+    if (!m_fillingFromMemory)
+    {
+        if (state.prim.tme)
+            if (RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0); source && source != &target)
+                ensureCoherent(*source);
+        ensureCoherent(target);
+    }
     target.dirty = true;
+    target.lastDraw = ++m_drawSerial;
     // Rows reached: the lowest vertex, clipped by the scissor (a full-screen scissor says nothing about the buffer).
     const uint32_t lowest = std::min<uint32_t>(context.scissor.y1 + 1u, static_cast<uint32_t>(std::max(0.0f, std::ceil(m_batchMaxY))));
     target.usedHeight = std::min(target.height, std::max(target.usedHeight, lowest));
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-    glViewport(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height));
+    glViewport(0, 0, static_cast<GLsizei>(target.width * m_scale), static_cast<GLsizei>(target.height * m_scale));
     glEnable(GL_SCISSOR_TEST);
-    glScissor(context.scissor.x0, context.scissor.y0, context.scissor.x1 - context.scissor.x0 + 1,
-              context.scissor.y1 - context.scissor.y0 + 1);
+    glScissor(static_cast<GLint>(context.scissor.x0 * m_scale), static_cast<GLint>(context.scissor.y0 * m_scale),
+              static_cast<GLsizei>((context.scissor.x1 - context.scissor.x0 + 1) * m_scale),
+              static_cast<GLsizei>((context.scissor.y1 - context.scissor.y0 + 1) * m_scale));
 
     // PS2X_GS_NATIVE_OFF=depth|alpha|blend|color (any of them): diagnostics that turn one stage off.
     static const char *s_off = std::getenv("PS2X_GS_NATIVE_OFF");
@@ -1526,7 +1750,8 @@ void GSNativeBackend::flushBatch()
     glUniform1i(m_uniforms.tcc, context.tex0.tcc);
     glUniform1i(m_uniforms.fog, state.prim.fge ? 1 : 0);
     glUniform3f(m_uniforms.fogColor, state.fogR / 255.0f, state.fogG / 255.0f, state.fogB / 255.0f);
-    // TEST: ATE, ATST, AREF. A failed test keeps the pixel unwritten (AFAIL other than KEEP is not translated yet).
+    // TEST: ATE, ATST, AREF. A failed test keeps the pixel unwritten (AFAIL KEEP); the other AFAIL modes draw the
+    // batch a second time for the failing pixels under their write masks.
     bool alphaTest = !offAlpha && (context.test & 0x1u) != 0u;
     // ATST NEVER with AFAIL other than KEEP: every pixel fails, and AFAIL says what is written anyway. That is a
     // write mask (FB_ONLY colour without Z, ZB_ONLY Z alone, RGB_ONLY colour without alpha or Z), not a test.
@@ -1548,29 +1773,42 @@ void GSNativeBackend::flushBatch()
             break;
         }
     }
+    const uint32_t afail = context.test >> 12 & 0x3u;
+    const bool depthWrites = depthTest && !context.zbuf.zmask;
+    // FB_ONLY without Z writes, or RGB_ONLY without Z or alpha writes: failing pixels are written like passing ones.
+    if (alphaTest && !depthWrites && (afail == 1u || (afail == 3u && keepAlpha)))
+        alphaTest = false;
+    const bool alphaFailPass = alphaTest && afail != 0u && (afail != 2u || depthWrites);
+    glUniform1i(m_uniforms.alphaFail, 0);
     glUniform1i(m_uniforms.alphaTest, alphaTest ? static_cast<int>(context.test >> 1 & 0x7u) : 1);
     glUniform1f(m_uniforms.alphaRef, static_cast<float>(context.test >> 4 & 0xFFu));
     // DATE: the destination alpha's top bit (DATM picks which value passes), read from a copy of the target.
     const bool date = (context.test >> 14 & 0x1u) != 0u;
     glUniform1i(m_uniforms.date, date ? ((context.test >> 15 & 0x1u) ? 2 : 1) : 0);
+    // An alpha byte FBMSK keeps only partly (SCTPT2 0x7F: the top bit written, the font in the bits below kept): the
+    // kept bits from a copy of the target, which such a draw never changes, so one copy serves the whole batch.
+    const uint32_t alphaKeep = fbmsk >> 24;
+    const bool partialAlpha = !keepAlpha && alphaKeep != 0u && !offColor;
+    glUniform1i(m_uniforms.alphaKeep, partialAlpha ? static_cast<int>(alphaKeep) : 0);
     glUniform1i(m_uniforms.dest, 1);
-    if (date)
+    if (date || partialAlpha)
     {
-        if (!m_destTexture || m_destWidth != target.width || m_destHeight != target.height)
+        const uint32_t destWidth = target.width * m_scale, destHeight = target.height * m_scale;
+        if (!m_destTexture || m_destWidth != destWidth || m_destHeight != destHeight)
         {
             if (!m_destTexture)
                 glGenTextures(1, &m_destTexture);
             glBindTexture(GL_TEXTURE_2D, m_destTexture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width, target.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, destWidth, destHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            m_destWidth = target.width;
-            m_destHeight = target.height;
+            m_destWidth = destWidth;
+            m_destHeight = destHeight;
         }
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, m_destTexture);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, target.width, target.height);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, destWidth, destHeight);
         glActiveTexture(GL_TEXTURE0);
     }
 
@@ -1579,6 +1817,21 @@ void GSNativeBackend::flushBatch()
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_batch.size() * sizeof(Vertex)), m_batch.data(),
                  GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
+    if (alphaFailPass)
+    {
+        const GLboolean r = offColor || (fbmsk & 0xFFu) != 0xFFu, g = offColor || (fbmsk >> 8 & 0xFFu) != 0xFFu;
+        const GLboolean b = offColor || (fbmsk >> 16 & 0xFFu) != 0xFFu, a = offColor || !keepAlpha;
+        glUniform1i(m_uniforms.alphaFail, 1);
+        glDepthMask(afail == 2u ? GL_TRUE : GL_FALSE);
+        if (afail == 2u)
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        else if (afail == 3u)
+            glColorMask(r, g, b, GL_FALSE);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
+        glUniform1i(m_uniforms.alphaFail, 0);
+        glDepthMask(depthWrites ? GL_TRUE : GL_FALSE);
+        glColorMask(r, g, b, a);
+    }
     // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
     if (static const char *probe = std::getenv("PS2X_GS_NATIVE_PROBE");
         probe && std::strtoul(probe, nullptr, 10) == target.fbp)
@@ -1679,7 +1932,17 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
     // A transfer that reads GS memory on the CPU side (local to host, local to local) needs the resolved pixels
     // there; one into GS memory only replaces blocks, which reach the GPU copy by themselves.
     if (command.direction == 1u || command.direction == 2u)
-        pullGpuPages();
+    {
+        // Only the source's pages (a game reading back a few pixels every frame, VP2's light level, should not
+        // wait for every page the targets resolved): its first page to the last row's, generously.
+        const uint32_t first = command.bitbltbuf.sbp / 32u;
+        const uint32_t pageRows = 32u; // CT32's page height, the smallest: covers the others
+        const uint32_t rows = static_cast<uint32_t>(command.trxpos.ssay) + command.trxreg.rrh;
+        const uint32_t end = first + std::max<uint32_t>(command.bitbltbuf.sbw, 1u) * ((rows + pageRows - 1u) / pageRows + 1u);
+        m_readFirstPage = first;
+        m_readEndPage = end;
+        pullGpuPages(first, end);
+    }
     if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
     {
         static uint32_t s_logged = 0, s_copies = 0;
@@ -1724,11 +1987,13 @@ bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
     const GLint sx = command.trxpos.ssax, sy = command.trxpos.ssay;
     const GLint dx = command.trxpos.dsax, dy = command.trxpos.dsay;
     const GLint w = command.trxreg.rrw, h = command.trxreg.rrh;
+    const GLint s = static_cast<GLint>(m_scale);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination.framebuffer);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glBlitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBlitFramebuffer(sx * s, sy * s, (sx + w) * s, (sy + h) * s, dx * s, dy * s, (dx + w) * s, (dy + h) * s, GL_COLOR_BUFFER_BIT,
+                      GL_NEAREST);
     destination.dirty = true;
     destination.usedHeight = std::min(destination.height,
                                       std::max(destination.usedHeight, static_cast<uint32_t>(dy + h)));
@@ -1777,7 +2042,7 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
             return false;
         const size_t bytes = static_cast<size_t>(width) * height * 4u;
         pixels.resize(bytes);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(target, read.x, read.y, width, height));
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         // Asynchronous read back through two pixel buffers per read circuit: this frame's read is queued and the
         // previous presentation's is copied out, so the GS thread does not wait for the GPU to finish the frame (one
@@ -1835,11 +2100,245 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
     return true;
 }
 
+uint32_t GSNativeBackend::readFramebufferAt1x(const RenderTarget &target, uint32_t x, uint32_t y, uint32_t width,
+                                              uint32_t height, bool depth)
+{
+    if (m_scale == 1u)
+        return target.framebuffer;
+    if (m_downFramebuffer == 0u)
+    {
+        glGenTextures(1, &m_downColor);
+        glBindTexture(GL_TEXTURE_2D, m_downColor);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kMaxTargetWidth, kTargetHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glGenTextures(1, &m_downDepth);
+        glBindTexture(GL_TEXTURE_2D, m_downDepth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, kMaxTargetWidth, kTargetHeight, 0, GL_DEPTH_COMPONENT, GL_FLOAT,
+                     nullptr);
+        GLint draw = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+        glGenFramebuffers(1, &m_downFramebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_downFramebuffer);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_downColor, 0);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_downDepth, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+    }
+    GLint draw = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST); // a blit is scissored
+    const GLint s = static_cast<GLint>(m_scale), x0 = static_cast<GLint>(x), y0 = static_cast<GLint>(y);
+    const GLint x1 = x0 + static_cast<GLint>(width), y1 = y0 + static_cast<GLint>(height);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_downFramebuffer);
+    glBlitFramebuffer(x0 * s, y0 * s, x1 * s, y1 * s, x0, y0, x1, y1, depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT,
+                      GL_NEAREST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+    return m_downFramebuffer;
+}
+
+bool GSNativeBackend::circuitSource(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, CircuitSource &out)
+{
+    const DisplayRead read = decodeDisplay(dispfb, display);
+    out.fbp = read.fbp;
+    const uint32_t lines = fieldMode ? (read.height + 1u) / 2u : read.height;
+    const auto it = m_targets.find(read.fbp);
+    if (it != m_targets.end())
+    {
+        const RenderTarget &target = it->second;
+        out.width = static_cast<int>(std::min(read.width, target.width - std::min(read.x, target.width)));
+        out.height = static_cast<int>(std::min(lines, target.height - std::min(read.y, target.height)));
+        if (out.width == 0 || out.height == 0)
+            return false;
+        out.texture = target.color;
+        out.x = static_cast<int>(read.x);
+        out.y = static_cast<int>(read.y);
+        out.scale = static_cast<int>(m_scale);
+        out.opaque = target.psm == 0x01u;
+        return true;
+    }
+    // Not drawn by us (an image the game uploaded straight into the displayed buffer: movies): GS memory.
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0, height = 0, fbp = 0;
+    if (!readCircuit(circuit, dispfb, display, fieldMode, pixels, width, height, fbp))
+        return false;
+    uint32_t &staging = m_circuitStaging[circuit];
+    if (staging == 0u)
+        glGenTextures(1, &staging);
+    GLint unpackBuffer = 0, rowLength = 0, alignment = 4;
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rowLength);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, staging);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, pixels.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<GLuint>(unpackBuffer));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+    out.texture = staging;
+    out.x = out.y = 0;
+    out.width = static_cast<int>(width);
+    out.height = static_cast<int>(height);
+    out.fbp = fbp;
+    out.scale = 1;
+    out.opaque = false;
+    return true;
+}
+
+bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, PresentationFrame &frame)
+{
+    const bool fieldMode = (request.smode2 & 0x3u) == 0x3u;
+    const uint64_t pmode = request.pmode;
+    const bool en1 = (pmode & 0x1u) != 0u, en2 = (pmode & 0x2u) != 0u;
+    const bool mmod = (pmode >> 5 & 0x1u) != 0u, slbg = (pmode >> 7 & 0x1u) != 0u;
+    const float alp = static_cast<float>(pmode >> 8 & 0xFFu) / 255.0f;
+    GlStateRestore restore;
+    // The draws' textures on units 0 and 1 given back too (GlStateRestore keeps the rest), whatever return is taken.
+    struct TextureBindings
+    {
+        GLint texture[2] = {};
+        TextureBindings()
+        {
+            for (int unit = 0; unit < 2; ++unit)
+            {
+                glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + unit));
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture[unit]);
+            }
+        }
+        ~TextureBindings()
+        {
+            for (int unit = 1; unit >= 0; --unit)
+            {
+                glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + unit));
+                glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture[unit]));
+            }
+        }
+    } bindings;
+    CircuitSource top, bottom;
+    const bool haveTop = en1 && circuitSource(1, request.dispfb1, request.display1, fieldMode, top);
+    const bool haveBottom = en2 && !slbg && circuitSource(2, request.dispfb2, request.display2, fieldMode, bottom);
+    if (!haveTop && !haveBottom)
+        return false;
+    if (m_presentProgram == 0u)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kPresentFragmentShader);
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glLinkProgram(program);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE)
+        {
+            glDeleteProgram(program);
+            return false;
+        }
+        m_presentProgram = program;
+    }
+    const uint32_t width = static_cast<uint32_t>(std::max(haveTop ? top.width : 0, haveBottom ? bottom.width : 0));
+    const uint32_t lines = static_cast<uint32_t>(std::max(haveTop ? top.height : 0, haveBottom ? bottom.height : 0));
+    const uint32_t height = (fieldMode ? lines * 2u : lines) * m_scale;
+    const uint32_t outWidth = width * m_scale;
+
+    PresentSlot &slot = m_presentSlots[m_presentNext];
+    if (slot.fence)
+    {
+        glDeleteSync(static_cast<GLsync>(slot.fence));
+        slot.fence = nullptr;
+    }
+    if (slot.texture == 0u || slot.width != outWidth || slot.height != height)
+    {
+        if (slot.texture == 0u)
+        {
+            glGenTextures(1, &slot.texture);
+            glGenFramebuffers(1, &slot.framebuffer);
+        }
+        // PS2X_PRESENT_FILTER=point: the window scales the picture with nearest texels (as for the other renderers).
+        static const GLint filter = []
+        {
+            const char *value = std::getenv("PS2X_PRESENT_FILTER");
+            return value && std::strcmp(value, "point") == 0 ? GL_NEAREST : GL_LINEAR;
+        }();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, slot.texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(outWidth), static_cast<GLsizei>(height), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
+        slot.width = outWidth;
+        slot.height = height;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
+    glViewport(0, 0, static_cast<GLsizei>(outWidth), static_cast<GLsizei>(height));
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_presentProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, haveTop ? top.texture : 0u);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, haveBottom ? bottom.texture : 0u);
+    const auto uniform = [this](const char *name) { return glGetUniformLocation(m_presentProgram, name); };
+    glUniform1i(uniform("uTop"), 0);
+    glUniform1i(uniform("uBottom"), 1);
+    glUniform4i(uniform("uTopRect"), top.x, top.y, top.width, top.height);
+    glUniform4i(uniform("uBottomRect"), bottom.x, bottom.y, bottom.width, bottom.height);
+    glUniform1i(uniform("uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(uniform("uTopScale"), top.scale);
+    glUniform1i(uniform("uBottomScale"), bottom.scale);
+    glUniform1i(uniform("uHaveTop"), haveTop ? 1 : 0);
+    glUniform1i(uniform("uHaveBottom"), haveBottom ? 1 : 0);
+    glUniform1i(uniform("uField"), fieldMode ? 1 : 0);
+    glUniform1i(uniform("uTopOpaque"), top.opaque ? 1 : 0);
+    glUniform1i(uniform("uMode"), !(en2 || slbg) ? 0 : mmod ? 1 : 2);
+    glUniform1i(uniform("uBlackUnder"), !slbg && !haveBottom ? 1 : 0);
+    glUniform1f(uniform("uAlp"), alp);
+    glUniform3f(uniform("uBackground"), static_cast<float>(request.bgcolor & 0xFFu) / 255.0f,
+                static_cast<float>(request.bgcolor >> 8 & 0xFFu) / 255.0f, static_cast<float>(request.bgcolor >> 16 & 0xFFu) / 255.0f);
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    slot.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+
+    // The window gets the picture composed at the previous presentation (done by now; waited for if not), so the GS
+    // thread never waits for this one: one presentation of latency, as the CPU path's asynchronous read back.
+    const int shown = m_presentComposed >= 0 ? m_presentComposed : m_presentNext;
+    PresentSlot &ready = m_presentSlots[shown];
+    if (ready.fence)
+        glClientWaitSync(static_cast<GLsync>(ready.fence), GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull);
+    m_presentComposed = m_presentNext;
+    m_presentNext = (m_presentNext + 1) % 3;
+    frame.glTexture = ready.texture;
+    frame.width = ready.width;
+    frame.height = ready.height;
+    frame.displayFbp = haveTop ? top.fbp : bottom.fbp;
+    frame.sourceFbp = frame.displayFbp;
+    return true;
+}
+
 PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
 {
     flushBatch();
     PresentationFrame frame;
     if (!ensureContext())
+        return frame;
+    static const bool cpuPresent = std::getenv("PS2X_GS_NATIVE_CPUPRESENT") != nullptr;
+    if (!cpuPresent && presentOnGpu(request, frame))
         return frame;
     // Interlaced field mode (SMODE2 INT and FFMD): the game draws one field of half the lines; show each line twice.
     const bool fieldMode = (request.smode2 & 0x3u) == 0x3u;
@@ -1955,7 +2454,7 @@ bool GSNativeBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 
 uint32_t GSNativeBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    pullGpuPages();
+    pullGpuPages(m_readFirstPage, m_readEndPage);
     return m_memory->ConsumeLocalToHostBytes(dst, maxBytes);
 }
 

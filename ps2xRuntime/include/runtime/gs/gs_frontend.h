@@ -169,6 +169,10 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // A game paced by its own frame ends (a native loop) shows the newest finished picture at each of them: the last
+    // buffer drawn with the width and format of the one DISPFB shows replaces it, whatever buffer the game's vblank
+    // handler pointed DISPFB at (an interlaced game flips per field, at vblanks that no longer follow its frames).
+    void setPresentNewestDisplayBuffer(bool on) { m_presentNewest = on; }
     // A native renderer's draws for a skipped VU1 program (runtime/native/native_gs_hook.h): a marker in the queue,
     // in the order of the PATH1 packets around it, that calls the hook on the GS thread with context 0 or 1's
     // render target. Does not wait.
@@ -187,6 +191,8 @@ public:
                                           uint32_t *outDisplayFbp = nullptr,
                                           uint32_t *outSourceFbp = nullptr,
                                           bool *outUsedPreferred = nullptr) const;
+    // The latched frame as a GL texture (PresentationFrame::glTexture), when the renderer handed one over.
+    bool latchedHostPresentationTexture(uint32_t &texture, uint32_t &width, uint32_t &height) const;
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -278,6 +284,8 @@ private:
     static void submitNativeBatch(void *user, const ps2x::native::Material &material, const float matrix[16], float gsZScale,
                                   const ps2x::native::Vertex *vertices, uint32_t count);
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
+    bool m_presentNewest = false;          // setPresentNewestDisplayBuffer
+    uint32_t m_newestDisplayFbp = ~0u;     // the last buffer drawn with the displayed buffer's width and format
     GSPresentationRequest buildPresentationRequestUnlocked() const;
     void latchHostPresentationFrame(const GSPresentationRequest *displayRegisters);
     std::atomic<uint64_t> m_queuedLatchesDone{0};
@@ -366,6 +374,7 @@ private:
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
     std::vector<uint8_t> m_hostPresentationFrame;
+    uint32_t m_hostPresentationTexture = 0;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
     uint32_t m_hostPresentationDisplayFbp = 0;

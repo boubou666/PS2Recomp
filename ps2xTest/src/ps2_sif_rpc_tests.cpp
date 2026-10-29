@@ -214,10 +214,10 @@ namespace
         setRegU32(*ctx, 4, K_IOPEE_QD);
         setRegU32(*ctx, 5, static_cast<uint32_t>(runtime->eeScheduler().currentThreadId()));
         SifSetRpcQueue(rdram, ctx, runtime);
-        setRegU32(*ctx, 29, K_STACK_ADDR);
-        writeGuestU32(rdram, K_STACK_ADDR + 0x10u, 0u);         // cfunc
-        writeGuestU32(rdram, K_STACK_ADDR + 0x14u, 0u);         // cbuf
-        writeGuestU32(rdram, K_STACK_ADDR + 0x18u, K_IOPEE_QD); // qd
+        // Arguments 5-7 in t0-t2 (EE EABI).
+        setRegU32(*ctx, 8, 0u);          // cfunc
+        setRegU32(*ctx, 9, 0u);          // cbuf
+        setRegU32(*ctx, 10, K_IOPEE_QD); // qd
         setRegU32(*ctx, 4, K_IOPEE_SD);
         setRegU32(*ctx, 5, K_IOPEE_SID);
         setRegU32(*ctx, 6, K_IOPEE_SERVER);
@@ -376,10 +376,10 @@ void register_ps2_sif_rpc_tests()
             SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifSetRpcQueue should succeed");
 
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0x9000u);          // cfunc
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kClientCbufAddr);  // cbuf
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);          // qd
+            // Arguments 5-7 in t0-t2 (EE EABI).
+            setRegU32(env.ctx, 8, 0x9000u);          // cfunc
+            setRegU32(env.ctx, 9, kClientCbufAddr);  // cbuf
+            setRegU32(env.ctx, 10, kQdAddr);         // qd
 
             setRegU32(env.ctx, 4, kSdAddr);
             setRegU32(env.ctx, 5, kSid);
@@ -393,7 +393,7 @@ void register_ps2_sif_rpc_tests()
             t.Equals(qdAfterRegister.link, kSdAddr, "queue link should point at registered server");
             t.Equals(static_cast<uint32_t>(sdAfterRegister.sid), kSid, "server sid should match registered sid");
             t.Equals(sdAfterRegister.buf, kServerBufAddr, "server buf should match register arg");
-            t.Equals(sdAfterRegister.cbuf, kClientCbufAddr, "server cbuf should match stack arg");
+            t.Equals(sdAfterRegister.cbuf, kClientCbufAddr, "server cbuf should match the cbuf argument");
             t.Equals(sdAfterRegister.base, kQdAddr, "server base should point to queue");
 
             setRegU32(env.ctx, 4, kClientAddr);
@@ -606,10 +606,9 @@ void register_ps2_sif_rpc_tests()
             SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifSetRpcQueue should succeed");
 
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kServerCbufAddr);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);
+            setRegU32(env.ctx, 8, 0u);               // cfunc, cbuf, qd in t0-t2 (EE EABI)
+            setRegU32(env.ctx, 9, kServerCbufAddr);
+            setRegU32(env.ctx, 10, kQdAddr);
 
             setRegU32(env.ctx, 4, kSdAddr);
             setRegU32(env.ctx, 5, kSid);
@@ -679,10 +678,9 @@ void register_ps2_sif_rpc_tests()
             SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifSetRpcQueue should succeed");
 
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);
+            setRegU32(env.ctx, 8, 0u);               // cfunc, cbuf, qd in t0-t2 (EE EABI)
+            setRegU32(env.ctx, 9, 0u);
+            setRegU32(env.ctx, 10, kQdAddr);
 
             setRegU32(env.ctx, 4, kSdAddr);
             setRegU32(env.ctx, 5, kSid);

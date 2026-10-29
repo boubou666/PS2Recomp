@@ -1,6 +1,11 @@
 #include "runtime/native/native_renderer.h"
+
+#include "raylib.h"
+#include "rlgl.h"
+
 #include "ps2_runtime.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/ps2_input_bindings.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -537,8 +542,96 @@ static void DrawFpsOverlay(uint64_t gameFrames, uint64_t displayFlips, uint64_t 
     DrawText(text, x, padding + padding / 2, fontSize, color);
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+// PS2X_FRAME_DUMP=<dir>: the presented frame as raw RGBA every PS2X_FRAME_DUMP_EVERY seconds (default 5).
+static bool frameDumpDue()
 {
+    static const char *s_frameDumpDir = std::getenv("PS2X_FRAME_DUMP");
+    if (!s_frameDumpDir || !*s_frameDumpDir)
+        return false;
+    static const double s_frameDumpEvery = []
+    {
+        const char *every = std::getenv("PS2X_FRAME_DUMP_EVERY");
+        return every && *every ? std::max(0.1, std::atof(every)) : 5.0;
+    }();
+    static auto s_nextFrameDump = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < s_nextFrameDump)
+        return false;
+    s_nextFrameDump = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(s_frameDumpEvery));
+    return true;
+}
+
+static void writeFrameDump(const uint8_t *pixels, size_t bytes, uint32_t width, uint32_t height)
+{
+    static uint32_t s_frameDumpIndex = 0u;
+    std::ostringstream name;
+    name << std::getenv("PS2X_FRAME_DUMP") << "/frame_" << s_frameDumpIndex++ << '_' << width << 'x' << height << ".rgba";
+    std::ofstream file(name.str(), std::ios::binary);
+    file.write(reinterpret_cast<const char *>(pixels),
+               static_cast<std::streamsize>(std::min<size_t>(bytes, static_cast<size_t>(width) * height * 4u)));
+}
+
+// Unattended frame capture: PS2X_CAPTURE_DIR=<folder> saves the presented guest frame as frame_<tenths of a second>.png
+// every PS2X_CAPTURE_INTERVAL seconds (default 5), independent of window focus. Returns the file name when one is due.
+static bool frameCaptureDue(char (&path)[1024])
+{
+    static const char *s_captureDir = std::getenv("PS2X_CAPTURE_DIR");
+    if (!s_captureDir || !*s_captureDir)
+        return false;
+    static const double s_captureInterval = []()
+    {
+        const char *value = std::getenv("PS2X_CAPTURE_INTERVAL");
+        const double parsed = value ? std::atof(value) : 0.0;
+        return parsed > 0.0 ? parsed : 5.0;
+    }();
+    static const auto s_captureStart = std::chrono::steady_clock::now();
+    static double s_nextCapture = s_captureInterval;
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_captureStart).count();
+    if (elapsed < s_nextCapture)
+        return false;
+    s_nextCapture += s_captureInterval;
+    std::snprintf(path, sizeof(path), "%s/frame_%06d.png", s_captureDir, static_cast<int>(elapsed * 10.0));
+    return true;
+}
+
+static void writeFrameCapture(const char *path, uint8_t *pixels, int rowPixels, int height)
+{
+    Image image{};
+    image.data = pixels;
+    image.width = rowPixels;
+    image.height = height;
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    ExportImage(image, path);
+}
+
+// A frame the GS renderer presents as its own GL texture, read back for the dump and the capture when one is due.
+static void dumpPresentedTexture(uint32_t texture, uint32_t width, uint32_t height)
+{
+    if (texture == 0u || width == 0u || height == 0u)
+        return;
+    const bool dump = frameDumpDue();
+    char path[1024];
+    const bool capture = frameCaptureDue(path);
+    if (!dump && !capture)
+        return;
+    auto *pixels = static_cast<uint8_t *>(rlReadTexturePixels(texture, static_cast<int>(width), static_cast<int>(height),
+                                                              PIXELFORMAT_UNCOMPRESSED_R8G8B8A8));
+    if (!pixels)
+        return;
+    if (dump)
+        writeFrameDump(pixels, static_cast<size_t>(width) * height * 4u, width, height);
+    if (capture)
+        writeFrameCapture(path, pixels, static_cast<int>(width), static_cast<int>(height));
+    RL_FREE(pixels);
+}
+
+// outGlTexture: the renderer's own texture holding the frame (PresentationFrame::glTexture), drawn instead of tex.
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight, uint32_t &outGlTexture)
+{
+    static uint32_t s_lastGlTexture = 0u;
+    outGlTexture = 0u;
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -578,6 +671,18 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outGlTexture = s_lastGlTexture;
+        return;
+    }
+    s_lastGlTexture = 0u;
+    if (uint32_t texture = 0u, textureWidth = 0u, textureHeight = 0u;
+        !overridden && rt->gsForPresentation().latchedHostPresentationTexture(texture, textureWidth, textureHeight))
+    {
+        outGlTexture = s_lastGlTexture = texture;
+        outWidth = s_lastWidth = textureWidth;
+        outHeight = s_lastHeight = textureHeight;
+        s_hasUploadedFrame = true;
+        dumpPresentedTexture(texture, textureWidth, textureHeight);
         return;
     }
 
@@ -629,29 +734,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    // PS2X_FRAME_DUMP=<dir>: write the presented frame as raw RGBA every PS2X_FRAME_DUMP_EVERY seconds (default 5).
-    static const char *s_frameDumpDir = std::getenv("PS2X_FRAME_DUMP");
-    if (s_frameDumpDir && *s_frameDumpDir && !s_scratch.empty() && width != 0u && height != 0u)
-    {
-        static const double s_frameDumpEvery = []
-        {
-            const char *every = std::getenv("PS2X_FRAME_DUMP_EVERY");
-            return every && *every ? std::max(0.1, std::atof(every)) : 5.0;
-        }();
-        static auto s_nextFrameDump = std::chrono::steady_clock::now();
-        static uint32_t s_frameDumpIndex = 0u;
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= s_nextFrameDump)
-        {
-            s_nextFrameDump = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                        std::chrono::duration<double>(s_frameDumpEvery));
-            std::ostringstream name;
-            name << s_frameDumpDir << "/frame_" << s_frameDumpIndex++ << '_' << width << 'x' << height << ".rgba";
-            std::ofstream file(name.str(), std::ios::binary);
-            file.write(reinterpret_cast<const char *>(s_scratch.data()),
-                       static_cast<std::streamsize>(std::min<size_t>(s_scratch.size(), static_cast<size_t>(width) * height * 4u)));
-        }
-    }
+    if (!s_scratch.empty() && width != 0u && height != 0u && frameDumpDue())
+        writeFrameDump(s_scratch.data(), s_scratch.size(), width, height);
 
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
@@ -679,34 +763,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outHeight = height;
     s_hasUploadedFrame = true;
 
-    // Unattended frame capture: PS2X_CAPTURE_DIR=<folder> saves the presented guest frame as
-    // frame_<seconds>.png every PS2X_CAPTURE_INTERVAL seconds (default 5), independent of window focus.
-    static const char *s_captureDir = std::getenv("PS2X_CAPTURE_DIR");
-    if (s_captureDir && *s_captureDir && width != 0u && height != 0u)
-    {
-        static const double s_captureInterval = []()
-        {
-            const char *value = std::getenv("PS2X_CAPTURE_INTERVAL");
-            const double parsed = value ? std::atof(value) : 0.0;
-            return parsed > 0.0 ? parsed : 5.0;
-        }();
-        static const auto s_captureStart = std::chrono::steady_clock::now();
-        static double s_nextCapture = s_captureInterval;
-        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_captureStart).count();
-        if (elapsed >= s_nextCapture)
-        {
-            s_nextCapture += s_captureInterval;
-            Image image{};
-            image.data = s_uploadBuffer.data();
-            image.width = FB_MAX_WIDTH;
-            image.height = static_cast<int>(std::min<uint32_t>(height, FB_MAX_HEIGHT));
-            image.mipmaps = 1;
-            image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-            char path[1024];
-            std::snprintf(path, sizeof(path), "%s/frame_%06d.png", s_captureDir, static_cast<int>(elapsed * 10.0));
-            ExportImage(image, path);
-        }
-    }
+    if (char path[1024]; width != 0u && height != 0u && frameCaptureDue(path))
+        writeFrameCapture(path, s_uploadBuffer.data(), FB_MAX_WIDTH, static_cast<int>(std::min<uint32_t>(height, FB_MAX_HEIGHT)));
 }
 
 PS2Runtime::PS2Runtime()
@@ -1508,7 +1566,15 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // PS2X_WINDOW_SIZE=<width>x<height>: the window's size when it opens (it can be resized after).
+        int windowWidth = HOST_WINDOW_WIDTH, windowHeight = HOST_WINDOW_HEIGHT;
+        if (const char *size = std::getenv("PS2X_WINDOW_SIZE"); size && *size)
+        {
+            int w = 0, h = 0;
+            if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w >= 160 && h >= 120)
+                windowWidth = w, windowHeight = h;
+        }
+        InitWindow(windowWidth, windowHeight, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -3639,9 +3705,20 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         if (IsKeyPressed(KEY_F10)) // F10: start the GS recording (PS2X_GS_RECORD with PS2X_GS_RECORD_AT=key)
             ps2GsRequestRecording();
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        uint32_t presentGlTexture = 0u;
+        UploadFrame(frameTex, this, presentWidth, presentHeight, presentGlTexture);
+        Texture2D shownTex = frameTex;
+        if (presentGlTexture != 0u) // the GS renderer's own texture (GS native back end): drawn as it is
+        {
+            shownTex.id = presentGlTexture;
+            shownTex.width = static_cast<int>(presentWidth);
+            shownTex.height = static_cast<int>(presentHeight);
+            shownTex.mipmaps = 1;
+            shownTex.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        }
 
         BeginDrawing();
+        ps2_input::frameUpdate(); // the mouse and the wheel, for the pad bindings (input.ini)
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
@@ -3672,8 +3749,8 @@ void PS2Runtime::run()
             return value && std::string_view(value) == "only";
         }();
         if (!(s_nativeOnly && ps2x::native::Renderer::instance().enabled() && ps2x::native::Renderer::instance().hasDraws()))
-            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        ps2x::native::Renderer::instance().setGsFrame(frameTex.id, frameTex.width, frameTex.height, frameTex.format);
+            DrawTexturePro(shownTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        ps2x::native::Renderer::instance().setGsFrame(shownTex.id, shownTex.width, shownTex.height, shownTex.format);
         ps2x::native::Renderer::instance().present(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
         DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), eeScheduler().currentCycle(), screenWidth, screenHeight);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
