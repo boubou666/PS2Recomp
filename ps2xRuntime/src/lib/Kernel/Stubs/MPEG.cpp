@@ -2655,12 +2655,23 @@ namespace ps2_stubs
                 haveFrame = true;
                 if (g_mpeg_stub_state.pictureTraceCount < mpegTraceLimit())
                 {
+                    // Average of a sparse sample of the picture (0-255), to see a decoder giving black pictures.
+                    uint64_t pictureSum = 0u;
+                    uint64_t pictureSamples = 0u;
+                    for (size_t i = 0; i + 2u < frame.rgba.size(); i += 4u * 97u)
+                    {
+                        pictureSum += frame.rgba[i] + frame.rgba[i + 1u] + frame.rgba[i + 2u];
+                        ++pictureSamples;
+                    }
+                    const uint64_t pictureMean = pictureSamples ? pictureSum / (3u * pictureSamples) : 0u;
+                    (void)pictureMean;
                     PS2_IF_AGRESSIVE_LOGS({
                         std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
                                   << std::dec << " generation=" << g_mpeg_stub_state.cdStreamGeneration
                                   << " frame=" << frameCount
                                   << " queued=" << playback.decodedFrames.size()
-                                  << " size=" << width << "x" << height << std::endl;
+                                  << " size=" << width << "x" << height
+                                  << " mean=" << pictureMean << std::endl;
                     });
                     ++g_mpeg_stub_state.pictureTraceCount;
                 }
