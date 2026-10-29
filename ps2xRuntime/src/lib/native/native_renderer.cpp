@@ -165,7 +165,11 @@ void main()
         batch.key = m_key;
         batch.group = m_streamDraws ? m_group : 0u;
         m_building.lastGroup = std::max(m_building.lastGroup, batch.group);
-        m_building.vertices.insert(m_building.vertices.end(), vertices, vertices + count);
+        // Once the GS front end draws the GS-context batches itself (drawn into the GS frame), present() never draws
+        // the frame: such a batch only goes to the stream.
+        const bool frameCopy = !(m_streamDraws && material.fromGsContext && m_drewIntoGs.load(std::memory_order_relaxed));
+        if (frameCopy)
+            m_building.vertices.insert(m_building.vertices.end(), vertices, vertices + count);
         if (m_streamDraws)
         {
             StreamBatch entry;
@@ -178,7 +182,8 @@ void main()
             if (m_stream.size() > 65536u) // nobody drains them (no GS markers): keep the latest frames' worth
                 m_stream.pop_front();
         }
-        m_building.batches.push_back(batch);
+        if (frameCopy)
+            m_building.batches.push_back(batch);
     }
 
     void Renderer::endFrame()

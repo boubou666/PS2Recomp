@@ -10,6 +10,7 @@
 #include "external/glad.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -276,6 +277,34 @@ void main()
         setGsDrawHook(on ? &Renderer::gsDraw : nullptr);
     }
 
+    bool Renderer::takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user)
+    {
+        std::vector<StreamBatch> taken;
+        bool left = false;
+        {
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            for (auto it = m_stream.begin(); it != m_stream.end() && it->group <= group;)
+            {
+                if (it->batch.material.fromGsContext)
+                {
+                    taken.push_back(std::move(*it));
+                    it = m_stream.erase(it);
+                }
+                else
+                {
+                    left = true;
+                    ++it;
+                }
+            }
+        }
+        if (!taken.empty()) // the GS frame has them: present() must not draw the frame over it again
+            m_drewIntoGs.store(true, std::memory_order_relaxed);
+        for (const StreamBatch &entry : taken)
+            visit(user, entry.batch.material, entry.batch.matrix, entry.gsZScale, entry.vertices.data(),
+                  static_cast<uint32_t>(entry.vertices.size()));
+        return left;
+    }
+
     bool Renderer::hasGroup(uint64_t group)
     {
         std::lock_guard<std::mutex> lock(m_streamMutex);
@@ -286,6 +315,41 @@ void main()
 
     void Renderer::drawGroups(uint64_t group, const GsDrawTarget &target)
     {
+        // PS2X_NATIVE_GS_STATS=1: every 2 s, the markers drawn, their batches and vertices, the time spent drawing
+        // them on the GS thread and the textures the cache decoded meanwhile.
+        static const bool s_stats = [] { const char *v = std::getenv("PS2X_NATIVE_GS_STATS"); return v && *v == '1'; }();
+        struct Stats
+        {
+            uint64_t markers = 0, batches = 0, vertices = 0, decodes = 0;
+            double seconds = 0.0;
+            std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+        };
+        static Stats s_window;
+        const auto statsStart = std::chrono::steady_clock::now();
+        struct StatsScope
+        {
+            Stats &w;
+            std::chrono::steady_clock::time_point start;
+            ~StatsScope()
+            {
+                if (!s_stats)
+                    return;
+                const auto now = std::chrono::steady_clock::now();
+                w.seconds += std::chrono::duration<double>(now - start).count();
+                ++w.markers;
+                if (now - w.since >= std::chrono::seconds(2))
+                {
+                    const uint64_t decodes = ps2x::native::textures().decodes();
+                    std::fprintf(stderr, "[native-gs] 2 s: %llu markers, %llu batches, %llu vertices, %.1f ms drawing, %llu texture decodes\n",
+                                 static_cast<unsigned long long>(w.markers), static_cast<unsigned long long>(w.batches),
+                                 static_cast<unsigned long long>(w.vertices), w.seconds * 1000.0,
+                                 static_cast<unsigned long long>(decodes - w.decodes));
+                    const uint64_t keep = decodes;
+                    w = Stats{};
+                    w.decodes = keep;
+                }
+            }
+        } statsScope{s_window, statsStart};
         std::vector<StreamBatch> batches;
         {
             std::lock_guard<std::mutex> lock(m_streamMutex);
@@ -340,6 +404,8 @@ void main()
         std::vector<Vertex> vertices;
         for (const StreamBatch &entry : batches)
             vertices.insert(vertices.end(), entry.vertices.begin(), entry.vertices.end());
+        s_window.batches += batches.size();
+        s_window.vertices += vertices.size();
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
         glViewport(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height));
         glEnable(GL_SCISSOR_TEST);
@@ -364,7 +430,8 @@ void main()
             const char *value = std::getenv("PS2X_NATIVE_GS_DEBUG");
             return value && *value == '1' ? 1 : 0;
         }();
-        glUniform1i(glGetUniformLocation(pass.program, "uDebug"), s_debug);
+        static const GLint s_locDebug = glGetUniformLocation(pass.program, "uDebug"); // one program per GS thread
+        glUniform1i(s_locDebug, s_debug);
         glActiveTexture(GL_TEXTURE0);
         // Our textures' own filtering, not a sampler object the GS renderer left on unit 0.
         GLint sampler = 0;

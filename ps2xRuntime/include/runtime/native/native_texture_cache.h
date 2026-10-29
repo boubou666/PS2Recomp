@@ -48,6 +48,7 @@ namespace ps2x::native
 
         const uint8_t *memory() const { return m_memory.data(); }
         uint64_t uploads() const { return m_uploads; }
+        uint64_t decodes() const { return m_decodes; }
 
     private:
         uint32_t decodeTexel(uint32_t psm, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint64_t tex0,
