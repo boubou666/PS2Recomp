@@ -48,6 +48,15 @@ namespace ps2x::native
         g_directGate.store(gate, std::memory_order_release);
     }
 
+    namespace
+    {
+        std::atomic<bool> g_mscntGroups{false};
+    }
+
+    void setMscntGroups(bool on) { g_mscntGroups.store(on, std::memory_order_release); }
+
+    bool mscntGroups() { return g_mscntGroups.load(std::memory_order_acquire); }
+
     bool directSkipped(uint32_t qwords)
     {
         const DirectGate gate = g_directGate.load(std::memory_order_acquire);
