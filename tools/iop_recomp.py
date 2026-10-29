@@ -236,10 +236,11 @@ def pointer_seeds(module):
         if is_prologue(insn):
             seeds.add(insn)
         if is_prologue(addr):
-            back = addr - 8
-            while module.contains(back) and module.word(back) == 0 and module.word(back + 4) == 0:
+            # Skip the zero padding back to the delay slot: JR $ra is just before it (or is it, under a nop slot).
+            back = addr - 4
+            while module.contains(back) and module.word(back) == 0 and module.word(back - 4) != 0x03E00008:
                 back -= 4
-            if module.word(back) == 0x03E00008:
+            if module.word(back - 4) == 0x03E00008 or module.word(back) == 0x03E00008:
                 seeds.add(addr)
         if insn >> 26 != 0x0F:
             continue
