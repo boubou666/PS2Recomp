@@ -1356,6 +1356,8 @@ void GSNativeBackend::ensureVram()
 
 GSNativeBackend::RenderTarget *GSNativeBackend::depthOwner(const RenderTarget &target, const GSZbufReg &zbuf)
 {
+    if (std::getenv("PS2X_GS_NATIVE_DIAG_NOBORROW"))
+        return nullptr;
     RenderTarget *owner = nullptr;
     for (auto &[fbp, other] : m_targets)
         if (&other != &target && other.zbp == zbuf.zbp && other.width == target.width && other.height == target.height &&
@@ -1366,6 +1368,8 @@ GSNativeBackend::RenderTarget *GSNativeBackend::depthOwner(const RenderTarget &t
 
 bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZbufReg &zbuf)
 {
+    if (std::getenv("PS2X_GS_NATIVE_DIAG_NOBORROW"))
+        return false;
     const auto it = m_targets.find(zbuf.zbp);
     if (it == m_targets.end() || &it->second == &target || !colorFormat(it->second.psm))
         return false;
