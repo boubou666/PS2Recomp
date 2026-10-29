@@ -2559,6 +2559,12 @@ void EeScheduler::waitForEvent()
         const auto next = m_deadlines.begin(); // sorted by cycle, then sequence
         deadlineCycle = next->deadlineCycle;
         hostDeadline = next->hostDeadline;
+        // Native frames leave EE time ahead of the vblank timeline whenever a frame accounts more cycles than it
+        // took: waiting for the timeline's host time would stall the game for the whole lead.
+        if (m_nativeFrames)
+            hostDeadline = std::chrono::steady_clock::now() +
+                           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               eeCyclesToHostDuration(deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u));
         deadlineKind = "deadline:" + std::to_string(static_cast<int>(next->event.type));
     }
     if (hasTimerDeadline)
