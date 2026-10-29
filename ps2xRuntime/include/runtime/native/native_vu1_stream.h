@@ -62,8 +62,10 @@ namespace ps2x::native
         // last native one does not stay over a menu) and starts the next frame.
         void frameEnd();
 
-        // For the port's hooks: VU1 memory as the stream filled it, the running program's TOP and ITOP.
+        // For the port's hooks: VU1 memory as the stream filled it, the running program's TOP and ITOP, and how many
+        // MPGs have changed the code so far (a port telling programs apart by their code hashes it again only then).
         const uint8_t *code() const { return m_code; }
+        uint64_t codeVersion() const { return m_codeVersion; }
         const uint32_t *data() const { return m_data; }
         uint32_t top() const { return m_top; }
         uint32_t itop() const { return m_itops; }
@@ -97,6 +99,7 @@ namespace ps2x::native
         } m_running = Running::None;
         uint32_t m_runningPc = 0;
         uint64_t m_group = 0;
+        uint64_t m_codeVersion = 0;
     };
 }
 
