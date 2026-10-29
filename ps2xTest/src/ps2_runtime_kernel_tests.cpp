@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <sstream>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -1157,6 +1158,19 @@ void register_ps2_runtime_kernel_tests()
             env.runtime.eeScheduler().accountCycles(0x200u);
             t.IsTrue(env.runtime.readCop0Count() >= 0x100u && env.runtime.readCop0Count() < 0x1000u,
                      "Count should wrap at 32 bits like the hardware register");
+        });
+
+        tc.Run("COP0 Count on the wall clock follows host time, not accounted EE cycles", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.writeCop0Count(1000u);
+            env.runtime.setCop0WallClock(true);
+            const uint32_t start = env.runtime.readCop0Count();
+            t.IsTrue(start - 1000u < 2949120u, "switching keeps Count's value (within 10 ms of host time)");
+            env.runtime.eeScheduler().accountCycles(100000000u);
+            t.IsTrue(env.runtime.readCop0Count() - start < 29491200u, "accounted EE cycles should not move it (100 ms)");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            t.IsTrue(env.runtime.readCop0Count() - start >= 5898240u, "20 ms of host time should add 20 ms of EE cycles");
         });
 
         tc.Run("COP0 performance counters count EE cycles while PCCR.CTE is set", [](TestCase &t)

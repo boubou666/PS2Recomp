@@ -3157,14 +3157,38 @@ bool PS2Runtime::isStopRequested() const
     return m_stopRequested.load(std::memory_order_relaxed);
 }
 
+// The clock COP0 Count and the performance counters run on: the EE's cycles, or with setCop0WallClock the host's
+// time in EE cycles (294.912 MHz). A game that times its frames with Count (The Third Age measures its step and spins
+// its frame limiter on it) then runs on real time whatever the emulated EE clock does.
+uint64_t PS2Runtime::cop0Clock() const noexcept
+{
+    if (!m_cop0WallClock)
+        return m_eeScheduler->currentCycle();
+    static const auto s_start = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - s_start);
+    return static_cast<uint64_t>(static_cast<long double>(elapsed.count()) * 0.294912L);
+}
+
+void PS2Runtime::setCop0WallClock(bool on) noexcept
+{
+    // Count and the counters keep their values across the switch.
+    const uint32_t count = readCop0Count();
+    uint32_t pcr[2] = {readCop0Perf(1u), readCop0Perf(3u)};
+    m_cop0WallClock = on;
+    writeCop0Count(count);
+    const uint64_t now = cop0Clock();
+    for (uint32_t counter = 0; counter < 2u; ++counter)
+        m_cop0PcrBase[counter] = now - pcr[counter];
+}
+
 uint32_t PS2Runtime::readCop0Count() const noexcept
 {
-    return static_cast<uint32_t>(m_eeScheduler->currentCycle() - m_cop0CountBase);
+    return static_cast<uint32_t>(cop0Clock() - m_cop0CountBase);
 }
 
 void PS2Runtime::writeCop0Count(uint32_t value) noexcept
 {
-    m_cop0CountBase = m_eeScheduler->currentCycle() - value;
+    m_cop0CountBase = cop0Clock() - value;
 }
 
 uint32_t PS2Runtime::readCop0Perf(uint32_t select) const noexcept
@@ -3174,12 +3198,12 @@ uint32_t PS2Runtime::readCop0Perf(uint32_t select) const noexcept
     const uint32_t counter = (select >> 1) & 1u;
     if ((m_cop0Pccr & 0x80000000u) == 0u)
         return m_cop0PcrValue[counter];
-    return static_cast<uint32_t>(m_eeScheduler->currentCycle() - m_cop0PcrBase[counter]);
+    return static_cast<uint32_t>(cop0Clock() - m_cop0PcrBase[counter]);
 }
 
 void PS2Runtime::writeCop0Perf(uint32_t select, uint32_t value) noexcept
 {
-    const uint64_t now = m_eeScheduler->currentCycle();
+    const uint64_t now = cop0Clock();
     if ((select & 1u) == 0u)
     {
         // Starting or stopping the counters keeps their current values.
