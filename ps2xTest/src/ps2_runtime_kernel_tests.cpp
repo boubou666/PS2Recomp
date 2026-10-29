@@ -5,6 +5,7 @@
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -550,6 +551,25 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
+        tc.Run("rand follows newlib: 31-bit results from its LCG, srand reseeds it", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            SET_GPR_U32(&ctx, 4, 1u);
+            ps2_stubs::srand(rdram.data(), &ctx, nullptr);
+            ps2_stubs::rand(rdram.data(), &ctx, nullptr);
+            t.Equals(getRegU32(&ctx, 2), 0x5851F42Du, "first value after srand(1)");
+            ps2_stubs::rand(rdram.data(), &ctx, nullptr);
+            t.Equals(getRegU32(&ctx, 2), 0x40B18CCFu, "second value after srand(1)");
+            uint32_t highest = 0u;
+            for (int i = 0; i < 64; ++i)
+            {
+                ps2_stubs::rand(rdram.data(), &ctx, nullptr);
+                highest = std::max(highest, getRegU32(&ctx, 2));
+            }
+            t.IsTrue(highest > 0x7FFFu && highest <= 0x7FFFFFFFu, "results span RAND_MAX 0x7FFFFFFF, not 0x7FFF");
+        });
+
         tc.Run("unsigned loads and ABI word writes extend independently", [](TestCase &t)
         {
             constexpr uint64_t kUpper = 0x1122334455667788ull;
