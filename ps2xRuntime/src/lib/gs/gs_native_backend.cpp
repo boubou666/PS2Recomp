@@ -34,8 +34,10 @@ noperspective out vec3 vTex;
 out float vFog;
 void main()
 {
-    // GS pixel coordinates: row 0 at the bottom of the GL texture, so a read back starts at GS row 0.
-    gl_Position = vec4(aPosition.xy / uTargetSize * 2.0 - 1.0, aPosition.z * 2.0 - 1.0, 1.0);
+    // GS pixel coordinates: row 0 at the bottom of the GL texture, so a read back starts at GS row 0. The GS samples
+    // a pixel at its integer coordinates, GL at its centre: half a pixel to the right and down, less 1/64 so that no
+    // edge on the GS's 1/16 grid falls exactly on a pixel centre.
+    gl_Position = vec4((aPosition.xy + 31.0 / 64.0) / uTargetSize * 2.0 - 1.0, aPosition.z * 2.0 - 1.0, 1.0);
     vColor = aColor;
     vTex = aTex;
     vFog = aFog;
@@ -53,6 +55,7 @@ layout(location = 0, index = 1) out vec4 outFactor;
 uniform sampler2D uSampler;
 uniform vec2 uTexSize;
 uniform float uTexAlphaScale;
+uniform float uSampleShift;
 uniform int uTextured;
 uniform int uTfx;
 uniform int uTcc;
@@ -150,6 +153,7 @@ void main()
     if (uTextured != 0)
     {
         vec2 tc = vTex.xy / vTex.z;
+        tc -= (dFdx(tc) + dFdy(tc)) * uSampleShift;
         if (uDecode == 0 && uTargetWrap != 0)
         {
             // A render target sampled directly: the GS's CLAMP modes over 2^TW x 2^TH texels (or the region), not
@@ -586,6 +590,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.wrapU = glGetUniformLocation(m_program, "uWrapU");
     m_uniforms.wrapV = glGetUniformLocation(m_program, "uWrapV");
     m_uniforms.linear = glGetUniformLocation(m_program, "uLinear");
+    m_uniforms.sampleShift = glGetUniformLocation(m_program, "uSampleShift");
     m_uniforms.targetWrap = glGetUniformLocation(m_program, "uTargetWrap");
 
     glGenVertexArrays(1, &m_vertexArray);
@@ -1735,6 +1740,8 @@ void GSNativeBackend::flushBatch()
                          state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1);
     }
     glUniform1i(m_uniforms.textured, textured ? 1 : 0);
+    glUniform1f(m_uniforms.sampleShift,
+                textured && (context.tex1 >> 5 & 0x1u) != 0u ? static_cast<float>(m_scale) / 64.0f : 0.0f);
     glUniform2f(m_uniforms.texSize, texWidth, texHeight);
     glUniform1i(m_uniforms.sampler, 0);
     glUniform1i(m_uniforms.tfx, context.tex0.tfx);
