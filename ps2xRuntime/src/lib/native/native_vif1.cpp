@@ -7,6 +7,9 @@ namespace ps2x::native
     namespace
     {
         std::atomic<Vif1Observer> g_observer{nullptr};
+        std::atomic<bool> g_observeOnVif1Thread{false};
+        std::atomic<Vif1Runner> g_runner{nullptr};
+        std::atomic<void *> g_runnerUser{nullptr};
         std::atomic<Vu1Gate> g_gate{nullptr};
         std::atomic<DirectGate> g_directGate{nullptr};
         std::atomic<const VIFRegisters *> g_vif1Registers{nullptr};
@@ -14,14 +17,34 @@ namespace ps2x::native
         std::atomic<void *> g_clockUser{nullptr};
     }
 
-    void setVif1Observer(Vif1Observer observer)
+    void setVif1Observer(Vif1Observer observer, bool onVif1Thread)
     {
+        g_observeOnVif1Thread.store(onVif1Thread, std::memory_order_release);
         g_observer.store(observer, std::memory_order_release);
     }
 
     bool vif1Observed()
     {
         return g_observer.load(std::memory_order_relaxed) != nullptr;
+    }
+
+    bool vif1ObservedOnVif1Thread()
+    {
+        return vif1Observed() && g_observeOnVif1Thread.load(std::memory_order_acquire);
+    }
+
+    void setVif1Runner(Vif1Runner runner, void *user)
+    {
+        g_runnerUser.store(user, std::memory_order_release);
+        g_runner.store(runner, std::memory_order_release);
+    }
+
+    void runOnVif1Thread(std::function<void()> job)
+    {
+        if (Vif1Runner runner = g_runner.load(std::memory_order_acquire))
+            runner(g_runnerUser.load(std::memory_order_acquire), std::move(job));
+        else
+            job();
     }
 
     void observeVif1(const uint8_t *stream, size_t bytes)

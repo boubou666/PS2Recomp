@@ -1128,6 +1128,8 @@ void PS2Memory::vif1WorkerMain()
         switch (job.kind)
         {
         case Vif1Job::Kind::Vif1:
+            if (job.observe)
+                ps2x::native::observeVif1(job.data.data(), job.data.size());
             processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
             break;
         case Vif1Job::Kind::Path3:

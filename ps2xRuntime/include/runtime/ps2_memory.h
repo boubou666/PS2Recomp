@@ -436,6 +436,7 @@ public:
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
         std::vector<DmaSegment> segments;
+        bool observe = false;
     };
     struct DmaSignalStall
     {
@@ -486,6 +487,7 @@ public:
         uint32_t address = 0;
         uint64_t value = 0;
         std::function<void()> callback;
+        bool observe = false;
     };
     void queueVif1Job(std::vector<uint8_t> data);
     void queueVif1Job(Vif1Job job);

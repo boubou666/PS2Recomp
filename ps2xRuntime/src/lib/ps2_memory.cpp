@@ -348,12 +348,23 @@ PS2Memory::PS2Memory()
                 memory.advanceVif1WorkerClock(cycles);
         },
         this);
+    ps2x::native::setVif1Runner(
+        [](void *user, std::function<void()> job)
+        {
+            PS2Memory &memory = *static_cast<PS2Memory *>(user);
+            if (memory.vif1Threaded() && !memory.onVif1Worker())
+                memory.queueVif1Callback(std::move(job));
+            else
+                job();
+        },
+        this);
 }
 
 PS2Memory::~PS2Memory()
 {
     ps2x::native::setVif1Registers(nullptr);
     ps2x::native::setVif1ClockAdvance(nullptr, nullptr);
+    ps2x::native::setVif1Runner(nullptr, nullptr);
     stopVif1Worker();
     if (m_rdram)
     {
@@ -1666,7 +1677,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                      : channelBase == 0x10009000u ? m_pendingVif1Transfers
                                                                   : m_pendingVif0Transfers;
                 const size_t queuedBefore = channelQueue.size();
-                auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+                const bool observeLater = channelBase == kVif1Channel && m_vif1Threaded && ps2x::native::vif1ObservedOnVif1Thread();
+                auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount, bool observe = false)
                 {
                     if (qwCount == 0)
                         return;
@@ -1675,6 +1687,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     pt.fromScratchpad = scratch;
                     pt.srcAddr = srcAddr;
                     pt.qwc = qwCount;
+                    pt.observe = observe;
                     if (channelBase == 0x1000A000u)
                         m_pendingGifTransfers.push_back(pt);
                     else if (channelBase == 0x10009000u)
@@ -1689,16 +1702,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 if (mode == 0 && qwc > 0 && !stallable)
                 {
-                    if (channelBase == kVif1Channel && ps2x::native::vif1Observed() && !isScratchpad(madr))
+                    const bool observe = channelBase == kVif1Channel && ps2x::native::vif1Observed() && !isScratchpad(madr);
+                    if (observe && !observeLater)
                         ps2x::native::observeVif1(m_rdram + (madr & PS2_RAM_MASK), std::min<size_t>(size_t{qwc} * 16u, PS2_RAM_SIZE - (madr & PS2_RAM_MASK)));
-                    enqueueTransfer(madr, qwc);
+                    enqueueTransfer(madr, qwc, observe && observeLater);
                 }
                 else if (mode == 1 || (mode == 0 && qwc > 0))
                 {
                     std::vector<DmaSegment> segments;
                     std::vector<uint8_t> chainBuf = readDmaSourceChain(channelBase, chcr, stallable ? &segments : nullptr,
                                                                        mode == 0 ? qwc : 0u, mode == 0);
-                    if (channelBase == kVif1Channel)
+                    if (channelBase == kVif1Channel && !observeLater)
                         ps2x::native::observeVif1(chainBuf.data(), chainBuf.size());
 
                     if (!chainBuf.empty())
@@ -1707,6 +1721,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         pt.fromScratchpad = false;
                         pt.srcAddr = 0;
                         pt.qwc = 0;
+                        pt.observe = observeLater;
                         pt.chainData = std::move(chainBuf);
                         pt.segments = std::move(segments);
                         if (channelBase == 0x1000A000)
@@ -2683,7 +2698,10 @@ void PS2Memory::processPendingTransfers()
                     srcPhys += chunk;
                 }
             }
-            queueVif1Job(std::move(data));
+            Vif1Job job;
+            job.data = std::move(data);
+            job.observe = p.observe;
+            queueVif1Job(std::move(job));
             continue;
         }
         if (!p.chainData.empty())
