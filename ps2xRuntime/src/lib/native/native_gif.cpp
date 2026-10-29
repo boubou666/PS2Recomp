@@ -402,14 +402,13 @@ namespace ps2x::native
         if (count == 2 && type == 6)
         {
             const Kick &a = kicks[0], &b = kicks[1];
+            const float au = a.u * a.q / b.q, av = a.v * a.q / b.q;
             corner[0] = b;
-            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = a.u, corner[0].v = a.v;
+            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = au, corner[0].v = av;
             corner[1] = b;
-            corner[1].y = a.y, corner[1].v = a.v;
+            corner[1].y = a.y, corner[1].v = av;
             corner[2] = b;
-            corner[2].x = a.x, corner[2].u = a.u;
-            for (Kick &c : corner)
-                c.q = 1.0f;
+            corner[2].x = a.x, corner[2].u = au;
             corner[3] = b;
             for (Kick &c : corner)
                 c.rgba = last;
