@@ -1252,6 +1252,11 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
             fromTarget = true;
             drawnWidth = source->width;
             drawnHeight = std::max(source->usedHeight, 1u);
+            // Its rows stop where the next buffer in GS memory starts (VP2's 512x480 scene at FBP 200 ends at the
+            // display buffer at FBP 320), whatever a taller pass once drew into the GL texture.
+            for (const auto &[fbp, other] : m_targets)
+                if (fbp > source->fbp && source->fbw != 0u)
+                    drawnHeight = std::min(drawnHeight, std::max((fbp - source->fbp) / source->fbw * 32u, 1u));
             width = static_cast<float>(source->width);
             height = static_cast<float>(source->height);
             texture = source->color;
