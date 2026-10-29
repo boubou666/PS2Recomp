@@ -12,8 +12,9 @@ namespace ps2x::native
     // still holds what the stream refers to): a chain flattened the way VIF1 receives it (each tag's two VIF codes,
     // then its data), or a normal transfer's quadwords. The adapter reads the game's own 3D data from it (meshes,
     // matrices, lights) wherever in the game's code the send happens.
-    // onVif1Thread: called on the VIF1 thread instead, with each transfer as VIF1 gets it, right before VIF1 runs it
-    // (for an adapter that reads only the stream, not the EE memory it refers to: its work then runs beside the EE).
+    // onVif1Thread: called on the VIF1 thread instead, with each transfer as VIF1 gets it, in pieces: up to each MSCAL /
+    // MSCNT before VIF1 asks the gate about it, then the rest after the transfer (for an adapter that reads only the
+    // stream, not the EE memory it refers to: its programs then run beside the EE, between VIF1's own commands).
     using Vif1Observer = void (*)(const uint8_t *stream, size_t bytes);
 
     void setVif1Observer(Vif1Observer observer, bool onVif1Thread = false);

@@ -413,6 +413,7 @@ public:
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
+    const uint8_t *m_vif1ObservedTo = nullptr, *m_vif1ObserveEnd = nullptr;
     bool m_vif1PendingPath2DirectHl = false;
     // The DIRECT that left the IMAGE pending ran out of buffer: its data continues raw at the next VIF1 data.
     bool m_vif1PendingPath2ImageRaw = false;
@@ -490,6 +491,7 @@ public:
         bool observe = false;
     };
     void queueVif1Job(std::vector<uint8_t> data);
+    void observeVif1Until(const uint8_t *end);
     void queueVif1Job(Vif1Job job);
     void waitForVif1Until(uint64_t queued) const;
     bool m_gsLag = false;

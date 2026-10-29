@@ -250,7 +250,12 @@ namespace ps2x::native
                 renderer.setKey(0);
             }
             if (m_running == Running::Sandbox)
+            {
+                const uint64_t cyclesBefore = m_sandbox->cycles();
                 m_sandbox->resume(m_code, sizeof(m_code), reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), m_top, m_itops);
+                if (m_config.onVif1Thread)
+                    advanceVif1Clock(m_sandbox->cycles() - cyclesBefore);
+            }
             else if (m_running == Running::Port)
                 m_config.draw(*this, m_runningPc, true);
             return;
