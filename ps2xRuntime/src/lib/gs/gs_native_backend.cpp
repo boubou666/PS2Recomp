@@ -2380,6 +2380,23 @@ void GSNativeBackend::flushBatch()
     glBindVertexArray(0);
     if (!drawnPages.empty())
         wroteTargetPages(target, drawnPages);
+    // PS2X_GS_NATIVE_WATCH=<fbp>,<x>,<y>: that target's pixel after every batch from the 1600th (diagnostics).
+    if (static const char *watch = std::getenv("PS2X_GS_NATIVE_WATCH"); watch && m_drawSerial >= 1600u)
+    {
+        unsigned wf = 0, wx = 0, wy = 0;
+        std::sscanf(watch, "%u,%u,%u", &wf, &wx, &wy);
+        if (auto w = m_targets.find(wf); w != m_targets.end())
+        {
+            uint8_t px[4] = {};
+            GLint drawFb = 0;
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFb);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, w->second.framebuffer);
+            glReadPixels(static_cast<GLint>(wx), static_cast<GLint>(wy), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            std::fprintf(stderr, "[gs:watch] after #%llu into fbp=%u psm=0x%x%s: %u psm=0x%x (%u,%u)=%u,%u,%u,%u\n",
+                         static_cast<unsigned long long>(m_drawSerial), target.fbp, target.psm, m_fillingFromMemory ? " (reload)" : "",
+                         wf, w->second.psm, wx, wy, px[0], px[1], px[2], px[3]);
+        }
+    }
     if (depthTarget && !depthPages.empty() && !context.zbuf.zmask && !offDepth)
         wroteDepthPages(*depthTarget, depthPages);
     m_batch.clear();
