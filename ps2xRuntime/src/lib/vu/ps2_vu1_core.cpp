@@ -5,12 +5,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cfenv>
 #include <limits>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <string>
+#include <vector>
 #include <ps2_log.h>
 
 namespace
@@ -1179,6 +1183,45 @@ void VU1Interpreter::resolveCompiledImage(CompiledImage &image) const
     }
 }
 
+namespace
+{
+    // PS2X_VU1_STATS: counted on the VU1 thread only, printed from it.
+    void vu1Stats(bool compiled, uint32_t pc)
+    {
+        static uint64_t s_compiled = 0, s_interpreted = 0;
+        static std::map<uint32_t, uint64_t> s_interpretedPcs;
+        static auto s_last = std::chrono::steady_clock::now();
+        if (compiled)
+            ++s_compiled;
+        else
+        {
+            ++s_interpreted;
+            ++s_interpretedPcs[pc & ~0xFFu]; // by 256-byte block of VU1 code
+        }
+        if (((s_compiled + s_interpreted) & 0xFFFFu) != 0u)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_last < std::chrono::seconds(5))
+            return;
+        s_last = now;
+        std::vector<std::pair<uint64_t, uint32_t>> top;
+        for (const auto &[block, count] : s_interpretedPcs)
+            top.emplace_back(count, block);
+        std::sort(top.rbegin(), top.rend());
+        std::string blocks;
+        for (size_t i = 0; i < top.size() && i < 6u; ++i)
+        {
+            char entry[48];
+            std::snprintf(entry, sizeof(entry), " 0x%x:%llu", top[i].second, static_cast<unsigned long long>(top[i].first));
+            blocks += entry;
+        }
+        std::fprintf(stderr, "[VU1 stats] pairs compiled %llu, interpreted %llu (%.1f%%); interpreted blocks:%s\n",
+                     static_cast<unsigned long long>(s_compiled), static_cast<unsigned long long>(s_interpreted),
+                     100.0 * static_cast<double>(s_interpreted) / static_cast<double>(s_compiled + s_interpreted),
+                     blocks.c_str());
+    }
+}
+
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles, bool runToCompletion)
@@ -1226,13 +1269,25 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             compiled = m_compiledImage->byPair.data();
     }
 
+    // PS2X_VU1_STATS=1: how much VU1 microcode runs compiled and how much through the interpreter (with the pcs the
+    // interpreter runs most), every 5 s.
+    static const bool s_stats = [] { const char *v = std::getenv("PS2X_VU1_STATS"); return v && v[0] == '1'; }();
+    const bool stats = s_stats && vu1;
     while (canIssue(context))
     {
         StepResult result;
         if (compiled && (m_state.pc & 7u) == 0u && compiled[m_state.pc >> 3])
+        {
+            if (stats)
+                vu1Stats(true, m_state.pc);
             result = compiled[m_state.pc >> 3](*this, context);
+        }
         else
+        {
+            if (stats)
+                vu1Stats(false, m_state.pc);
             result = stepPair(getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc), context);
+        }
         if (result == StepResult::Continue)
             continue;
         programEnded = result == StepResult::Ended;
