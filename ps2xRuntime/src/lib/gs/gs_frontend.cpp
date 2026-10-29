@@ -2644,6 +2644,21 @@ void GS::vertexKick(bool drawing)
         // compare renderers at the same point of a frame.
         static const long long s_stopPrim = [] { const char *v = std::getenv("PS2X_GS_STOPPRIM"); return v ? std::atoll(v) : -1ll; }();
         static long long s_prims = 0;
+        // PS2X_GS_PRIMLOG=<first>,<last>: those primitives (index, frame, test, zbuf, tex0, first vertex).
+        if (static const char *s_log = std::getenv("PS2X_GS_PRIMLOG"); s_log)
+        {
+            static const long long s_first = std::atoll(s_log);
+            static const long long s_last = [] { const char *c = std::strchr(std::getenv("PS2X_GS_PRIMLOG"), ','); return c ? std::atoll(c + 1) : 0ll; }();
+            if (s_prims >= s_first && s_prims <= s_last)
+                std::fprintf(stderr, "[gs:prim] %lld type=%u fbp=%u psm=0x%x fbmsk=0x%x test=0x%llx zbp=%u zpsm=0x%x zmsk=%d tme=%d tbp=%u tpsm=0x%x abe=%d alpha=0x%llx v0=(%.1f,%.1f z=%.0f a=%u) v1=(%.1f,%.1f z=%.0f)
+",
+                             s_prims, static_cast<unsigned>(batch.state.prim.type), batch.state.context.frame.fbp, batch.state.context.frame.psm,
+                             batch.state.context.frame.fbmsk, static_cast<unsigned long long>(batch.state.context.test), batch.state.context.zbuf.zbp,
+                             batch.state.context.zbuf.psm, batch.state.context.zbuf.zmask ? 1 : 0, batch.state.prim.tme ? 1 : 0,
+                             batch.state.context.tex0.tbp0, batch.state.context.tex0.psm, batch.state.prim.abe ? 1 : 0,
+                             static_cast<unsigned long long>(batch.state.context.alpha), batch.vertices[0].x, batch.vertices[0].y,
+                             batch.vertices[0].z, batch.vertices[0].a, batch.vertices[1].x, batch.vertices[1].y, batch.vertices[1].z);
+        }
         if (s_stopPrim < 0 || s_prims++ < s_stopPrim)
             m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
