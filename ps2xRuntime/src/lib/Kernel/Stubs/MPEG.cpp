@@ -28,6 +28,18 @@ extern "C"
 
 namespace ps2_stubs
 {
+    // How many lines each kind of [MPEG:...] trace prints (PS2X_MPEG_TRACE_LIMIT, default 32): later movies of a
+    // game that plays several are past the default by the time they start.
+    static uint32_t mpegTraceLimit()
+    {
+        static const uint32_t limit = []
+        {
+            const char *value = std::getenv("PS2X_MPEG_TRACE_LIMIT");
+            return value && *value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 32u;
+        }();
+        return limit;
+    }
+
     namespace
     {
         struct MpegDecodedFrame
@@ -108,7 +120,7 @@ namespace ps2_stubs
                 }
 
                 static uint32_t s_feedLogCount = 0u;
-                const bool shouldLog = (s_feedLogCount < 32u);
+                const bool shouldLog = (s_feedLogCount < mpegTraceLimit());
                 if (shouldLog)
                     ++s_feedLogCount;
 
@@ -344,7 +356,7 @@ namespace ps2_stubs
                 if (ret < 0 && ret != AVERROR(EAGAIN))
                 {
                     static uint32_t s_rejectedPacketLogCount = 0u;
-                    if (s_rejectedPacketLogCount < 32u)
+                    if (s_rejectedPacketLogCount < mpegTraceLimit())
                     {
                         std::cerr << "[MPEG] decoder rejected packet, dropping: "
                                   << ffmpegErrorString(ret) << std::endl;
@@ -368,7 +380,7 @@ namespace ps2_stubs
                     if (ret < 0)
                     {
                         static uint32_t s_receiveErrorLogCount = 0u;
-                        if (s_receiveErrorLogCount < 32u)
+                        if (s_receiveErrorLogCount < mpegTraceLimit())
                         {
                             std::cerr << "[MPEG] decoder receive failed, dropping: "
                                       << ffmpegErrorString(ret) << std::endl;
@@ -1083,7 +1095,7 @@ namespace ps2_stubs
             }
 
             const uint32_t feedEsIdx = g_mpeg_stub_state.feedEsTraceCount++;
-            if (feedEsIdx < 32u)
+            if (feedEsIdx < mpegTraceLimit())
             {
                 PS2_IF_AGRESSIVE_LOGS({
                     char hexBuf[16] = {};
@@ -2315,7 +2327,7 @@ namespace ps2_stubs
 
         if (backpressured)
         {
-            if (traceIdx < 32u)
+            if (traceIdx < mpegTraceLimit())
             {
                 PS2_IF_AGRESSIVE_LOGS({
                     std::cerr << "[MPEG:DemuxPss:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr << std::dec << " decoded=" << decodedCount << std::endl;
@@ -2337,7 +2349,7 @@ namespace ps2_stubs
             }
         }
 
-        if (traceIdx < 32u)
+        if (traceIdx < mpegTraceLimit())
         {
             PS2_IF_AGRESSIVE_LOGS({
                 std::cerr << "[MPEG:DemuxPss] mpeg=0x" << std::hex << mpegAddr
@@ -2425,7 +2437,7 @@ namespace ps2_stubs
 
         if (backpressured)
         {
-            if (traceIdx < 32u)
+            if (traceIdx < mpegTraceLimit())
             {
                 PS2_IF_AGRESSIVE_LOGS({
                     std::cerr << "[MPEG:DemuxPssRing:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr
@@ -2449,7 +2461,7 @@ namespace ps2_stubs
             }
         }
 
-        if (traceIdx < 32u)
+        if (traceIdx < mpegTraceLimit())
         {
             PS2_IF_AGRESSIVE_LOGS({
                 std::cerr << "[MPEG:DemuxPssRing] mpeg=0x" << std::hex << mpegAddr
@@ -2556,7 +2568,7 @@ namespace ps2_stubs
                 !playback.streamEnded &&
                 !playback.decoderFailed)
             {
-                if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
+                if (g_mpeg_stub_state.getPictureWaitTraceCount < mpegTraceLimit())
                 {
                     PS2_IF_AGRESSIVE_LOGS({
                         std::cerr << "[MPEG:GetPicture] waiting for frames, mpeg=0x" << std::hex << mpegAddr
@@ -2629,7 +2641,7 @@ namespace ps2_stubs
                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
                 haveFrame = true;
-                if (g_mpeg_stub_state.pictureTraceCount < 32u)
+                if (g_mpeg_stub_state.pictureTraceCount < mpegTraceLimit())
                 {
                     PS2_IF_AGRESSIVE_LOGS({
                         std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
