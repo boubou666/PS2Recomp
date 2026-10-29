@@ -2658,8 +2658,9 @@ void GS::vertexKick(bool drawing)
                              static_cast<unsigned long long>(batch.state.context.alpha), batch.vertices[0].x, batch.vertices[0].y,
                              batch.vertices[0].z, batch.vertices[0].a, batch.vertices[1].x, batch.vertices[1].y, batch.vertices[1].z);
         }
-        if (s_stopPrim < 0 || s_prims++ < s_stopPrim)
+        if (s_stopPrim < 0 || s_prims < s_stopPrim)
             m_backend->Submit(batch);
+        ++s_prims;
         recordDrawDebugEventUnlocked(needed);
     }
 
