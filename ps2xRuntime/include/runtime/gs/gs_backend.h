@@ -38,11 +38,30 @@ public:
     // A native renderer's draws at this point of the stream (GS::queueNativeDraw): the hook with this context's
     // render target. Renderers that keep GS memory themselves have none to give: a null target, with the context's
     // offset and scissor still (the native renderer clips its own frame to them).
+    // The context's drawing registers for a native draw marker (GsDrawTarget's raw registers).
+    static void fillNativeRegisters(ps2x::native::GsDrawTarget &target, const GSContext &context)
+    {
+        const GSTex0Reg &t = context.tex0;
+        target.tex0 = static_cast<uint64_t>(t.tbp0 & 0x3FFFu) | (static_cast<uint64_t>(t.tbw & 0x3Fu) << 14) |
+                      (static_cast<uint64_t>(t.psm & 0x3Fu) << 20) | (static_cast<uint64_t>(t.tw & 0xFu) << 26) |
+                      (static_cast<uint64_t>(t.th & 0xFu) << 30) | (static_cast<uint64_t>(t.tcc & 1u) << 34) |
+                      (static_cast<uint64_t>(t.tfx & 3u) << 35) | (static_cast<uint64_t>(t.cbp & 0x3FFFu) << 37) |
+                      (static_cast<uint64_t>(t.cpsm & 0xFu) << 51) | (static_cast<uint64_t>(t.csm & 1u) << 55) |
+                      (static_cast<uint64_t>(t.csa & 0x1Fu) << 56) | (static_cast<uint64_t>(t.cld & 7u) << 61);
+        target.texa = context.texaRaw;
+        target.alpha = context.alpha;
+        target.test = context.test;
+        target.clamp = context.clamp;
+        target.fogcol = context.fogcol;
+        target.zmask = context.zbuf.zmask;
+    }
+
     virtual void NativeDraw(uint64_t group, const GSContext &context)
     {
         if (const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook())
         {
             ps2x::native::GsDrawTarget target;
+            fillNativeRegisters(target, context);
             target.xOffset = context.xyoffset.ofx;
             target.yOffset = context.xyoffset.ofy;
             target.scissorX0 = context.scissor.x0;

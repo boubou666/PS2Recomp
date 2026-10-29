@@ -378,6 +378,10 @@ namespace ps2_stubs
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
         bool ok = tryRead(selected);
+        static const bool logReads = std::getenv("PS2X_CD_LOG") != nullptr;
+        if (logReads)
+            std::cerr << "[cd] sceCdRead lbn=0x" << std::hex << a0 << " sectors=0x" << a1 << " buf=0x" << a2
+                      << " ra=0x" << getRegU32(ctx, 31) << std::dec << (ok ? "" : " (alternate)") << std::endl;
 
         if (!ok)
         {

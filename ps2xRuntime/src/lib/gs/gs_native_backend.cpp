@@ -954,6 +954,9 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
 GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf)
 {
     FrameTarget out;
+    // A game whose first draws are all native submits no GS primitive before this: the GS thread is the submit thread.
+    if (m_submitThread == std::thread::id{})
+        m_submitThread = std::this_thread::get_id();
     flushBatch();
     if (!ensureContext(true))
         return out;
@@ -979,6 +982,7 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
         return;
     const FrameTarget frame = frameTarget(context.frame, context.zbuf);
     ps2x::native::GsDrawTarget target;
+    fillNativeRegisters(target, context);
     target.framebuffer = frame.framebuffer;
     target.color = frame.color;
     target.depth = frame.depth;
@@ -1909,6 +1913,20 @@ PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
         }
         frame.pixels.swap(doubled);
         frame.height = height * 2u;
+    }
+    // The host reads presented frames 640 pixels per row (GS::copyLatchedHostPresentationFrame, as the CPU and
+    // paraLLEl-GS backends hand them): a narrower picture (The Third Age's is 512 wide) is laid out on that stride,
+    // or its copy runs past the end and the window shows the magenta blank.
+    constexpr uint32_t kHostFrameWidth = 640u;
+    if (frame.width != kHostFrameWidth)
+    {
+        const uint32_t shown = std::min(frame.width, kHostFrameWidth);
+        std::vector<uint8_t> strided(static_cast<size_t>(kHostFrameWidth) * frame.height * 4u, 0u);
+        for (uint32_t y = 0; y < frame.height; ++y)
+            std::memcpy(&strided[static_cast<size_t>(y) * kHostFrameWidth * 4u],
+                        &frame.pixels[static_cast<size_t>(y) * frame.width * 4u], static_cast<size_t>(shown) * 4u);
+        frame.pixels.swap(strided);
+        frame.width = shown;
     }
     return frame;
 }

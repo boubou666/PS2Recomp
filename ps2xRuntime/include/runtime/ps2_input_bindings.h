@@ -49,7 +49,7 @@ namespace ps2_input
     struct Profile
     {
         std::vector<Binding> actions[ActionCount];
-        int gamepad = 0; // which gamepad's buttons and axes this player reads
+        int gamepad = -1; // which gamepad (raylib slot) this player reads; -1: the pad port's among the connected ones
     };
 
     struct MouseSettings
@@ -74,13 +74,13 @@ namespace ps2_input
     std::string configPath();
 
     // The PS2 pad for a player: buttons as the PS2 sends them (a bit cleared per pressed button) and the sticks, 0..255
-    // with 128 the centre (rx, ry, lx, ly).
+    // with 128 the centre (rx, ry, lx, ly). autoGamepad: the gamepad of a player whose profile says -1 (none: -1).
     struct PadState
     {
         uint16_t buttons = 0xFFFFu;
         uint8_t rx = 128, ry = 128, lx = 128, ly = 128;
     };
-    PadState padState(int player);
+    PadState padState(int player, int autoGamepad = -1);
 
     // Window thread, once a frame: mouse movement and wheel, cursor capture. setUiOpen: a runtime window has the mouse
     // (the cursor is free and the mouse drives no binding meanwhile).
@@ -93,6 +93,6 @@ namespace ps2_input
     std::string bindingName(const Binding &binding); // "key:SPACE", "pad:RIGHT_FACE_DOWN", "mouse:LEFT", ...
     bool parseBinding(const std::string &text, Binding &binding);
 
-    // The Controls window's capture: the first input pressed since the last call, if any.
+    // The Controls window's capture: the first input pressed since the last call, if any (gamepad -1: any gamepad).
     bool pollAnyInput(int gamepad, Binding &binding);
 }
