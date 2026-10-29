@@ -350,6 +350,17 @@ void main()
 }
 )";
 
+    constexpr const char *kWrapFragmentShader = R"(#version 330 core
+uniform sampler2D uWrapped;
+out vec4 outColor;
+void main()
+{
+    vec4 c = texelFetch(uWrapped, ivec2(gl_FragCoord.xy), 0);
+    vec3 v = round(c.rgb * 255.0);
+    outColor = vec4((v - 256.0 * floor(v / 256.0)) / 255.0, c.a);
+}
+)";
+
     // GL state a helper changes while flushBatch has the draw set up (a resolve or the GPU copy's set-up from inside
     // bindTexture): saved on construction, put back on destruction.
     struct GlStateRestore
@@ -523,7 +534,7 @@ void main()
             return false;
         if (a.prim.tme != b.prim.tme || a.prim.fge != b.prim.fge || a.prim.abe != b.prim.abe || a.prim.fst != b.prim.fst)
             return false;
-        if (a.prim.abe && x.alpha != y.alpha)
+        if (a.prim.abe && (x.alpha != y.alpha || ((a.colclamp ^ b.colclamp) & 0x1u) != 0u))
             return false;
         if (a.prim.fge && (a.fogR != b.fogR || a.fogG != b.fogG || a.fogB != b.fogB))
             return false;
@@ -1096,6 +1107,65 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     return true;
+}
+
+void GSNativeBackend::beginWrappedBlend(RenderTarget &target, const GSScissorReg &scissor)
+{
+    const uint32_t width = target.width * m_scale, height = target.height * m_scale;
+    if (!m_wrapTexture || m_wrapWidth != width || m_wrapHeight != height)
+    {
+        if (!m_wrapTexture)
+        {
+            glGenTextures(1, &m_wrapTexture);
+            glGenFramebuffers(1, &m_wrapFramebuffer);
+        }
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, m_wrapTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glActiveTexture(GL_TEXTURE0);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_wrapFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_wrapTexture, 0);
+        m_wrapWidth = width;
+        m_wrapHeight = height;
+    }
+    const GLint s = static_cast<GLint>(m_scale);
+    const GLint x0 = scissor.x0 * s, y0 = scissor.y0 * s, x1 = (scissor.x1 + 1) * s, y1 = (scissor.y1 + 1) * s;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_wrapFramebuffer);
+    glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_wrapTexture, 0);
+}
+
+void GSNativeBackend::endWrappedBlend(RenderTarget &target, const GSScissorReg &scissor)
+{
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
+    if (!m_wrapProgram)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kWrapFragmentShader);
+        m_wrapProgram = glCreateProgram();
+        glAttachShader(m_wrapProgram, vertex);
+        glAttachShader(m_wrapProgram, fragment);
+        glLinkProgram(m_wrapProgram);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+    }
+    const GlStateRestore restore;
+    const GLint s = static_cast<GLint>(m_scale);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(scissor.x0 * s, scissor.y0 * s, (scissor.x1 - scissor.x0 + 1) * s, (scissor.y1 - scissor.y0 + 1) * s);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_wrapProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_wrapTexture);
+    glUniform1i(glGetUniformLocation(m_wrapProgram, "uWrapped"), 0);
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
 void GSNativeBackend::syncVramToGpu()
@@ -1715,6 +1785,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
 void GSNativeBackend::applyBlend(const GSDrawState &state)
 {
     m_blendOut = 0;
+    m_blendWraps = false;
     if (!state.prim.abe)
     {
         glDisable(GL_BLEND);
@@ -1774,6 +1845,9 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
         glDisable(GL_BLEND);
         return;
     }
+    const bool sum = a != b && ((b == Zero && a != d && d != Zero) || (a == Zero && b != d && d != Zero) ||
+                                (d == Zero && a != Zero && b != Zero));
+    m_blendWraps = sum && m_blendOut == 0 && (state.colclamp & 0x1u) == 0u;
     glEnable(GL_BLEND);
     glBlendEquationSeparate(equation, GL_FUNC_ADD);
     glBlendFuncSeparate(source, destination, GL_ONE, GL_ZERO);
@@ -1965,6 +2039,9 @@ void GSNativeBackend::flushBatch()
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, destWidth, destHeight);
         glActiveTexture(GL_TEXTURE0);
     }
+    const bool wraps = !offBlend && m_blendWraps;
+    if (wraps)
+        beginWrappedBlend(target, context.scissor);
 
     glBindVertexArray(m_vertexArray);
     glBindBuffer(GL_ARRAY_BUFFER, m_vertexBuffer);
@@ -1986,6 +2063,8 @@ void GSNativeBackend::flushBatch()
         glDepthMask(depthWrites ? GL_TRUE : GL_FALSE);
         glColorMask(r, g, b, a);
     }
+    if (wraps)
+        endWrappedBlend(target, context.scissor);
     if (borrowedDepth)
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, target.depth, 0);
     // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
