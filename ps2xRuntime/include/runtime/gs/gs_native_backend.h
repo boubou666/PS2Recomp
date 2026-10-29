@@ -120,6 +120,8 @@ private:
     void flushBatch();
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
+    // Whether the queued primitives read only texels a render target drew (else they sample GS memory).
+    bool batchReadsWithin(const GSDrawState &state, const RenderTarget &source) const;
     // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
