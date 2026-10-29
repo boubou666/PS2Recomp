@@ -605,13 +605,14 @@ namespace ps2x::iop::detail
             return running;
         }
 
-        // Recompiled modules (ps2x/iop/iop_native.h; PS2X_IOP_NATIVE=1): the native entries of the loaded modules
-        // whose file hash and base match a registration, by physical address, and a bit per word of RAM to check them.
-        const bool nativeModules = []
+        // Recompiled modules (ps2x/iop/iop_native.h; PS2X_IOP_NATIVE=1, read as each module loads, so a game override
+        // can set it): the native entries of the loaded modules whose file hash and base match a registration, by
+        // physical address, and a bit per word of RAM to check them.
+        static bool nativeModules()
         {
             const char *value = std::getenv("PS2X_IOP_NATIVE");
             return value && *value == '1';
-        }();
+        }
         std::unordered_map<uint32_t, native::Function> nativeEntries;
         std::vector<uint64_t> nativeBits = std::vector<uint64_t>(kRamSize / 4u / 64u, 0u);
         uint64_t sliceEnd = ~0ull; // runCpu's: native code stops at its loop heads once there
@@ -634,7 +635,7 @@ namespace ps2x::iop::detail
 
         void activateNative(const Module &module, std::span<const uint8_t> file)
         {
-            if (!nativeModules)
+            if (!nativeModules())
                 return;
             const uint64_t hash = fileHash(file);
             for (const native::RegisteredModule &registered : native::registeredModules())
