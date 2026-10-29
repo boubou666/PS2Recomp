@@ -158,6 +158,16 @@ namespace
             std::printf("  tag nloop=%u eop=%u flg=%u nreg=%u regs=%016llx", static_cast<unsigned>(lo & 0x7FFFu),
                         static_cast<unsigned>((lo >> 15) & 1u), static_cast<unsigned>((lo >> 58) & 3u),
                         static_cast<unsigned>((lo >> 60) & 0xFu), static_cast<unsigned long long>(hi));
+            // A+D: the registers it writes (register number = value), to read a pass's set-up.
+            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+            if (((lo >> 58) & 3u) == 0u && ((lo >> 60) & 0xFu) == 1u && (hi & 0xFu) == 0xEu)
+                for (uint32_t i = 0; i < nloop && 32u + i * 16u <= command.bytes.size(); ++i)
+                {
+                    uint64_t value = 0, reg = 0;
+                    std::memcpy(&value, command.bytes.data() + 16u + i * 16u, sizeof(value));
+                    std::memcpy(&reg, command.bytes.data() + 24u + i * 16u, sizeof(reg));
+                    std::printf(" %02x=%llx", static_cast<unsigned>(reg & 0xFFu), static_cast<unsigned long long>(value));
+                }
         }
         else if (command.kind == GsTraceCommand::NativeImageUpload)
         {
