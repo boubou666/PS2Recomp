@@ -153,7 +153,7 @@ namespace ps2x::iop::detail
         constexpr uint64_t kCdvdCompletionCycles = 128u;
 
         // When a CD command's completion callback runs. By default at once (128 IOP cycles). With
-        // PS2X_IOP_CD_SECTORS_PER_SECOND=<rate> a read takes what the drive would: 1 ms of access plus its sectors at
+        // PS2X_IOP_CD_SECTORS_PER_SECOND=<rate> a read takes what the drive would: its access time plus its sectors at
         // that rate (4x DVD: about 2700). Games that stream from the IOP may count on reads taking time: The Third
         // Age's intro cinematic freed objects still in use (a different crash each run) when every read completed at
         // once, and runs clean with drive-like reads.
@@ -164,10 +164,17 @@ namespace ps2x::iop::detail
                 const char *value = std::getenv("PS2X_IOP_CD_SECTORS_PER_SECOND");
                 return value && *value ? std::strtoull(value, nullptr, 0) : 0ull;
             }();
+            // PS2X_IOP_CD_ACCESS_US: the access time before the sectors come (default 1000 us; a drive seeks for tens
+            // of milliseconds).
+            static const uint64_t s_accessUs = []
+            {
+                const char *value = std::getenv("PS2X_IOP_CD_ACCESS_US");
+                return value && *value ? std::strtoull(value, nullptr, 0) : 1000ull;
+            }();
             if (s_rate == 0u || sectors == 0u)
                 return kCdvdCompletionCycles;
             constexpr uint64_t kIopHz = 36864000u;
-            return kIopHz / 1000u + static_cast<uint64_t>(sectors) * kIopHz / s_rate;
+            return kIopHz * s_accessUs / 1000000u + static_cast<uint64_t>(sectors) * kIopHz / s_rate;
         }
         constexpr uint32_t kMaxSifCommandPacket = 112u;
         constexpr uint64_t kSifDmaCompletionCycles = 128u;
