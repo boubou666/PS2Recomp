@@ -179,7 +179,7 @@ namespace ps2x::native
         // In the GS stream where VU1's output would have been; with renderers keeping GS memory themselves, present()
         // draws over the GS frame, clipped per group.
         renderer.setStreamDraws(true);
-        setVif1Observer(&onVif1);
+        setVif1Observer(&onVif1, m_config.onVif1Thread);
         setVu1Gate(&programGate);
         setDirectGate(&directGate);
         m_installed = true;
@@ -212,7 +212,11 @@ namespace ps2x::native
 
     void Vu1StreamAdapter::frameEnd()
     {
-        if (m_installed)
+        if (!m_installed)
+            return;
+        if (m_config.onVif1Thread)
+            runOnVif1Thread([this] { publish(); });
+        else
             publish();
     }
 
