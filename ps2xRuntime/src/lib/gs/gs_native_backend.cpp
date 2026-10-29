@@ -671,6 +671,9 @@ void GSNativeBackend::fillTargetFromMemory(const GSFrameReg &frame, uint32_t row
     // The same memory read in its new format, as the GS would see it: a game alternating one buffer between CT16 and
     // CT32 (VP2's blur levels) reads back rows it did not redraw since. Runs inside flushBatch (its renderTarget call):
     // the pending batch is set aside, this one goes through the same path, sampling GS memory, not the new target.
+    if (const char *v = std::getenv("PS2X_GS_NATIVE_TARGETLOG"); v && std::atoi(v) > 0)
+        std::fprintf(stderr, "[gs:native] reload fbp=%u fbw=%u psm=0x%x rows=%u serial=%llu\n", frame.fbp, frame.fbw, frame.psm,
+                     rows, static_cast<unsigned long long>(m_drawSerial));
     std::vector<Vertex> pending;
     pending.swap(m_batch);
     const GSDrawState pendingState = m_batchState;
@@ -987,6 +990,15 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     const uint32_t width = target.fbw * 64u;
     const uint32_t height = target.usedHeight;
     target.dirty = false;
+    // PS2X_GS_NATIVE_TARGETLOG=<n>: the first n resolves and reloads (fbp, width, format, rows, draw serial).
+    static const int s_targetLog = [] { const char *v = std::getenv("PS2X_GS_NATIVE_TARGETLOG"); return v ? std::atoi(v) : 0; }();
+    static int s_targetLogged = 0;
+    if (s_targetLogged < s_targetLog)
+    {
+        ++s_targetLogged;
+        std::fprintf(stderr, "[gs:native] resolve fbp=%u fbw=%u psm=0x%x rows=%u last=%llu serial=%llu\n", target.fbp, target.fbw,
+                     target.psm, height, static_cast<unsigned long long>(target.lastDraw), static_cast<unsigned long long>(m_drawSerial));
+    }
     // PS2X_GS_NATIVE_NORESOLVE=1: skip resolves (wrong pictures), to time what they cost.
     static const bool noResolve = std::getenv("PS2X_GS_NATIVE_NORESOLVE") != nullptr;
     if (noResolve || width == 0u || height == 0u || width > target.width)
