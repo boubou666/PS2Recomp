@@ -2304,15 +2304,16 @@ void GSNativeBackend::flushBatch()
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, target.depth, 0);
     // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
     if (static const char *probe = std::getenv("PS2X_GS_NATIVE_PROBE");
-        probe && std::strtoul(probe, nullptr, 10) == target.fbp)
+        probe && std::strtoul(probe, nullptr, 10) == target.fbp &&
+        (!std::getenv("PS2X_GS_NATIVE_PROBE_TBP") || std::strtoul(std::getenv("PS2X_GS_NATIVE_PROBE_TBP"), nullptr, 10) == context.tex0.tbp0))
     {
         static uint32_t s_probes = 0;
         if (s_probes++ < 60u)
         {
             uint8_t pixel[4] = {};
             glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
-            glReadPixels(320, 128, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
-            std::fprintf(stderr, "[gs:probe] fbp=%u after %zu verts tme=%d textured=%d tbp=%u: (320,128)=%u,%u,%u,%u "
+            glReadPixels(20, 100, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+            std::fprintf(stderr, "[gs:probe] fbp=%u after %zu verts tme=%d textured=%d tbp=%u: (20,100)=%u,%u,%u,%u "
                                  "fbo=%x\n",
                          target.fbp, m_batch.size(), state.prim.tme ? 1 : 0, textured ? 1 : 0, context.tex0.tbp0,
                          pixel[0], pixel[1], pixel[2], pixel[3], glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
@@ -2320,8 +2321,8 @@ void GSNativeBackend::flushBatch()
             {
                 uint8_t texel[4] = {};
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, m_lastSourceFramebuffer);
-                glReadPixels(320, 224, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel);
-                std::fprintf(stderr, "[gs:probe]   source (320,224)=%u,%u,%u,%u\n", texel[0], texel[1], texel[2],
+                glReadPixels(2, 9, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+                std::fprintf(stderr, "[gs:probe]   source (2,9)=%u,%u,%u,%u\n", texel[0], texel[1], texel[2],
                              texel[3]);
                 m_lastSourceFramebuffer = 0;
             }
