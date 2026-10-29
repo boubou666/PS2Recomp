@@ -197,6 +197,7 @@ namespace ps2x::native
             const float q = asFloat(static_cast<uint32_t>(m_rgbaq >> 32));
             k.u = q != 0.0f ? m_s / q : m_s;
             k.v = q != 0.0f ? m_t / q : m_t;
+            k.q = q != 0.0f ? q : 1.0f;
         }
 
         const uint32_t type = m_prim & 7u;
@@ -383,6 +384,7 @@ namespace ps2x::native
             v.z = k.z;
             v.u = k.u;
             v.v = k.v;
+            v.q = m_gsWrites ? k.q : 1.0f;
             v.fog = k.fog;
             v.rgba = fixedAlpha ? (rgba & 0x00ffffffu) | (static_cast<uint32_t>((alpha >> 32) & 0xffu) << 24) : rgba;
             m_triangles.push_back(v);
@@ -406,6 +408,8 @@ namespace ps2x::native
             corner[1].y = a.y, corner[1].v = a.v;
             corner[2] = b;
             corner[2].x = a.x, corner[2].u = a.u;
+            for (Kick &c : corner)
+                c.q = 1.0f;
             corner[3] = b;
             for (Kick &c : corner)
                 c.rgba = last;

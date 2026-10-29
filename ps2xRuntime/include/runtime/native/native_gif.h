@@ -40,7 +40,7 @@ namespace ps2x::native
     private:
         struct Kick
         {
-            float x = 0, y = 0, z = 0, u = 0, v = 0, fog = 1.0f;
+            float x = 0, y = 0, z = 0, u = 0, v = 0, fog = 1.0f, q = 1.0f;
             uint32_t rgba = 0;
         };
         void parse(const uint8_t *data, size_t bytes, bool draw);
