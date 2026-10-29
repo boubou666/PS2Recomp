@@ -47,8 +47,8 @@ void main()
 }
 )";
 
-        // As the present pass, but the alpha an opaque draw stores is the GS's (0x80 = 1.0, byte 128); blended
-        // draws keep the target's alpha (their blend factors).
+        // As the present pass, but every draw stores its source alpha as the GS does (0x80 = 1.0, byte 128); a blend
+        // takes As at its own scale from the second output.
         const char *kFragmentShader = R"(#version 330
 in vec2 vUv;
 in vec4 vCol;
@@ -57,11 +57,11 @@ uniform sampler2D uTex;
 uniform int uTextured;
 uniform int uAlphaTest;
 uniform float uAlphaRef;
-uniform int uOpaque;
 uniform int uFog;
 uniform vec3 uFogColour;
 uniform int uDebug;
-out vec4 fragColor;
+layout(location = 0, index = 0) out vec4 fragColor;
+layout(location = 0, index = 1) out vec4 fragFactor;
 void main()
 {
     vec4 colour = vCol * (255.0 / 128.0);
@@ -71,8 +71,8 @@ void main()
         discard;
     if (uFog != 0)
         c.rgb = mix(uFogColour, c.rgb, clamp(vFog, 0.0, 1.0));
-    if (uOpaque != 0)
-        c.a *= 128.0 / 255.0;
+    fragFactor = vec4(c.a);
+    c.a *= 128.0 / 255.0;
     if (uDebug != 0)
         c = vec4(1.0, 0.0, 1.0, 128.0 / 255.0);
     fragColor = c;
@@ -102,7 +102,7 @@ void main()
     {
         GLuint program = 0, vao = 0, vbo = 0;
         GLint locM = -1, locOffset = -1, locTargetSize = -1, locDepthScale = -1, locTex = -1, locTextured = -1;
-        GLint locAlphaTest = -1, locAlphaRef = -1, locOpaque = -1, locFog = -1, locFogColour = -1;
+        GLint locAlphaTest = -1, locAlphaRef = -1, locFog = -1, locFogColour = -1;
         bool failed = false;
         struct GpuTexture
         {
@@ -134,7 +134,6 @@ void main()
             locTextured = glGetUniformLocation(program, "uTextured");
             locAlphaTest = glGetUniformLocation(program, "uAlphaTest");
             locAlphaRef = glGetUniformLocation(program, "uAlphaRef");
-            locOpaque = glGetUniformLocation(program, "uOpaque");
             locFog = glGetUniformLocation(program, "uFog");
             locFogColour = glGetUniformLocation(program, "uFogColour");
             glGenVertexArrays(1, &vao);
@@ -451,7 +450,6 @@ void main()
             glUniform1i(pass.locTextured, textured ? 1 : 0);
             glUniform1i(pass.locAlphaTest, m.alphaTest ? 1 : 0);
             glUniform1f(pass.locAlphaRef, m.alphaRef / 128.0f);
-            glUniform1i(pass.locOpaque, m.blend == Material::Blend::Opaque ? 1 : 0);
             glUniform1i(pass.locFog, m.fog ? 1 : 0);
             const float fogColour[3] = {static_cast<float>(m.fogColour & 0xffu) / 255.0f, static_cast<float>((m.fogColour >> 8) & 0xffu) / 255.0f,
                                         static_cast<float>((m.fogColour >> 16) & 0xffu) / 255.0f};
@@ -465,7 +463,7 @@ void main()
                 if (m.blend == Material::Blend::AdditiveByDestination)
                     glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
                 else
-                    glBlendFuncSeparate(GL_SRC_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                    glBlendFuncSeparate(GL_SRC1_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC1_ALPHA, GL_ONE, GL_ZERO);
             }
             if (m.depthTest)
             {
@@ -477,7 +475,10 @@ void main()
             glDepthMask(m.depthWrite ? GL_TRUE : GL_FALSE);
             glDrawArrays(GL_TRIANGLES, first, count);
             if (m.blend == Material::Blend::AdditiveByDestination) // DST_ALPHA is Ad / 255, half the GS's Ad / 128
+            {
+                glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE, GL_ONE, GL_ZERO);
                 glDrawArrays(GL_TRIANGLES, first, count);
+            }
             first += count;
         }
         glBindSampler(0, static_cast<GLuint>(sampler));
