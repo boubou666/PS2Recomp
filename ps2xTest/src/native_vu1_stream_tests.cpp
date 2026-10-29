@@ -76,6 +76,24 @@ void register_native_vu1_stream_tests()
             t.Equals(Vu1StreamAdapter::instance().codeVersion(), before + 2u, "one per MPG");
         });
 
+        tc.Run("a program the sandbox ran moves the VIF1 clock on by its cycles where VU1 skips it", [](TestCase &t)
+        {
+            install();
+            g_translate = false;
+            g_active = true;
+            std::vector<uint32_t> stream;
+            mpgEndingProgram(stream);
+            send(stream);
+            send({vif(0x14, 0, 0)});
+            static uint64_t s_cycles = 0;
+            s_cycles = 0;
+            ps2x::native::setVif1ClockAdvance([](void *, uint64_t cycles) { s_cycles += cycles; }, nullptr);
+            t.Equals(s_cycles, uint64_t{0}, "nothing before VIF1 gets to it");
+            t.IsTrue(ps2x::native::vu1Skipped(Vu1StreamAdapter::instance().code(), 0), "VU1 skips it");
+            ps2x::native::setVif1ClockAdvance(nullptr, nullptr);
+            t.IsTrue(s_cycles > 0u, "the clock moved on by the program's cycles");
+        });
+
         tc.Run("UNPACK fills the adapter's copy of VU1 data memory at its address", [](TestCase &t)
         {
             install();

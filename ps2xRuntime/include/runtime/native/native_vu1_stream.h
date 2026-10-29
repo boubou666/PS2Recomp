@@ -55,6 +55,10 @@ namespace ps2x::native
             // (GifToNative::setGsWrites): for the native GL GS renderer, whose textures and render targets they then
             // use (a game drawing into its own targets, or texturing from them).
             bool gsWrites = false;
+            // The adapter reads the stream on the VIF1 thread, right before VIF1 runs each transfer (setVif1Observer's
+            // onVif1Thread), so its sandbox runs beside the EE as VU1 did; active, choose and draw are then called
+            // there, and frameEnd's work is queued there behind the transfers sent before it.
+            bool onVif1Thread = false;
         };
 
         static Vu1StreamAdapter &instance();

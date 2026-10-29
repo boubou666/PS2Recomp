@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 struct VIFRegisters;
 
@@ -11,11 +12,20 @@ namespace ps2x::native
     // still holds what the stream refers to): a chain flattened the way VIF1 receives it (each tag's two VIF codes,
     // then its data), or a normal transfer's quadwords. The adapter reads the game's own 3D data from it (meshes,
     // matrices, lights) wherever in the game's code the send happens.
+    // onVif1Thread: called on the VIF1 thread instead, with each transfer as VIF1 gets it, right before VIF1 runs it
+    // (for an adapter that reads only the stream, not the EE memory it refers to: its work then runs beside the EE).
     using Vif1Observer = void (*)(const uint8_t *stream, size_t bytes);
 
-    void setVif1Observer(Vif1Observer observer);
+    void setVif1Observer(Vif1Observer observer, bool onVif1Thread = false);
     bool vif1Observed();
+    bool vif1ObservedOnVif1Thread();
     void observeVif1(const uint8_t *stream, size_t bytes);
+
+    // Runs a job on the VIF1 thread after the transfers sent so far (at once without a VIF1 thread, or on it).
+    using Vif1Runner = void (*)(void *user, std::function<void()> job);
+
+    void setVif1Runner(Vif1Runner runner, void *user);
+    void runOnVif1Thread(std::function<void()> job);
 
     // A microprogram the native port draws itself: VU1 does not run it, nor the MSCNTs that continue it. Asked on the
     // VIF1 thread at each MSCAL / MSCALF with VU1's code memory as VIF1 left it and the start address.
@@ -31,6 +41,13 @@ namespace ps2x::native
 
     void setDirectGate(DirectGate gate);
     bool directSkipped(uint32_t qwords);
+
+    // On the VIF1 thread, for a program its gate skipped: the VU1 cycles the program took elsewhere, which move the VIF1
+    // thread's clock on as VU1 running it would have (with the GS lag, the EE waits for that clock).
+    using Vif1ClockAdvance = void (*)(void *user, uint64_t cycles);
+
+    void setVif1ClockAdvance(Vif1ClockAdvance advance, void *user);
+    void advanceVif1Clock(uint64_t cycles);
 
     // VIF1's own registers (the VIF1 thread's, read without a lock): STMASK / STROW / STCOL / STMOD a game set in a
     // transfer the adapter did not see (at boot) are there. Null before the runtime registers them.
