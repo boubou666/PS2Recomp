@@ -151,6 +151,24 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+
+        // When a CD command's completion callback runs. By default at once (128 IOP cycles). With
+        // PS2X_IOP_CD_SECTORS_PER_SECOND=<rate> a read takes what the drive would: 1 ms of access plus its sectors at
+        // that rate (4x DVD: about 2700). Games that stream from the IOP may count on reads taking time: The Third
+        // Age's intro cinematic freed objects still in use (a different crash each run) when every read completed at
+        // once, and runs clean with drive-like reads.
+        uint64_t cdvdCompletionCycles(uint32_t sectors)
+        {
+            static const uint64_t s_rate = []
+            {
+                const char *value = std::getenv("PS2X_IOP_CD_SECTORS_PER_SECOND");
+                return value && *value ? std::strtoull(value, nullptr, 0) : 0ull;
+            }();
+            if (s_rate == 0u || sectors == 0u)
+                return kCdvdCompletionCycles;
+            constexpr uint64_t kIopHz = 36864000u;
+            return kIopHz / 1000u + static_cast<uint64_t>(sectors) * kIopHz / s_rate;
+        }
         constexpr uint32_t kMaxSifCommandPacket = 112u;
         constexpr uint64_t kSifDmaCompletionCycles = 128u;
         constexpr uint32_t kSifCommandHandlerBudget = 100000u;
@@ -418,19 +436,24 @@ namespace ps2x::iop::detail
             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
-            if (iequals(call.library, "cdvdman") && cdvd.dispatchImport(call.ordinal, cpu))
+            if (iequals(call.library, "cdvdman"))
             {
-                if (const auto callback = cdvd.takeCompletionCallback())
+                // sceCdRead's sector count, before the call returns in $v0.
+                const uint32_t readSectors = call.ordinal == 6u ? cpu.gpr[5] : 0u;
+                if (cdvd.dispatchImport(call.ordinal, cpu))
                 {
-                    pendingGuestCallbacks.emplace(
-                        totalCycles + kCdvdCompletionCycles,
-                        ScheduledGuestCallback{
-                            callback->address,
-                            callback->gp,
-                            callback->reason,
-                        });
+                    if (const auto callback = cdvd.takeCompletionCallback())
+                    {
+                        pendingGuestCallbacks.emplace(
+                            totalCycles + cdvdCompletionCycles(readSectors),
+                            ScheduledGuestCallback{
+                                callback->address,
+                                callback->gp,
+                                callback->reason,
+                            });
+                    }
+                    return ImportDisposition::Handled;
                 }
-                return ImportDisposition::Handled;
             }
 
             if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
