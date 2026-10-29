@@ -831,6 +831,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
+            observeVif1Until(data + pos + qwCount * 16u);
             // A whole packet the native port draws: the GS does not get it (numbered as a skipped program).
             if (!truncated && m_vif1PendingPath2ImageQwc == 0u && ps2x::native::directSkipped(imm ? imm : 65536u))
             {
