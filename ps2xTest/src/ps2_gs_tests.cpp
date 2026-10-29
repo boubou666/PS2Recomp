@@ -656,9 +656,16 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             constexpr uint32_t kEnvAddr = 0x5000u;
             constexpr uint32_t kDisplayOffset = 24u; // pmode, smode2, dispfb, display
+            // The interlace/field mode comes from libgraph's parameters, set by sceGsResetGraph (as on the console;
+            // a game may build its display before the reset, from libgraph's defaults), not from SMODE2.
             auto displayHeight = [&](uint64_t smode2)
             {
-                runtime.memory().gs().smode2 = smode2;
+                R5900Context resetCtx{};
+                setRegU32(resetCtx, 4, 0u);
+                setRegU32(resetCtx, 5, static_cast<uint32_t>(smode2 & 1u));        // SCE_GS_INTERLACE
+                setRegU32(resetCtx, 6, 2u);                                         // SCE_GS_NTSC
+                setRegU32(resetCtx, 7, static_cast<uint32_t>((smode2 >> 1) & 1u)); // SCE_GS_FRAME / FIELD
+                ps2_stubs::sceGsResetGraph(rdram.data(), &resetCtx, &runtime);
                 R5900Context ctx{};
                 setRegU32(ctx, 4, kEnvAddr);
                 setRegU32(ctx, 5, 0u);
