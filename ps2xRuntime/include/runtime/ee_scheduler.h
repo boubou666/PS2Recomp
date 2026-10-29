@@ -453,6 +453,12 @@ public:
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
+    // Blocks the current guest thread until deadline on the host clock while the other guest threads run: a native
+    // frame end for a game whose frame wait sleeps until its vblank (JC2, SCTPT2), where lower-priority threads work in
+    // that time; holding the executor itself (FramePacer::frameEnd) starves them. At the deadline onWake runs on the
+    // executor (charge EE time, present the frame), then completion resumes the thread (return value, pc).
+    [[noreturn]] void waitHostDeadline(std::chrono::steady_clock::time_point deadline, std::function<void()> onWake,
+                                       std::function<void(R5900Context &)> completion = {});
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
@@ -600,6 +606,16 @@ private:
                                    std::chrono::steady_clock::now() - start).count()),
                                std::memory_order_relaxed);
     }
+    // waitHostDeadline: a host thread (started on first use) posts each wake-up at its deadline.
+    static constexpr uint32_t kHostDeadlineWaitType = 0x48445750u; // 'HDWP'
+    void hostDeadlineLoop();
+    std::mutex m_hostDeadlineMutex;
+    std::condition_variable m_hostDeadlineCv;
+    std::vector<std::pair<std::chrono::steady_clock::time_point, uint64_t>> m_hostDeadlines; // guarded by the mutex
+    std::unordered_map<uint64_t, std::function<void()>> m_hostDeadlineWakes; // executor only
+    uint64_t m_hostDeadlineToken = 0; // executor only
+    bool m_hostDeadlineQuit = false; // guarded by the mutex; set by the destructor
+    std::thread m_hostDeadlineThread;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
