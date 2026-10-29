@@ -687,10 +687,11 @@ void register_ps2_memory_tests()
 
             mem.write32(0x12001000u, 0x1u);
             t.Equals(static_cast<uint32_t>(regs.siglblid), 0x3u, "acknowledging applies the waiting SIGNAL");
-            t.Equals(static_cast<uint32_t>(regs.csr.load()) & 0x3u, 0x1u, "CSR.SIGNAL is set again, FINISH still waits");
+            t.Equals(static_cast<uint32_t>(regs.csr.load()) & 0x3u, 0x3u,
+                     "CSR.SIGNAL is set again and FINISH follows (only a SIGNAL waits for the acknowledge)");
 
             mem.write32(0x12001000u, 0x1u);
-            t.Equals(static_cast<uint32_t>(regs.csr.load()) & 0x3u, 0x2u, "the next acknowledge lets FINISH through");
+            t.Equals(static_cast<uint32_t>(regs.csr.load()) & 0x3u, 0x2u, "the next acknowledge leaves FINISH");
             ps2GsResetEvents();
         });
 
