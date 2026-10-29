@@ -2,6 +2,7 @@
 #include "LibC.h"
 #include "ps2_log.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 
@@ -1098,14 +1099,22 @@ namespace ps2_stubs
         setReturnU32(ctx, 0u);
     }
 
+    // newlib's rand, the EE C library's: games scale it by 1 / (RAND_MAX + 1) with RAND_MAX 0x7FFFFFFF.
+    std::atomic<uint64_t> g_randNext{1u};
+
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, std::rand() & 0x7FFF);
+        uint64_t next = g_randNext.load(std::memory_order_relaxed);
+        uint64_t advanced = 0u;
+        do
+            advanced = next * 6364136223846793005ull + 1u;
+        while (!g_randNext.compare_exchange_weak(next, advanced, std::memory_order_relaxed));
+        setReturnS32(ctx, static_cast<int32_t>((advanced >> 32) & 0x7FFFFFFFu));
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::srand(getRegU32(ctx, 4));
+        g_randNext.store(getRegU32(ctx, 4), std::memory_order_relaxed);
         setReturnS32(ctx, 0);
     }
 
