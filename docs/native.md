@@ -129,9 +129,16 @@ interpreted, the way the EE's code is recompiled.
 
 ## Sound on the wall clock (native/renderer)
 
-`PS2X_SPU2_WALLCLOCK=1`: the SPU2 mixes when the host's audio callback asks for frames, at 48 kHz of real time, as
-the console's SPU2 runs on its own clock whatever the CPUs do. Voices, envelopes, the AutoDMA input and reverb
-advance by the frames played, not by IOP cycles or the game's frame rate; transfers that are not AutoDMA still end
-on the IOP clock (`PS2X_SPU2_DMA_CYCLES_PER_2BYTES`), and the interrupts the mixing raises reach the IOP at its next
-advance (within 1 ms of IOP time). Register and DMA accesses and the mixing share a lock. Without the switch the
-SPU2 mixes a sample per 768 IOP cycles and the host stretches the output to its rate, as before.
+`PS2X_SPU2_WALLCLOCK=1`: the SPU2 runs at 48 kHz of real time, the rate the host's audio device plays, as the
+console's SPU2 runs on its own clock whatever the CPUs do. The IOP's advances mix sample by sample into a queue the
+host's audio callback takes its frames from, so an AutoDMA half (256 samples, 5.3 ms) ends, raises its interrupt and
+is refilled by the driver before the next one plays, as on the console, even though the callback takes several
+hundred frames at once (up to 1024, 21 ms). The queue's depth paces the SPU2: it aims at one pull plus 512 frames
+ahead (the IOP's advances can be ~10 ms apart in real time), the samples coming up to 12.5% faster or slower on the
+IOP clock to keep it there, and the SPU2 stops while the queue holds a pull plus 1024 frames: the sound is about
+15 ms behind the IOP on average, 30 to 43 ms at most depending on the device's pull. Frames the queue lacks when the
+callback pulls (the IOP late or slower than real time) are mixed by the callback itself, their interrupts reaching
+the IOP at its next advance; the state dump's `late=` counts them. Transfers that are not AutoDMA end on the IOP
+clock (`PS2X_SPU2_DMA_CYCLES_PER_2BYTES`). Register and DMA accesses and the mixing share a lock. Best with
+`PS2X_IOP_WALLCLOCK=1`, which keeps the IOP's time on the host's. Without the switch the SPU2 mixes a sample per 768
+IOP cycles and the host stretches the output to its rate, as before.
