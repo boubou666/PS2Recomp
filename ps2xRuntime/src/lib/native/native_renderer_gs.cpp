@@ -242,15 +242,7 @@ void main()
         {
             m.tex0 = target.tex0;
             m.texa = target.texa;
-            const uint32_t a = target.alpha & 3u, b = (target.alpha >> 2) & 3u, c = (target.alpha >> 4) & 3u,
-                           d = (target.alpha >> 6) & 3u;
-            if (!m.alphaBlend)
-                m.blend = Material::Blend::Opaque;
-            else if (a == 0u && b == 2u && d == 1u) // (Cs - 0) * As/FIX + Cd
-                m.blend = Material::Blend::Additive;
-            else
-                m.blend = Material::Blend::Alpha; // (Cs - Cd) * As + Cd, and the cases this renderer does not have
-            (void)c;
+            m.blend = m.alphaBlend ? blendOf(target.alpha) : Material::Blend::Opaque;
             const bool ate = target.test & 1u;
             const uint32_t atst = (target.test >> 1) & 7u, aref = (target.test >> 4) & 0xFFu;
             m.alphaTest = ate && (atst == 5u || atst == 6u); // GEQUAL / GREATER (the others: drawn as always)
@@ -470,7 +462,10 @@ void main()
             {
                 glEnable(GL_BLEND);
                 glBlendEquation(GL_FUNC_ADD);
-                glBlendFuncSeparate(GL_SRC_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                if (m.blend == Material::Blend::AdditiveByDestination)
+                    glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+                else
+                    glBlendFuncSeparate(GL_SRC_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
             }
             if (m.depthTest)
             {
@@ -481,6 +476,8 @@ void main()
                 glDisable(GL_DEPTH_TEST);
             glDepthMask(m.depthWrite ? GL_TRUE : GL_FALSE);
             glDrawArrays(GL_TRIANGLES, first, count);
+            if (m.blend == Material::Blend::AdditiveByDestination) // DST_ALPHA is Ad / 255, half the GS's Ad / 128
+                glDrawArrays(GL_TRIANGLES, first, count);
             first += count;
         }
         glBindSampler(0, static_cast<GLuint>(sampler));
