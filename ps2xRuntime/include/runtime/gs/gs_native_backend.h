@@ -154,6 +154,11 @@ private:
     void pullGpuPages(uint32_t firstPage, uint32_t endPage); // only GS memory pages in [first, end)
     uint32_t m_readFirstPage = 0, m_readEndPage = 0xFFFFFFFFu; // the current local-to-host transfer's source pages
     uint32_t m_swizzleTexture = 0;
+    // The GS's CLUT buffer (512 16-bit entries, loaded by TEX0's CLD from GS memory), as indexed textures read it:
+    // not the palette's current bytes in GS memory, which the game may have rewritten since the load.
+    uint32_t m_clutTexture = 0;
+    std::array<uint16_t, 512> m_clutUploaded{};
+    bool m_clutStale = true;
     // 256-byte blocks of GS memory (m_vram, written in stream order by the transfers, CLUT writes and CPU resolves)
     // the GPU copy has not received yet.
     std::vector<uint8_t> m_dirtyBlocks = std::vector<uint8_t>(16384u, 1u);
@@ -225,7 +230,7 @@ private:
         int targetSize = -1, texSize = -1, textured = -1, fst = -1, tfx = -1, tcc = -1, fog = -1, fogColor = -1;
         int alphaTest = -1, alphaRef = -1, alphaFail = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
         int dest = -1, date = -1;
-        int vram = -1, swizzle = -1, decode = -1, texFmt = -1, texSel = -1, texKind = -1, clutFmt = -1, cbp = -1;
+        int vram = -1, swizzle = -1, decode = -1, texFmt = -1, texSel = -1, texKind = -1, csm = -1, clutBuffer = -1;
         int texa = -1, wrapU = -1, wrapV = -1, linear = -1, targetWrap = -1;
     } m_uniforms;
 

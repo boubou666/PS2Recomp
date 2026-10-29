@@ -56,6 +56,8 @@ public:
     // The current CLUT (GS::saveDrawingState / loadDrawingState); waits for queued drawing.
     std::vector<uint8_t> SaveClutState();
     void LoadClutState(const uint8_t *data, size_t size);
+    // The CLUT buffer of a backend that draws nothing on workers (the native back end's GS memory).
+    const std::array<uint16_t, 512> &Clut() const { return m_clut; }
 
 private:
     bool m_asyncAllowed = true;

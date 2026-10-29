@@ -75,8 +75,8 @@ uniform int uDecode;
 uniform ivec4 uTexFmt;  // swizzle row, page width, page height, bits a pixel takes in memory
 uniform ivec4 uTexSel;  // bit offset in the word (T8H, T4HL, T4HH), bits kept, TBP0, TBW
 uniform ivec4 uTexKind; // 0 CT32 / 1 CT24 / 2 CT16 / 3 indexed, CT16 palette, CSA, palette entries
-uniform ivec4 uClutFmt; // the palette's layout, as uTexFmt
-uniform int uCbp;
+uniform int uCsm;
+uniform usampler2D uClutBuffer; // the GS's CLUT buffer: 512 16-bit entries
 uniform vec3 uTexa;     // TA0, TA1, AEM
 uniform ivec4 uWrapU;   // CLAMP mode, 2^TW - 1, MINU, MAXU
 uniform ivec4 uWrapV;
@@ -125,11 +125,18 @@ vec4 gsTexel(ivec2 p)
     uint v = gsRead(uTexFmt, uTexSel.x, uTexSel.y, uTexSel.z, uTexSel.w, p);
     if (uTexKind.x != 3)
         return gsColor(v, uTexKind.x);
-    // CSM1 palette: entry i at (x, y) of a 16-wide image, a 16-entry palette CSA * 16 entries in.
-    uint index = uTexKind.w == 16 ? (uint(uTexKind.z) * 16u + v) & 255u : v;
-    ivec2 q = ivec2(int((index & 7u) | ((index & 16u) >> 1u)), int(((index >> 5u) << 1u) | ((index >> 3u) & 1u)));
-    uint entry = gsRead(uClutFmt, 0, uClutFmt.w, uCbp, 1, q);
-    return gsColor(entry, uTexKind.y != 0 ? 2 : 0);
+    // The CLUT buffer as GSCpuBackend::LookupCLUT reads it: CSA picks 16-entry rows, a 32-bit entry's high half is
+    // 256 entries further.
+    bool c16 = uTexKind.y != 0;
+    uint base = uint(uTexKind.z & (c16 ? 31 : 15)) << 4u;
+    uint source = uTexKind.w == 16 ? v & 15u : v;
+    uint index = (base + source) & (c16 ? 511u : 255u);
+    if (!c16 && uCsm == 0 && uTexKind.w == 256)
+        index = min((source & 0xF0u) + base, 240u) + (source & 15u);
+    uint entry = texelFetch(uClutBuffer, ivec2(int(index), 0), 0).r;
+    if (!c16)
+        entry |= texelFetch(uClutBuffer, ivec2(int(index) + 256, 0), 0).r << 16u;
+    return gsColor(entry, c16 ? 2 : 0);
 }
 
 vec4 gsSample(vec2 t)
@@ -580,8 +587,8 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.texFmt = glGetUniformLocation(m_program, "uTexFmt");
     m_uniforms.texSel = glGetUniformLocation(m_program, "uTexSel");
     m_uniforms.texKind = glGetUniformLocation(m_program, "uTexKind");
-    m_uniforms.clutFmt = glGetUniformLocation(m_program, "uClutFmt");
-    m_uniforms.cbp = glGetUniformLocation(m_program, "uCbp");
+    m_uniforms.csm = glGetUniformLocation(m_program, "uCsm");
+    m_uniforms.clutBuffer = glGetUniformLocation(m_program, "uClutBuffer");
     m_uniforms.texa = glGetUniformLocation(m_program, "uTexa");
     m_uniforms.wrapU = glGetUniformLocation(m_program, "uWrapU");
     m_uniforms.wrapV = glGetUniformLocation(m_program, "uWrapV");
@@ -930,6 +937,11 @@ void GSNativeBackend::ensureVram()
     glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, kSwizzleWidth, kInverseHeight, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
                  inverse.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenTextures(1, &m_clutTexture);
+    glBindTexture(GL_TEXTURE_2D, m_clutTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, 512, 1, 0, GL_RED_INTEGER, GL_UNSIGNED_SHORT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glGenFramebuffers(1, &m_vramFramebuffer);
@@ -1309,9 +1321,19 @@ bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
     syncVramToGpu();
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, m_clutTexture);
+    if (m_clutStale)
+    {
+        m_clutUploaded = m_memory->Clut();
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 1, GL_RED_INTEGER, GL_UNSIGNED_SHORT, m_clutUploaded.data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        m_clutStale = false;
+    }
     glActiveTexture(GL_TEXTURE0);
 
-    const GpuLayout clut = tex0.cpsm == 0x02u ? kLayoutC16 : tex0.cpsm == 0x0Au ? kLayoutC16S : kLayoutC32;
+    const bool clut16 = tex0.cpsm == 0x02u || tex0.cpsm == 0x0Au;
     const uint64_t clamp = context.clamp;
     const int maxU = (1 << std::min<uint32_t>(tex0.tw, 10u)) - 1, maxV = (1 << std::min<uint32_t>(tex0.th, 10u)) - 1;
     glUniform1i(m_uniforms.vram, 2);
@@ -1319,9 +1341,9 @@ bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
     glUniform1i(m_uniforms.decode, 1);
     glUniform4i(m_uniforms.texFmt, layout.row, layout.pageWidth, layout.pageHeight, layout.bits);
     glUniform4i(m_uniforms.texSel, bitOffset, bitsKept, static_cast<int>(tex0.tbp0), static_cast<int>(tex0.tbw));
-    glUniform4i(m_uniforms.texKind, kind, clut.bits == 16 ? 1 : 0, static_cast<int>(tex0.csa), entries);
-    glUniform4i(m_uniforms.clutFmt, clut.row, clut.pageWidth, clut.pageHeight, clut.bits);
-    glUniform1i(m_uniforms.cbp, static_cast<int>(tex0.cbp));
+    glUniform4i(m_uniforms.texKind, kind, clut16 ? 1 : 0, static_cast<int>(tex0.csa), entries);
+    glUniform1i(m_uniforms.csm, static_cast<int>(tex0.csm));
+    glUniform1i(m_uniforms.clutBuffer, 5);
     glUniform3f(m_uniforms.texa, static_cast<float>(state.texa.ta0), static_cast<float>(state.texa.ta1),
                 state.texa.aem ? 1.0f : 0.0f);
     glUniform4i(m_uniforms.wrapU, static_cast<int>(clamp & 0x3u), maxU, static_cast<int>(clamp >> 4 & 0x3FFu),
@@ -1890,7 +1912,17 @@ void GSNativeBackend::Submit(const GSPrimitiveBatch &batch)
 
 void GSNativeBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
+    if (tex0.cld == 0u)
+        return;
+    const uint32_t clutPage = tex0.cbp / 32u;
+    pullGpuPages(clutPage, clutPage + (tex0.csm == 0u ? 1u : std::max<uint32_t>(texclut.cbw, 1u) * (texclut.cov / 32u + 2u)));
     m_memory->LoadClut(tex0, texclut);
+    // The primitives batched so far read the CLUT they were drawn with.
+    if (!m_clutStale && m_memory->Clut() != m_clutUploaded)
+    {
+        flushBatch();
+        m_clutStale = true;
+    }
 }
 
 void GSNativeBackend::markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
