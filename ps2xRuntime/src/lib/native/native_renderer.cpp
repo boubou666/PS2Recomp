@@ -139,6 +139,12 @@ void main()
     Renderer::Renderer() = default;
     Renderer::~Renderer() = default;
 
+    Material::Blend blendOf(uint64_t alpha)
+    {
+        const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
+        return a == 0u && b == 2u && d == 1u ? Material::Blend::Additive : Material::Blend::Alpha;
+    }
+
     Renderer &Renderer::instance()
     {
         static Renderer renderer;

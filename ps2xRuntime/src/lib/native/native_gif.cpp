@@ -261,11 +261,7 @@ namespace ps2x::native
         m.clampV = wmt == 1u || wmt == 2u;
         m.blend = Material::Blend::Opaque;
         if ((attributes >> 6) & 1u) // ABE
-        {
-            const uint64_t alpha = m_alpha[context];
-            const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
-            m.blend = a == 0u && b == 2u && d == 1u ? Material::Blend::Additive : Material::Blend::Alpha;
-        }
+            m.blend = blendOf(m_alpha[context]);
         const uint64_t test = m_test[context];
         const bool alphaTest = test & 1u;
         const uint32_t atst = (test >> 1) & 7u, aref = (test >> 4) & 0xffu, afail = (test >> 12) & 3u;

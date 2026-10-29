@@ -57,6 +57,9 @@ namespace ps2x::native
         uint8_t context = 0; // PRIM.CTXT of a fromGsContext draw
     };
 
+    // The blend of a draw with PRIM.ABE set, from the GS's ALPHA register.
+    Material::Blend blendOf(uint64_t alpha);
+
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size
     // that fills the window (the GS XYOFFSET and the frame size; a 640 x 448 / 512 or 640 x 256 picture).
     struct Screen

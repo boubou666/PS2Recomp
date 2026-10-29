@@ -242,15 +242,7 @@ void main()
         {
             m.tex0 = target.tex0;
             m.texa = target.texa;
-            const uint32_t a = target.alpha & 3u, b = (target.alpha >> 2) & 3u, c = (target.alpha >> 4) & 3u,
-                           d = (target.alpha >> 6) & 3u;
-            if (!m.alphaBlend)
-                m.blend = Material::Blend::Opaque;
-            else if (a == 0u && b == 2u && d == 1u) // (Cs - 0) * As/FIX + Cd
-                m.blend = Material::Blend::Additive;
-            else
-                m.blend = Material::Blend::Alpha; // (Cs - Cd) * As + Cd, and the cases this renderer does not have
-            (void)c;
+            m.blend = m.alphaBlend ? blendOf(target.alpha) : Material::Blend::Opaque;
             const bool ate = target.test & 1u;
             const uint32_t atst = (target.test >> 1) & 7u, aref = (target.test >> 4) & 0xFFu;
             m.alphaTest = ate && (atst == 5u || atst == 6u); // GEQUAL / GREATER (the others: drawn as always)
