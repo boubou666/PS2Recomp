@@ -1280,7 +1280,8 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
         const auto [drainNanoseconds, drains] = GSCpuBackend::TakeDrainStats();
         text << "[state] gs frames=" << lag.frames << " ee waited " << lag.waitNanoseconds / 1000000u << " ms for the GS thread, "
              << drains << " raster drains took " << drainNanoseconds / 1000000u << " ms, drawing estimate "
-             << runtime.gsForPresentation().estimatedDrawCycles() << " cycles";
+             << runtime.gsForPresentation().estimatedDrawCycles() << " cycles, display flips="
+             << runtime.gsForPresentation().displayFlips() << " game frames=" << runtime.gameFrames();
         if (memory.vif1Threaded())
         {
             static uint64_t lastVif1WaitNs = 0;
