@@ -951,7 +951,7 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
     ps2x::native::textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
 }
 
-GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf)
+GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf, uint32_t rows)
 {
     FrameTarget out;
     // A game whose first draws are all native submits no GS primitive before this: the GS thread is the submit thread.
@@ -962,7 +962,10 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
         return out;
     RenderTarget &target = renderTarget(frame);
     target.dirty = true;
-    target.usedHeight = target.height; // what another renderer draws is not tracked: resolve it whole
+    // Down to the scissor's last row, as a GS draw counts the rows it reaches: the whole target would also cover the
+    // GS memory below the picture, where a game uploads its textures, and each upload there dropped the target with
+    // the native draws in it (TMB's 3D frame came out black).
+    target.usedHeight = std::min(target.height, std::max(target.usedHeight, rows));
     target.alphaWritten = true;
     target.zbp = zbuf.zbp;
     target.zpsm = zbuf.psm;
@@ -980,7 +983,7 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
     if (!hook)
         return;
-    const FrameTarget frame = frameTarget(context.frame, context.zbuf);
+    const FrameTarget frame = frameTarget(context.frame, context.zbuf, context.scissor.y1 + 1u);
     ps2x::native::GsDrawTarget target;
     fillNativeRegisters(target, context);
     target.framebuffer = frame.framebuffer;

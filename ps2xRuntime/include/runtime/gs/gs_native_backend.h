@@ -64,7 +64,8 @@ public:
         uint32_t width = 0, height = 0;
         double zScale = 0.0;
     };
-    FrameTarget frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf);
+    // rows: how far down the native draw may write (its scissor), what the target then covers in GS memory.
+    FrameTarget frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf, uint32_t rows);
     void NativeDraw(uint64_t group, const GSContext &context) override;
     bool PresentsOnDrawThread() const override { return true; }
 
