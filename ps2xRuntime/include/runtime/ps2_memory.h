@@ -139,6 +139,25 @@ public:
     uint8_t *getScratchpad() { return m_scratchpad; }
     uint8_t *getIOPRAM() { return iop_ram; }
     uint64_t dmaStartCount() const { return m_dmaStartCount.load(std::memory_order_relaxed); }
+    // The last GIF channel events, for diagnostics: 'S' start (CHCR with STR: chcr, madr, qwc), 'Q' end interrupt
+    // queued, 'C' end interrupts consumed (count, 1 = by a sceDmaSend stub), 'D' dispatched (handlers started,
+    // 1 = held because the cause is disabled).
+    struct GifEvent
+    {
+        uint32_t kind = 0, a = 0, b = 0, c = 0;
+    };
+    static constexpr uint32_t kGifEvents = 32u;
+    // Also GS events: 'p' posted (event 0 SIGNAL / 1 FINISH / 2 LABEL, CSR), 'a' applied (event, CSR after).
+    static void noteGifEvent(uint32_t kind, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0)
+    {
+        const uint32_t slot = s_gifEventNext.fetch_add(1, std::memory_order_relaxed) % kGifEvents;
+        s_gifEvents[slot] = {kind, a, b, c};
+    }
+    std::array<GifEvent, kGifEvents> gifEvents(uint32_t &next) const
+    {
+        next = s_gifEventNext.load(std::memory_order_relaxed);
+        return s_gifEvents;
+    }
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
@@ -252,6 +271,10 @@ public:
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     uint32_t processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
+    // A GIF channel transfer (normal mode, PATH3) of a packet the host built, as if the EE had started it: in order
+    // with the rest of the GIF stream, and the channel ends with its DMAC interrupt. For HLE calls that send GS
+    // packets (sceGsExecLoadImage) without taking guest memory for them.
+    void submitHostGifTransfer(const uint8_t *data, uint32_t size);
     // A SIGNAL that reaches the GS while CSR.SIGNAL is set stops the GS until the CPU clears the bit. The GIF and
     // VIF1 DMA channels stop at such a SIGNAL (CHCR.STR stays set, MADR/QWC/TADR point at it) and continue from
     // memory once CSR.SIGNAL is acknowledged. PS2X_GS_SIGNAL_STALL=0 disables it.
@@ -333,6 +356,8 @@ public:
 
     bool m_seenGifCopy;
     std::atomic<uint64_t> m_dmaStartCount{0};
+    static inline std::array<GifEvent, kGifEvents> s_gifEvents{};
+    static inline std::atomic<uint32_t> s_gifEventNext{0};
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};

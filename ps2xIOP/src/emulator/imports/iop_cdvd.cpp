@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "iop_cdvd.h"
 
 #include "../core/iop_cpu.h"
@@ -713,7 +714,8 @@ namespace ps2x::iop::detail
             }
 
             const bool ok = read && memory.writeRam(destination, bytes.data(), bytes.size());
-            if (readLogCount < 64u || (readLogCount % 256u) == 0u || !ok)
+            static const bool logAll = std::getenv("PS2X_CD_LOG") != nullptr; // every read (PS2X_CD_LOG=1)
+            if (logAll || readLogCount < 64u || (readLogCount % 256u) == 0u || !ok)
             {
                 char line[128];
                 std::snprintf(line, sizeof(line), "[IOP cdvd] read #%u lsn=0x%x sectors=0x%x dst=0x%x %s",

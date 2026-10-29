@@ -954,6 +954,9 @@ void GSNativeBackend::resolveTarget(RenderTarget &target)
 GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf)
 {
     FrameTarget out;
+    // A game whose first draws are all native submits no GS primitive before this: the GS thread is the submit thread.
+    if (m_submitThread == std::thread::id{})
+        m_submitThread = std::this_thread::get_id();
     flushBatch();
     if (!ensureContext(true))
         return out;
@@ -979,6 +982,7 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
         return;
     const FrameTarget frame = frameTarget(context.frame, context.zbuf);
     ps2x::native::GsDrawTarget target;
+    fillNativeRegisters(target, context);
     target.framebuffer = frame.framebuffer;
     target.color = frame.color;
     target.depth = frame.depth;

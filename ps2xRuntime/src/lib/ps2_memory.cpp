@@ -150,13 +150,18 @@ namespace
         return 0u;
     }
 
-    // Caller holds g_gsEventMutex.
+    // Caller holds g_gsEventMutex. Only a SIGNAL that finds the previous one not yet acknowledged (CSR.SIGNAL
+    // still set) holds the GS, and what follows it, as on the console: a FINISH or LABEL after an acknowledged-or-
+    // first SIGNAL still comes (VP2's menu masks SIGNAL, never clears it, and waits for FINISH).
     uint32_t drainGsEvents(GSRegisters &regs, uint64_t now)
     {
         uint32_t raised = 0u;
-        while (!g_gsPendingEvents.empty() && g_gsPendingEvents.front().due <= now && (regs.csr.load() & 0x1ull) == 0u)
+        while (!g_gsPendingEvents.empty() && g_gsPendingEvents.front().due <= now &&
+               !(g_gsPendingEvents.front().event == GsCpuEvent::Signal && (regs.csr.load() & 0x1ull) != 0u))
         {
             raised |= applyGsEvent(regs, g_gsPendingEvents.front());
+            PS2Memory::noteGifEvent('a', static_cast<uint32_t>(g_gsPendingEvents.front().event),
+                                    static_cast<uint32_t>(regs.csr.load()));
             g_gsPendingEvents.pop_front();
         }
         return raised;
@@ -209,11 +214,17 @@ namespace
     inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
     {
         if (off == 0u)
+        {
+            if (value & 0x3u)
+                PS2Memory::noteGifEvent('c', value);
             csr.fetch_and(~(static_cast<uint64_t>(value) & kGsCsrW1cMask));
+        }
     }
 
     inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
     {
+        if (value & 0x3u)
+            PS2Memory::noteGifEvent('c', static_cast<uint32_t>(value));
         csr.fetch_and(~(value & kGsCsrW1cMask));
     }
 
@@ -498,6 +509,7 @@ bool PS2Memory::initialize(size_t ramSize)
 uint32_t ps2GsPostEvent(GSRegisters &regs, GsCpuEvent event, uint32_t id, uint32_t mask, uint64_t due, uint64_t now)
 {
     std::lock_guard<std::mutex> lock(g_gsEventMutex);
+    PS2Memory::noteGifEvent('p', static_cast<uint32_t>(event), static_cast<uint32_t>(regs.csr.load()));
     g_gsPendingEvents.push_back({event, id, mask, std::max(due, g_gsPendingEvents.empty() ? 0u : g_gsPendingEvents.back().due)});
     return drainGsEvents(regs, now);
 }
@@ -1501,6 +1513,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10008000u && address < 0x1000F000u && (address & 0xFFu) <= 0x50u &&
         dmaChannelSignalStalled(address & ~0xFFu))
     {
+        if (address == 0x1000A000u && (value & 0x100u) != 0u)
+            noteGifEvent('X', value);
         if ((address & 0xFFu) != 0u || (value & 0x100u) != 0u)
             return true;
         m_signalStalls.erase(std::remove_if(m_signalStalls.begin(), m_signalStalls.end(),
@@ -1600,6 +1614,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         }
         if ((address & 0xFF) == 0x00 && (value & 0x100))
         {
+            if (address == 0x1000A000u)
+                noteGifEvent('S', value, m_ioRegisters[0x1000A010u], m_ioRegisters[0x1000A020u] & 0xFFFFu);
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
             if (!dmacEnabled)
@@ -1637,6 +1653,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
+                auto &channelQueue = channelBase == 0x1000A000u   ? m_pendingGifTransfers
+                                     : channelBase == 0x10009000u ? m_pendingVif1Transfers
+                                                                  : m_pendingVif0Transfers;
+                const size_t queuedBefore = channelQueue.size();
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
                     if (qwCount == 0)
@@ -1701,6 +1721,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 else if (qwc > 0)
                 {
                     enqueueTransfer(madr, qwc);
+                }
+
+                // Nothing to move (normal mode with QWC 0, or a chain with no data): the channel ends at once, as on
+                // the console. Without this its STR only cleared on the next CHCR read and its end interrupt never
+                // came (VP2's menu waits on its GIF queue for that interrupt).
+                if (channelQueue.size() == queuedBefore)
+                {
+                    completeDmacChannel(channelBase, channelBase == 0x1000A000u ? 2u : channelBase == 0x10009000u ? 1u : 0u);
+                    return true;
                 }
 
                 const bool autoProcessTransfers =
@@ -2759,8 +2788,24 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
+void PS2Memory::submitHostGifTransfer(const uint8_t *data, uint32_t size)
+{
+    static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
+    if (!data || size < 16u)
+        return;
+    noteGifEvent('S', 0x101u, 0u, size / 16u);
+    PendingTransfer pt;
+    pt.chainData.assign(data, data + (size & ~15u));
+    m_pendingGifTransfers.push_back(std::move(pt));
+    m_ioRegisters[GIF_CHANNEL + 0x00u] = 0x101u;
+    m_ioRegisters[GIF_CHANNEL + 0x20u] = 0u;
+    processPendingTransfers();
+}
+
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 {
+    if (cause == 2u)
+        noteGifEvent('Q');
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
     m_completedDmacCauses.push_back(cause);
 }

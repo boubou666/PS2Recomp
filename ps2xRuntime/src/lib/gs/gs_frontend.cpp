@@ -1,4 +1,5 @@
 #include "runtime/native/native_texture_cache.h"
+#include "runtime/native/native_renderer.h"
 #include "ThreadNaming.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
@@ -185,7 +186,7 @@ namespace
 {
     // PS2X_GS_RECORD=<file> (+ PS2X_GS_RECORD_AT=<sec> from process start, PS2X_GS_RECORD_SECONDS=<sec>, default 10):
     // records the commands the GS thread processes, with VRAM and the drawing state at the start, for
-    // ps2_gs_replay.
+    // ps2_gs_replay. PS2X_GS_RECORD_AT=key starts it when ps2GsRequestRecording() is called (F10 in the runner).
     struct GsRecorder
     {
         FILE *out = nullptr;
@@ -210,7 +211,7 @@ namespace
                 return;
             }
             if (const char *at = std::getenv("PS2X_GS_RECORD_AT"))
-                startAt = std::atof(at);
+                startAt = std::strcmp(at, "key") == 0 ? -1.0 : std::atof(at);
             if (const char *duration = std::getenv("PS2X_GS_RECORD_SECONDS"))
                 seconds = std::atof(duration);
             out = std::fopen(path, "wb");
@@ -225,6 +226,12 @@ namespace
         }
     };
     [[maybe_unused]] const double g_gsRecorderClock = GsRecorder::sinceProcessStart();
+    std::atomic<bool> g_gsRecordRequested{false};
+}
+
+void ps2GsRequestRecording()
+{
+    g_gsRecordRequested.store(true, std::memory_order_relaxed);
 }
 
 bool GS::shouldQueue() const
@@ -401,7 +408,79 @@ void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
-void GS::enqueue(QueuedCommand &&command)
+void GS::submitNativeBatch(void *user, const ps2x::native::Material &material, const float m[16], float gsZScale,
+                           const ps2x::native::Vertex *vertices, uint32_t count)
+{
+    GS &gs = *static_cast<GS *>(user);
+    if (!gs.m_backend)
+        return;
+    GSPrimReg prim{};
+    prim.type = GS_PRIM_TRIANGLE;
+    prim.iip = true;
+    prim.tme = material.textured;
+    prim.fge = material.fog;
+    prim.abe = material.alphaBlend;
+    const int ctxt = material.context != 0 ? 1 : 0;
+    prim.ctxt = ctxt != 0;
+    const GSPrimReg saved = gs.m_prim;
+    gs.m_prim = prim;
+    GSPrimitiveBatch batch = gs.buildDrawBatch(0);
+    gs.m_prim = saved;
+    batch.vertexCount = 3;
+    for (uint32_t i = 0; i + 2u < count; i += 3u)
+    {
+        bool behind = false;
+        for (uint32_t k = 0; k < 3u; ++k)
+        {
+            const ps2x::native::Vertex &v = vertices[i + k];
+            const float cx = m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12];
+            const float cy = m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13];
+            const float cz = m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14];
+            const float cw = m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15];
+            behind |= !(cw > 0.0f);
+            const float q = cw != 0.0f ? 1.0f / cw : 0.0f;
+            GSVertex &g = batch.vertices[k];
+            g.x = cx * q;
+            g.y = cy * q;
+            // Z as a VU program hands it to the GS (FTOI into XYZ): saturated to a signed 32-bit integer, whose bits
+            // the GS takes as unsigned (a negative Z wraps high), the same depth as the program's own packets.
+            const double zs = static_cast<double>(cz) * q * gsZScale;
+            const double zf = zs == zs ? std::clamp(zs, -2147483648.0, 2147483647.0) : 0.0;
+            g.z = static_cast<double>(static_cast<uint32_t>(static_cast<int32_t>(zf)));
+            g.q = q;
+            g.s = v.u * q;
+            g.t = v.v * q;
+            g.r = static_cast<uint8_t>(v.rgba & 0xFFu);
+            g.g = static_cast<uint8_t>((v.rgba >> 8) & 0xFFu);
+            g.b = static_cast<uint8_t>((v.rgba >> 16) & 0xFFu);
+            g.a = static_cast<uint8_t>((v.rgba >> 24) & 0xFFu);
+            g.fog = static_cast<uint8_t>(std::clamp(v.fog * 255.0f + 0.5f, 0.0f, 255.0f));
+        }
+        if (!behind)
+            gs.m_backend->Submit(batch);
+        // PS2X_NATIVE_GS_STATS=1: every 2 s, the triangles submitted, those behind the camera, and the last target.
+        static const bool s_stats = [] { const char *v = std::getenv("PS2X_NATIVE_GS_STATS"); return v && *v == '1'; }();
+        if (s_stats)
+        {
+            static uint64_t s_sent = 0, s_behind = 0;
+            static auto s_since = std::chrono::steady_clock::now();
+            ++(behind ? s_behind : s_sent);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_since >= std::chrono::seconds(2))
+            {
+                const GSContext &c = batch.state.context;
+                std::fprintf(stderr, "[native-gs] 2 s: %llu triangles to the back end, %llu behind; last fbp %u psm %u zbp %u test %#llx prim tme %d fge %d abe %d ctxt %d\n",
+                             static_cast<unsigned long long>(s_sent), static_cast<unsigned long long>(s_behind),
+                             c.frame.fbp, c.frame.psm, c.zbuf.zbp, static_cast<unsigned long long>(c.test),
+                             prim.tme, prim.fge, prim.abe, prim.ctxt);
+                s_sent = s_behind = 0;
+                s_since = now;
+            }
+        }
+    }
+}
+
+uint64_t GS::enqueue(QueuedCommand &&command)
 {
     std::unique_lock<std::mutex> lock(m_queueMutex);
     if (!m_worker.joinable())
@@ -409,11 +488,13 @@ void GS::enqueue(QueuedCommand &&command)
     m_queueIdle.wait(lock, [this]() { return m_queuedBytes < kMaxQueuedBytes; });
     m_queuedBytes += command.bytes.size();
     m_queue.push_back(std::move(command));
+    const uint64_t index = m_pushed++;
     m_queuedCommands.store(m_queue.size(), std::memory_order_release);
     const bool wake = m_workerSleeping;
     lock.unlock();
     if (wake)
         m_queueReady.notify_one();
+    return index;
 }
 
 void GS::workerLoop()
@@ -460,6 +541,7 @@ void GS::workerLoop()
             }
             command = std::move(m_queue.front());
             m_queue.pop_front();
+            ++m_popped;
             m_queuedCommands.store(m_queue.size(), std::memory_order_release);
             m_workerBusy = true;
         }
@@ -469,7 +551,8 @@ void GS::workerLoop()
         if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow && !m_parallel)
         {
             const double now = GsRecorder::sinceProcessStart();
-            if (!recorder.started && now >= recorder.startAt && m_backend)
+            const bool due = recorder.startAt < 0.0 ? g_gsRecordRequested.load(std::memory_order_relaxed) : now >= recorder.startAt;
+            if (!recorder.started && due && m_backend)
             {
                 const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
                 // No image transfer in flight: none set up, or the last one complete (a game uploading every frame
@@ -497,6 +580,8 @@ void GS::workerLoop()
                     writeGsTraceCommand(recorder.out, static_cast<uint8_t>(command.kind), command.registers, data, size);
             }
         }
+        if (queueTraceActive())
+            traceQueuedCommand(command);
         if (m_parallel)
             processWithParallel(command);
         else
@@ -618,14 +703,116 @@ void GS::processWithParallel(const QueuedCommand &command)
     }
 }
 
+// PS2X_GS_QUEUE_TRACE=<seconds>[:<commands>]: from that time after start, the GS thread logs the commands it runs (GIF
+// packets by their first tag, A+D registers named by id, native markers), to see what draws in which order.
+namespace
+{
+    std::atomic<int> g_queueTraceLeft{-1};
+}
+
+bool GS::queueTraceActive()
+{
+    static const auto start = std::chrono::steady_clock::now();
+    static const char *env = std::getenv("PS2X_GS_QUEUE_TRACE");
+    if (!env)
+        return false;
+    int left = g_queueTraceLeft.load(std::memory_order_relaxed);
+    if (left == -1)
+    {
+        const double at = std::atof(env);
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < at)
+            return false;
+        const char *colon = std::strchr(env, ':');
+        left = colon ? std::atoi(colon + 1) : 4000;
+        g_queueTraceLeft.store(left, std::memory_order_relaxed);
+    }
+    return left > 0;
+}
+
+void GS::traceQueuedCommand(const QueuedCommand &command)
+{
+    g_queueTraceLeft.fetch_sub(1, std::memory_order_relaxed);
+    const uint8_t *data = command.bytes.data();
+    const size_t size = command.bytes.size();
+    switch (command.kind)
+    {
+    case QueuedCommand::Kind::GifPacket:
+    {
+        std::string line = "[gs-queue] gif " + std::to_string(size) + " B:";
+        size_t offset = 0;
+        for (int tags = 0; offset + 16u <= size && tags < 8; ++tags)
+        {
+            uint64_t lo = 0, hi = 0;
+            std::memcpy(&lo, data + offset, 8u);
+            std::memcpy(&hi, data + offset + 8u, 8u);
+            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
+            uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            char buffer[96];
+            if ((lo >> 46) & 1u)
+                std::snprintf(buffer, sizeof(buffer), " [prim %u ctxt %u abe %u n%u]", static_cast<unsigned>((lo >> 47) & 7u),
+                              static_cast<unsigned>((lo >> 56) & 1u), static_cast<unsigned>((lo >> 53) & 1u), nloop);
+            else
+                std::snprintf(buffer, sizeof(buffer), " [flg %u n%u]", flg, nloop);
+            line += buffer;
+            if (flg == 0u && nreg == 1u && (hi & 0xFu) == 0xEu) // A+D: the registers written
+            {
+                line += " ad";
+                for (uint32_t i = 0; i < nloop && offset + 16u + i * 16u + 16u <= size && i < 12u; ++i)
+                {
+                    uint64_t value = 0, reg = 0;
+                    std::memcpy(&value, data + offset + 16u + i * 16u, 8u);
+                    std::memcpy(&reg, data + offset + 24u + i * 16u, 8u);
+                    std::snprintf(buffer, sizeof(buffer), " %02x=%llx", static_cast<unsigned>(reg & 0xFFu),
+                                  static_cast<unsigned long long>(value));
+                    line += buffer;
+                }
+            }
+            const size_t loopBytes = flg == 0u ? nreg * 16u : flg == 1u ? nreg * 8u : 16u;
+            const size_t dataBytes = flg == 1u ? ((static_cast<size_t>(nloop) * nreg + 1u) & ~size_t{1}) * 8u : nloop * loopBytes;
+            offset += 16u + dataBytes;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        break;
+    }
+    case QueuedCommand::Kind::Call:
+        std::fprintf(stderr, "[gs-queue] call (native marker or worker task)\n");
+        break;
+    case QueuedCommand::Kind::PresentationLatch:
+        std::fprintf(stderr, "[gs-queue] presentation latch\n");
+        break;
+    default:
+        std::fprintf(stderr, "[gs-queue] command %d, %zu B\n", static_cast<int>(command.kind), size);
+        break;
+    }
+}
+
 void GS::queueNativeDraw(uint64_t group, int context)
 {
     const int index = context != 0 ? 1 : 0;
-    auto draw = [this, group, index]() {
+    // Draws every native group up to the cell's value: a marker still at the queue's tail (nothing queued after it,
+    // not taken by the GS thread yet) takes the new group instead of a second marker following it.
+    auto cell = std::make_shared<std::atomic<uint64_t>>(group);
+    static const bool s_noCoalesce = std::getenv("PS2X_NATIVE_NO_COALESCE") != nullptr; // one marker per group (A/B)
+    if (shouldQueue() && !s_noCoalesce)
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        if (m_markerGroup && m_markerIndex + 1u == m_pushed && m_popped <= m_markerIndex && m_markerContext == index)
+        {
+            m_markerGroup->store(group, std::memory_order_release);
+            return;
+        }
+    }
+    auto draw = [this, cell, index]() {
+        const uint64_t group = cell->load(std::memory_order_acquire);
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         if (!m_backend)
             return;
         GSContext context = m_ctx[index];
+        context.texaRaw = static_cast<uint64_t>(m_texa.ta0) | (m_texa.aem ? (1ull << 15) : 0ull) | (static_cast<uint64_t>(m_texa.ta1) << 32);
+        context.fogcol = static_cast<uint32_t>(m_fogR) | (static_cast<uint32_t>(m_fogG) << 8) | (static_cast<uint32_t>(m_fogB) << 16);
         if (m_parallel) // the packets go to paraLLEl-GS whole: its registers, not the front end's
         {
             uint64_t xyoffset = 0, scissor = 0;
@@ -637,6 +824,14 @@ void GS::queueNativeDraw(uint64_t group, int context)
             context.scissor.y0 = static_cast<uint16_t>((scissor >> 32) & 0x7FFu);
             context.scissor.y1 = static_cast<uint16_t>((scissor >> 48) & 0x7FFu);
         }
+        // Objects whose material is the GS state here go to this renderer as triangles under that state (textures
+        // decoded where the GS keeps them, the same blending and tests as GS primitives); the rest to the hook.
+        // (The hook's target flushes this renderer's batch: only for groups that still have batches for it.)
+        if (g_queueTraceLeft.load(std::memory_order_relaxed) > 0)
+            std::fprintf(stderr, "[gs-queue]   native group %llu ctx %d test %#llx zbuf %u\n", static_cast<unsigned long long>(group), index,
+                         static_cast<unsigned long long>(m_ctx[index].test), m_ctx[index].zbuf.zbp);
+        if (!m_parallel && !ps2x::native::Renderer::instance().takeGsContextBatches(group, &GS::submitNativeBatch, this))
+            return;
         m_backend->NativeDraw(group, context);
     };
     if (!shouldQueue())
@@ -647,7 +842,11 @@ void GS::queueNativeDraw(uint64_t group, int context)
     QueuedCommand command;
     command.kind = QueuedCommand::Kind::Call;
     command.call = std::move(draw);
-    enqueue(std::move(command));
+    const uint64_t pushedAt = enqueue(std::move(command));
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    m_markerIndex = pushedAt; // coalesces only while nothing was pushed after it
+    m_markerContext = index;
+    m_markerGroup = cell;
 }
 
 void GS::runOnWorker(std::function<void()> work)

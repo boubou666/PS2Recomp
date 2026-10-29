@@ -24,6 +24,7 @@
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
+#include "runtime/native/native_vu1_hle.h"
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
@@ -143,9 +144,15 @@ namespace ps2_stubs
 // Runtime that receives GS SIGNAL/FINISH edge notifications (see ps2NotifyGsCsrEdge).
 static std::atomic<PS2Runtime *> g_gsCsrEdgeRuntime{nullptr};
 
+void ps2GsRequestRecording(); // gs_frontend.cpp
+
 static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
+// The host texture the picture is uploaded to: room for a doubled scanout (paraLLEl's super-sampled
+// high_resolution_scanout, PS2X_GS_SSAA >= 4).
+static constexpr int FB_MAX_WIDTH = FB_WIDTH * 2;
+static constexpr int FB_MAX_HEIGHT = FB_HEIGHT * 2;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 #if defined(PLATFORM_VITA)
@@ -542,7 +549,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    static std::vector<uint8_t> s_uploadBuffer(static_cast<size_t>(FB_MAX_WIDTH) * FB_MAX_HEIGHT * 4u, 0u);
 
     s_scratch.clear();
     uint32_t overrideWidth = 0u;
@@ -587,7 +594,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(FB_MAX_WIDTH, FB_MAX_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -650,10 +657,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, FB_MAX_WIDTH);
+        const uint32_t copyHeight = std::min<uint32_t>(height, FB_MAX_HEIGHT);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(FB_MAX_WIDTH) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -692,8 +699,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             s_nextCapture += s_captureInterval;
             Image image{};
             image.data = s_uploadBuffer.data();
-            image.width = FB_WIDTH;
-            image.height = static_cast<int>(std::min<uint32_t>(height, FB_HEIGHT));
+            image.width = FB_MAX_WIDTH;
+            image.height = static_cast<int>(std::min<uint32_t>(height, FB_MAX_HEIGHT));
             image.mipmaps = 1;
             image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             char path[1024];
@@ -1363,6 +1370,29 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled = (vu0Fbrst & (1u << 11)) != 0u;
                                      g_vu1MscalCount.fetch_add(1u, std::memory_order_relaxed);
                                      g_gsDumpVu1ProgramPc.store(startPC, std::memory_order_relaxed);
+                                     // The port's native version of this microprogram, if it has one (VU1 then does
+                                     // not run): runtime/native/native_vu1_hle.h.
+                                     if (const ps2x::native::Vu1Hle hle = ps2x::native::vu1Hle())
+                                     {
+                                         ps2x::native::Vu1HleRun run;
+                                         run.code = m_memory.getVU1Code();
+                                         run.data = m_memory.getVU1Data();
+                                         run.state = &m_vu1.state();
+                                         run.startPc = startPC;
+                                         run.top = top;
+                                         run.itop = itop;
+                                         run.user = &m_memory;
+                                         run.kick = [](void *user, const uint8_t *packet, uint32_t bytes)
+                                         { static_cast<PS2Memory *>(user)->submitGifPacket(GifPathId::Path1, packet, bytes); };
+                                         run.nativeUser = &m_gs;
+                                         run.nativeDraw = [](void *user, uint64_t group, int context)
+                                         { static_cast<GS *>(user)->queueNativeDraw(group, context); };
+                                         if (hle(run))
+                                         {
+                                             g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
+                                             return;
+                                         }
+                                     }
                                      const uint64_t cyclesBefore = m_vu1.state().cycles;
                                      Vu1Recorder::instance().run(m_vu1, m_memory, false, startPC, top, itop, kVu1ProgramCycleLimit, [&]
                                                                  { m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
@@ -2367,7 +2397,10 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
-    for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+    const std::vector<uint32_t> causes = m_memory.consumeCompletedDmacCauses();
+    if (const auto gifEnds = std::count(causes.begin(), causes.end(), 2u))
+        m_memory.noteGifEvent('C', static_cast<uint32_t>(gifEnds), 0u);
+    for (uint32_t cause : causes)
     {
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
     }
@@ -3460,9 +3493,15 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+    Image blank = GenImageColor(FB_MAX_WIDTH, FB_MAX_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    // The picture is scaled to the window bilinearly (raylib's default is nearest, which draws each PS2 pixel as a
+    // block and the text with stairs); PS2X_PRESENT_FILTER=point keeps nearest.
+    {
+        const char *filter = std::getenv("PS2X_PRESENT_FILTER");
+        SetTextureFilter(frameTex, filter && std::strcmp(filter, "point") == 0 ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -3556,6 +3595,8 @@ void PS2Runtime::run()
         }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        if (IsKeyPressed(KEY_F10)) // F10: start the GS recording (PS2X_GS_RECORD with PS2X_GS_RECORD_AT=key)
+            ps2GsRequestRecording();
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();
