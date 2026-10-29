@@ -1482,6 +1482,14 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         request.vsyncTick = displayRegisters->vsyncTick;
         request.smode1 = displayRegisters->smode1;
     }
+    if (m_presentNewest && m_newestDisplayFbp != ~0u)
+    {
+        const auto newest = [this](uint64_t dispfb) { return (dispfb & ~0x1FFull) | m_newestDisplayFbp; };
+        if ((request.pmode & 0x2u) != 0u)
+            request.dispfb2 = newest(request.dispfb2);
+        else if ((request.pmode & 0x1u) != 0u)
+            request.dispfb1 = newest(request.dispfb1);
+    }
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         if (request.dispfb1 != m_lastLatchedDispfb1 || request.dispfb2 != m_lastLatchedDispfb2)
@@ -2796,6 +2804,12 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
+    if (m_presentNewest && m_privRegs)
+    {
+        const uint64_t dispfb = (m_privRegs->pmode & 0x2u) != 0u ? m_privRegs->dispfb2 : m_privRegs->dispfb1;
+        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u))
+            m_newestDisplayFbp = ctx.frame.fbp;
+    }
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
         m_hasPreferredDisplaySource = false;
     if (state.prim.type != GS_PRIM_SPRITE || batch.vertexCount < 2u)
