@@ -1196,6 +1196,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     const GSContext &context = state.context;
     GLuint texture = 0;
     bool fromTarget = false;
+    uint32_t drawnWidth = 0, drawnHeight = 0; // a render target sampled directly: the texels it drew
     // PS2X_GS_NATIVE_LOG: each distinct texture read that overlaps a render target's pages, as (render target, texture
     // format and base, offset in pages): what still falls back to the texture cache, which has no drawn pixels.
     if (static const bool logOverlaps = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logOverlaps)
@@ -1221,6 +1222,8 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     {
         fromTarget = true;
         texture = m_depthTexture;
+        drawnWidth = static_cast<uint32_t>(width);
+        drawnHeight = static_cast<uint32_t>(height);
     }
     else if (colorFormat(context.tex0.psm))
     {
@@ -1247,6 +1250,8 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
                              source->fbp == target.fbp ? 1 : 0);
             }
             fromTarget = true;
+            drawnWidth = source->width;
+            drawnHeight = std::max(source->usedHeight, 1u);
             width = static_cast<float>(source->width);
             height = static_cast<float>(source->height);
             texture = source->color;
@@ -1344,12 +1349,16 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     if (fromTarget)
     {
         const uint64_t clamp = context.clamp;
-        const int maxU = (1 << std::min<uint32_t>(context.tex0.tw, 10u)) - 1;
-        const int maxV = (1 << std::min<uint32_t>(context.tex0.th, 10u)) - 1;
+        // Clamping stops at the last texel the target drew: past it the GS reads the memory after the buffer
+        // (another buffer, nearly the same picture), the GL texture rows nobody drew (VP2 copies its 512x480 scene
+        // with v up to 480: bilinear's second texel drew a coloured line along the bottom and right edges).
+        const int lastU = static_cast<int>(drawnWidth) - 1, lastV = static_cast<int>(drawnHeight) - 1;
+        const int maxU = std::min((1 << std::min<uint32_t>(context.tex0.tw, 10u)) - 1, lastU);
+        const int maxV = std::min((1 << std::min<uint32_t>(context.tex0.th, 10u)) - 1, lastV);
         glUniform4i(m_uniforms.wrapU, static_cast<int>(clamp & 0x3u), maxU, static_cast<int>(clamp >> 4 & 0x3FFu),
-                    static_cast<int>(clamp >> 14 & 0x3FFu));
+                    std::min(static_cast<int>(clamp >> 14 & 0x3FFu), lastU));
         glUniform4i(m_uniforms.wrapV, static_cast<int>(clamp >> 2 & 0x3u), maxV, static_cast<int>(clamp >> 24 & 0x3FFu),
-                    static_cast<int>(clamp >> 34 & 0x3FFu));
+                    std::min(static_cast<int>(clamp >> 34 & 0x3FFu), lastV));
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
