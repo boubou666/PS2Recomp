@@ -172,9 +172,9 @@ void main()
         else if (uTfx == 1)
             c = vec4(t.rgb, uTcc != 0 ? t.a : vc.a);
         else if (uTfx == 2)
-            c = vec4(t.rgb * vc.rgb + vc.a, uTcc != 0 ? t.a + vc.a : vc.a);
+            c = vec4(t.rgb * vc.rgb + vColor.a, uTcc != 0 ? t.a + vc.a : vc.a);
         else
-            c = vec4(t.rgb * vc.rgb + vc.a, uTcc != 0 ? t.a : vc.a);
+            c = vec4(t.rgb * vc.rgb + vColor.a, uTcc != 0 ? t.a : vc.a);
     }
     if (uFog != 0)
         c.rgb = mix(uFogColor, c.rgb, vFog);
