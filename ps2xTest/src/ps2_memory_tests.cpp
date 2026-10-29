@@ -2374,16 +2374,19 @@ void register_ps2_memory_tests()
             mem.setVif1Threaded(true);
 
             static std::vector<size_t> s_pieces;
-            static std::atomic<int> s_offThread{0}, s_piecesAtGate{-1}, s_jobsAfter{0};
+            static std::atomic<int> s_offThread{0}, s_piecesAtGate{-1}, s_jobsAfter{0}, s_vu1Unpacked{0};
             static PS2Memory *s_mem = nullptr;
             s_pieces.clear();
-            s_offThread = 0, s_piecesAtGate = -1, s_jobsAfter = 0;
+            s_offThread = 0, s_piecesAtGate = -1, s_jobsAfter = 0, s_vu1Unpacked = 0;
             s_mem = &mem;
             ps2x::native::setVif1Observer(
                 [](const uint8_t *, size_t bytes)
                 {
                     s_pieces.push_back(bytes);
                     s_offThread += s_mem->onVif1Worker() ? 1 : 0;
+                    const ps2x::native::Vu1Memory vu1 = ps2x::native::vu1Memory();
+                    if (s_pieces.size() == 1u && vu1.data == s_mem->getVU1Data() && vu1.code == s_mem->getVU1Code())
+                        s_vu1Unpacked = vu1.data[0] == 1u && vu1.data[16] == 0u ? 1 : 0;
                 },
                 true);
             ps2x::native::setVu1Gate([](const uint8_t *, uint32_t)
@@ -2413,6 +2416,8 @@ void register_ps2_memory_tests()
             }
             t.Equals(s_piecesAtGate.load(), 1, "the gate is asked once the observer has the MSCAL");
             t.Equals(s_offThread.load(), 2, "on the VIF1 thread");
+            t.Equals(s_vu1Unpacked.load(), 1, "with VU1's memory as VIF1 left it at the MSCAL");
+            t.IsTrue(ps2x::native::vu1Memory().data == nullptr, "VU1's memory only handed out while observed");
             t.Equals(s_jobsAfter.load(), 1, "a job run on the VIF1 thread comes after the transfer");
             ps2x::native::setVu1Gate(nullptr);
             ps2x::native::setVif1Observer(nullptr);
