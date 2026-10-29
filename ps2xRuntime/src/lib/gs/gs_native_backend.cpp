@@ -2067,6 +2067,16 @@ void GSNativeBackend::flushBatch()
     // Shared memory: the pages the batch draws over, and those of a target it samples directly, first get what was
     // written there since (other targets, transfers), through GS memory. A read in another format resolves into GS
     // memory in bindTexture.
+    if (const char *probeTbp = std::getenv("PS2X_GS_NATIVE_PROBE_TBP");
+        probeTbp && !m_fillingFromMemory && std::strtoul(probeTbp, nullptr, 10) == context.tex0.tbp0 && state.prim.type == GS_PRIM_SPRITE)
+        if (auto s = m_targets.find(context.tex0.tbp0 / 32u); s != m_targets.end())
+        {
+            uint8_t texel[4] = {};
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, s->second.framebuffer);
+            glReadPixels(2, 9, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+            std::fprintf(stderr, "[gs:probe] source at flush start: fbp=%u psm=0x%x (2,9)=%u,%u,%u,%u into fbp=%u\n", s->second.fbp,
+                         s->second.psm, texel[0], texel[1], texel[2], texel[3], target.fbp);
+        }
     std::vector<uint32_t> drawnPages, depthPages;
     RenderTarget *depthTarget = nullptr;
     if (!m_fillingFromMemory)
