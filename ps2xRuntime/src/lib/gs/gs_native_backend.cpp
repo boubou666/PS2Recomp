@@ -310,6 +310,22 @@ void main()
 }
 )";
 
+    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment.
+    constexpr const char *kDepthFromColorFragmentShader = R"(#version 330 core
+uniform sampler2D uColor;
+uniform int uSixteen;
+uniform uint uZMask;
+uniform float uZScale;
+void main()
+{
+    ivec2 p = min(ivec2(gl_FragCoord.xy), textureSize(uColor, 0) - 1);
+    uvec4 c = uvec4(round(texelFetch(uColor, p, 0) * 255.0));
+    uint z = uSixteen != 0 ? (c.r >> 3u) | (c.g >> 3u) << 5u | (c.b >> 3u) << 10u | (c.a >> 7u) << 15u
+                           : c.r | c.g << 8u | c.b << 16u | c.a << 24u;
+    gl_FragDepth = clamp(float(z & uZMask) * uZScale, 0.0, 1.0);
+}
+)";
+
     // GL state a helper changes while flushBatch has the draw set up (a resolve or the GPU copy's set-up from inside
     // bindTexture): saved on construction, put back on destruction.
     struct GlStateRestore
@@ -967,6 +983,76 @@ void GSNativeBackend::ensureVram()
         glDeleteProgram(m_resolveProgram);
         m_resolveProgram = 0;
     }
+}
+
+GSNativeBackend::RenderTarget *GSNativeBackend::depthOwner(const RenderTarget &target, const GSZbufReg &zbuf)
+{
+    RenderTarget *owner = nullptr;
+    for (auto &[fbp, other] : m_targets)
+        if (&other != &target && other.zbp == zbuf.zbp && other.width == target.width && other.height == target.height &&
+            (!owner || other.lastDraw > owner->lastDraw))
+            owner = &other;
+    return owner;
+}
+
+bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZbufReg &zbuf)
+{
+    const auto it = m_targets.find(zbuf.zbp);
+    if (it == m_targets.end() || &it->second == &target || !colorFormat(it->second.psm))
+        return false;
+    const RenderTarget &source = it->second;
+    if (!m_depthFromColorProgram)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kDepthFromColorFragmentShader);
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glLinkProgram(program);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE)
+        {
+            glDeleteProgram(program);
+            return false;
+        }
+        m_depthFromColorProgram = program;
+    }
+    const uint32_t width = target.width * m_scale, height = target.height * m_scale;
+    if (!m_borrowedDepth || m_borrowedDepthWidth != width || m_borrowedDepthHeight != height)
+    {
+        if (!m_borrowedDepth)
+            glGenTextures(1, &m_borrowedDepth);
+        glBindTexture(GL_TEXTURE_2D, m_borrowedDepth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width, height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        m_borrowedDepthWidth = width;
+        m_borrowedDepthHeight = height;
+    }
+    GlStateRestore restore;
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_borrowedDepth, 0);
+    glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_TRUE);
+    glUseProgram(m_depthFromColorProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source.color);
+    const uint32_t zMask = (zbuf.psm & 0x0Fu) == 0x0u ? 0xFFFFFFFFu : (zbuf.psm & 0x0Fu) == 0x1u ? 0xFFFFFFu : 0xFFFFu;
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColor"), 0);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), (source.psm & 0x2u) != 0u ? 1 : 0);
+    glUniform1ui(glGetUniformLocation(m_depthFromColorProgram, "uZMask"), zMask);
+    glUniform1f(glGetUniformLocation(m_depthFromColorProgram, "uZScale"), static_cast<float>(depthScale(zbuf.psm)));
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    return true;
 }
 
 void GSNativeBackend::syncVramToGpu()
@@ -1688,13 +1774,26 @@ void GSNativeBackend::flushBatch()
     const bool offDepth = s_off && std::strstr(s_off, "depth"), offAlpha = s_off && std::strstr(s_off, "alpha");
     const bool offBlend = s_off && std::strstr(s_off, "blend"), offColor = s_off && std::strstr(s_off, "color");
     const bool depthTest = !offDepth && (context.test >> 16 & 0x1u) != 0u;
+    bool borrowedDepth = false;
     if (depthTest)
     {
+        // A Z buffer another target drew (shadow volumes into their own buffer against the scene's depth), or another
+        // target's colour (a shadow mask then tested as Z, read only).
+        if (context.zbuf.zbp != target.zbp && !m_fillingFromMemory)
+        {
+            if (RenderTarget *owner = depthOwner(target, context.zbuf))
+            {
+                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, owner->depth, 0);
+                borrowedDepth = true;
+            }
+            else if (context.zbuf.zmask)
+                borrowedDepth = depthFromColorTarget(target, context.zbuf);
+        }
         static constexpr GLenum kDepthFunc[4] = {GL_NEVER, GL_ALWAYS, GL_GEQUAL, GL_GREATER};
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(kDepthFunc[context.test >> 17 & 0x3u]);
         glDepthMask(context.zbuf.zmask ? GL_FALSE : GL_TRUE);
-        if (!context.zbuf.zmask)
+        if (!context.zbuf.zmask && !borrowedDepth)
         {
             target.zbp = context.zbuf.zbp;
             target.zpsm = context.zbuf.psm;
@@ -1838,6 +1937,8 @@ void GSNativeBackend::flushBatch()
         glDepthMask(depthWrites ? GL_TRUE : GL_FALSE);
         glColorMask(r, g, b, a);
     }
+    if (borrowedDepth)
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, target.depth, 0);
     // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
     if (static const char *probe = std::getenv("PS2X_GS_NATIVE_PROBE");
         probe && std::strtoul(probe, nullptr, 10) == target.fbp)
