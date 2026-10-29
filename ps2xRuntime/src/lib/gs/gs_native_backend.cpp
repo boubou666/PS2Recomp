@@ -31,6 +31,7 @@ layout(location = 3) in float aFog;
 uniform vec2 uTargetSize;
 out vec4 vColor;
 noperspective out vec3 vTex;
+noperspective out float vDepth;
 out float vFog;
 void main()
 {
@@ -38,6 +39,7 @@ void main()
     gl_Position = vec4(aPosition.xy / uTargetSize * 2.0 - 1.0, aPosition.z * 2.0 - 1.0, 1.0);
     vColor = aColor;
     vTex = aTex;
+    vDepth = aPosition.z;
     vFog = aFog;
 }
 )";
@@ -47,6 +49,7 @@ void main()
     constexpr const char *kFragmentShader = R"(#version 330 core
 in vec4 vColor;
 noperspective in vec3 vTex;
+noperspective in float vDepth;
 in float vFog;
 layout(location = 0, index = 0) out vec4 outColor;
 layout(location = 0, index = 1) out vec4 outFactor;
@@ -144,6 +147,9 @@ vec4 gsSample(vec2 t)
 
 void main()
 {
+    // The depth itself, not gl_Position.z: z * 2 - 1 next to -1 has float steps of ~1e-7, so the small Z a game
+    // tests with GREATER (Jade Cocoon 2: a movie sprite at Z 1 over a clear at Z 0, Z32) fell on the clear's depth.
+    gl_FragDepth = vDepth;
     vec4 vc = vColor * (255.0 / 128.0);
     vec4 c = vc;
     if (uTextured != 0)
