@@ -1844,6 +1844,20 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
             height = static_cast<float>(source->height);
             texture = source->color;
             m_lastSourceFramebuffer = source->framebuffer;
+            if (const char *probeTbp = std::getenv("PS2X_GS_NATIVE_PROBE_TBP");
+                probeTbp && std::strtoul(probeTbp, nullptr, 10) == context.tex0.tbp0 && state.prim.type == GS_PRIM_SPRITE)
+            {
+                GLint drawFb = 0;
+                glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFb);
+                uint8_t texel[4] = {};
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
+                glReadPixels(2, 9, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+                std::fprintf(stderr, "[gs:probe] source before draw: fbp=%u psm=0x%x fbw=%u (2,9)=%u,%u,%u,%u page400 v%llu/%llu\n",
+                             source->fbp, source->psm, source->fbw, texel[0], texel[1], texel[2], texel[3],
+                             static_cast<unsigned long long>(source->pages.empty() ? 0 : source->pages[0]),
+                             static_cast<unsigned long long>(m_pageVersion[source->fbp]));
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFb));
+            }
             if (source->fbp == target.fbp && !std::getenv("PS2X_GS_NATIVE_NOFEEDBACKCOPY"))
             {
                 const uint32_t feedbackWidth = source->width * m_scale, feedbackHeight = source->height * m_scale;
