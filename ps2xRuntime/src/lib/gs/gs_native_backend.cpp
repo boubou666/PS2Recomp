@@ -2305,7 +2305,7 @@ void GSNativeBackend::flushBatch()
     // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
     if (static const char *probe = std::getenv("PS2X_GS_NATIVE_PROBE");
         probe && std::strtoul(probe, nullptr, 10) == target.fbp &&
-        (!std::getenv("PS2X_GS_NATIVE_PROBE_TBP") || std::strtoul(std::getenv("PS2X_GS_NATIVE_PROBE_TBP"), nullptr, 10) == context.tex0.tbp0))
+        (!std::getenv("PS2X_GS_NATIVE_PROBE_TBP") || (state.prim.type == GS_PRIM_SPRITE && std::strtoul(std::getenv("PS2X_GS_NATIVE_PROBE_TBP"), nullptr, 10) == context.tex0.tbp0)))
     {
         static uint32_t s_probes = 0;
         if (s_probes++ < 60u)
