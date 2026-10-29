@@ -562,6 +562,7 @@ bool GSNativeBackend::ensureContext(bool create)
 
 GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &frame)
 {
+    uint32_t refillRows = 0; // a target replacing another at the same address: the rows that one held
     auto it = m_targets.find(frame.fbp);
     if (it != m_targets.end())
     {
@@ -580,6 +581,7 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
         }
         if (existing.dirty && existing.usedHeight != 0u)
             resolveTarget(existing);
+        refillRows = existing.usedHeight;
         glDeleteFramebuffers(1, &existing.framebuffer);
         glDeleteTextures(1, &existing.color);
         glDeleteTextures(1, &existing.depth);
@@ -611,7 +613,56 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    return m_targets.emplace(frame.fbp, target).first->second;
+    RenderTarget &created = m_targets.emplace(frame.fbp, target).first->second;
+    if (refillRows != 0u)
+        fillTargetFromMemory(frame, std::min(refillRows, created.height));
+    return created;
+}
+
+void GSNativeBackend::fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows)
+{
+    // The same memory read in its new format, as the GS would see it: a game alternating one buffer between CT16 and
+    // CT32 (VP2's blur levels) reads back rows it did not redraw since. Runs inside flushBatch (its renderTarget call):
+    // the pending batch is set aside, this one goes through the same path, sampling GS memory, not the new target.
+    std::vector<Vertex> pending;
+    pending.swap(m_batch);
+    const GSDrawState pendingState = m_batchState;
+    const float pendingMaxY = m_batchMaxY;
+    const uint32_t width = std::clamp<uint32_t>(frame.fbw * 64u, 64u, kMaxTargetWidth);
+    GSPrimitiveBatch fill{};
+    GSContext &context = fill.state.context;
+    context.frame = frame;
+    context.frame.fbmsk = 0u;
+    context.scissor.x1 = static_cast<uint16_t>(width - 1u);
+    context.scissor.y1 = static_cast<uint16_t>(rows - 1u);
+    context.tex0.tbp0 = frame.fbp * 32u;
+    context.tex0.tbw = static_cast<uint8_t>(frame.fbw);
+    context.tex0.psm = frame.psm;
+    const auto log2Ceil = [](uint32_t n) { uint8_t b = 0; while ((1u << b) < n && b < 10u) ++b; return b; };
+    context.tex0.tw = log2Ceil(width);
+    context.tex0.th = log2Ceil(rows);
+    context.tex0.tcc = 1u;
+    context.tex0.tfx = 1u; // decal
+    context.clamp = 0x5u;  // clamp, nearest (TEX1 0)
+    fill.state.prim.type = GS_PRIM_SPRITE;
+    fill.state.prim.tme = true;
+    fill.state.prim.fst = true;
+    fill.state.texa.ta0 = 0x80u;
+    fill.state.texa.ta1 = 0x80u;
+    fill.vertexCount = 2u;
+    fill.vertices[1].x = static_cast<float>(width);
+    fill.vertices[1].y = static_cast<float>(rows);
+    fill.vertices[1].u = static_cast<uint16_t>(std::min<uint32_t>(width * 16u, 0xFFFFu));
+    fill.vertices[1].v = static_cast<uint16_t>(std::min<uint32_t>(rows * 16u, 0xFFFFu));
+    fill.vertices[1].r = fill.vertices[1].g = fill.vertices[1].b = fill.vertices[1].a = 0x80u;
+    m_batchMaxY = 0.0f;
+    m_fillingFromMemory = true;
+    appendPrimitive(fill);
+    flushBatch();
+    m_fillingFromMemory = false;
+    m_batch.swap(pending);
+    m_batchState = pendingState;
+    m_batchMaxY = pendingMaxY;
 }
 
 GSNativeBackend::RenderTarget *GSNativeBackend::renderTargetAtBlock(uint32_t block)
@@ -1229,7 +1280,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     {
         // Only a read in the target's own layout samples it directly (CT24 reads CT32 pixels as they are); another
         // format (a CT32 buffer read as CT16 to split its channels) sees GS memory, through resolveTargetsUnder.
-        RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0);
+        RenderTarget *source = m_fillingFromMemory ? nullptr : renderTargetAtBlock(context.tex0.tbp0);
         const auto sameLayout = [](uint32_t a, uint32_t b) { return a == b || ((a | b) & ~0x1u) == 0u; };
         if (source && !sameLayout(source->psm, context.tex0.psm))
             source = nullptr;

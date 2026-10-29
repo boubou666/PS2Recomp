@@ -120,6 +120,8 @@ private:
     void flushBatch();
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
+    // A target that replaces another at the same address (another format or width) starts with what GS memory holds.
+    void fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows);
     // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
@@ -203,6 +205,7 @@ private:
 
     // The batch being collected: draws whose state draws the same way (sameDrawState).
     std::vector<Vertex> m_batch;
+    bool m_fillingFromMemory = false; // fillTargetFromMemory's draw: textures from GS memory, never a target
     float m_batchMaxY = 0.0f; // the batch's lowest row, for its render target's usedHeight
     GSDrawState m_batchState{};
 };
