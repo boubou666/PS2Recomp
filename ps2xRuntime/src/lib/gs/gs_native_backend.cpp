@@ -1848,7 +1848,7 @@ void GSNativeBackend::flushBatch()
                          "[gs:draw] #%llu fbp=%u psm=0x%x fbmsk=0x%x prim=%d tme=%d textured=%d tex0 psm=0x%x tbp=%u tbw=%u "
                          "tw=%u th=%u tfx=%u tcc=%u cbp=%u abe=%d alpha=0x%llx test=0x%llx fst=%d verts=%zu "
                          "v0=(%.1f,%.1f z=%.6f rgba=%u,%u,%u,%u st=%.1f,%.1f,%.2f) zbuf=%u/0x%x/%d ctxt=%d iip=%d "
-                         "scissor=%u-%u,%u-%u\n",
+                         "scissor=%u-%u,%u-%u colclamp=%d\n",
                          static_cast<unsigned long long>(index), context.frame.fbp, context.frame.psm,
                          context.frame.fbmsk, static_cast<int>(state.prim.type), state.prim.tme ? 1 : 0,
                          textured ? 1 : 0, context.tex0.psm, context.tex0.tbp0, context.tex0.tbw, context.tex0.tw,
@@ -1857,7 +1857,8 @@ void GSNativeBackend::flushBatch()
                          state.prim.fst ? 1 : 0, m_batch.size(), m_batch[0].x, m_batch[0].y, m_batch[0].z, m_batch[0].r,
                          m_batch[0].g, m_batch[0].b, m_batch[0].a, m_batch[0].s, m_batch[0].t, m_batch[0].q,
                          context.zbuf.zbp, context.zbuf.psm, context.zbuf.zmask ? 1 : 0, state.prim.ctxt ? 1 : 0,
-                         state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1);
+                         state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1,
+                         static_cast<int>(state.colclamp & 0x1u));
     }
     glUniform1i(m_uniforms.textured, textured ? 1 : 0);
     glUniform1f(m_uniforms.sampleShift,
