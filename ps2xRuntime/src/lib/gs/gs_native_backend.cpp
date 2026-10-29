@@ -150,7 +150,7 @@ vec4 gsSample(vec2 t)
 void main()
 {
     vec4 vc = vColor * (255.0 / 128.0);
-    vec4 c = vc;
+    vec4 c = uTextured != 0 ? vc : vec4(vColor.rgb, vc.a);
     if (uTextured != 0)
     {
         vec2 tc = vTex.xy / vTex.z;
