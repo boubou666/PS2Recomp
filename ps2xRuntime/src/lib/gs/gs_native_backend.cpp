@@ -560,6 +560,16 @@ bool GSNativeBackend::ensureContext(bool create)
     return true;
 }
 
+namespace
+{
+    // PS2X_GS_NATIVE_NOCOHERENCE=1: no reload of targets from GS memory (format changes, overlapping targets).
+    bool coherenceOff()
+    {
+        static const bool off = std::getenv("PS2X_GS_NATIVE_NOCOHERENCE") != nullptr;
+        return off;
+    }
+}
+
 GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &frame)
 {
     uint32_t refillRows = 0; // a target replacing another at the same address: the rows that one held
@@ -614,7 +624,7 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     RenderTarget &created = m_targets.emplace(frame.fbp, target).first->second;
-    if (refillRows != 0u)
+    if (refillRows != 0u && !coherenceOff())
         fillTargetFromMemory(frame, std::min(refillRows, created.height));
     return created;
 }
@@ -638,9 +648,10 @@ void GSNativeBackend::resolveInDrawOrder(std::vector<RenderTarget *> &targets)
             resolveTarget(*target);
 }
 
+
 void GSNativeBackend::ensureCoherent(RenderTarget &target)
 {
-    if (m_fillingFromMemory || target.usedHeight == 0u)
+    if (m_fillingFromMemory || target.usedHeight == 0u || coherenceOff())
         return;
     const auto [begin, end] = targetBlocks(target.fbp, target.fbw, target.psm, target.usedHeight);
     std::vector<RenderTarget *> overlapping;
