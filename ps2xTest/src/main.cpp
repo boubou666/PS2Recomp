@@ -15,6 +15,7 @@ void register_ps2_vu_tests();
 void register_ps2_gs_tests();
 void register_native_texture_cache_tests();
 void register_ps2_iop_tests();
+void register_ps2_iop_spu2_tests();
 void register_ps2_sif_rpc_tests();
 void register_ps2_sif_dma_tests();
 void register_ps2_recompiler_tests();
@@ -41,6 +42,7 @@ int main()
     register_ps2_gs_tests();
     register_native_texture_cache_tests();
     register_ps2_iop_tests();
+    register_ps2_iop_spu2_tests();
     register_ps2_sif_rpc_tests();
     register_ps2_sif_dma_tests();
     register_ps2_recompiler_tests();
