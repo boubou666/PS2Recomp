@@ -35,8 +35,10 @@ noperspective out float vDepth;
 out float vFog;
 void main()
 {
-    // GS pixel coordinates: row 0 at the bottom of the GL texture, so a read back starts at GS row 0.
-    gl_Position = vec4(aPosition.xy / uTargetSize * 2.0 - 1.0, aPosition.z * 2.0 - 1.0, 1.0);
+    // GS pixel coordinates: row 0 at the bottom of the GL texture, so a read back starts at GS row 0. The GS samples
+    // a pixel at its integer coordinates, GL at its centre: half a pixel to the right and down, less 1/64 so that no
+    // edge on the GS's 1/16 grid falls exactly on a pixel centre.
+    gl_Position = vec4((aPosition.xy + 31.0 / 64.0) / uTargetSize * 2.0 - 1.0, aPosition.z * 2.0 - 1.0, 1.0);
     vColor = aColor;
     vTex = aTex;
     vDepth = aPosition.z;
@@ -56,6 +58,7 @@ layout(location = 0, index = 1) out vec4 outFactor;
 uniform sampler2D uSampler;
 uniform vec2 uTexSize;
 uniform float uTexAlphaScale;
+uniform float uSampleShift;
 uniform int uTextured;
 uniform int uTfx;
 uniform int uTcc;
@@ -65,7 +68,7 @@ uniform int uAlphaTest;
 uniform float uAlphaRef;
 uniform int uAlphaFail; // 1: the AFAIL pass, which draws the pixels that fail the alpha test
 uniform int uBlendOut;
-uniform sampler2D uDest; // a copy of the render target, for the destination alpha test
+uniform sampler2D uDest; // a copy of the render target: the destination alpha test, the blend's Ad
 uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
 uniform int uAlphaKeep;  // FBMSK's alpha bits when it keeps only some: those come from uDest
 uniform int uBlendFactor;
@@ -157,6 +160,7 @@ void main()
     if (uTextured != 0)
     {
         vec2 tc = vTex.xy / vTex.z;
+        tc -= (dFdx(tc) + dFdy(tc)) * uSampleShift;
         if (uDecode == 0 && uTargetWrap != 0)
         {
             // A render target sampled directly: the GS's CLAMP modes over 2^TW x 2^TH texels (or the region), not
@@ -175,9 +179,9 @@ void main()
         else if (uTfx == 1)
             c = vec4(t.rgb, uTcc != 0 ? t.a : vc.a);
         else if (uTfx == 2)
-            c = vec4(t.rgb * vc.rgb + vc.a, uTcc != 0 ? t.a + vc.a : vc.a);
+            c = vec4(t.rgb * vc.rgb + vColor.a, uTcc != 0 ? t.a + vc.a : vc.a);
         else
-            c = vec4(t.rgb * vc.rgb + vc.a, uTcc != 0 ? t.a : vc.a);
+            c = vec4(t.rgb * vc.rgb + vColor.a, uTcc != 0 ? t.a : vc.a);
     }
     if (uFog != 0)
         c.rgb = mix(uFogColor, c.rgb, vFog);
@@ -200,9 +204,11 @@ void main()
         if (set != (uDate == 2))
             discard;
     }
-    // The GS blend's C: the source alpha or FIX (0x80 is 1.0). Blends that fixed-function GL cannot express take
-    // part of the work here: the factor as colour (Cd * (1 + C) through DST_COLOR, ONE), or Cs * (1 + C).
-    float factor = uBlendFactor == 2 ? uBlendFix : clamp(c.a, 0.0, 2.0);
+    // The GS blend's C: the source alpha, the destination's or FIX (0x80 is 1.0). Blends that fixed-function GL cannot
+    // express take part of the work here: the factor as colour (Cd * (1 + C) through DST_COLOR, ONE), or Cs * (1 + C).
+    float factor = uBlendFactor == 2 ? uBlendFix
+                 : uBlendFactor == 1 ? texelFetch(uDest, ivec2(gl_FragCoord.xy), 0).a * (255.0 / 128.0)
+                                     : clamp(c.a, 0.0, 2.0);
     vec3 rgb = c.rgb;
     if (uBlendOut == 1)
         rgb = vec3(factor);
@@ -315,6 +321,22 @@ void main()
     if (p0.y >= uUsedHeight && p1.y >= uUsedHeight)
         discard;
     outWord = pack16(bytes(p0)) | (pack16(bytes(p1)) << 16u);
+}
+)";
+
+    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment.
+    constexpr const char *kDepthFromColorFragmentShader = R"(#version 330 core
+uniform sampler2D uColor;
+uniform int uSixteen;
+uniform uint uZMask;
+uniform float uZScale;
+void main()
+{
+    ivec2 p = min(ivec2(gl_FragCoord.xy), textureSize(uColor, 0) - 1);
+    uvec4 c = uvec4(round(texelFetch(uColor, p, 0) * 255.0));
+    uint z = uSixteen != 0 ? (c.r >> 3u) | (c.g >> 3u) << 5u | (c.b >> 3u) << 10u | (c.a >> 7u) << 15u
+                           : c.r | c.g << 8u | c.b << 16u | c.a << 24u;
+    gl_FragDepth = clamp(float(z & uZMask) * uZScale, 0.0, 1.0);
 }
 )";
 
@@ -471,6 +493,15 @@ void main()
                static_cast<uint64_t>(texa.ta1) << 32;
     }
 
+    // A CT24 target has no alpha: the GS blends with Ad as 0x80 there, which is FIX 0x80.
+    uint64_t effectiveAlpha(const GSContext &context)
+    {
+        uint64_t alpha = context.alpha;
+        if ((alpha >> 4 & 0x3u) == 1u && context.frame.psm == 0x01u)
+            alpha = (alpha & ~(0x3ull << 4 | 0xFFull << 32)) | 2ull << 4 | 0x80ull << 32;
+        return alpha;
+    }
+
     // Everything in a draw's state that changes how it is drawn, compared to decide when a batch ends.
     bool sameDrawState(const GSDrawState &a, const GSDrawState &b)
     {
@@ -601,6 +632,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.wrapU = glGetUniformLocation(m_program, "uWrapU");
     m_uniforms.wrapV = glGetUniformLocation(m_program, "uWrapV");
     m_uniforms.linear = glGetUniformLocation(m_program, "uLinear");
+    m_uniforms.sampleShift = glGetUniformLocation(m_program, "uSampleShift");
     m_uniforms.targetWrap = glGetUniformLocation(m_program, "uTargetWrap");
 
     glGenVertexArrays(1, &m_vertexArray);
@@ -966,6 +998,76 @@ void GSNativeBackend::ensureVram()
         glDeleteProgram(m_resolveProgram);
         m_resolveProgram = 0;
     }
+}
+
+GSNativeBackend::RenderTarget *GSNativeBackend::depthOwner(const RenderTarget &target, const GSZbufReg &zbuf)
+{
+    RenderTarget *owner = nullptr;
+    for (auto &[fbp, other] : m_targets)
+        if (&other != &target && other.zbp == zbuf.zbp && other.width == target.width && other.height == target.height &&
+            (!owner || other.lastDraw > owner->lastDraw))
+            owner = &other;
+    return owner;
+}
+
+bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZbufReg &zbuf)
+{
+    const auto it = m_targets.find(zbuf.zbp);
+    if (it == m_targets.end() || &it->second == &target || !colorFormat(it->second.psm))
+        return false;
+    const RenderTarget &source = it->second;
+    if (!m_depthFromColorProgram)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kDepthFromColorFragmentShader);
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glLinkProgram(program);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE)
+        {
+            glDeleteProgram(program);
+            return false;
+        }
+        m_depthFromColorProgram = program;
+    }
+    const uint32_t width = target.width * m_scale, height = target.height * m_scale;
+    if (!m_borrowedDepth || m_borrowedDepthWidth != width || m_borrowedDepthHeight != height)
+    {
+        if (!m_borrowedDepth)
+            glGenTextures(1, &m_borrowedDepth);
+        glBindTexture(GL_TEXTURE_2D, m_borrowedDepth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width, height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        m_borrowedDepthWidth = width;
+        m_borrowedDepthHeight = height;
+    }
+    GlStateRestore restore;
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_borrowedDepth, 0);
+    glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_TRUE);
+    glUseProgram(m_depthFromColorProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source.color);
+    const uint32_t zMask = (zbuf.psm & 0x0Fu) == 0x0u ? 0xFFFFFFFFu : (zbuf.psm & 0x0Fu) == 0x1u ? 0xFFFFFFu : 0xFFFFu;
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColor"), 0);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), (source.psm & 0x2u) != 0u ? 1 : 0);
+    glUniform1ui(glGetUniformLocation(m_depthFromColorProgram, "uZMask"), zMask);
+    glUniform1f(glGetUniformLocation(m_depthFromColorProgram, "uZScale"), static_cast<float>(depthScale(zbuf.psm)));
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    return true;
 }
 
 void GSNativeBackend::syncVramToGpu()
@@ -1591,12 +1693,12 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
         return;
     }
     // GS blending: (A - B) * C >> 7 + D, A/B/D from Cs, Cd, 0 and C from As, Ad, FIX. Mapped onto fixed-function
-    // blending, with As as the shader's second output (dual-source) and FIX as the constant alpha.
-    const uint64_t alpha = state.context.alpha;
+    // blending, with As or Ad (0x80 is 1.0, so not GL's DST_ALPHA) as the shader's second output (dual-source) and FIX
+    // as the constant alpha.
+    const uint64_t alpha = effectiveAlpha(state.context);
     const uint32_t a = alpha & 0x3u, b = alpha >> 2 & 0x3u, c = alpha >> 4 & 0x3u, d = alpha >> 6 & 0x3u;
-    const GLenum factor = c == 0u ? GL_SRC1_ALPHA : c == 1u ? GL_DST_ALPHA : GL_CONSTANT_ALPHA;
-    const GLenum inverse = c == 0u ? GL_ONE_MINUS_SRC1_ALPHA : c == 1u ? GL_ONE_MINUS_DST_ALPHA
-                                                                       : GL_ONE_MINUS_CONSTANT_ALPHA;
+    const GLenum factor = c == 2u ? GL_CONSTANT_ALPHA : GL_SRC1_ALPHA;
+    const GLenum inverse = c == 2u ? GL_ONE_MINUS_CONSTANT_ALPHA : GL_ONE_MINUS_SRC1_ALPHA;
     if (c == 2u)
         glBlendColor(0.0f, 0.0f, 0.0f, std::min(1.0f, static_cast<float>(alpha >> 32 & 0xFFu) / 128.0f));
     enum { Cs = 0, Cd = 1, Zero = 2 };
@@ -1623,7 +1725,7 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
         equation = GL_FUNC_SUBTRACT, source = GL_ONE, destination = factor;
     else if (a == Cd && b == Zero && d == Zero)
         source = GL_ZERO, destination = factor;
-    else if (a == Cd && b == Zero && d == Cd && c != 1u)
+    else if (a == Cd && b == Zero && d == Cd)
         m_blendOut = 1, source = GL_DST_COLOR, destination = GL_ONE; // Cd * C + Cd: brightening
     else if (a == Cs && b == Zero && d == Cs)
         m_blendOut = 2, source = GL_ONE, destination = GL_ZERO; // Cs * (1 + C)
@@ -1687,13 +1789,26 @@ void GSNativeBackend::flushBatch()
     const bool offDepth = s_off && std::strstr(s_off, "depth"), offAlpha = s_off && std::strstr(s_off, "alpha");
     const bool offBlend = s_off && std::strstr(s_off, "blend"), offColor = s_off && std::strstr(s_off, "color");
     const bool depthTest = !offDepth && (context.test >> 16 & 0x1u) != 0u;
+    bool borrowedDepth = false;
     if (depthTest)
     {
+        // A Z buffer another target drew (shadow volumes into their own buffer against the scene's depth), or another
+        // target's colour (a shadow mask then tested as Z, read only).
+        if (context.zbuf.zbp != target.zbp && !m_fillingFromMemory)
+        {
+            if (RenderTarget *owner = depthOwner(target, context.zbuf))
+            {
+                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, owner->depth, 0);
+                borrowedDepth = true;
+            }
+            else if (context.zbuf.zmask)
+                borrowedDepth = depthFromColorTarget(target, context.zbuf);
+        }
         static constexpr GLenum kDepthFunc[4] = {GL_NEVER, GL_ALWAYS, GL_GEQUAL, GL_GREATER};
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(kDepthFunc[context.test >> 17 & 0x3u]);
         glDepthMask(context.zbuf.zmask ? GL_FALSE : GL_TRUE);
-        if (!context.zbuf.zmask)
+        if (!context.zbuf.zmask && !borrowedDepth)
         {
             target.zbp = context.zbuf.zbp;
             target.zpsm = context.zbuf.psm;
@@ -1718,8 +1833,9 @@ void GSNativeBackend::flushBatch()
 
     glUseProgram(m_program);
     glUniform1i(m_uniforms.blendOut, state.prim.abe ? m_blendOut : 0);
-    glUniform1i(m_uniforms.blendFactor, static_cast<int>(context.alpha >> 4 & 0x3u));
-    glUniform1f(m_uniforms.blendFix, static_cast<float>(context.alpha >> 32 & 0xFFu) / 128.0f);
+    const uint64_t alpha = effectiveAlpha(context);
+    glUniform1i(m_uniforms.blendFactor, static_cast<int>(alpha >> 4 & 0x3u));
+    glUniform1f(m_uniforms.blendFix, static_cast<float>(alpha >> 32 & 0xFFu) / 128.0f);
     glUniform2f(m_uniforms.targetSize, static_cast<float>(target.width), static_cast<float>(target.height));
     float texWidth = 1.0f, texHeight = 1.0f;
     const bool textured = state.prim.tme && bindTexture(state, target, texWidth, texHeight);
@@ -1750,6 +1866,8 @@ void GSNativeBackend::flushBatch()
                          state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1);
     }
     glUniform1i(m_uniforms.textured, textured ? 1 : 0);
+    glUniform1f(m_uniforms.sampleShift,
+                textured && (context.tex1 >> 5 & 0x1u) != 0u ? static_cast<float>(m_scale) / 64.0f : 0.0f);
     glUniform2f(m_uniforms.texSize, texWidth, texHeight);
     glUniform1i(m_uniforms.sampler, 0);
     glUniform1i(m_uniforms.tfx, context.tex0.tfx);
@@ -1790,6 +1908,7 @@ void GSNativeBackend::flushBatch()
     glUniform1f(m_uniforms.alphaRef, static_cast<float>(context.test >> 4 & 0xFFu));
     // DATE: the destination alpha's top bit (DATM picks which value passes), read from a copy of the target.
     const bool date = (context.test >> 14 & 0x1u) != 0u;
+    const bool blendReadsDest = state.prim.abe && (alpha >> 4 & 0x3u) == 1u;
     glUniform1i(m_uniforms.date, date ? ((context.test >> 15 & 0x1u) ? 2 : 1) : 0);
     // An alpha byte FBMSK keeps only partly (SCTPT2 0x7F: the top bit written, the font in the bits below kept): the
     // kept bits from a copy of the target, which such a draw never changes, so one copy serves the whole batch.
@@ -1797,7 +1916,7 @@ void GSNativeBackend::flushBatch()
     const bool partialAlpha = !keepAlpha && alphaKeep != 0u && !offColor;
     glUniform1i(m_uniforms.alphaKeep, partialAlpha ? static_cast<int>(alphaKeep) : 0);
     glUniform1i(m_uniforms.dest, 1);
-    if (date || partialAlpha)
+    if (date || partialAlpha || blendReadsDest)
     {
         const uint32_t destWidth = target.width * m_scale, destHeight = target.height * m_scale;
         if (!m_destTexture || m_destWidth != destWidth || m_destHeight != destHeight)
@@ -1838,6 +1957,8 @@ void GSNativeBackend::flushBatch()
         glDepthMask(depthWrites ? GL_TRUE : GL_FALSE);
         glColorMask(r, g, b, a);
     }
+    if (borrowedDepth)
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, target.depth, 0);
     // PS2X_GS_NATIVE_PROBE=<fbp>: after each batch into that render target, its pixel (320, 128) and the batch.
     if (static const char *probe = std::getenv("PS2X_GS_NATIVE_PROBE");
         probe && std::strtoul(probe, nullptr, 10) == target.fbp)
