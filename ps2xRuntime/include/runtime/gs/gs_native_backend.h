@@ -149,6 +149,8 @@ private:
     std::vector<uint8_t> m_gpuNewer = std::vector<uint8_t>(512u, 0u);
     bool m_anyGpuNewer = false;
     void pullGpuPages();
+    void pullGpuPages(uint32_t firstPage, uint32_t endPage); // only GS memory pages in [first, end)
+    uint32_t m_readFirstPage = 0, m_readEndPage = 0xFFFFFFFFu; // the current local-to-host transfer's source pages
     uint32_t m_swizzleTexture = 0;
     // 256-byte blocks of GS memory (m_vram, written in stream order by the transfers, CLUT writes and CPU resolves)
     // the GPU copy has not received yet.

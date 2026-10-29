@@ -923,20 +923,33 @@ void GSNativeBackend::syncVramToGpu()
 
 void GSNativeBackend::pullGpuPages()
 {
+    pullGpuPages(0u, static_cast<uint32_t>(m_gpuNewer.size()));
+}
+
+void GSNativeBackend::pullGpuPages(uint32_t firstPage, uint32_t endPage)
+{
     if (!m_anyGpuNewer || !m_vram || !m_vramFramebuffer || !ensureContext())
         return;
     const GlStateRestore restore;
-    m_anyGpuNewer = false;
     syncVramToGpu();
     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    endPage = std::min<uint32_t>(endPage, static_cast<uint32_t>(m_gpuNewer.size()));
+    bool left = false;
     for (uint32_t page = 0; page < m_gpuNewer.size(); ++page)
-        if (m_gpuNewer[page])
+    {
+        if (!m_gpuNewer[page])
+            continue;
+        if (page < firstPage || page >= endPage)
         {
-            m_gpuNewer[page] = 0u;
-            glReadPixels(0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
-                         m_vram + static_cast<size_t>(page) * 8192u);
+            left = true; // another range's reader pulls it
+            continue;
         }
+        m_gpuNewer[page] = 0u;
+        glReadPixels(0, static_cast<GLint>(page * 2u), 1024, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                     m_vram + static_cast<size_t>(page) * 8192u);
+    }
+    m_anyGpuNewer = left;
 }
 
 bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
@@ -1813,7 +1826,17 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
     // A transfer that reads GS memory on the CPU side (local to host, local to local) needs the resolved pixels
     // there; one into GS memory only replaces blocks, which reach the GPU copy by themselves.
     if (command.direction == 1u || command.direction == 2u)
-        pullGpuPages();
+    {
+        // Only the source's pages (a game reading back a few pixels every frame, VP2's light level, should not
+        // wait for every page the targets resolved): its first page to the last row's, generously.
+        const uint32_t first = command.bitbltbuf.sbp / 32u;
+        const uint32_t pageRows = 32u; // CT32's page height, the smallest: covers the others
+        const uint32_t rows = static_cast<uint32_t>(command.trxpos.ssay) + command.trxreg.rrh;
+        const uint32_t end = first + std::max<uint32_t>(command.bitbltbuf.sbw, 1u) * ((rows + pageRows - 1u) / pageRows + 1u);
+        m_readFirstPage = first;
+        m_readEndPage = end;
+        pullGpuPages(first, end);
+    }
     if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
     {
         static uint32_t s_logged = 0, s_copies = 0;
@@ -2089,7 +2112,7 @@ bool GSNativeBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 
 uint32_t GSNativeBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    pullGpuPages();
+    pullGpuPages(m_readFirstPage, m_readEndPage);
     return m_memory->ConsumeLocalToHostBytes(dst, maxBytes);
 }
 
