@@ -1711,16 +1711,18 @@ namespace ps2_stubs
         // libmpeg calls the sceMpegCbNodata callback (sceMpegAddCallback type 1) from its IPU wait loops when the
         // input runs dry; a game that feeds its movie from there (The Third Age with sceMpegAddBs, Fighting for One
         // Piece with a demux) sends nothing until asked. As _dispatchMpegCbNodata does, the callback gets (mpeg,
-        // cbdata of type 1, its data) with the GP it was registered with, and its result is ignored. It runs as
-        // thread code, not in interrupt context, since it may read the disc and block; GetPicture stays parked
-        // meanwhile, and runs again once it returns, asking again if it still has no picture.
+        // cbdata of type 1, its data) with the GP it was registered with. It runs on the thread that called
+        // sceMpegGetPicture, as libmpeg calls it from there: the callback may read the disc, block, and use the game's
+        // heap (The Third Age's frees its last packet), so it must not cut into whatever thread happens to run, as a
+        // queued invocation does (that corrupted The Third Age's dlmalloc heap mid-malloc). GetPicture runs again once
+        // it returns, asking again if it still has no picture.
         constexpr uint32_t kMpegCbNodata = 1u;
 
-        bool requestNodataCallback(uint8_t *rdram, R5900Context *callerCtx, PS2Runtime *runtime, uint32_t mpegAddr,
-                                   MpegPlaybackState &playback)
+        bool nodataCallback(uint8_t *rdram, R5900Context *callerCtx, PS2Runtime *runtime, uint32_t mpegAddr,
+                            MpegPlaybackState &playback, GuestInvocation &invocation)
         {
             if (playback.nodataCallbackPending)
-                return true;
+                return false;
             const auto registered = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
             if (registered == g_mpeg_stub_state.callbacksByMpeg.end())
                 return false;
@@ -1736,7 +1738,6 @@ namespace ps2_stubs
             std::memset(cbData, 0, kMpegCallbackDataSize);
             *reinterpret_cast<uint32_t *>(cbData) = kMpegCbNodata;
 
-            GuestInvocation invocation{};
             invocation.kind = GuestInvocationKind::HleCall;
             invocation.context = *callerCtx;
             invocation.context.pc = callback->func;
@@ -1749,30 +1750,50 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 29, 0u);
             SET_GPR_U32(&invocation.context, 31, 0u);
             const uint32_t addBsBefore = playback.addBsCalls;
-            invocation.onComplete = [runtime, cbDataAddr, mpegAddr, addBsBefore](const R5900Context &done, R5900Context &)
+            invocation.onComplete = [rdram, runtime, cbDataAddr, mpegAddr, addBsBefore](const R5900Context &done,
+                                                                                        R5900Context &caller)
             {
                 runtime->guestFree(cbDataAddr);
+                bool waitForData = false;
                 {
                     // sceMpegDelete may have dropped the stream while the callback ran: do not bring it back.
                     std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
                     const auto playback = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
                     if (playback == g_mpeg_stub_state.playbackByMpeg.end())
+                    {
+                        setReturnS32(&caller, -1);
                         return;
+                    }
                     playback->second.nodataCallbackPending = false;
                     // A callback that fed nothing and returned 0 has no more data: the movie's input is over (The
                     // Third Age's, 0x1BE698, calls sceMpegInit and returns 0 once its packet queue is empty). Without
                     // this, GetPicture waits for a picture that never comes; with it, the pictures left are shown and
                     // sceMpegIsEnd then reports the end.
-                    if (static_cast<int32_t>(getRegU32(&done, 2)) == 0 && playback->second.addBsCalls == addBsBefore)
+                    const bool fed = playback->second.addBsCalls != addBsBefore;
+                    if (static_cast<int32_t>(getRegU32(&done, 2)) == 0 && !fed)
                     {
                         playback->second.inputFinished = true;
                         playback->second.streamEnded = true;
                     }
+                    // Nothing fed and the stream still open: the game's data is not there yet (another thread reads
+                    // the disc). Ask again after the next vblank instead of spinning on the callback.
+                    else
+                        waitForData = !fed && !g_mpeg_stub_state.currentCdStreamEofSeen && !playback->second.decoderFailed &&
+                                      playback->second.decodedFrames.empty();
                 }
-                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+                if (waitForData)
+                {
+                    runtime->eeScheduler().waitVSync(runtime->eeScheduler().currentVSyncTick(), -1,
+                                                     [rdram, runtime](R5900Context &resumeContext)
+                                                     {
+                                                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                                                             return;
+                                                         sceMpegGetPicture(rdram, &resumeContext, runtime);
+                                                     });
+                }
+                sceMpegGetPicture(rdram, &caller, runtime);
             };
             playback.nodataCallbackPending = true;
-            runtime->eeScheduler().queueInvocation(std::move(invocation));
             return true;
         }
 
@@ -2578,7 +2599,11 @@ namespace ps2_stubs
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
-                (void)requestNodataCallback(rdram, ctx, runtime, mpegAddr, playback);
+                if (GuestInvocation callback{}; nodataCallback(rdram, ctx, runtime, mpegAddr, playback, callback))
+                {
+                    lock.unlock();
+                    runtime->eeScheduler().invokeCurrent(std::move(callback));
+                }
                 lock.unlock();
                 runtime->eeScheduler().waitExternal(
                     EeWaitReason::Mpeg,
