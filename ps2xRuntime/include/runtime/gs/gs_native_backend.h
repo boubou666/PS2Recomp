@@ -167,6 +167,29 @@ private:
     // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
     int m_blendOut = 0;
     // One PCRTC read circuit's picture (RGBA8, alpha as the GS stores it), from its render target or else GS memory.
+    // The presentation on the GPU (default; PS2X_GS_NATIVE_CPUPRESENT=1 reads the circuits back and merges them on the
+    // CPU): the two read circuits merged as PMODE says into a texture the window draws (PresentationFrame::glTexture),
+    // three in turn, the window drawing the one composed a presentation earlier while the next is composed.
+    struct PresentSlot
+    {
+        uint32_t texture = 0, framebuffer = 0, width = 0, height = 0;
+        void *fence = nullptr; // GLsync: the composition done
+    };
+    PresentSlot m_presentSlots[3];
+    int m_presentNext = 0;
+    int m_presentComposed = -1;
+    uint32_t m_presentProgram = 0;
+    uint32_t m_circuitStaging[3] = {}; // a circuit read from GS memory (no render target there), per circuit
+    // A read circuit's picture on the GPU: a render target's texture, or GS memory read on the CPU into a staging one.
+    struct CircuitSource
+    {
+        uint32_t texture = 0;
+        int x = 0, y = 0, width = 0, height = 0;
+        uint32_t fbp = 0;
+        bool opaque = false; // CT24: no alpha (0x80)
+    };
+    bool circuitSource(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, CircuitSource &out);
+    bool presentOnGpu(const GSPresentationRequest &request, PresentationFrame &frame);
     bool readCircuit(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels,
                      uint32_t &width, uint32_t &height, uint32_t &fbp);
 

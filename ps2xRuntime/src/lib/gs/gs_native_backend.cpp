@@ -212,6 +212,41 @@ void main()
 }
 )";
 
+    // PCRTC: circuit 1 (top) over circuit 2 (bottom) or the background colour, per PMODE; in field mode each line of
+    // the field shows twice. Output rows top first (row 0 is the picture's first line, as GS rows are in targets).
+    constexpr const char *kPresentFragmentShader = R"(#version 330 core
+uniform sampler2D uTop;
+uniform sampler2D uBottom;
+uniform ivec4 uTopRect;
+uniform ivec4 uBottomRect;
+uniform int uHaveTop;
+uniform int uHaveBottom;
+uniform int uField;
+uniform int uTopOpaque;
+uniform int uMode;
+uniform int uBlackUnder;
+uniform float uAlp;
+uniform vec3 uBackground;
+out vec4 fragColor;
+void main()
+{
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int line = uField != 0 ? p.y / 2 : p.y;
+    vec3 under = uBlackUnder != 0 ? vec3(0.0) : uBackground;
+    if (uHaveBottom != 0 && p.x < uBottomRect.z && line < uBottomRect.w)
+        under = texelFetch(uBottom, uBottomRect.xy + ivec2(p.x, line), 0).rgb;
+    vec3 colour = under;
+    if (uHaveTop != 0 && p.x < uTopRect.z && line < uTopRect.w)
+    {
+        vec4 over = texelFetch(uTop, uTopRect.xy + ivec2(p.x, line), 0);
+        // Circuit 1's alpha counts 0x80 as 1.0; with only circuit 1 shown it simply replaces the background.
+        float a = uMode == 0 ? 1.0 : uMode == 1 ? uAlp : min(1.0, (uTopOpaque != 0 ? 128.0 / 255.0 : over.a) * (255.0 / 128.0));
+        colour = over.rgb * a + under * (1.0 - a);
+    }
+    fragColor = vec4(colour, 1.0);
+}
+)";
+
     constexpr const char *kResolveFragmentShader = R"(#version 330 core
 layout(location = 0) out uint outWord;
 uniform sampler2D uTarget;   // the render target's colour, GL row 0 = GS row 0, alpha as the GS stores it
@@ -2006,11 +2041,201 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
     return true;
 }
 
+bool GSNativeBackend::circuitSource(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, CircuitSource &out)
+{
+    const DisplayRead read = decodeDisplay(dispfb, display);
+    out.fbp = read.fbp;
+    const uint32_t lines = fieldMode ? (read.height + 1u) / 2u : read.height;
+    const auto it = m_targets.find(read.fbp);
+    if (it != m_targets.end())
+    {
+        const RenderTarget &target = it->second;
+        out.width = static_cast<int>(std::min(read.width, target.width - std::min(read.x, target.width)));
+        out.height = static_cast<int>(std::min(lines, target.height - std::min(read.y, target.height)));
+        if (out.width == 0 || out.height == 0)
+            return false;
+        out.texture = target.color;
+        out.x = static_cast<int>(read.x);
+        out.y = static_cast<int>(read.y);
+        out.opaque = target.psm == 0x01u;
+        return true;
+    }
+    // Not drawn by us (an image the game uploaded straight into the displayed buffer: movies): GS memory.
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0, height = 0, fbp = 0;
+    if (!readCircuit(circuit, dispfb, display, fieldMode, pixels, width, height, fbp))
+        return false;
+    uint32_t &staging = m_circuitStaging[circuit];
+    if (staging == 0u)
+        glGenTextures(1, &staging);
+    GLint unpackBuffer = 0, rowLength = 0, alignment = 4;
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rowLength);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, staging);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, pixels.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<GLuint>(unpackBuffer));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+    out.texture = staging;
+    out.x = out.y = 0;
+    out.width = static_cast<int>(width);
+    out.height = static_cast<int>(height);
+    out.fbp = fbp;
+    out.opaque = false;
+    return true;
+}
+
+bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, PresentationFrame &frame)
+{
+    const bool fieldMode = (request.smode2 & 0x3u) == 0x3u;
+    const uint64_t pmode = request.pmode;
+    const bool en1 = (pmode & 0x1u) != 0u, en2 = (pmode & 0x2u) != 0u;
+    const bool mmod = (pmode >> 5 & 0x1u) != 0u, slbg = (pmode >> 7 & 0x1u) != 0u;
+    const float alp = static_cast<float>(pmode >> 8 & 0xFFu) / 255.0f;
+    GlStateRestore restore;
+    // The draws' textures on units 0 and 1 given back too (GlStateRestore keeps the rest), whatever return is taken.
+    struct TextureBindings
+    {
+        GLint texture[2] = {};
+        TextureBindings()
+        {
+            for (int unit = 0; unit < 2; ++unit)
+            {
+                glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + unit));
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture[unit]);
+            }
+        }
+        ~TextureBindings()
+        {
+            for (int unit = 1; unit >= 0; --unit)
+            {
+                glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + unit));
+                glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture[unit]));
+            }
+        }
+    } bindings;
+    CircuitSource top, bottom;
+    const bool haveTop = en1 && circuitSource(1, request.dispfb1, request.display1, fieldMode, top);
+    const bool haveBottom = en2 && !slbg && circuitSource(2, request.dispfb2, request.display2, fieldMode, bottom);
+    if (!haveTop && !haveBottom)
+        return false;
+    if (m_presentProgram == 0u)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kPresentFragmentShader);
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glLinkProgram(program);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE)
+        {
+            glDeleteProgram(program);
+            return false;
+        }
+        m_presentProgram = program;
+    }
+    const uint32_t width = static_cast<uint32_t>(std::max(haveTop ? top.width : 0, haveBottom ? bottom.width : 0));
+    const uint32_t lines = static_cast<uint32_t>(std::max(haveTop ? top.height : 0, haveBottom ? bottom.height : 0));
+    const uint32_t height = fieldMode ? lines * 2u : lines;
+
+    PresentSlot &slot = m_presentSlots[m_presentNext];
+    if (slot.fence)
+    {
+        glDeleteSync(static_cast<GLsync>(slot.fence));
+        slot.fence = nullptr;
+    }
+    if (slot.texture == 0u || slot.width != width || slot.height != height)
+    {
+        if (slot.texture == 0u)
+        {
+            glGenTextures(1, &slot.texture);
+            glGenFramebuffers(1, &slot.framebuffer);
+        }
+        // PS2X_PRESENT_FILTER=point: the window scales the picture with nearest texels (as for the other renderers).
+        static const GLint filter = []
+        {
+            const char *value = std::getenv("PS2X_PRESENT_FILTER");
+            return value && std::strcmp(value, "point") == 0 ? GL_NEAREST : GL_LINEAR;
+        }();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, slot.texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
+        slot.width = width;
+        slot.height = height;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
+    glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_presentProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, haveTop ? top.texture : 0u);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, haveBottom ? bottom.texture : 0u);
+    const auto uniform = [this](const char *name) { return glGetUniformLocation(m_presentProgram, name); };
+    glUniform1i(uniform("uTop"), 0);
+    glUniform1i(uniform("uBottom"), 1);
+    glUniform4i(uniform("uTopRect"), top.x, top.y, top.width, top.height);
+    glUniform4i(uniform("uBottomRect"), bottom.x, bottom.y, bottom.width, bottom.height);
+    glUniform1i(uniform("uHaveTop"), haveTop ? 1 : 0);
+    glUniform1i(uniform("uHaveBottom"), haveBottom ? 1 : 0);
+    glUniform1i(uniform("uField"), fieldMode ? 1 : 0);
+    glUniform1i(uniform("uTopOpaque"), top.opaque ? 1 : 0);
+    glUniform1i(uniform("uMode"), !(en2 || slbg) ? 0 : mmod ? 1 : 2);
+    glUniform1i(uniform("uBlackUnder"), !slbg && !haveBottom ? 1 : 0);
+    glUniform1f(uniform("uAlp"), alp);
+    glUniform3f(uniform("uBackground"), static_cast<float>(request.bgcolor & 0xFFu) / 255.0f,
+                static_cast<float>(request.bgcolor >> 8 & 0xFFu) / 255.0f, static_cast<float>(request.bgcolor >> 16 & 0xFFu) / 255.0f);
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    slot.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+
+    // The window gets the picture composed at the previous presentation (done by now; waited for if not), so the GS
+    // thread never waits for this one: one presentation of latency, as the CPU path's asynchronous read back.
+    const int shown = m_presentComposed >= 0 ? m_presentComposed : m_presentNext;
+    PresentSlot &ready = m_presentSlots[shown];
+    if (ready.fence)
+        glClientWaitSync(static_cast<GLsync>(ready.fence), GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull);
+    m_presentComposed = m_presentNext;
+    m_presentNext = (m_presentNext + 1) % 3;
+    frame.glTexture = ready.texture;
+    frame.width = ready.width;
+    frame.height = ready.height;
+    frame.displayFbp = haveTop ? top.fbp : bottom.fbp;
+    frame.sourceFbp = frame.displayFbp;
+    return true;
+}
+
 PresentationFrame GSNativeBackend::Present(const GSPresentationRequest &request)
 {
     flushBatch();
     PresentationFrame frame;
     if (!ensureContext())
+        return frame;
+    static const bool cpuPresent = std::getenv("PS2X_GS_NATIVE_CPUPRESENT") != nullptr;
+    if (!cpuPresent && presentOnGpu(request, frame))
         return frame;
     // Interlaced field mode (SMODE2 INT and FFMD): the game draws one field of half the lines; show each line twice.
     const bool fieldMode = (request.smode2 & 0x3u) == 0x3u;
