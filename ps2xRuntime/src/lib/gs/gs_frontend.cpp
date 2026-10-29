@@ -1462,6 +1462,7 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         {
             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
             m_hostPresentationFrame.clear();
+            m_hostPresentationTexture = 0u;
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
             return;
@@ -1480,6 +1481,14 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         request.bgcolor = displayRegisters->bgcolor;
         request.vsyncTick = displayRegisters->vsyncTick;
         request.smode1 = displayRegisters->smode1;
+    }
+    if (m_presentNewest && m_newestDisplayFbp != ~0u)
+    {
+        const auto newest = [this](uint64_t dispfb) { return (dispfb & ~0x1FFull) | m_newestDisplayFbp; };
+        if ((request.pmode & 0x2u) != 0u)
+            request.dispfb2 = newest(request.dispfb2);
+        else if ((request.pmode & 0x1u) != 0u)
+            request.dispfb1 = newest(request.dispfb1);
     }
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
@@ -1515,6 +1524,7 @@ void GS::storePresentationFrame(PresentationFrame &&frame)
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationTexture = frame.glTexture;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
         m_hostPresentationDisplayFbp = displayFbp;
@@ -1528,6 +1538,17 @@ void GS::storePresentationFrame(PresentationFrame &&frame)
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
     }
+}
+
+bool GS::latchedHostPresentationTexture(uint32_t &texture, uint32_t &width, uint32_t &height) const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    if (!m_hasHostPresentationFrame || m_hostPresentationTexture == 0u)
+        return false;
+    texture = m_hostPresentationTexture;
+    width = m_hostPresentationWidth;
+    height = m_hostPresentationHeight;
+    return true;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -2783,6 +2804,12 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
+    if (m_presentNewest && m_privRegs)
+    {
+        const uint64_t dispfb = (m_privRegs->pmode & 0x2u) != 0u ? m_privRegs->dispfb2 : m_privRegs->dispfb1;
+        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u))
+            m_newestDisplayFbp = ctx.frame.fbp;
+    }
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
         m_hasPreferredDisplaySource = false;
     if (state.prim.type != GS_PRIM_SPRITE || batch.vertexCount < 2u)

@@ -85,6 +85,7 @@ private:
         uint32_t zbp = ~0u;      // the ZBUF its depth buffer was last written as (pages), for depth read as a texture
         uint8_t zpsm = 0;
         bool alphaWritten = false; // a draw wrote its alpha (else GS memory's top bytes stay what they were)
+        uint64_t lastDraw = 0;     // m_drawSerial of its last batch: overlapping targets resolve oldest first
     };
 
     struct Vertex
@@ -121,6 +122,13 @@ private:
     void flushBatch();
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
+    // A target that replaces another at the same address (another format or width) starts with what GS memory holds.
+    void fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows);
+    // Targets sharing GS memory (VP2 draws a blur level at FBP 402, inside FBP 400's pages): when another one drew
+    // there after this one, both go to GS memory in drawing order and this one is reloaded from it.
+    void ensureCoherent(RenderTarget &target);
+    void resolveInDrawOrder(std::vector<RenderTarget *> &targets);
+    uint64_t m_drawSerial = 0;
     // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
@@ -142,6 +150,8 @@ private:
     std::vector<uint8_t> m_gpuNewer = std::vector<uint8_t>(512u, 0u);
     bool m_anyGpuNewer = false;
     void pullGpuPages();
+    void pullGpuPages(uint32_t firstPage, uint32_t endPage); // only GS memory pages in [first, end)
+    uint32_t m_readFirstPage = 0, m_readEndPage = 0xFFFFFFFFu; // the current local-to-host transfer's source pages
     uint32_t m_swizzleTexture = 0;
     // 256-byte blocks of GS memory (m_vram, written in stream order by the transfers, CLUT writes and CPU resolves)
     // the GPU copy has not received yet.
@@ -157,6 +167,29 @@ private:
     // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
     int m_blendOut = 0;
     // One PCRTC read circuit's picture (RGBA8, alpha as the GS stores it), from its render target or else GS memory.
+    // The presentation on the GPU (default; PS2X_GS_NATIVE_CPUPRESENT=1 reads the circuits back and merges them on the
+    // CPU): the two read circuits merged as PMODE says into a texture the window draws (PresentationFrame::glTexture),
+    // three in turn, the window drawing the one composed a presentation earlier while the next is composed.
+    struct PresentSlot
+    {
+        uint32_t texture = 0, framebuffer = 0, width = 0, height = 0;
+        void *fence = nullptr; // GLsync: the composition done
+    };
+    PresentSlot m_presentSlots[3];
+    int m_presentNext = 0;
+    int m_presentComposed = -1;
+    uint32_t m_presentProgram = 0;
+    uint32_t m_circuitStaging[3] = {}; // a circuit read from GS memory (no render target there), per circuit
+    // A read circuit's picture on the GPU: a render target's texture, or GS memory read on the CPU into a staging one.
+    struct CircuitSource
+    {
+        uint32_t texture = 0;
+        int x = 0, y = 0, width = 0, height = 0;
+        uint32_t fbp = 0;
+        bool opaque = false; // CT24: no alpha (0x80)
+    };
+    bool circuitSource(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, CircuitSource &out);
+    bool presentOnGpu(const GSPresentationRequest &request, PresentationFrame &frame);
     bool readCircuit(int circuit, uint64_t dispfb, uint64_t display, bool fieldMode, std::vector<uint8_t> &pixels,
                      uint32_t &width, uint32_t &height, uint32_t &fbp);
 
@@ -179,7 +212,7 @@ private:
     struct Uniforms
     {
         int targetSize = -1, texSize = -1, textured = -1, fst = -1, tfx = -1, tcc = -1, fog = -1, fogColor = -1;
-        int alphaTest = -1, alphaRef = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
+        int alphaTest = -1, alphaRef = -1, alphaFail = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
         int dest = -1, date = -1;
         int vram = -1, swizzle = -1, decode = -1, texFmt = -1, texSel = -1, texKind = -1, clutFmt = -1, cbp = -1;
         int texa = -1, wrapU = -1, wrapV = -1, linear = -1, targetWrap = -1;
@@ -204,6 +237,7 @@ private:
 
     // The batch being collected: draws whose state draws the same way (sameDrawState).
     std::vector<Vertex> m_batch;
+    bool m_fillingFromMemory = false; // fillTargetFromMemory's draw: textures from GS memory, never a target
     float m_batchMaxY = 0.0f; // the batch's lowest row, for its render target's usedHeight
     GSDrawState m_batchState{};
 };

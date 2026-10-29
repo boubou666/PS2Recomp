@@ -538,8 +538,11 @@ static void DrawFpsOverlay(uint64_t gameFrames, uint64_t displayFlips, uint64_t 
     DrawText(text, x, padding + padding / 2, fontSize, color);
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+// outGlTexture: the renderer's own texture holding the frame (PresentationFrame::glTexture), drawn instead of tex.
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight, uint32_t &outGlTexture)
 {
+    static uint32_t s_lastGlTexture = 0u;
+    outGlTexture = 0u;
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -579,6 +582,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outGlTexture = s_lastGlTexture;
+        return;
+    }
+    s_lastGlTexture = 0u;
+    if (uint32_t texture = 0u, textureWidth = 0u, textureHeight = 0u;
+        !overridden && rt->gsForPresentation().latchedHostPresentationTexture(texture, textureWidth, textureHeight))
+    {
+        outGlTexture = s_lastGlTexture = texture;
+        outWidth = s_lastWidth = textureWidth;
+        outHeight = s_lastHeight = textureHeight;
+        s_hasUploadedFrame = true;
         return;
     }
 
@@ -3616,7 +3630,17 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         if (IsKeyPressed(KEY_F10)) // F10: start the GS recording (PS2X_GS_RECORD with PS2X_GS_RECORD_AT=key)
             ps2GsRequestRecording();
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        uint32_t presentGlTexture = 0u;
+        UploadFrame(frameTex, this, presentWidth, presentHeight, presentGlTexture);
+        Texture2D shownTex = frameTex;
+        if (presentGlTexture != 0u) // the GS renderer's own texture (GS native back end): drawn as it is
+        {
+            shownTex.id = presentGlTexture;
+            shownTex.width = static_cast<int>(presentWidth);
+            shownTex.height = static_cast<int>(presentHeight);
+            shownTex.mipmaps = 1;
+            shownTex.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        }
 
         BeginDrawing();
         ps2_input::frameUpdate(); // the mouse and the wheel, for the pad bindings (input.ini)
@@ -3650,8 +3674,8 @@ void PS2Runtime::run()
             return value && std::string_view(value) == "only";
         }();
         if (!(s_nativeOnly && ps2x::native::Renderer::instance().enabled() && ps2x::native::Renderer::instance().hasDraws()))
-            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        ps2x::native::Renderer::instance().setGsFrame(frameTex.id, frameTex.width, frameTex.height, frameTex.format);
+            DrawTexturePro(shownTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        ps2x::native::Renderer::instance().setGsFrame(shownTex.id, shownTex.width, shownTex.height, shownTex.format);
         ps2x::native::Renderer::instance().present(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
         DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), eeScheduler().currentCycle(), screenWidth, screenHeight);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
