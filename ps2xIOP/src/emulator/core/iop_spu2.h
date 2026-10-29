@@ -44,6 +44,7 @@ namespace ps2x::iop::detail
             uint64_t admaTransfers = 0;
             uint64_t admaBytes = 0;
             uint64_t admaUnderruns = 0;
+            uint64_t lateFrames = 0;
             uint64_t ioWrites = 0;
             uint64_t irqs = 0;
             uint64_t registerWrites = 0;
@@ -82,10 +83,12 @@ namespace ps2x::iop::detail
         void flush();
 
         // On the wall clock (PS2X_SPU2_WALLCLOCK=1), as the console's SPU2 runs on its own 48 kHz clock: the host's
-        // audio callback pulls the frames it plays (pull, any thread) and the mixing (voices, envelopes, the AutoDMA
-        // input, reverb) advances by them, whatever the game's frame rate or the IOP's clock. advanceTo then only
-        // completes the transfers that are not AutoDMA (on the IOP clock, as before) and hands the IOP the interrupts
-        // the mixing raised. Register and DMA accesses and the mixing take a lock.
+        // audio callback pulls the frames it plays (pull, any thread) from a queue the IOP's advances mix into, sample
+        // by sample on the IOP clock as without the switch, so the AutoDMA refills and IRQA hits reach the IOP between
+        // samples. The queue's depth paces the mixing to the frames the device takes: about one pull plus a margin
+        // ahead, never more than one pull plus two margins (the SPU2 stops while the queue is full). What the queue
+        // lacks at a pull the callback mixes itself (lateFrames), its interrupts reaching the IOP at its next advance.
+        // Register and DMA accesses and the mixing take a lock.
         [[nodiscard]] bool wallClock() const noexcept { return m_wallClock; }
         void pull(int16_t *frames, size_t count);
 
@@ -102,7 +105,10 @@ namespace ps2x::iop::detail
         // The interrupts the mixing raised on the wall clock, for the IOP's thread (deliverDeferred).
         void raise(int irq);
         void deliverDeferred();
+        [[nodiscard]] bool wallClockQueueFull() const noexcept;
         bool m_wallClock = false;
+        size_t m_pullFrames = 0;
+        uint64_t m_wallCyclesPerSample = CyclesPerSample;
         std::recursive_mutex m_mutex;
         std::atomic<uint32_t> m_deferredIrqs{0};
 
