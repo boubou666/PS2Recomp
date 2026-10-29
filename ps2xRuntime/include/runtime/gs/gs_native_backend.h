@@ -127,6 +127,7 @@ private:
     // there after this one, both go to GS memory in drawing order and this one is reloaded from it.
     void ensureCoherent(RenderTarget &target);
     void resolveInDrawOrder(std::vector<RenderTarget *> &targets);
+    uint32_t rowsUpTo(const RenderTarget &target, uint64_t endBlock) const;
     uint64_t m_drawSerial = 0;
     // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
