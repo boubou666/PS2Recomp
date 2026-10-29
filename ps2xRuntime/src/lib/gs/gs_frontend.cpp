@@ -2640,7 +2640,12 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
+        // PS2X_GS_STOPPRIM=<n> (diagnostics): only the first n primitives reach the back end, whichever it is, to
+        // compare renderers at the same point of a frame.
+        static const long long s_stopPrim = [] { const char *v = std::getenv("PS2X_GS_STOPPRIM"); return v ? std::atoll(v) : -1ll; }();
+        static long long s_prims = 0;
+        if (s_stopPrim < 0 || s_prims++ < s_stopPrim)
+            m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
 
