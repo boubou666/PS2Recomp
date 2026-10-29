@@ -67,6 +67,7 @@ uniform int uAlphaFail; // 1: the AFAIL pass, which draws the pixels that fail t
 uniform int uBlendOut;
 uniform sampler2D uDest; // a copy of the render target, for the destination alpha test
 uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
+uniform int uAlphaKeep;  // FBMSK's alpha bits when it keeps only some: those come from uDest
 uniform int uBlendFactor;
 uniform float uBlendFix;
 
@@ -208,6 +209,13 @@ void main()
     else if (uBlendOut == 2)
         rgb = c.rgb * (1.0 + factor);
     outColor = vec4(clamp(rgb, 0.0, 1.0), clamp(c.a, 0.0, 2.0) * (128.0 / 255.0));
+    if (uAlphaKeep != 0)
+    {
+        uint source = uint(min(floor(clamp(c.a, 0.0, 2.0) * 128.0 + 0.5), 255.0));
+        uint stored = uint(texelFetch(uDest, ivec2(gl_FragCoord.xy), 0).a * 255.0 + 0.5);
+        uint keep = uint(uAlphaKeep);
+        outColor.a = float((source & ~keep) | (stored & keep)) / 255.0;
+    }
     outFactor = vec4(clamp(factor, 0.0, 1.0));
 }
 )";
@@ -580,6 +588,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.fst = glGetUniformLocation(m_program, "uTexAlphaScale");
     m_uniforms.dest = glGetUniformLocation(m_program, "uDest");
     m_uniforms.date = glGetUniformLocation(m_program, "uDate");
+    m_uniforms.alphaKeep = glGetUniformLocation(m_program, "uAlphaKeep");
     m_uniforms.vram = glGetUniformLocation(m_program, "uVram");
     m_uniforms.swizzle = glGetUniformLocation(m_program, "uSwizzle");
     m_uniforms.decode = glGetUniformLocation(m_program, "uDecode");
@@ -1782,8 +1791,13 @@ void GSNativeBackend::flushBatch()
     // DATE: the destination alpha's top bit (DATM picks which value passes), read from a copy of the target.
     const bool date = (context.test >> 14 & 0x1u) != 0u;
     glUniform1i(m_uniforms.date, date ? ((context.test >> 15 & 0x1u) ? 2 : 1) : 0);
+    // An alpha byte FBMSK keeps only partly (SCTPT2 0x7F: the top bit written, the font in the bits below kept): the
+    // kept bits from a copy of the target, which such a draw never changes, so one copy serves the whole batch.
+    const uint32_t alphaKeep = fbmsk >> 24;
+    const bool partialAlpha = !keepAlpha && alphaKeep != 0u && !offColor;
+    glUniform1i(m_uniforms.alphaKeep, partialAlpha ? static_cast<int>(alphaKeep) : 0);
     glUniform1i(m_uniforms.dest, 1);
-    if (date)
+    if (date || partialAlpha)
     {
         const uint32_t destWidth = target.width * m_scale, destHeight = target.height * m_scale;
         if (!m_destTexture || m_destWidth != destWidth || m_destHeight != destHeight)
