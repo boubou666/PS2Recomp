@@ -433,6 +433,12 @@ void GS::submitNativeBatch(void *user, const ps2x::native::Material &material, c
     GS &gs = *static_cast<GS *>(user);
     if (!gs.m_backend)
         return;
+    if (material.gsWrites) // the drawing state its packet set (a sandboxed microprogram's), as if the GS had it
+    {
+        std::lock_guard<std::recursive_mutex> lock(gs.m_stateMutex);
+        for (const auto &[reg, value] : *material.gsWrites)
+            gs.writeRegisterUnlocked(reg, value);
+    }
     GSPrimReg prim{};
     prim.type = GS_PRIM_TRIANGLE;
     prim.iip = true;

@@ -107,5 +107,25 @@ void register_native_vu1_stream_tests()
             t.IsTrue(ps2x::native::directSkipped(2), "a vertex kick: drawn natively");
             t.IsFalse(ps2x::native::directSkipped(2), "an image: the GS gets it");
         });
+
+        tc.Run("an image continued in the next DIRECT is not read as GIF tags", [](TestCase &t)
+        {
+            install();
+            g_active = true;
+            // DIRECT 1: an IMAGE tag of 2 quadwords and no data; DIRECT 2: its pixels, which read as a PACKED A+D
+            // vertex kick; then a real vertex kick.
+            const uint32_t imageTag[] = {0x00008002u, 0x08000000u, 0u, 0u};
+            const uint32_t pixels[] = {0x00008001u, 0x10000000u, 0x0000000eu, 0u, 0x00100010u, 0u, 0x00000005u, 0u};
+            std::vector<uint32_t> stream = {0, 0, 0, vif(0x50, 0, 1)};
+            stream.insert(stream.end(), std::begin(imageTag), std::end(imageTag));
+            stream.insert(stream.end(), {0, 0, 0, vif(0x50, 0, 2)});
+            stream.insert(stream.end(), std::begin(pixels), std::end(pixels));
+            stream.insert(stream.end(), {0, 0, 0, vif(0x50, 0, 2)});
+            stream.insert(stream.end(), std::begin(pixels), std::end(pixels));
+            send(stream);
+            // The VIF1 interpreter asks about the tag's DIRECT and the last one only (the pixels go to the image).
+            t.IsFalse(ps2x::native::directSkipped(1), "the image tag: the GS gets it");
+            t.IsTrue(ps2x::native::directSkipped(2), "the vertex kick after the image: drawn natively");
+        });
     });
 }
