@@ -1191,34 +1191,6 @@ bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width,
     return true;
 }
 
-bool GSNativeBackend::batchReadsWithin(const GSDrawState &state, const RenderTarget &source) const
-{
-    // The texels the queued primitives reach, bilinear's second texel included, after the CLAMP modes: a picture
-    // copied with its last row or column at the texture's edge (VP2's 512x480 scene onto the display buffer) reads
-    // one texel past it, which on the GS is the memory after the buffer, not the GL texture's undrawn rows.
-    const GSContext &context = state.context;
-    const bool linear = (context.tex1 >> 5 & 0x1u) != 0u;
-    float maxS = 0.0f, maxT = 0.0f;
-    for (const Vertex &v : m_batch)
-    {
-        const float q = v.q != 0.0f ? v.q : 1.0f;
-        maxS = std::max(maxS, v.s / q);
-        maxT = std::max(maxT, v.t / q);
-    }
-    const auto reach = [linear](float coord, uint32_t wrap, uint32_t size, uint32_t regionMax) -> uint32_t {
-        uint32_t texels = linear ? static_cast<uint32_t>(std::max(0.0f, std::floor(coord - 0.5f))) + 2u
-                                 : static_cast<uint32_t>(std::max(0.0f, std::ceil(coord)));
-        // Clamp and the repeats stay inside 2^TW x 2^TH (a repeat past it wraps to texels already counted).
-        return wrap == 2u ? std::min(texels, regionMax + 1u) : std::min(texels, size);
-    };
-    const uint64_t clamp = context.clamp;
-    const uint32_t texWidth = 1u << std::min<uint32_t>(context.tex0.tw, 10u);
-    const uint32_t texHeight = 1u << std::min<uint32_t>(context.tex0.th, 10u);
-    const uint32_t columns = reach(maxS, static_cast<uint32_t>(clamp & 0x3u), texWidth, static_cast<uint32_t>(clamp >> 14 & 0x3FFu));
-    const uint32_t rows = reach(maxT, static_cast<uint32_t>(clamp >> 2 & 0x3u), texHeight, static_cast<uint32_t>(clamp >> 34 & 0x3FFu));
-    return columns <= source.width && rows <= std::max(source.usedHeight, 1u);
-}
-
 bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height)
 {
     const GSContext &context = state.context;
@@ -1258,8 +1230,6 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
         const auto sameLayout = [](uint32_t a, uint32_t b) { return a == b || ((a | b) & ~0x1u) == 0u; };
         if (source && !sameLayout(source->psm, context.tex0.psm))
             source = nullptr;
-        if (source && !batchReadsWithin(state, *source))
-            source = nullptr; // texels past what the target drew: GS memory has them (another buffer, often)
         if (source)
         {
             // A render target sampled as a texture (copies, blurs, depth of field). When the draw also writes it,
