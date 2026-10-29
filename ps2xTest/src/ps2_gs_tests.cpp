@@ -655,10 +655,18 @@ void register_ps2_gs_tests()
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             constexpr uint32_t kEnvAddr = 0x5000u;
-            constexpr uint32_t kDisplayOffset = 24u; // pmode, smode2, dispfb, display
-            auto displayHeight = [&](uint64_t smode2)
+            constexpr uint32_t kDisplayOffset = 24u;
+            auto resetGraph = [&](uint32_t ffmode)
             {
-                runtime.memory().gs().smode2 = smode2;
+                R5900Context resetCtx{};
+                setRegU32(resetCtx, 4, 0u);
+                setRegU32(resetCtx, 5, 1u);
+                setRegU32(resetCtx, 6, 2u);
+                setRegU32(resetCtx, 7, ffmode);
+                ps2_stubs::sceGsResetGraph(rdram.data(), &resetCtx, &runtime);
+            };
+            auto displayHeight = [&]()
+            {
                 R5900Context ctx{};
                 setRegU32(ctx, 4, kEnvAddr);
                 setRegU32(ctx, 5, 0u);
@@ -669,8 +677,15 @@ void register_ps2_gs_tests()
                 std::memcpy(&display, rdram.data() + kEnvAddr + kDisplayOffset, sizeof(display));
                 return static_cast<uint32_t>((display >> 44) & 0x7FFu) + 1u;
             };
-            t.Equals(displayHeight(0x3u), 512u, "interlaced FRAME mode shows a 256-line buffer on 512 lines");
-            t.Equals(displayHeight(0x1u), 256u, "interlaced FIELD mode keeps DH at the buffer height");
+
+            resetGraph(1u);
+            t.Equals(displayHeight(), 512u, "interlaced FRAME mode shows a 256-line buffer on 512 lines");
+            resetGraph(0u);
+            t.Equals(displayHeight(), 256u, "interlaced FIELD mode keeps DH at the buffer height");
+
+            resetGraph(1u);
+            runtime.memory().gs().smode2 = 0u;
+            t.Equals(displayHeight(), 512u, "the mode comes from libgraph's parameters, not from SMODE2");
         });
 
         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)
