@@ -1478,6 +1478,32 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
+bool PS2Runtime::useNativeGsRenderer()
+{
+#if defined(PS2X_HAVE_NATIVE_GS)
+    if (m_nativeGsRenderer)
+        return true;
+    if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
+    {
+        // The front end then feeds the shared texture cache every upload (native/native_texture_cache.h).
+        ps2x::native::setUploadsWanted(true);
+        m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+        m_nativeGsRenderer = true;
+    }
+    return m_nativeGsRenderer;
+#else
+    return false;
+#endif
+}
+
+bool PS2Runtime::requestNativeGsRenderer()
+{
+    // PS2X_GS_RENDERER, when set, has the last word (initialize() already acted on "native").
+    if (const char *renderer = std::getenv("PS2X_GS_RENDERER"); renderer && *renderer)
+        return m_nativeGsRenderer;
+    return useNativeGsRenderer();
+}
+
 bool PS2Runtime::initialize(const char *title)
 {
     try
@@ -1505,14 +1531,7 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PS2X_HAVE_NATIVE_GS)
         // The native renderer draws on a context shared with the window's (created here, on the main thread).
         if (const char *renderer = std::getenv("PS2X_GS_RENDERER"); renderer && std::string_view(renderer) == "native")
-        {
-            if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
-            {
-                // The front end then feeds the shared texture cache every upload (native/native_texture_cache.h).
-                ps2x::native::setUploadsWanted(true);
-                m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
-            }
-        }
+            useNativeGsRenderer();
 #endif
         if (m_debugUiInitCallback)
         {
