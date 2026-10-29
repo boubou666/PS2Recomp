@@ -51,6 +51,10 @@ namespace ps2x::native
             // own rule (directs) while active, with the packet's quadwords.
             std::function<bool(Vu1StreamAdapter &adapter, const uint32_t *packet, size_t qwords)> drawDirect;
             bool directs = true; // DIRECT packets that only draw (no image transfer) drawn natively
+            // The sandbox's and the DIRECTs' draws go to the GS front end with their packets' register writes
+            // (GifToNative::setGsWrites): for the native GL GS renderer, whose textures and render targets they then
+            // use (a game drawing into its own targets, or texturing from them).
+            bool gsWrites = false;
         };
 
         static Vu1StreamAdapter &instance();
@@ -100,6 +104,10 @@ namespace ps2x::native
         uint32_t m_runningPc = 0;
         uint64_t m_group = 0;
         uint64_t m_codeVersion = 0;
+        // A GIF IMAGE a DIRECT left unfinished: its quadwords continue in the next DIRECTs (or right after, without a
+        // VIFcode), as the VIF1 interpreter takes them, so neither is read as GIF tags nor asked about.
+        uint32_t m_pendingImageQwc = 0;
+        bool m_pendingImageRaw = false;
     };
 }
 

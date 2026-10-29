@@ -101,6 +101,33 @@ namespace ps2x::native
             return draws;
         }
 
+        // The quadwords of a GIF IMAGE a packet leaves unfinished (0: none), as the VIF1 interpreter reckons them.
+        uint32_t pendingImageQwc(const uint32_t *words, size_t qwords)
+        {
+            size_t q = 0;
+            while (q < qwords)
+            {
+                const uint64_t lo = words[q * 4] | (static_cast<uint64_t>(words[q * 4 + 1]) << 32);
+                ++q;
+                const uint64_t nloop = lo & 0x7fffu, flg = (lo >> 58) & 3u;
+                const uint64_t nreg = ((lo >> 60) & 0xfu) ? ((lo >> 60) & 0xfu) : 16u;
+                const uint64_t payload = flg == 0u ? nloop * nreg : flg == 1u ? (nloop * nreg + 1u) / 2u : nloop;
+                if (flg >= 2u && payload > qwords - q)
+                    return static_cast<uint32_t>(payload - (qwords - q));
+                if (payload > qwords - q)
+                    return 0u;
+                q += payload;
+            }
+            return 0u;
+        }
+
+        // A DIRECT(HL) next (alone, or after a NOP): the pending image goes on in its data.
+        bool directCodeFollows(const uint32_t *words, size_t count)
+        {
+            const auto isDirect = [](uint32_t code) { return ((code >> 24) & 0x7eu) == 0x50u; };
+            return (count >= 1u && isDirect(words[0])) || (count >= 2u && words[0] == 0u && isDirect(words[1]));
+        }
+
         void onVif1(const uint8_t *stream, size_t bytes) { Vu1StreamAdapter::instance().observe(stream, bytes); }
 
         struct Stats
@@ -136,6 +163,7 @@ namespace ps2x::native
         m_config = std::move(config);
         if (!m_sandbox)
             m_sandbox = new Vu1Sandbox();
+        m_sandbox->gif().setGsWrites(m_config.gsWrites);
         Renderer &renderer = Renderer::instance();
         renderer.setEnabled(true);
         renderer.beginFrame(m_config.screen);
@@ -201,6 +229,13 @@ namespace ps2x::native
         Renderer &renderer = Renderer::instance();
         if (cmd == 0x17u) // MSCNT: continues the program where it ended, where it runs
         {
+            // Its draws are a group of their own, at the MSCNT's place in the GS stream (after what the stream sent
+            // since the MSCAL: a texture, a CLUT, registers its packets draw with); VIF1 numbers it the same way.
+            if (m_running != Running::None)
+            {
+                renderer.beginGroup(++m_group);
+                renderer.setKey(0);
+            }
             if (m_running == Running::Sandbox)
                 m_sandbox->resume(m_code, sizeof(m_code), reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), m_top, m_itops);
             else if (m_running == Running::Port)
@@ -239,6 +274,25 @@ namespace ps2x::native
 
     void Vu1StreamAdapter::direct(const uint32_t *words, size_t qwords, size_t size)
     {
+        if (m_pendingImageQwc != 0u)
+        {
+            // The rest of an image: the VIF1 interpreter sends it to the GS without asking the gate, then what follows
+            // in the packet as GIF data.
+            const size_t image = std::min<size_t>(m_pendingImageQwc, qwords);
+            m_pendingImageQwc -= static_cast<uint32_t>(image);
+            words += image * 4u;
+            qwords -= image;
+            if (qwords != 0u)
+            {
+                m_sandbox->gif().registers(reinterpret_cast<const uint8_t *>(words), qwords * 16u);
+                if (const uint32_t pending = pendingImageQwc(words, qwords))
+                {
+                    m_pendingImageQwc = pending;
+                    m_pendingImageRaw = qwords + image < size;
+                }
+            }
+            return;
+        }
         const bool active = !m_config.active || m_config.active();
         const bool whole = qwords == size;
         Renderer &renderer = Renderer::instance();
@@ -271,6 +325,11 @@ namespace ps2x::native
             ++g_stats.directsGs;
             // The GS draws it; the sandbox's packets draw with the registers it sets.
             m_sandbox->gif().registers(reinterpret_cast<const uint8_t *>(words), qwords * 16u);
+            if (const uint32_t pending = pendingImageQwc(words, qwords))
+            {
+                m_pendingImageQwc = pending;
+                m_pendingImageRaw = !whole;
+            }
         }
     }
 
@@ -279,6 +338,16 @@ namespace ps2x::native
         size_t i = 0;
         while (i < count)
         {
+            if (m_pendingImageQwc != 0u && (m_pendingImageRaw || !directCodeFollows(words + i, count - i)))
+            {
+                // Image quadwords straight in the stream (no VIFcode before them): the GS's, as VIF1 takes them.
+                const size_t image = std::min<size_t>(m_pendingImageQwc, (count - i) / 4u);
+                if (image == 0u)
+                    break;
+                m_pendingImageQwc -= static_cast<uint32_t>(image);
+                i += image * 4u;
+                continue;
+            }
             const uint32_t code = words[i++];
             const uint32_t cmd = (code >> 24) & 0x7fu, num = (code >> 16) & 0xffu, imm = code & 0xffffu;
             if ((cmd & 0x60u) == 0x60u) // UNPACK, as VIF1 does it (masks, row / column, add modes)

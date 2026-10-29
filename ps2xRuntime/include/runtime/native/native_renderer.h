@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ps2x::native
@@ -57,6 +58,10 @@ namespace ps2x::native
         bool fromGsContext = false;
         bool alphaBlend = true;
         uint8_t context = 0; // PRIM.CTXT of a fromGsContext draw
+        // GS register writes (address, value) the GS front end makes before a fromGsContext draw, in order: the A+D
+        // and packed register writes of the packet it came from (a sandboxed microprogram's TEX0 with its CLUT load,
+        // CLAMP, TEX1, ALPHA, ...), so it draws with the state the packet would have set. Not part of batching.
+        std::shared_ptr<const std::vector<std::pair<uint8_t, uint64_t>>> gsWrites;
     };
 
     // The blend of a draw with PRIM.ABE set, from the GS's ALPHA register.

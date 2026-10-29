@@ -133,6 +133,9 @@ namespace ps2x::native
 
     void GifToNative::write(uint32_t reg, uint64_t value, bool draw)
     {
+        // The drawing state a packet sets (not the vertex queue's registers), for the GS to set too (setGsWrites).
+        if (m_gsWrites && draw && reg >= 0x06u && reg != 0x0cu && reg != 0x0du)
+            m_pendingWrites.emplace_back(static_cast<uint8_t>(reg), value);
         switch (reg)
         {
         case 0x00: // PRIM: a new primitive
@@ -353,12 +356,23 @@ namespace ps2x::native
             return; // the alpha test never passes and nothing is written (KEEP), or only depth (ZB_ONLY)
         if (((test >> 16) & 1u) && ((test >> 17) & 3u) == 0u)
             return; // depth test NEVER
-        const Material m = material();
-        if (!m_batchOpen || !sameMaterial(m, m_batchMaterial))
+        Material m = material();
+        if (m_gsWrites)
+        {
+            m.fromGsContext = true;
+            m.context = static_cast<uint8_t>(context);
+            m.alphaBlend = (attributes >> 6) & 1u;
+        }
+        if (!m_batchOpen || !sameMaterial(m, m_batchMaterial) || !m_pendingWrites.empty())
         {
             flush();
             m_batchMaterial = m;
             m_batchOpen = true;
+            if (!m_pendingWrites.empty())
+            {
+                m_batchMaterial.gsWrites = std::make_shared<const std::vector<std::pair<uint8_t, uint64_t>>>(std::move(m_pendingWrites));
+                m_pendingWrites.clear();
+            }
         }
         // A constant alpha (ALPHA.C = FIX) stands in for the source alpha.
         const uint64_t alpha = m_alpha[context];
