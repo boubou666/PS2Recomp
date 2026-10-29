@@ -758,6 +758,8 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            if (m_vu1ProgramSkipped && m_vu1SkipCallback) // the native port's next group (see Vu1StreamAdapter)
+                m_vu1SkipCallback(~0u);
             if (m_vu1MscntCallback && !m_vu1ProgramSkipped)
                 m_vu1MscntCallback(runTop, runItop);
             continue;

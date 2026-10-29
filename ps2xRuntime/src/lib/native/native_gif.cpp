@@ -133,6 +133,9 @@ namespace ps2x::native
 
     void GifToNative::write(uint32_t reg, uint64_t value, bool draw)
     {
+        // The drawing state a packet sets (not the vertex queue's registers), for the GS to set too (setGsWrites).
+        if (m_gsWrites && draw && reg >= 0x06u && reg != 0x0cu && reg != 0x0du)
+            m_pendingWrites.emplace_back(static_cast<uint8_t>(reg), value);
         switch (reg)
         {
         case 0x00: // PRIM: a new primitive
@@ -194,6 +197,7 @@ namespace ps2x::native
             const float q = asFloat(static_cast<uint32_t>(m_rgbaq >> 32));
             k.u = q != 0.0f ? m_s / q : m_s;
             k.v = q != 0.0f ? m_t / q : m_t;
+            k.q = q != 0.0f ? q : 1.0f;
         }
 
         const uint32_t type = m_prim & 7u;
@@ -350,12 +354,23 @@ namespace ps2x::native
             return; // the alpha test never passes and nothing is written (KEEP), or only depth (ZB_ONLY)
         if (((test >> 16) & 1u) && ((test >> 17) & 3u) == 0u)
             return; // depth test NEVER
-        const Material m = material();
-        if (!m_batchOpen || !sameMaterial(m, m_batchMaterial))
+        Material m = material();
+        if (m_gsWrites)
+        {
+            m.fromGsContext = true;
+            m.context = static_cast<uint8_t>(context);
+            m.alphaBlend = (attributes >> 6) & 1u;
+        }
+        if (!m_batchOpen || !sameMaterial(m, m_batchMaterial) || !m_pendingWrites.empty())
         {
             flush();
             m_batchMaterial = m;
             m_batchOpen = true;
+            if (!m_pendingWrites.empty())
+            {
+                m_batchMaterial.gsWrites = std::make_shared<const std::vector<std::pair<uint8_t, uint64_t>>>(std::move(m_pendingWrites));
+                m_pendingWrites.clear();
+            }
         }
         // A constant alpha (ALPHA.C = FIX) stands in for the source alpha.
         const uint64_t alpha = m_alpha[context];
@@ -369,6 +384,7 @@ namespace ps2x::native
             v.z = k.z;
             v.u = k.u;
             v.v = k.v;
+            v.q = m_gsWrites ? k.q : 1.0f;
             v.fog = k.fog;
             v.rgba = fixedAlpha ? (rgba & 0x00ffffffu) | (static_cast<uint32_t>((alpha >> 32) & 0xffu) << 24) : rgba;
             m_triangles.push_back(v);
@@ -386,12 +402,13 @@ namespace ps2x::native
         if (count == 2 && type == 6)
         {
             const Kick &a = kicks[0], &b = kicks[1];
+            const float au = a.u * a.q / b.q, av = a.v * a.q / b.q;
             corner[0] = b;
-            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = a.u, corner[0].v = a.v;
+            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = au, corner[0].v = av;
             corner[1] = b;
-            corner[1].y = a.y, corner[1].v = a.v;
+            corner[1].y = a.y, corner[1].v = av;
             corner[2] = b;
-            corner[2].x = a.x, corner[2].u = a.u;
+            corner[2].x = a.x, corner[2].u = au;
             corner[3] = b;
             for (Kick &c : corner)
                 c.rgba = last;

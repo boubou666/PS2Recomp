@@ -395,6 +395,7 @@ add_library(ps2_runtime STATIC
     src/lib/native/native_vif1.cpp
     src/lib/native/native_gif.cpp
     src/lib/native/native_vu1_sandbox.cpp
+    src/lib/native/native_vu1_stream.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/ps2_iop_host.cpp
