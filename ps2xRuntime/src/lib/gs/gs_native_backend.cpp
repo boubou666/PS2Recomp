@@ -560,20 +560,9 @@ bool GSNativeBackend::ensureContext(bool create)
     return true;
 }
 
-namespace
-{
-    // A target's blocks in GS memory, as far as it drew: pages of 64 x 32 pixels (64 x 64 in CT16).
-    std::pair<uint64_t, uint64_t> targetBlocks(uint32_t fbp, uint32_t fbw, uint8_t psm, uint32_t rows)
-    {
-        const uint32_t pageRows = (psm == 0x02u || psm == 0x0Au) ? 64u : 32u;
-        const uint64_t begin = static_cast<uint64_t>(fbp) * 32u;
-        return {begin, begin + static_cast<uint64_t>(std::max(fbw, 1u)) * ((rows + pageRows - 1u) / pageRows) * 32u};
-    }
-}
-
 GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &frame)
 {
-    uint64_t refillEnd = 0; // a target replacing another at the same address: the memory that one held
+    uint32_t refillRows = 0; // a target replacing another at the same address: the rows that one held
     auto it = m_targets.find(frame.fbp);
     if (it != m_targets.end())
     {
@@ -592,7 +581,7 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
         }
         if (existing.dirty && existing.usedHeight != 0u)
             resolveTarget(existing);
-        refillEnd = targetBlocks(existing.fbp, existing.fbw, existing.psm, existing.usedHeight).second;
+        refillRows = existing.usedHeight;
         glDeleteFramebuffers(1, &existing.framebuffer);
         glDeleteTextures(1, &existing.color);
         glDeleteTextures(1, &existing.depth);
@@ -625,26 +614,20 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     RenderTarget &created = m_targets.emplace(frame.fbp, target).first->second;
-    if (refillEnd != 0u)
-        if (const uint32_t rows = rowsUpTo(created, refillEnd); rows != 0u)
-        {
-            created.usedHeight = rows;
-            fillTargetFromMemory(frame, rows);
-        }
+    if (refillRows != 0u)
+        fillTargetFromMemory(frame, std::min(refillRows, created.height));
     return created;
 }
 
-
-uint32_t GSNativeBackend::rowsUpTo(const RenderTarget &target, uint64_t endBlock) const
+namespace
 {
-    // Rows of this target's layout that reach the given block (whole page rows), within its texture.
-    const uint32_t pageRows = (target.psm == 0x02u || target.psm == 0x0Au) ? 64u : 32u;
-    const uint64_t begin = static_cast<uint64_t>(target.fbp) * 32u;
-    const uint64_t rowBlocks = static_cast<uint64_t>(std::max(target.fbw, 1u)) * 32u;
-    if (endBlock <= begin)
-        return 0u;
-    const uint64_t pageRowsReached = (endBlock - begin + rowBlocks - 1u) / rowBlocks;
-    return static_cast<uint32_t>(std::min<uint64_t>(pageRowsReached * pageRows, target.height));
+    // A target's blocks in GS memory, as far as it drew: pages of 64 x 32 pixels (64 x 64 in CT16).
+    std::pair<uint64_t, uint64_t> targetBlocks(uint32_t fbp, uint32_t fbw, uint8_t psm, uint32_t rows)
+    {
+        const uint32_t pageRows = (psm == 0x02u || psm == 0x0Au) ? 64u : 32u;
+        const uint64_t begin = static_cast<uint64_t>(fbp) * 32u;
+        return {begin, begin + static_cast<uint64_t>(std::max(fbw, 1u)) * ((rows + pageRows - 1u) / pageRows) * 32u};
+    }
 }
 
 void GSNativeBackend::resolveInDrawOrder(std::vector<RenderTarget *> &targets)
@@ -662,7 +645,6 @@ void GSNativeBackend::ensureCoherent(RenderTarget &target)
     const auto [begin, end] = targetBlocks(target.fbp, target.fbw, target.psm, target.usedHeight);
     std::vector<RenderTarget *> overlapping;
     bool stale = false;
-    uint64_t reach = end; // the memory newer overlapping targets wrote, past this target's own rows too
     for (auto &[fbp, other] : m_targets)
     {
         if (&other == &target || other.usedHeight == 0u)
@@ -671,15 +653,10 @@ void GSNativeBackend::ensureCoherent(RenderTarget &target)
         if (otherBegin >= end || begin >= otherEnd)
             continue;
         overlapping.push_back(&other);
-        if (other.lastDraw > target.lastDraw)
-        {
-            stale = true;
-            reach = std::max(reach, otherEnd);
-        }
+        stale |= other.lastDraw > target.lastDraw;
     }
     if (!stale)
         return;
-    target.usedHeight = std::max(target.usedHeight, rowsUpTo(target, reach));
     overlapping.push_back(&target);
     resolveInDrawOrder(overlapping);
     GSFrameReg frame{};
