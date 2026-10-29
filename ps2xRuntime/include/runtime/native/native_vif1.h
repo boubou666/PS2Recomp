@@ -32,6 +32,13 @@ namespace ps2x::native
     void setDirectGate(DirectGate gate);
     bool directSkipped(uint32_t qwords);
 
+    // On the VIF1 thread, for a program its gate skipped: the VU1 cycles the program took elsewhere, which move the VIF1
+    // thread's clock on as VU1 running it would have (with the GS lag, the EE waits for that clock).
+    using Vif1ClockAdvance = void (*)(void *user, uint64_t cycles);
+
+    void setVif1ClockAdvance(Vif1ClockAdvance advance, void *user);
+    void advanceVif1Clock(uint64_t cycles);
+
     // VIF1's own registers (the VIF1 thread's, read without a lock): STMASK / STROW / STCOL / STMOD a game set in a
     // transfer the adapter did not see (at boot) are there. Null before the runtime registers them.
     void setVif1Registers(const VIFRegisters *registers);

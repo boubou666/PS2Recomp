@@ -340,11 +340,20 @@ PS2Memory::PS2Memory()
     if (const char *stall = std::getenv("PS2X_GS_SIGNAL_STALL"); stall && stall[0] == '0')
         m_signalStallEnabled = false;
     ps2x::native::setVif1Registers(&vif1_regs);
+    ps2x::native::setVif1ClockAdvance(
+        [](void *user, uint64_t cycles)
+        {
+            PS2Memory &memory = *static_cast<PS2Memory *>(user);
+            if (memory.onVif1Worker() && memory.gsLag())
+                memory.advanceVif1WorkerClock(cycles);
+        },
+        this);
 }
 
 PS2Memory::~PS2Memory()
 {
     ps2x::native::setVif1Registers(nullptr);
+    ps2x::native::setVif1ClockAdvance(nullptr, nullptr);
     stopVif1Worker();
     if (m_rdram)
     {
