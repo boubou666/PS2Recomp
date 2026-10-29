@@ -1566,7 +1566,15 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // PS2X_WINDOW_SIZE=<width>x<height>: the window's size when it opens (it can be resized after).
+        int windowWidth = HOST_WINDOW_WIDTH, windowHeight = HOST_WINDOW_HEIGHT;
+        if (const char *size = std::getenv("PS2X_WINDOW_SIZE"); size && *size)
+        {
+            int w = 0, h = 0;
+            if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w >= 160 && h >= 120)
+                windowWidth = w, windowHeight = h;
+        }
+        InitWindow(windowWidth, windowHeight, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
