@@ -78,11 +78,12 @@ namespace ps2x::native
             }
         }
 
-        // GS colours to RGBA8: alpha 0x80 is opaque, so it doubles (clamped).
+        // GS colours to RGBA8, alpha as the GS has it (0x80 is 1.0, up to 0xff: almost 2.0): the shaders scale it by
+        // 255 / 128. Doubled and clamped here, every texel alpha over 0x80 became 0x80, and an 0xff texel under an
+        // 0x40 vertex (TMB's crates and HUD) came out half transparent where the GS draws it opaque.
         uint32_t fromCt32(uint32_t c)
         {
-            const uint32_t a = std::min<uint32_t>(255u, (c >> 24) * 2u);
-            return (c & 0x00ffffffu) | (a << 24);
+            return c;
         }
 
         uint32_t fromCt16(uint32_t c, uint64_t texa)
@@ -91,7 +92,6 @@ namespace ps2x::native
             const uint32_t ta0 = texa & 0xffu, ta1 = (texa >> 32) & 0xffu;
             const bool aem = (texa >> 15) & 1u;
             uint32_t a = (c & 0x8000u) ? ta1 : ((aem && (c & 0x7fffu) == 0u) ? 0u : ta0);
-            a = std::min<uint32_t>(255u, a * 2u);
             return r | (g << 8) | (b << 16) | (a << 24);
         }
 
@@ -99,7 +99,7 @@ namespace ps2x::native
         {
             const bool aem = (texa >> 15) & 1u;
             const uint32_t rgb = c & 0x00ffffffu;
-            const uint32_t a = (aem && rgb == 0u) ? 0u : std::min<uint32_t>(255u, (texa & 0xffu) * 2u);
+            const uint32_t a = (aem && rgb == 0u) ? 0u : static_cast<uint32_t>(texa & 0xffu);
             return rgb | (a << 24);
         }
 

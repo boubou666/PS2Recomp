@@ -77,6 +77,7 @@ void main()
     if (uTextured != 0)
     {
         vec4 texel = texture(uTex, vUv);
+        texel.a *= 255.0 / 128.0; // the GS's alpha (TextureCache: 0x80 is 1.0)
         float highlight = uTfx >= 2 ? vCol.a : 0.0;
         c.rgb = uTfx == 1 ? texel.rgb : texel.rgb * colour.rgb + highlight;
         if (uTcc != 0)

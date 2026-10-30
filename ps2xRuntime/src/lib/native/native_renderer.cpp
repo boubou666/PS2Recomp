@@ -63,7 +63,7 @@ out vec4 fragColor;
 void main()
 {
     vec4 colour = vCol * (255.0 / 128.0);
-    vec4 texel = uTextured != 0 ? texture(uTex, vUv) : vec4(1.0);
+    vec4 texel = uTextured != 0 ? texture(uTex, vUv) * vec4(1.0, 1.0, 1.0, 255.0 / 128.0) : vec4(1.0); // GS alpha
     fragColor = clamp(texel * colour, 0.0, 1.0);
     if (uAlphaTest != 0 && fragColor.a <= uAlphaRef)
         discard;

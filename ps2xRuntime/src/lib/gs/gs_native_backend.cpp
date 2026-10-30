@@ -45,7 +45,8 @@ void main()
 )";
 
     // GS colour arithmetic with 0x80 as 1.0. The render target keeps alpha as the GS stores it (0x80 for 1.0), so a
-    // texture read back from a render target doubles it (uTexAlphaScale 2), one from the texture cache does not.
+    // texture read back from a render target doubles it (uTexAlphaScale 2), one from the texture cache (the GS's
+    // alpha in a byte) scales it by 255 / 128.
     constexpr const char *kFragmentShader = R"(#version 330 core
 in vec4 vColor;
 noperspective in vec3 vTex;
@@ -2266,7 +2267,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-    glUniform1f(m_uniforms.fst, fromTarget ? 2.0f : 1.0f);
+    glUniform1f(m_uniforms.fst, fromTarget ? 2.0f : 255.0f / 128.0f); // the cache keeps the GS's alpha (0x80 is 1.0)
     return true;
 }
 
