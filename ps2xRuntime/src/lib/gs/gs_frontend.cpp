@@ -2544,6 +2544,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         m_texa.ta0 = static_cast<uint8_t>(value & 0xFFu);
         m_texa.aem = ((value >> 15) & 0x1u) != 0u;
         m_texa.ta1 = static_cast<uint8_t>((value >> 32) & 0xFFu);
+        ps2x::native::Renderer::instance().setGsTexa(value & 0xFF000080FFull); // TA0, AEM, TA1
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t texaIndex = s_debugTexaWriteCount.fetch_add(1u, std::memory_order_relaxed);
             if (texaIndex < 24u)

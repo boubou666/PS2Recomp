@@ -167,9 +167,11 @@ void main()
             return;
         Batch batch;
         batch.material = material;
+        if (!material.fromGsContext && material.texa == 0u)
+            batch.material.texa = m_gsTexa.load(std::memory_order_relaxed); // the GS's (setGsTexa)
         std::memcpy(batch.matrix, matrix, sizeof(batch.matrix));
         if (material.textured && !material.fromGsContext)
-            batch.texture = ps2x::native::textures().texture(material.tex0, material.texa, material.region);
+            batch.texture = ps2x::native::textures().texture(material.tex0, batch.material.texa, material.region);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
         batch.key = m_key;

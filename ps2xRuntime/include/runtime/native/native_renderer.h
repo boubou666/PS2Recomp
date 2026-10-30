@@ -89,6 +89,10 @@ namespace ps2x::native
         // Triangles (three vertices each) with an object-to-screen matrix: column c is matrix[4c..4c+3], screen
         // point = M * (x, y, z, 1), then divided by w (as a VU's projection).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count);
+        // The GS's TEXA as the game last wrote it (GS front end): a draw whose material sets no TEXA of its own (texa
+        // 0, not fromGsContext) decodes its texture with it, as the GS would (16- and 24-bit texels take their alpha
+        // from it; a game may write TEXA once, outside the stream a port reads).
+        void setGsTexa(uint64_t texa) { m_gsTexa.store(texa, std::memory_order_relaxed); }
         void endFrame();
         // Depth a game reads back from the GS (a visibility test: TMB's lens flares sample the Z buffer, which the
         // native frame is not in). While asked for (wantDepth, again within a second), present() copies the native
@@ -167,6 +171,7 @@ namespace ps2x::native
         };
 
     private:
+        std::atomic<uint64_t> m_gsTexa{0};
         Renderer();
         ~Renderer();
         struct Gpu;
