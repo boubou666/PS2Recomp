@@ -557,6 +557,24 @@ void main()
             Material m = entry.batch.material.fromGsContext ? materialFromGs(entry.batch.material, target) : entry.batch.material;
             if (m.texaFromGs)
                 m.texa = target.texa;
+            // PS2X_NATIVE_GS_COMPARE=<n>: a port's own material against the GS state at its marker, the first n that
+            // differ (TEX0, blend, alpha test, depth, clamp).
+            static int s_compareLeft = [] { const char *v = std::getenv("PS2X_NATIVE_GS_COMPARE"); return v ? std::atoi(v) : 0; }();
+            if (s_compareLeft > 0 && !entry.batch.material.fromGsContext && m.blend != Material::Blend::ShadowVolume)
+            {
+                const Material g = materialFromGs(entry.batch.material, target);
+                const uint64_t tex0Mask = ~((uint64_t{7} << 61)); // CLD aside
+                if ((m.tex0 & tex0Mask) != (g.tex0 & tex0Mask) || m.blend != g.blend || m.alphaTest != g.alphaTest ||
+                    m.alphaRef != g.alphaRef || m.depthTest != g.depthTest || m.depthWrite != g.depthWrite || m.clamp != g.clamp)
+                {
+                    --s_compareLeft;
+                    std::fprintf(stderr, "[native-gs] material differs (group %llu): tex0 %#llx/%#llx blend %d/%d atest %d/%d ref %u/%u depth %d%d/%d%d clamp %#llx/%#llx\n",
+                                 static_cast<unsigned long long>(entry.group), static_cast<unsigned long long>(m.tex0),
+                                 static_cast<unsigned long long>(g.tex0), static_cast<int>(m.blend), static_cast<int>(g.blend), m.alphaTest ? 1 : 0,
+                                 g.alphaTest ? 1 : 0, m.alphaRef, g.alphaRef, m.depthTest ? 1 : 0, m.depthWrite ? 1 : 0, g.depthTest ? 1 : 0,
+                                 g.depthWrite ? 1 : 0, static_cast<unsigned long long>(m.clamp), static_cast<unsigned long long>(g.clamp));
+                }
+            }
             const GLsizei count = static_cast<GLsizei>(entry.vertices.size());
             glUniform1f(pass.locDepthScale, static_cast<float>(entry.gsZScale * target.zScale));
             glUniform4fv(pass.locM, 4, entry.batch.matrix);
