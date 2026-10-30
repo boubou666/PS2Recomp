@@ -1945,6 +1945,136 @@ void register_ps2_gs_tests()
             t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 1u, 3u), kTexels[1], "the last row should be drawn");
         });
 
+        tc.Run("GS 64-pixel sprite strips ending at x + 63.5 cover 64 pixels each, without a seam", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            constexpr uint32_t kTexTbp = 64u;
+            for (uint32_t y = 0u; y < 2u; ++y)
+                for (uint32_t x = 0u; x < 128u; ++x)
+                    writeReferencePSMCT32Pixel(vram, kTexTbp, 2u, x, y, 0x80000000u | (y << 16) | x);
+            gs.writeRegister(GS_REG_FRAME_1, 150ull | (2ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (127ull << 16) | (3ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, (8ull << 4) | ((8ull << 4) << 32));
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTexTbp | (2ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                 (7ull << 26) | (1ull << 30) | (1ull << 34));
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_CLAMP_1, 0x5ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            for (uint64_t strip = 0u; strip < 2u; ++strip)
+            {
+                const uint64_t x0 = 128u + strip * 1024u - 8u;
+                gs.writeRegister(GS_REG_UV, (strip * 1024u) | (8ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, x0 | (128ull << 16));
+                gs.writeRegister(GS_REG_UV, (strip * 1024u + 1024u) | (24ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, (x0 + 1024u) | (144ull << 16));
+            }
+            uint32_t wrong = 0u;
+            for (uint32_t x = 0u; x < 128u; ++x)
+                wrong += readReferenceFramePSMCT32Pixel(vram, 150u, 2u, x, 0u) != (0x80000000u | x) ? 1u : 0u;
+            t.Equals(wrong, 0u, "strips from 64k - 0.5 to 64k + 63.5 should cover pixels 64k..64k + 63, texel x at pixel x");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 2u, 63u, 0u), 0x8000003Fu, "pixel 63 should be drawn");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 2u, 64u, 0u), 0x80000040u, "pixel 64 should be drawn");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 2u, 5u, 1u), 0u, "row 1 lies outside [0, 1)");
+        });
+
+        tc.Run("GS triangle edges through pixel sample points follow the top-left rule", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, 150ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (15ull << 16) | (15ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0x68ull | (0x80ull << 32));
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 6));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80101010ull);
+            auto xyz = [](uint64_t x, uint64_t y) { return (x << 4) | ((y << 4) << 16); };
+            gs.writeRegister(GS_REG_XYZ2, xyz(2, 2));
+            gs.writeRegister(GS_REG_XYZ2, xyz(6, 2));
+            gs.writeRegister(GS_REG_XYZ2, xyz(6, 6));
+            gs.writeRegister(GS_REG_XYZ2, xyz(2, 2));
+            gs.writeRegister(GS_REG_XYZ2, xyz(6, 6));
+            gs.writeRegister(GS_REG_XYZ2, xyz(2, 6));
+            uint32_t wrong = 0u;
+            for (uint32_t y = 0u; y < 8u; ++y)
+            {
+                for (uint32_t x = 0u; x < 8u; ++x)
+                {
+                    const uint32_t expected = (x >= 2u && x < 6u && y >= 2u && y < 6u) ? 0x101010u : 0u;
+                    wrong += (readReferenceFramePSMCT32Pixel(vram, 150u, 1u, x, y) & 0xFFFFFFu) != expected ? 1u : 0u;
+                }
+            }
+            t.Equals(wrong, 0u,
+                     "a quad from (2, 2) to (6, 6) split on its diagonal should draw pixels 2..5 once each: the left and top "
+                     "edges and the shared diagonal on one side only");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 3u, 3u) & 0xFFFFFFu, 0x101010u,
+                     "a pixel on the shared diagonal should be drawn by one triangle");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 6u, 3u), 0u, "the right edge x = 6 is outside");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 3u, 6u), 0u, "the bottom edge y = 6 is outside");
+        });
+
+        tc.Run("GS bilinear 1:1 copy with UVs on texel centres reproduces the source exactly", [](TestCase &t)
+        {
+            constexpr uint32_t kTexTbp = 64u;
+            auto texel = [](uint32_t x, uint32_t y) { return 0x80000000u | ((y * 37u) << 16) | ((x * 29u) << 8) | (x * 7u + y); };
+            auto setup = [&](GS &gs, std::vector<uint8_t> &vram, uint64_t prim)
+            {
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                for (uint32_t y = 0u; y < 4u; ++y)
+                    for (uint32_t x = 0u; x < 8u; ++x)
+                        writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, x, y, texel(x, y));
+                gs.writeRegister(GS_REG_FRAME_1, 150ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+                gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_TEX0_1, kTexTbp | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                     (3ull << 26) | (2ull << 30) | (1ull << 34));
+                gs.writeRegister(GS_REG_TEX1_1, 0x60ull);
+                gs.writeRegister(GS_REG_CLAMP_1, 0x5ull);
+                gs.writeRegister(GS_REG_PRIM, prim | (1ull << 4) | (1ull << 8));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            };
+            auto vertex = [](GS &gs, uint64_t x, uint64_t y)
+            {
+                gs.writeRegister(GS_REG_UV, (x * 16u + 8u) | ((y * 16u + 8u) << 16));
+                gs.writeRegister(GS_REG_XYZ2, (x << 4) | ((y << 4) << 16));
+            };
+            auto mismatches = [&](const std::vector<uint8_t> &vram)
+            {
+                uint32_t wrong = 0u;
+                for (uint32_t y = 0u; y < 4u; ++y)
+                    for (uint32_t x = 0u; x < 8u; ++x)
+                        wrong += readReferenceFramePSMCT32Pixel(vram, 150u, 1u, x, y) != texel(x, y) ? 1u : 0u;
+                return wrong;
+            };
+
+            std::vector<uint8_t> spriteVram(PS2_GS_VRAM_SIZE, 0u);
+            GS sprite;
+            setup(sprite, spriteVram, GS_PRIM_SPRITE);
+            vertex(sprite, 0, 0);
+            vertex(sprite, 8, 4);
+            t.Equals(mismatches(spriteVram), 0u, "a sprite from (0, 0) to (8, 4) with UVs 0.5..8.5 should copy each texel");
+
+            std::vector<uint8_t> triangleVram(PS2_GS_VRAM_SIZE, 0u);
+            GS triangles;
+            setup(triangles, triangleVram, GS_PRIM_TRIANGLE);
+            vertex(triangles, 0, 0);
+            vertex(triangles, 8, 0);
+            vertex(triangles, 8, 4);
+            vertex(triangles, 0, 0);
+            vertex(triangles, 8, 4);
+            vertex(triangles, 0, 4);
+            t.Equals(mismatches(triangleVram), 0u, "the same copy drawn as two triangles should copy each texel");
+        });
+
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
