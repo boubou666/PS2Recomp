@@ -66,6 +66,7 @@ uniform ivec2 uWrap;      // CLAMP WMS / WMT: 0 repeat, 1 clamp, 2 region clamp,
 uniform ivec4 uRegion;    // MINU, MAXU, MINV, MAXV
 uniform vec2 uTexSize;
 uniform int uShadowCount; // a shadow volume's faces: +1 seen from the front, -1 from the back (a float count image)
+uniform int uFba;
 out vec4 fragColor;
 float wrap(float t, int mode, int lo, int hi, float size)
 {
@@ -96,6 +97,11 @@ void main()
         c.rgb = mix(uFogColour, c.rgb, clamp(vFog, 0.0, 1.0));
     if (uOpaque != 0)
         c.a *= 128.0 / 255.0;
+    if (uFba != 0) // the stored alpha byte with its high bit set
+    {
+        float b = floor(c.a * 255.0 + 0.5);
+        c.a = (b < 128.0 ? b + 128.0 : b) / 255.0;
+    }
     if (uAlphaAsColour != 0)
         c.rgb = vec3(c.a);
     if (uDebug != 0)
@@ -148,7 +154,7 @@ void main()
         GLuint program = 0, vao = 0, vbo = 0;
         GLint locM = -1, locOffset = -1, locTargetSize = -1, locDepthScale = -1, locTex = -1, locTextured = -1;
         GLint locAlphaTest = -1, locAlphaRef = -1, locOpaque = -1, locFog = -1, locFogColour = -1, locAlphaAsColour = -1;
-        GLint locWrap = -1, locRegion = -1, locTexSize = -1;
+        GLint locWrap = -1, locRegion = -1, locTexSize = -1, locFba = -1;
         bool failed = false;
         struct GpuTexture
         {
@@ -185,6 +191,7 @@ void main()
             locWrap = glGetUniformLocation(program, "uWrap");
             locRegion = glGetUniformLocation(program, "uRegion");
             locTexSize = glGetUniformLocation(program, "uTexSize");
+            locFba = glGetUniformLocation(program, "uFba");
             locFog = glGetUniformLocation(program, "uFog");
             locFogColour = glGetUniformLocation(program, "uFogColour");
             glGenVertexArrays(1, &vao);
@@ -638,6 +645,7 @@ void main()
                                         static_cast<float>((fog >> 16) & 0xffu) / 255.0f};
             glUniform3fv(pass.locFogColour, 1, fogColour);
             glUniform1i(pass.locAlphaAsColour, m.blend == Material::Blend::Brighten ? 1 : 0);
+            glUniform1i(pass.locFba, m.fba ? 1 : 0);
             switch (m.blend)
             {
             case Material::Blend::Opaque:

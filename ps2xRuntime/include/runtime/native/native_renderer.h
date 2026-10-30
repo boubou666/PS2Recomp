@@ -57,6 +57,8 @@ namespace ps2x::native
         // The CLAMP register as written, for its region modes (WMS / WMT 2 REGION_CLAMP to MINU..MAXU, 3 REGION_REPEAT
         // (u & MINU) | MAXU): a texture atlas's part. 0: clampU / clampV alone.
         uint64_t clamp = 0;
+        // FBA: the alpha written gets its high bit set (0x80 added below it), as the GS's FBA register does.
+        bool fba = false;
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
         // The GS state where the draw's group sits in the stream (a stream draw, beginGroup) gives tex0, texa, blend,
