@@ -514,6 +514,13 @@ void main()
                                  static_cast<unsigned long long>(t0 & 0x3fff), static_cast<unsigned long long>((t0 >> 37) & 0x3fff),
                                  static_cast<unsigned long long>((t0 >> 51) & 0xf), static_cast<unsigned long long>((t0 >> 56) & 0x1f), tcc ? 1 : 0,
                                  static_cast<unsigned long long>(m.texa), texture->width, texture->height, share * 100.0);
+                    if (share > 0.5)
+                    {
+                        std::string pages;
+                        for (const auto &[page, generation] : texture->pages)
+                            pages += " " + std::to_string(page) + "@" + std::to_string(generation);
+                        std::fprintf(stderr, "[native:tex]   pages (page@generation, 0 never uploaded):%s\n", pages.c_str());
+                    }
                     if (tcc && share > 0.5)
                     {
                         char name[96];

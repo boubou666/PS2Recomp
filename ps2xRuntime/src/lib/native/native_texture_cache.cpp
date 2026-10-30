@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 
 namespace ps2x::native
 {
@@ -225,6 +228,17 @@ namespace ps2x::native
         const uint32_t h = (trxreg >> 32) & 0xfffu;
         if (w == 0u || h == 0u)
             return;
+        // PS2X_NATIVE_TEXSTATS=1: each upload destination, once (where a game's textures and palettes land).
+        if (static const bool s_texStats = std::getenv("PS2X_NATIVE_TEXSTATS") != nullptr; s_texStats)
+        {
+            static std::unordered_map<uint64_t, bool> s_seen;
+            const uint64_t key = bitbltbuf >> 32 ^ (trxpos >> 32) << 32 ^ trxreg * 0x9e3779b97f4a7c15ull;
+            if (!s_seen[key])
+            {
+                s_seen[key] = true;
+                std::fprintf(stderr, "[native:upload] dbp %u dbw %u dpsm %#x at %u,%u %ux%u, %zu bytes\n", dbp, dbw, dpsm, dx, dy, w, h, bytes);
+            }
+        }
         const uint32_t bpp = bitsPerPixel(dpsm);
         const size_t pixels = std::min<size_t>(static_cast<size_t>(w) * h, bytes * 8u / bpp);
         for (size_t i = 0; i < pixels; ++i)
