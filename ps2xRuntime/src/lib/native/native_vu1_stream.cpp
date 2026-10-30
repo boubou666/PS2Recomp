@@ -182,6 +182,7 @@ namespace ps2x::native
         setVif1Observer(&onVif1, m_config.onVif1Thread);
         setVu1Gate(&programGate);
         setDirectGate(&directGate);
+        setMscntGroups(true); // an MSCNT is a group of its own here, so VIF1 must count it too
         m_installed = true;
     }
 
