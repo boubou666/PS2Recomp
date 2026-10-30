@@ -38,31 +38,32 @@ namespace
         return image;
     }
 
-    uint32_t opaque(uint32_t c) { return (c & 0x00ffffffu) | ((c >> 24) * 2u << 24); } // GS 0x80 alpha -> 0xff scale
+    uint32_t asUploaded(uint32_t c) { return c; } // the GS's own alpha (0x80 is 1.0), scaled by the shaders
 }
 
 void register_native_texture_cache_tests()
 {
     MiniTest::Case("NativeTextureCache", [](TestCase &tc)
     {
-        tc.Run("CT32 texture decodes as uploaded, alpha scaled from 0x80 to 0xff", [](TestCase &t)
+        tc.Run("CT32 texture decodes as uploaded, alpha as the GS has it", [](TestCase &t)
         {
             TextureCache cache;
             std::vector<uint8_t> pixels(8 * 8 * 4);
             for (size_t i = 0; i < pixels.size(); ++i)
                 pixels[i] = static_cast<uint8_t>(i * 13u);
             for (size_t i = 3; i < pixels.size(); i += 4)
-                pixels[i] = 0x80;
+                pixels[i] = i < 128u ? 0x80 : 0xff; // 1.0, and the GS's almost 2.0 (an opaque texel under a faded vertex)
             cache.upload(bitbltbuf(0, 1, 0x00), 0, trxreg(8, 8), pixels.data(), pixels.size());
             const TextureCache::Texture &texture = *cache.texture(tex0(0, 1, 0x00, 3, 3));
             t.Equals(texture.width, 8u, "width 2^TW");
             bool same = true;
             for (size_t i = 0; i < 64; ++i)
             {
-                const uint32_t c = pixels[i * 4] | (pixels[i * 4 + 1] << 8) | (pixels[i * 4 + 2] << 16) | (0xffu << 24);
+                const uint32_t c = pixels[i * 4] | (pixels[i * 4 + 1] << 8) | (pixels[i * 4 + 2] << 16) |
+                                   (static_cast<uint32_t>(pixels[i * 4 + 3]) << 24);
                 same &= texture.rgba[i] == c;
             }
-            t.IsTrue(same, "every texel equals the uploaded pixel, opaque");
+            t.IsTrue(same, "every texel equals the uploaded pixel, alpha over 0x80 kept");
         });
 
         tc.Run("T8 texture looks its indices up in a CSM1 CT32 palette", [](TestCase &t)
@@ -77,7 +78,7 @@ void register_native_texture_cache_tests()
             const TextureCache::Texture &texture = *cache.texture(tex0(64, 1, 0x13, 4, 4, 200));
             bool same = true;
             for (uint32_t i = 0; i < 256; ++i)
-                same &= texture.rgba[i] == opaque(colour(i));
+                same &= texture.rgba[i] == asUploaded(colour(i));
             t.IsTrue(same, "texel i shows palette entry i, wherever CSM1 stored it");
         });
 
@@ -93,7 +94,7 @@ void register_native_texture_cache_tests()
             const TextureCache::Texture &texture = *cache.texture(tex0(128, 1, 0x14, 4, 0, 200, 3));
             bool same = true;
             for (uint32_t i = 0; i < 16; ++i)
-                same &= texture.rgba[i] == opaque(colour(48u + i));
+                same &= texture.rgba[i] == asUploaded(colour(48u + i));
             t.IsTrue(same, "texel i shows entry CSA * 16 + i");
         });
 
