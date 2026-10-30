@@ -52,7 +52,16 @@ namespace
         return packet;
     }
 
-    std::vector<Vertex> drawSprite(bool gsWrites)
+    std::vector<uint32_t> testWrite(uint64_t test)
+    {
+        std::vector<uint32_t> packet;
+        const uint64_t tag = 1u | (1ull << 60);
+        quad(packet, static_cast<uint32_t>(tag), static_cast<uint32_t>(tag >> 32), 0xeu, 0);
+        quad(packet, static_cast<uint32_t>(test), static_cast<uint32_t>(test >> 32), 0x47u, 0);
+        return packet;
+    }
+
+    std::vector<Vertex> drawSprite(bool gsWrites, const std::vector<uint32_t> &before = {})
     {
         Renderer &renderer = Renderer::instance();
         renderer.setStreamDraws(true);
@@ -61,7 +70,9 @@ namespace
         renderer.beginGroup(1);
         GifToNative gif;
         gif.setGsWrites(gsWrites);
-        const std::vector<uint32_t> packet = stqSprite(0.5f, 0.25f, 2.0f, 1.0f, 1.0f, 4.0f);
+        std::vector<uint32_t> packet = before;
+        const std::vector<uint32_t> sprite = stqSprite(0.5f, 0.25f, 2.0f, 1.0f, 1.0f, 4.0f);
+        packet.insert(packet.end(), sprite.begin(), sprite.end());
         gif.packet(reinterpret_cast<const uint8_t *>(packet.data()), packet.size() * 4u);
         gif.flush();
         renderer.takeGsContextBatches(~0ull, &take, nullptr);
@@ -92,6 +103,14 @@ void register_native_gif_tests()
             }
             t.IsTrue(sameQ, "Q of the second vertex on every corner");
             t.IsTrue(uv, "S and T over that Q");
+        });
+        tc.Run("an alpha test that never passes still draws what its AFAIL writes", [](TestCase &t)
+        {
+            const uint64_t never = 1u | (1ull << 16) | (2ull << 17);
+            t.Equals(drawSprite(true, testWrite(never | (3ull << 12))).size(), size_t{6}, "RGB_ONLY drawn");
+            t.Equals(drawSprite(true, testWrite(never | (1ull << 12))).size(), size_t{6}, "FB_ONLY drawn");
+            t.Equals(drawSprite(true, testWrite(never | (2ull << 12))).size(), size_t{6}, "ZB_ONLY drawn by the GS");
+            t.Equals(drawSprite(true, testWrite(never)).size(), size_t{0}, "KEEP skipped");
         });
     });
 }
