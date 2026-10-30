@@ -3,6 +3,8 @@
 
 namespace ps2_stubs
 {
+    uint64_t mcHostCreationTime(const std::filesystem::path &path); // MemoryCardHostTime.cpp
+
     namespace
     {
         constexpr int32_t kMcCmdGetInfo = 0x01;
@@ -791,13 +793,22 @@ namespace ps2_stubs
                             dirEntries.push_back(entry);
                         }
 
-                        std::sort(dirEntries.begin(), dirEntries.end(),
-                                  [](const std::filesystem::directory_entry &lhs,
-                                     const std::filesystem::directory_entry &rhs)
-                                  {
-                                      return toLowerAscii(lhs.path().filename().string()) <
-                                             toLowerAscii(rhs.path().filename().string());
-                                  });
+                        // A memory card lists a directory in creation order, and games rely on it: JC2 finds
+                        // its save slots as entries 6, 7 and 8 (after ., .., icon.sys and three icons) and showed
+                        // every slot empty with names in alphabetical order. Creation time where the host keeps
+                        // one (Windows), then the name.
+                        std::vector<std::pair<uint64_t, std::string>> keys;
+                        for (const auto &entry : dirEntries)
+                            keys.emplace_back(mcHostCreationTime(entry.path()), toLowerAscii(entry.path().filename().string()));
+                        std::vector<size_t> order(dirEntries.size());
+                        for (size_t i = 0; i < order.size(); ++i)
+                            order[i] = i;
+                        std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) { return keys[lhs] < keys[rhs]; });
+                        std::vector<std::filesystem::directory_entry> sorted;
+                        sorted.reserve(order.size());
+                        for (size_t i : order)
+                            sorted.push_back(dirEntries[i]);
+                        dirEntries.swap(sorted);
 
                         for (const auto &entry : dirEntries)
                         {
@@ -1086,6 +1097,8 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdOpen, result);
         }
+        RUNTIME_LOG("[MC] Open port=" << port << " '" << path << "' flags=0x" << std::hex << flags << std::dec
+                                      << " -> " << result);
         setReturnS32(ctx, 0);
     }
 
@@ -1124,6 +1137,9 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdRead, result);
         }
+        RUNTIME_LOG("[MC] Read fd=" << fd << " dst=0x" << std::hex << dstAddr << " size=0x" << size << std::dec
+                                    << " -> " << result << " first=0x" << std::hex
+                                    << (dst && result >= 4 ? *reinterpret_cast<const uint32_t *>(dst) : 0u) << std::dec);
         setReturnS32(ctx, 0);
     }
 
