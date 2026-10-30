@@ -329,6 +329,17 @@ namespace
         const int truncated = static_cast<int>(value);
         return value < static_cast<float>(truncated) ? truncated - 1 : truncated;
     }
+
+    int64_t floorDiv(int64_t numerator, int64_t denominator)
+    {
+        const int64_t quotient = numerator / denominator;
+        return (numerator % denominator != 0 && (numerator < 0) != (denominator < 0)) ? quotient - 1 : quotient;
+    }
+
+    int64_t ceilDiv(int64_t numerator, int64_t denominator)
+    {
+        return -floorDiv(-numerator, denominator);
+    }
 }
 
 namespace
@@ -786,7 +797,7 @@ namespace
             lastRow = clampInt(y1, ctx.scissor.y0, ctx.scissor.y1);
             return;
         }
-        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+        const float ofy = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
         const uint32_t count = std::min<uint32_t>(primitiveVertexCount(batch.state.prim.type), batch.vertexCount);
         float minY = batch.vertices[0].y;
         float maxY = minY;
@@ -803,7 +814,7 @@ namespace
     void primitiveColumns(const GSPrimitiveBatch &batch, int &firstColumn, int &lastColumn)
     {
         const auto &ctx = batch.state.context;
-        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
+        const float ofx = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
         const uint32_t count = std::min<uint32_t>(primitiveVertexCount(batch.state.prim.type), batch.vertexCount);
         float minX = batch.vertices[0].x;
         float maxX = minX;
@@ -3471,20 +3482,15 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
     const GSVertex &v2 = batch.vertices[2];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    const int64_t ofx = ctx.xyoffset.ofx;
+    const int64_t ofy = ctx.xyoffset.ofy;
+    const int64_t px[3] = {std::llround(v0.x * 16.0f) - ofx, std::llround(v1.x * 16.0f) - ofx, std::llround(v2.x * 16.0f) - ofx};
+    const int64_t py[3] = {std::llround(v0.y * 16.0f) - ofy, std::llround(v1.y * 16.0f) - ofy, std::llround(v2.y * 16.0f) - ofy};
 
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
-
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
+    int minX = static_cast<int>(floorDiv(std::min({px[0], px[1], px[2]}), 16));
+    int maxX = static_cast<int>(ceilDiv(std::max({px[0], px[1], px[2]}), 16));
+    int minY = static_cast<int>(floorDiv(std::min({py[0], py[1], py[2]}), 16));
+    int maxY = static_cast<int>(ceilDiv(std::max({py[0], py[1], py[2]}), 16));
 
     minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
     maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
@@ -3493,19 +3499,37 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
     if (!raster.ownsAnyIn(minX, minY, maxX, maxY))
         return;
 
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    // Integer sample points, top-left rule: a point on a left or top edge is inside, on a right or bottom edge outside.
+    // Edge functions in 1/16 pixels, positive inside.
+    struct Edge
+    {
+        int64_t a, b, c, bias;
+    };
+    Edge edges[3];
+    int64_t area = 0;
+    for (int i = 0; i < 3; ++i)
+    {
+        const int j = (i + 1) % 3;
+        const int k = (i + 2) % 3;
+        const int64_t dx = px[k] - px[j];
+        const int64_t dy = py[k] - py[j];
+        edges[i] = {dy, -dx, py[j] * dx - px[j] * dy, 0};
+        if (i == 0)
+            area = edges[0].a * px[0] + edges[0].b * py[0] + edges[0].c;
+    }
+    if (area == 0)
         return;
- (void)(uint64_t(maxX-minX+1)*uint64_t(maxY-minY+1));
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
-
-    // Each weight is linear in px: w = slope * (px - fx2) + rowTerm. Solving the three edge
-    // conditions gives the row's covered span; scanning only that span (padded, the
-    // per-pixel test below still decides) skips the empty part of the bounding box.
-    const float slope0 = ((fy1 - fy2) * winding) * invAbsDenom;
-    const float slope1 = ((fy2 - fy0) * winding) * invAbsDenom;
+    for (Edge &edge : edges)
+    {
+        if (area < 0)
+        {
+            edge.a = -edge.a;
+            edge.b = -edge.b;
+            edge.c = -edge.c;
+        }
+        edge.bias = (edge.a > 0 || (edge.a == 0 && edge.b > 0)) ? 0 : 1;
+    }
+    const double invArea = 1.0 / static_cast<double>(area < 0 ? -area : area);
 
     // Early depth test: WritePixel's Z comparison done before shading, so occluded pixels skip
     // the texture sample. A pixel failing it writes nothing whatever its colour, and sampling
@@ -3517,30 +3541,28 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
 
     for (int y = minY; y <= maxY; ++y)
     {
-        float py = static_cast<float>(y) + 0.5f;
-
-        const float row0 = (((fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-        const float row1 = (((fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-        float lo = static_cast<float>(minX) - 2.0f - fx2;
-        float hi = static_cast<float>(maxX) + 2.0f - fx2;
-        bool empty = false;
-        auto bound = [&](float slope, float rowTerm)
+        int64_t row[3];
+        int64_t lo = minX;
+        int64_t hi = maxX;
+        for (int i = 0; i < 3; ++i)
         {
-            // slope * d + rowTerm >= -kEdgeEpsilon
-            if (slope > 0.0f)
-                lo = std::max(lo, (-kEdgeEpsilon - rowTerm) / slope);
-            else if (slope < 0.0f)
-                hi = std::min(hi, (-kEdgeEpsilon - rowTerm) / slope);
-            else if (rowTerm < -kEdgeEpsilon)
-                empty = true;
-        };
-        bound(slope0, row0);
-        bound(slope1, row1);
-        bound(-(slope0 + slope1), 1.0f - row0 - row1);
-        if (empty || lo > hi + 1.0f)
+            const Edge &edge = edges[i];
+            row[i] = edge.b * (static_cast<int64_t>(y) * 16) + edge.c;
+            if (edge.a > 0)
+                lo = std::max(lo, ceilDiv(edge.bias - row[i], edge.a * 16));
+            else if (edge.a < 0)
+                hi = std::min(hi, floorDiv(row[i] - edge.bias, -edge.a * 16));
+            else if (row[i] < edge.bias)
+                hi = lo - 1;
+        }
+        if (lo > hi)
             continue;
-        const int spanX0 = std::max(minX, floorToInt(lo + fx2 - 0.5f) - 1);
-        const int spanX1 = std::min(maxX, floorToInt(hi + fx2 - 0.5f) + 2);
+        const int spanX0 = static_cast<int>(lo);
+        const int spanX1 = static_cast<int>(hi);
+        const auto weight = [&](int i, int x)
+        {
+            return static_cast<float>(static_cast<double>(row[i] + edges[i].a * (static_cast<int64_t>(x) * 16)) * invArea);
+        };
 
         for (int runStart = spanX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, spanX1); runStart = runEnd + 1)
         {
@@ -3554,20 +3576,13 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
             {
                 const int count = std::min(N, runEnd - xb + 1);
                 float w0[N], w1[N], w2[N];
-                int32_t covered[N];
                 for (int i = 0; i < N; ++i)
                 {
-                    float px = static_cast<float>(xb + i) + 0.5f;
-                    w0[i] = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-                    w1[i] = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-                    w2[i] = 1.0f - w0[i] - w1[i];
-                    covered[i] = (i < count && !(w0[i] < -kEdgeEpsilon || w1[i] < -kEdgeEpsilon || w2[i] < -kEdgeEpsilon)) ? 1 : 0;
+                    w0[i] = weight(0, xb + i);
+                    w1[i] = weight(1, xb + i);
+                    w2[i] = weight(2, xb + i);
                 }
-                uint32_t live = 0u;
-                for (int i = 0; i < N; ++i)
-                    live |= static_cast<uint32_t>(covered[i]) << i;
-                if (live == 0u)
-                    continue;
+                uint32_t live = (1u << count) - 1u;
 
                 u32 zs[N];
                 for (int i = 0; i < N; ++i)
@@ -3705,14 +3720,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
         }
         for (int x = runStart; x <= runEnd; ++x)
         {
-            float px = static_cast<float>(x) + 0.5f;
-
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
-                continue;
+            const float w0 = weight(0, x);
+            const float w1 = weight(1, x);
+            const float w2 = weight(2, x);
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
             const u32 pixelZ = gsDepthBits(z + 0.5);

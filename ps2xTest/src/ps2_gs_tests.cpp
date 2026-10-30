@@ -4411,7 +4411,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
-                gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
+                gs.writeRegister(GS_REG_ST, packSt(1.5f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
@@ -4578,7 +4578,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
+            gs.writeRegister(GS_REG_ST, packSt(3.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
             gs.writeRegister(GS_REG_XYZ2, 64ull);
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
@@ -4588,7 +4588,7 @@ void register_ps2_gs_tests()
             const uint32_t pixel =
                 readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
             t.Equals(pixel, kHomogeneousTexel,
-                     "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
+                     "the DDA should interpolate S=0.75 and Q=1.25 at pixel (1, 1), selecting texel 2 after S/Q");
         });
 
         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
