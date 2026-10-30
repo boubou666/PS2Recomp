@@ -473,6 +473,97 @@ namespace ps2x::vu1lift
         }
     };
 
+    // RNEXT: the next value of the R register's 23-bit generator, as a float in [1, 2).
+    inline uint32_t rnext(uint32_t r)
+    {
+        const uint32_t x = (r >> 4) & 1u;
+        const uint32_t y = (r >> 22) & 1u;
+        return (((r << 1) ^ x ^ y) & 0x007FFFFFu) | 0x3F800000u;
+    }
+
+    // The EFU's results, as VU1Interpreter computes them (the P value before it lands).
+    namespace efu
+    {
+        inline float x(__m128 v) { return normalizeOperand(laneValue(v, 0)); }
+        inline float y(__m128 v) { return normalizeOperand(laneValue(v, 1)); }
+        inline float z(__m128 v) { return normalizeOperand(laneValue(v, 2)); }
+        inline float w(__m128 v) { return normalizeOperand(laneValue(v, 3)); }
+        inline float squares(__m128 v) { return x(v) * x(v) + y(v) * y(v) + z(v) * z(v); }
+
+        inline float atanPolynomial(float value)
+        {
+            constexpr float c[] = {0.999999344348907f, -0.333298563957214f, 0.199465364217758f, -0.13085337519646f,
+                                   0.096420042216778f, -0.055909886956215f, 0.021861229091883f, -0.004054057877511f};
+            const float squared = value * value;
+            float polynomial = c[7];
+            for (int index = 6; index >= 0; --index)
+                polynomial = c[index] + squared * polynomial;
+            return 0.785398185253143f + value * polynomial;
+        }
+
+        inline float esadd(__m128 v) { return normalizeOperand(squares(v)); }
+        inline float ersadd(__m128 v)
+        {
+            const float sum = squares(v);
+            return normalizeOperand(sum != 0.0f ? 1.0f / sum : sum);
+        }
+        inline float eleng(__m128 v) { return normalizeOperand(std::sqrt(squares(v))); }
+        inline float erleng(__m128 v)
+        {
+            const float length = std::sqrt(squares(v));
+            return normalizeOperand(length != 0.0f ? 1.0f / length : length);
+        }
+        inline float eatanxy(__m128 v) { return normalizeOperand(x(v) != 0.0f ? atanPolynomial(y(v) / x(v)) : 0.0f); }
+        inline float eatanxz(__m128 v) { return normalizeOperand(x(v) != 0.0f ? atanPolynomial(z(v) / x(v)) : 0.0f); }
+        inline float esum(__m128 v) { return normalizeOperand(x(v) + y(v) + z(v) + w(v)); }
+        inline float esqrt(float value)
+        {
+            value = normalizeOperand(value);
+            return normalizeOperand(value >= 0.0f ? std::sqrt(value) : value);
+        }
+        inline float ersqrt(float value)
+        {
+            value = normalizeOperand(value);
+            float result = value;
+            if (result >= 0.0f)
+            {
+                result = std::sqrt(result);
+                if (result != 0.0f)
+                    result = 1.0f / result;
+            }
+            return normalizeOperand(result);
+        }
+        inline float ercpr(float value)
+        {
+            value = normalizeOperand(value);
+            return normalizeOperand(value != 0.0f ? 1.0f / value : value);
+        }
+        inline float esin(float value)
+        {
+            value = normalizeOperand(value);
+            constexpr float c[] = {1.0f, -0.166666567325592f, 0.008333025500178f, -0.000198074136279f, 0.000002601886990f};
+            const float squared = value * value;
+            float polynomial = c[4];
+            for (int index = 3; index >= 0; --index)
+                polynomial = c[index] + squared * polynomial;
+            return normalizeOperand(value * polynomial);
+        }
+        inline float eatan(float value) { return normalizeOperand(atanPolynomial(normalizeOperand(value))); }
+        inline float eexp(float value)
+        {
+            value = normalizeOperand(value);
+            constexpr float c[] = {0.249998688697815f, 0.031257584691048f, 0.002591371303424f,
+                                   0.000171562001924f, 0.000005430199963f, 0.000000690600018f};
+            float polynomial = c[5];
+            for (int index = 4; index >= 0; --index)
+                polynomial = c[index] + value * polynomial;
+            polynomial = 1.0f + value * polynomial;
+            polynomial *= polynomial;
+            polynomial *= polynomial;
+            return normalizeOperand(polynomial != 0.0f ? 1.0f / polynomial : std::numeric_limits<float>::max());
+        }
+    }
+
     struct RoundTowardZero
     {
         unsigned int csr = _mm_getcsr();

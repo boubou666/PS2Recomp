@@ -26,6 +26,14 @@ import sys
 BC = 'xyzw'
 FMAC_LATENCY = 4
 ACC_FORWARD = 1
+# EFU instructions by special code: (name, latency until P holds the result, lanes read; None = the one in fsf).
+# The EFU takes a new instruction a cycle before the previous result lands; two results can be in flight.
+EFU = {0x70: ('esadd', 11, 0xE), 0x71: ('ersadd', 18, 0xE), 0x72: ('eleng', 18, 0xE), 0x73: ('erleng', 24, 0xE),
+       0x74: ('eatanxy', 54, 0xC), 0x75: ('eatanxz', 54, 0xA), 0x76: ('esum', 12, 0xF), 0x78: ('esqrt', 12, None),
+       0x79: ('ersqrt', 18, None), 0x7A: ('ercpr', 12, None), 0x7C: ('esin', 29, None), 0x7D: ('eatan', 54, None),
+       0x7E: ('eexp', 44, None)}
+EFU_BY_NAME = {name: (latency, lanes) for name, latency, lanes in EFU.values()}
+MAX_EFU_ENTRIES = 2
 
 
 def lane_for_component(c):
@@ -50,6 +58,7 @@ class Usage:
         self.vi_latency = 0
         self.pipeline = None
         self.wait_q = False
+        self.wait_p = False
         self.reads_clip = False
         self.writes_clip = False
         self.delays_branch = False
@@ -220,7 +229,7 @@ class Lower:
             self.name = 'nop'
             return
         names = {0x00: 'lq', 0x01: 'sq', 0x04: 'ilw', 0x05: 'isw', 0x08: 'iaddiu', 0x09: 'isubiu', 0x11: 'fcset', 0x12: 'fcand', 0x13: 'fcor', 0x15: 'fsset', 0x16: 'fsand',
-                 0x1A: 'fmand', 0x1C: 'fcget', 0x20: 'b', 0x21: 'bal', 0x24: 'jr', 0x28: 'ibeq', 0x29: 'ibne', 0x2C: 'ibltz', 0x2D: 'ibgtz',
+                 0x1A: 'fmand', 0x1C: 'fcget', 0x20: 'b', 0x21: 'bal', 0x24: 'jr', 0x25: 'jalr', 0x28: 'ibeq', 0x29: 'ibne', 0x2C: 'ibltz', 0x2D: 'ibgtz',
                  0x2E: 'iblez', 0x2F: 'ibgez'}
         if self.op in names:
             self.name = names[self.op]
@@ -235,8 +244,10 @@ class Lower:
         if funct < 0x3C:
             raise ValueError(f'unsupported lower {word:#010x}')
         sp = (word & 3) | ((word >> 4) & 0x7C)
-        f2 = {0x30: 'move', 0x31: 'mr32', 0x34: 'lqi', 0x35: 'sqi', 0x38: 'div', 0x39: 'sqrt', 0x3A: 'rsqrt', 0x3B: 'waitq',
-              0x3C: 'mtir', 0x3D: 'mfir', 0x41: 'rget', 0x42: 'rinit', 0x68: 'xtop', 0x69: 'xitop', 0x6C: 'xgkick'}
+        f2 = {0x30: 'move', 0x31: 'mr32', 0x34: 'lqi', 0x35: 'sqi', 0x36: 'lqd', 0x37: 'sqd', 0x38: 'div', 0x39: 'sqrt',
+              0x3A: 'rsqrt', 0x3B: 'waitq', 0x3C: 'mtir', 0x3D: 'mfir', 0x40: 'rnext', 0x41: 'rget', 0x42: 'rinit',
+              0x64: 'mfp', 0x68: 'xtop', 0x69: 'xitop', 0x6C: 'xgkick', 0x7B: 'waitp'}
+        f2.update({sp: name for sp, (name, _, _) in EFU.items()})
         if sp not in f2:
             raise ValueError(f'unsupported lower {word:#010x}')
         self.name = f2[sp]
@@ -368,13 +379,36 @@ class Lower:
         elif n == 'xgkick':
             u.pipeline, u.latency = 'xgkick', 2
             rvi(self.is_)
+        elif n == 'jalr':
+            u.pipeline, u.latency = 'branch', 1
+            rvi(self.is_)
+            wvi(self.it)
+        elif n == 'lqd':
+            u.pipeline, u.latency, u.vi_latency, u.delays_branch = 'lsu', 4, 1, True
+            rvi(self.is_)
+            wvi(self.is_)
+            u.add_vf_write(self.ft, self.dest)
+        elif n == 'sqd':
+            u.pipeline, u.latency, u.delays_branch = 'lsu', 1, True
+            rvi(self.it)
+            wvi(self.it)
+            u.add_vf_read(self.fs, self.dest)
+        elif n in ('rnext', 'mfp'):
+            u.pipeline, u.latency = 'fmac', 4
+            u.add_vf_write(self.ft, self.dest)
+        elif n == 'waitp':
+            u.pipeline, u.wait_p = 'efu', True
+        elif n in EFU_BY_NAME:
+            latency, lanes = EFU_BY_NAME[n]
+            u.pipeline, u.latency = 'efu', latency
+            u.add_vf_read(self.fs, lanes if lanes is not None else lane_for_component(self.fsf))
         return u
 
     def is_branch(self):
-        return self.name in ('b', 'bal', 'jr', 'ibeq', 'ibne', 'ibltz', 'ibgtz', 'iblez', 'ibgez')
+        return self.name in ('b', 'bal', 'jr', 'jalr', 'ibeq', 'ibne', 'ibltz', 'ibgtz', 'iblez', 'ibgez')
 
     def is_store(self):
-        return self.name in ('sq', 'isw', 'sqi')
+        return self.name in ('sq', 'isw', 'sqi', 'sqd')
 
 
 class Pair:
@@ -422,8 +456,8 @@ class GenError(Exception):
 
 
 class TState:
-    __slots__ = ('vf', 'vi', 'acc', 'wb', 'fdiv', 'flags', 'mac', 'clip', 'last', 'kick', 'branch', 'ebit',
-                 'backup', 'stat', '_key')
+    __slots__ = ('vf', 'vi', 'acc', 'wb', 'fdiv', 'efu', 'efu_res', 'flags', 'mac', 'clip', 'last', 'kick', 'branch',
+                 'ebit', 'backup', 'stat', '_key')
 
     def __init__(self):
         self.vf = [0] * 128
@@ -431,6 +465,8 @@ class TState:
         self.acc = [0] * 4
         self.wb = 0
         self.fdiv = None
+        self.efu = ()  # P results in flight: (cycles until they land, slot), in slot order
+        self.efu_res = 0  # cycles until the EFU takes another instruction
         self.flags = ()
         self.mac = None
         self.clip = None
@@ -449,16 +485,19 @@ class TState:
         s.acc = list(self.acc)
         s.wb, s.fdiv, s.flags, s.mac, s.clip, s.last = self.wb, self.fdiv, self.flags, self.mac, self.clip, self.last
         s.kick, s.branch, s.ebit, s.backup, s.stat = self.kick, self.branch, self.ebit, self.backup, self.stat
+        s.efu, s.efu_res = self.efu, self.efu_res
         return s
 
     def key(self):
         if self._key is None:
-            self._key = (tuple(self.vf), tuple(self.vi), tuple(self.acc), self.wb, self.fdiv, self.flags, self.mac,
-                         self.clip, self.last, self.kick, self.branch, self.ebit, self.backup, self.stat)
+            self._key = (tuple(self.vf), tuple(self.vi), tuple(self.acc), self.wb, self.fdiv, self.efu, self.efu_res,
+                         self.flags, self.mac, self.clip, self.last, self.kick, self.branch, self.ebit, self.backup,
+                         self.stat)
         return self._key
 
     def horizon(self):
-        values = self.vf + self.vi + self.acc + [self.wb] + [f[0] for f in self.flags]
+        values = self.vf + self.vi + self.acc + [self.wb, self.efu_res] + [f[0] for f in self.flags]
+        values += [r for r, _ in self.efu]
         if self.fdiv is not None:
             values.append(self.fdiv)
         return max(values)
@@ -487,6 +526,9 @@ class Node:
         self.landed = []  # status-tracking programs: flag writes that land before the pair, (kind, pc)
         self.stat_src = None  # FSAND: the FMAC whose status flags it reads
         self.end_flags = ()  # END: the flag writes still in flight, (kind, pc)
+        self.land_p = ()  # the P slots whose results land before the pair, in slot order
+        self.efu_slot = None  # an EFU instruction: the slot its result waits in
+        self.end_p = ()  # END: the P slots still in flight
 
 
 class Program:
@@ -553,6 +595,10 @@ class Program:
                     ready = max(ready, s.acc[c])
         if p.lu.pipeline == 'fdiv' and s.fdiv is not None:
             ready = max(ready, s.fdiv)
+        if p.lu.pipeline == 'efu':
+            ready = max(ready, s.efu_res)
+        if p.lu.wait_p:
+            ready = max([ready] + [r for r, _ in s.efu])
         return ready
 
     def step(self, n):
@@ -573,6 +619,9 @@ class Program:
         if s.fdiv is not None and s.fdiv <= t:
             n.land_q = True
             s.fdiv = None
+        if s.efu:
+            n.land_p = tuple(slot for r, slot in s.efu if r <= t)
+            s.efu = tuple((r, slot) for r, slot in s.efu if r > t)
         flags = list(s.flags)
         while flags and flags[0][0] <= t:
             _, kind, pc = flags.pop(0)
@@ -617,6 +666,15 @@ class Program:
         lo = p.lower
         if lo.name in ('div', 'sqrt', 'rsqrt'):
             s.fdiv = t + (13 if lo.name == 'rsqrt' else 7)
+        if lo.name in EFU_BY_NAME:
+            used = {slot for _, slot in s.efu}
+            free = [slot for slot in range(MAX_EFU_ENTRIES) if slot not in used]
+            if not free:
+                raise GenError(f'{self.name}: EFU queue overflow at {p.pc:#x}')
+            latency = EFU_BY_NAME[lo.name][0]
+            n.efu_slot = free[0]
+            s.efu = tuple(sorted(s.efu + ((t + latency, free[0]),), key=lambda e: e[1]))
+            s.efu_res = t + latency - 1
         if lo.is_store():
             n.path1_store = s.kick
             s.wb = max(s.wb, t + 1)
@@ -650,7 +708,7 @@ class Program:
         if lo.is_branch():
             if lo.name in ('ibeq', 'ibne'):
                 branch_reads = (1 << lo.is_) | (1 << lo.it)
-            elif lo.name not in ('b', 'bal', 'jr'):
+            elif lo.name not in ('b', 'bal', 'jr', 'jalr'):
                 branch_reads = 1 << lo.is_
         if s.backup and branch_reads & (1 << s.backup):
             n.branch_backup = s.backup
@@ -668,21 +726,23 @@ class Program:
         s.wb = dec(s.wb)
         if s.fdiv is not None:
             s.fdiv = dec(s.fdiv)
+        s.efu = tuple((dec(r), slot) for r, slot in s.efu)
+        s.efu_res = dec(s.efu_res)
         s.flags = tuple((dec(r), k, pc) for r, k, pc in flags)
         ended = s.ebit
         if p.ebit and not ended:
             s.ebit = True
         outcomes = []
         if lo.is_branch():
-            if s.branch is not None:
-                raise GenError(f'{self.name}: branch in a delay slot at {p.pc:#x}')
-            if lo.name == 'jr':
+            # A branch in a delay slot (VP2's dispatch tables: "b X" then "ibeq ..., Y"), as VU1Interpreter runs it:
+            # taken, it replaces the pending branch and has a delay slot of its own; not taken, the pending one goes.
+            if lo.name in ('jr', 'jalr'):
                 outcomes.append((None, ('jr', 1)))
             elif lo.name in ('b', 'bal'):
                 outcomes.append((None, ((p.pc + 8 + lo.imm11 * 8) & self.mask, 1)))
             else:
                 outcomes.append(('taken', ((p.pc + 8 + lo.imm11 * 8) & self.mask, 1)))
-                outcomes.append(('not', None))
+                outcomes.append(('not', s.branch))
         else:
             outcomes.append((None, s.branch))
         for cond, branch in outcomes:
@@ -702,8 +762,10 @@ class Program:
             else:
                 ns.branch = None
             if ended:
-                tail = max([0, ns.wb] + [r for r, _, _ in ns.flags] + ([ns.fdiv] if ns.fdiv is not None else []))
+                tail = max([0, ns.wb] + [r for r, _, _ in ns.flags] + ([ns.fdiv] if ns.fdiv is not None else []) +
+                           [r for r, _ in ns.efu])
                 n.end = (tail, ns.kick, ns.fdiv is not None, ns.last, ns.mac)
+                n.end_p = tuple(slot for _, slot in ns.efu)
                 n.end_flags = tuple((k, pc) for _, k, pc in ns.flags if k in ('f', 's')) if self.track_status else ()
                 return
             for c, pc in next_pcs:
@@ -719,7 +781,8 @@ class Emitter:
         self.lines = []
         self.need_mac = set()
         self.need_clip = set()
-        self.uses_r = any(p is not None and p.lower.name in ('rget', 'rinit') for p in prog.pairs)
+        self.uses_r = any(p is not None and p.lower.name in ('rget', 'rinit', 'rnext') for p in prog.pairs)
+        self.uses_p = any(p is not None and (p.lower.name in EFU_BY_NAME or p.lower.name == 'mfp') for p in prog.pairs)
         for n in prog.nodes:
             if n.mac_src is not None:
                 self.need_mac.add(n.mac_src)
@@ -882,6 +945,32 @@ class Emitter:
             return [f'path.begin({vi(lo.is_)}, t);']
         if nm == 'jr':
             return [f'jrTarget = (static_cast<uint32_t>(static_cast<uint16_t>({vi(lo.is_)})) * 8u) & {self.prog.mask:#x}u;']
+        if nm == 'jalr':
+            out = [f'jrTarget = (static_cast<uint32_t>(static_cast<uint16_t>({vi(lo.is_)})) * 8u) & {self.prog.mask:#x}u;']
+            if lo.it:
+                out.append(f'{vi(lo.it)} = {((p.pc + 16) & self.prog.mask) >> 3};')
+            return out
+        if nm == 'lqd':
+            out = [f'{vi(lo.is_)} = i16({vi(lo.is_)} - 1);'] if lo.is_ else []
+            if lo.ft:
+                out.append(f'{vf(lo.ft)} = put<{lo.dest}>({vf(lo.ft)}, m.lq({vi(lo.is_)}));')
+            return out
+        if nm == 'sqd':
+            out = [f'{vi(lo.it)} = i16({vi(lo.it)} - 1);'] if lo.it else []
+            out.append(f'm.sq<{lo.dest}>({vi(lo.it)}, {vf(lo.fs)});')
+            return out
+        if nm == 'rnext':
+            out = ['rReg = rnext(rReg);']
+            if lo.ft:
+                out.append(f'{vf(lo.ft)} = put<{lo.dest}>({vf(lo.ft)}, floats(_mm_set1_epi32(static_cast<int32_t>(rReg))));')
+            return out
+        if nm == 'mfp':
+            return [f'{vf(lo.ft)} = put<{lo.dest}>({vf(lo.ft)}, _mm_set1_ps(pReg));'] if lo.ft else []
+        if nm == 'waitp':
+            return []
+        if nm in EFU_BY_NAME:
+            arg = vf(lo.fs) if EFU_BY_NAME[nm][1] is not None else f'laneValue({vf(lo.fs)}, {lo.fsf})'
+            return [f'pSlot{n.efu_slot} = efu::{nm}({arg});']
         if lo.is_branch():
             return []
         raise GenError(f'lower {nm} at {p.pc:#x} not written')
@@ -931,6 +1020,8 @@ class Emitter:
         if n.land_q:
             self.out('q = qPending;')
             self.out('landDi(f, diPending);')
+        for slot in n.land_p:
+            self.out(f'pReg = pSlot{slot};')
         self.land_status(n.landed)
         lower = self.lower(n, p)
         if n.save_backup:
@@ -962,6 +1053,8 @@ class Emitter:
             if fdiv:
                 self.out('q = qPending;')
                 self.out('landDi(f, diPending);')
+            for slot in n.end_p:
+                self.out(f'pReg = pSlot{slot};')
             self.land_status(n.end_flags)
             self.out(f'endCycle = t + 1 + {tail};')
             if kick:
@@ -1016,6 +1109,8 @@ class Emitter:
         self.out('float q = state.q, iReg = state.i, qPending = 0.0f;', 1)
         if self.uses_r:
             self.out('uint32_t rReg = state.r;', 1)
+        if self.uses_p:
+            self.out('float pReg = state.p, pSlot0 = 0.0f, pSlot1 = 0.0f;', 1)
         self.out('uint32_t diPending = 0u, clipWork = state.clip & 0xFFFFFFu, clip0 = clipWork, mac0 = state.mac;', 1)
         self.out('uint32_t unusedMac = 0u, unusedCur = 0u, lastMac = 0u, lastCur = 0u, endPc = 0u;', 1)
         self.out('[[maybe_unused]] int32_t viBack = 0;', 1)
@@ -1086,6 +1181,8 @@ class Emitter:
         self.out('state.i = iReg;', 1)
         if self.uses_r:
             self.out('state.r = rReg;', 1)
+        if self.uses_p:
+            self.out('state.p = pReg;', 1)
         self.out('state.clip = clipWork;', 1)
         self.out('if (hasFmac)', 1)
         self.out('state.mac = lastMac;', 2)
