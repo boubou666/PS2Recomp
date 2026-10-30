@@ -564,8 +564,11 @@ void main()
             {
                 const Material g = materialFromGs(entry.batch.material, target);
                 const uint64_t tex0Mask = ~((uint64_t{7} << 61)); // CLD aside
+                // CLAMP only where it samples differently (a region mode on either side).
+                const bool region = (m.clamp & 3u) >= 2u || ((m.clamp >> 2) & 3u) >= 2u || (g.clamp & 3u) >= 2u || ((g.clamp >> 2) & 3u) >= 2u;
                 if ((m.tex0 & tex0Mask) != (g.tex0 & tex0Mask) || m.blend != g.blend || m.alphaTest != g.alphaTest ||
-                    m.alphaRef != g.alphaRef || m.depthTest != g.depthTest || m.depthWrite != g.depthWrite || m.clamp != g.clamp)
+                    m.alphaRef != g.alphaRef || m.depthTest != g.depthTest || m.depthWrite != g.depthWrite ||
+                    (region && m.clamp != g.clamp))
                 {
                     --s_compareLeft;
                     std::fprintf(stderr, "[native-gs] material differs (group %llu): tex0 %#llx/%#llx blend %d/%d atest %d/%d ref %u/%u depth %d%d/%d%d clamp %#llx/%#llx\n",
