@@ -78,7 +78,11 @@ namespace ps2x::native
         std::shared_ptr<const Texture> textureFromStore(uint64_t tex0, uint64_t texa);
         void storeUpload(uint32_t dbp, uint32_t dbw, uint32_t dpsm, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                          const uint8_t *data, size_t bytes);
-        bool storedPixel(uint32_t base, uint32_t psm, uint32_t x, uint32_t y, uint32_t &value) const;
+        // A CT32 upload holding `base` in the GS's layout (an asset stored that way), and that asset read back at
+        // `relativeBase` (blocks from the upload's base) in `psm`, `bw` pages wide.
+        const StoredUpload *laidOutSource(uint32_t base, uint32_t &sourceBase, uint64_t &serial) const;
+        static void laidOut(const StoredUpload &source, uint32_t relativeBase, uint32_t psm, uint32_t bw, uint32_t width,
+                            uint32_t height, std::vector<uint32_t> &values);
         bool m_storeMode = false;
         std::unordered_map<uint64_t, StoredBase> m_store;
         struct StoredTexture

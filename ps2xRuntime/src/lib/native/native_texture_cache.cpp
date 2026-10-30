@@ -251,109 +251,179 @@ namespace ps2x::native
         ++base.serial;
     }
 
+    const TextureCache::StoredUpload *TextureCache::laidOutSource(uint32_t base, uint32_t &sourceBase, uint64_t &serial) const
+    {
+        // The newest CT32 upload whose span (pages of 64 x 32 pixels, dbw across) holds `base`.
+        const StoredUpload *source = nullptr;
+        for (const auto &[key, stored] : m_store)
+        {
+            if ((key & 0x3fu) != CT32)
+                continue;
+            const uint32_t dbp = static_cast<uint32_t>(key >> 6);
+            for (const StoredUpload &u : stored.uploads)
+            {
+                const uint32_t end = dbp + ((u.dy + u.h + 31u) / 32u) * std::max(u.dbw, 1u) * 32u;
+                if (base >= dbp && base < end && (!source || stored.serial >= serial))
+                {
+                    source = &u;
+                    sourceBase = dbp;
+                    serial = stored.serial;
+                }
+            }
+        }
+        return source;
+    }
+
     std::shared_ptr<const TextureCache::Texture> TextureCache::textureFromStore(uint64_t tex0, uint64_t texa)
     {
         const uint64_t selected = tex0 & ~((uint64_t{3} << 35) | (uint64_t{7} << 61));
         const uint32_t psm = (tex0 >> 20) & 0x3fu;
         const uint64_t key = selected ^ (indexed(psm) || psm == CT32 ? 0u : (texa * 0x9e3779b97f4a7c15ull));
-        const uint32_t tbp = tex0 & 0x3fffu;
+        const uint32_t tbp = tex0 & 0x3fffu, tbw = (tex0 >> 14) & 0x3fu;
         const uint32_t cbp = (tex0 >> 37) & 0x3fffu, cpsm = (tex0 >> 51) & 0xfu;
-        const auto serialOf = [&](uint32_t bp, uint32_t format) {
+        const uint32_t width = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu);
+        const uint32_t height = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
+
+        // Where the image and the palette come from: an upload in their own format at their base, or a CT32 upload
+        // holding them in the GS's layout (laidOut). Each source's serial says when it changed.
+        const auto direct = [&](uint32_t bp, uint32_t format) -> const StoredBase * {
             const auto it = m_store.find((static_cast<uint64_t>(bp) << 6) | format);
-            return it == m_store.end() ? 0u : it->second.serial;
+            return it == m_store.end() || it->second.uploads.empty() ? nullptr : &it->second;
         };
-        const uint64_t imageSerial = serialOf(tbp, psm), paletteSerial = indexed(psm) ? serialOf(cbp, cpsm) : 0u;
+        const StoredBase *image = direct(tbp, psm);
+        uint32_t imageLaidBase = 0, paletteLaidBase = 0;
+        uint64_t imageSerial = image ? image->serial : 0u, paletteSerial = 0u;
+        const StoredUpload *imageLaid = image || psm == CT32 ? nullptr : laidOutSource(tbp, imageLaidBase, imageSerial);
+        const StoredBase *palette = nullptr;
+        const StoredUpload *paletteLaid = nullptr;
+        if (indexed(psm))
+        {
+            palette = direct(cbp, cpsm);
+            if (palette)
+                paletteSerial = palette->serial;
+            else if (cpsm == CT32)
+                paletteLaid = laidOutSource(cbp, paletteLaidBase, paletteSerial);
+        }
         if (const auto it = m_storeTextures.find(key);
             it != m_storeTextures.end() && it->second.imageSerial == imageSerial && it->second.paletteSerial == paletteSerial)
             return it->second.texture;
-        const auto image = m_store.find((static_cast<uint64_t>(tbp) << 6) | psm);
-        if (image == m_store.end() || image->second.uploads.empty())
+        if (!image && !imageLaid)
         {
             ++m_storeMisses;
             m_storeTextures[key] = {nullptr, imageSerial, paletteSerial};
             return nullptr;
         }
+
+        uint32_t colours[256] = {};
+        if (indexed(psm))
+        {
+            const uint32_t csa = (tex0 >> 56) & 0x1fu;
+            const bool eight = psm == T8 || psm == T8H;
+            std::vector<uint32_t> laid;
+            if (paletteLaid)
+                laidOut(*paletteLaid, cbp - paletteLaidBase, CT32, 1, 16, 16, laid);
+            for (uint32_t i = 0; i < (eight ? 256u : 16u); ++i)
+            {
+                uint32_t px = 0, py = 0;
+                csm1Position(eight ? i : (csa * 16u + i) & 0xffu, px, py);
+                if (paletteLaid)
+                {
+                    colours[i] = fromCt32(laid[static_cast<size_t>(py) * 16u + px]);
+                    continue;
+                }
+                if (!palette)
+                    continue;
+                for (auto u = palette->uploads.rbegin(); u != palette->uploads.rend(); ++u)
+                    if (px >= u->dx && py >= u->dy && px < u->dx + u->w && py < u->dy + u->h)
+                    {
+                        const size_t at = static_cast<size_t>(py - u->dy) * u->w + (px - u->dx);
+                        if (cpsm == CT32 && at * 4u + 4u <= u->data.size())
+                        {
+                            uint32_t c;
+                            std::memcpy(&c, u->data.data() + at * 4u, 4u);
+                            colours[i] = fromCt32(c);
+                        }
+                        else if (cpsm != CT32 && at * 2u + 2u <= u->data.size())
+                            colours[i] = fromCt16(static_cast<uint32_t>(u->data[at * 2u]) | (u->data[at * 2u + 1u] << 8), texa);
+                        break;
+                    }
+            }
+        }
+        const auto colourOf = [&](uint32_t value) {
+            if (indexed(psm))
+                return colours[value & 0xffu];
+            return psm == CT32 ? fromCt32(value) : psm == CT24 ? fromCt24(value, texa) : fromCt16(value, texa);
+        };
+
         Texture texture;
         texture.key = key;
         texture.version = ++m_decodes;
-        texture.width = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu);
-        texture.height = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
-        uint32_t palette[256] = {};
-        if (indexed(psm))
+        texture.width = width;
+        texture.height = height;
+        texture.rgba.assign(static_cast<size_t>(width) * height, 0u);
+        if (imageLaid)
         {
-            // The palette as the game uploaded it to CBP: a CSM1 image (16 x 16 entries, or 8 x 2 for 16 colours).
-            const auto clut = m_store.find((static_cast<uint64_t>(cbp) << 6) | cpsm);
-            const uint32_t csa = (tex0 >> 56) & 0x1fu;
-            const bool eight = psm == T8 || psm == T8H;
-            if (clut != m_store.end())
-                for (uint32_t i = 0; i < (eight ? 256u : 16u); ++i)
-                {
-                    uint32_t px = 0, py = 0;
-                    csm1Position(eight ? i : (csa * 16u + i) & 0xffu, px, py);
-                    for (auto u = clut->second.uploads.rbegin(); u != clut->second.uploads.rend(); ++u)
-                        if (px >= u->dx && py >= u->dy && px < u->dx + u->w && py < u->dy + u->h)
-                        {
-                            const size_t at = static_cast<size_t>(py - u->dy) * u->w + (px - u->dx);
-                            if (cpsm == CT32 && at * 4u + 4u <= u->data.size())
-                            {
-                                uint32_t c;
-                                std::memcpy(&c, u->data.data() + at * 4u, 4u);
-                                palette[i] = fromCt32(c);
-                            }
-                            else if (cpsm != CT32 && at * 2u + 2u <= u->data.size())
-                                palette[i] = fromCt16(static_cast<uint32_t>(u->data[at * 2u]) | (u->data[at * 2u + 1u] << 8), texa);
-                            break;
-                        }
-                }
+            std::vector<uint32_t> values;
+            laidOut(*imageLaid, tbp - imageLaidBase, psm, tbw, width, height, values);
+            for (size_t i = 0; i < values.size(); ++i)
+                texture.rgba[i] = colourOf(values[i]);
         }
-        texture.rgba.assign(static_cast<size_t>(texture.width) * texture.height, 0u);
-        const uint32_t bpp = bitsPerPixel(psm);
-        for (const StoredUpload &u : image->second.uploads) // oldest first: newer ones overwrite
+        else
         {
-            const uint32_t x1 = std::min(u.dx + u.w, texture.width), y1 = std::min(u.dy + u.h, texture.height);
-            for (uint32_t y = u.dy; y < y1; ++y)
-                for (uint32_t x = u.dx; x < x1; ++x)
-                {
-                    const size_t i = static_cast<size_t>(y - u.dy) * u.w + (x - u.dx);
-                    uint32_t value = 0u;
-                    switch (bpp)
+            const uint32_t bpp = bitsPerPixel(psm);
+            for (const StoredUpload &u : image->uploads) // oldest first: newer ones overwrite
+            {
+                const uint32_t x1 = std::min(u.dx + u.w, width), y1 = std::min(u.dy + u.h, height);
+                for (uint32_t y = u.dy; y < y1; ++y)
+                    for (uint32_t x = u.dx; x < x1; ++x)
                     {
-                    case 32:
-                        if (i * 4u + 4u > u.data.size())
+                        const size_t i = static_cast<size_t>(y - u.dy) * u.w + (x - u.dx);
+                        uint32_t value = 0u;
+                        if (bpp == 32 && i * 4u + 4u <= u.data.size())
+                            std::memcpy(&value, u.data.data() + i * 4u, 4u);
+                        else if (bpp == 24 && i * 3u + 3u <= u.data.size())
+                            value = u.data[i * 3u] | (u.data[i * 3u + 1u] << 8) | (u.data[i * 3u + 2u] << 16);
+                        else if (bpp == 16 && i * 2u + 2u <= u.data.size())
+                            value = u.data[i * 2u] | (u.data[i * 2u + 1u] << 8);
+                        else if (bpp == 8 && i < u.data.size())
+                            value = u.data[i];
+                        else if (bpp == 4 && (i >> 1) < u.data.size())
+                            value = (u.data[i >> 1] >> ((i & 1u) * 4u)) & 0xfu;
+                        else
                             continue;
-                        std::memcpy(&value, u.data.data() + i * 4u, 4u);
-                        break;
-                    case 24:
-                        if (i * 3u + 3u > u.data.size())
-                            continue;
-                        value = u.data[i * 3u] | (u.data[i * 3u + 1u] << 8) | (u.data[i * 3u + 2u] << 16);
-                        break;
-                    case 16:
-                        if (i * 2u + 2u > u.data.size())
-                            continue;
-                        value = u.data[i * 2u] | (u.data[i * 2u + 1u] << 8);
-                        break;
-                    case 8:
-                        if (i >= u.data.size())
-                            continue;
-                        value = u.data[i];
-                        break;
-                    default:
-                        if ((i >> 1) >= u.data.size())
-                            continue;
-                        value = (u.data[i >> 1] >> ((i & 1u) * 4u)) & 0xfu;
-                        break;
+                        texture.rgba[static_cast<size_t>(y) * width + x] = colourOf(value);
                     }
-                    uint32_t &out = texture.rgba[static_cast<size_t>(y) * texture.width + x];
-                    if (indexed(psm))
-                        out = palette[value & 0xffu];
-                    else
-                        out = psm == CT32 ? fromCt32(value) : psm == CT24 ? fromCt24(value, texa) : fromCt16(value, texa);
-                }
+            }
         }
         auto shared = std::make_shared<const Texture>(std::move(texture));
         m_storeTextures[key] = {shared, imageSerial, paletteSerial};
         return shared;
+    }
+
+    void TextureCache::laidOut(const StoredUpload &source, uint32_t relativeBase, uint32_t psm, uint32_t bw, uint32_t width,
+                               uint32_t height, std::vector<uint32_t> &values)
+    {
+        // The asset as the CT32 data it was uploaded as, in a scratch image of its pages alone, read back at
+        // `relativeBase` in `psm`: the GS layout's formula, once per asset decode (no GS memory is kept).
+        static std::vector<uint8_t> scratch(kMemoryBytes);
+        const uint32_t pagesAcross = std::max(source.dbw, 1u);
+        const size_t used = std::min<size_t>(scratch.size(), static_cast<size_t>((source.dy + source.h + 31u) / 32u) * pagesAcross * kPageBytes +
+                                                                   static_cast<size_t>(relativeBase) * 256u + kPageBytes * 4u);
+        std::memset(scratch.data(), 0, used);
+        for (uint32_t y = 0; y < source.h; ++y)
+            for (uint32_t x = 0; x < source.w; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * source.w + x;
+                if (i * 4u + 4u > source.data.size())
+                    break;
+                uint32_t value;
+                std::memcpy(&value, source.data.data() + i * 4u, 4u);
+                GSMem::WriteCT32(scratch.data(), 0, pagesAcross, source.dx + x, source.dy + y, value);
+            }
+        values.assign(static_cast<size_t>(width) * height, 0u);
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                values[static_cast<size_t>(y) * width + x] = read(scratch.data(), psm, relativeBase, std::max(bw, 1u), x, y);
     }
 
     void TextureCache::uploadLocked(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, const uint8_t *data, size_t bytes)
