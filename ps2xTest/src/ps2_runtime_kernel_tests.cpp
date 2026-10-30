@@ -365,6 +365,39 @@ namespace
         }
     }
 
+    // waitHostDeadline: the main thread waits for a host deadline while a lower-priority thread runs.
+    constexpr uint32_t K_DEADLINE_MAIN = 0x300500u;
+    constexpr uint32_t K_DEADLINE_RESUME = 0x300504u;
+    constexpr uint32_t K_DEADLINE_LOW = 0x300600u;
+    std::chrono::steady_clock::time_point gDeadlineAt;
+    std::chrono::steady_clock::time_point gDeadlineResumedAt;
+
+    void deadlineMain(uint8_t *, R5900Context *, PS2Runtime *runtime)
+    {
+        gSchedulerTrace->push_back(1);
+        gDeadlineAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+        runtime->eeScheduler().waitHostDeadline(gDeadlineAt, [] { gSchedulerTrace->push_back(3); },
+                                                [](R5900Context &resume)
+                                                {
+                                                    setReturnU32(&resume, 0x600Du);
+                                                    resume.pc = K_DEADLINE_RESUME;
+                                                });
+    }
+
+    void deadlineResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gDeadlineResumedAt = std::chrono::steady_clock::now();
+        gSchedulerTrace->push_back(getRegU32(ctx, 2) == 0x600Du ? 4 : -4);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void deadlineLow(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gSchedulerTrace->push_back(2);
+        ctx->pc = 0u;
+    }
+
     void schedulerRotateA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         gSchedulerTrace->push_back(10);
@@ -712,6 +745,30 @@ void register_ps2_runtime_kernel_tests()
                       "all EE guest functions must execute on the single scheduler host thread");
             t.IsFalse(gGuestExecutingFlagMissing.load(std::memory_order_acquire),
                       "the scheduler must publish guest execution only around the active guest call");
+        });
+
+        tc.Run("waitHostDeadline blocks the thread until the host deadline while lower priorities run", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            env.runtime.registerFunction(K_DEADLINE_MAIN, deadlineMain);
+            env.runtime.registerFunction(K_DEADLINE_RESUME, deadlineResume);
+            env.runtime.registerFunction(K_DEADLINE_LOW, deadlineLow);
+
+            env.ctx.pc = K_DEADLINE_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            const int low = ee.createThread(EeThreadCreateParams{0, K_DEADLINE_LOW, 0x20000u, 0x800u, 0, 20, 0});
+            ee.startThread(low, 0, env.ctx, false);
+            ee.run();
+
+            t.Equals(trace.size(), size_t{4}, "main, the low thread, the wake-up and the resume each run once");
+            t.Equals(trace[0], 1, "main runs first and blocks");
+            t.Equals(trace[1], 2, "the lower-priority thread runs while main waits");
+            t.Equals(trace[2], 3, "the wake-up runs on the executor before main resumes");
+            t.Equals(trace[3], 4, "main resumes through its completion, with its return value");
+            t.IsTrue(gDeadlineResumedAt >= gDeadlineAt, "main does not resume before its deadline");
         });
 
         tc.Run("EE thread priorities span 0 through 127", [](TestCase &t)
