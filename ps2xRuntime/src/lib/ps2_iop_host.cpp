@@ -8,6 +8,11 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -306,11 +311,145 @@ std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
     return hostPath.string();
 }
 
+struct PS2IopHostAdapter::ReadAhead
+{
+    static constexpr size_t kWindowBytes = 2u << 20;
+    static constexpr size_t kWindows = 4u;
+    struct Window
+    {
+        uint64_t start = 0u;
+        std::vector<uint8_t> bytes;
+        bool loading = false;
+        uint64_t used = 0u; // for replacing the least recent one
+    };
+    std::mutex mutex;
+    std::condition_variable loaded;
+    Window windows[kWindows];
+    uint64_t clock = 0u;
+    std::FILE *file = nullptr; // the worker's own handle (seeks do not race the IOP's)
+    std::string path;
+    ~ReadAhead()
+    {
+        if (file)
+            std::fclose(file);
+    }
+};
+
+namespace
+{
+    int hostReadDelayMs()
+    {
+        static const int s_delayMs = []
+        {
+            const char *value = std::getenv("PS2X_HOST_READ_DELAY");
+            return value && *value ? std::atoi(value) : 0;
+        }();
+        return s_delayMs;
+    }
+
+    // Loads the window starting at `start` on a worker thread (if no window has or loads it).
+    void readAheadFrom(const std::shared_ptr<PS2IopHostAdapter::ReadAhead> &ahead, uint64_t start, uint64_t fileSize)
+    {
+        using ReadAhead = PS2IopHostAdapter::ReadAhead;
+        if (start >= fileSize)
+            return;
+        ReadAhead::Window *slot = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ahead->mutex);
+            for (ReadAhead::Window &w : ahead->windows)
+                if ((w.loading || !w.bytes.empty()) && start >= w.start && start < w.start + ReadAhead::kWindowBytes)
+                    return;
+            for (ReadAhead::Window &w : ahead->windows)
+                if (!w.loading && (!slot || w.used < slot->used))
+                    slot = &w;
+            if (!slot)
+                return;
+            slot->loading = true;
+            slot->start = start;
+            slot->bytes.clear();
+            slot->used = ++ahead->clock;
+        }
+        const size_t bytes = static_cast<size_t>(std::min<uint64_t>(ReadAhead::kWindowBytes, fileSize - start));
+        std::thread([ahead, slot, start, bytes]
+                    {
+                        std::vector<uint8_t> data(bytes);
+                        bool ok = false;
+                        {
+                            if (hostReadDelayMs() > 0)
+                                std::this_thread::sleep_for(std::chrono::milliseconds(hostReadDelayMs()));
+                            if (!ahead->file)
+                            {
+#if defined(_WIN32)
+                                ahead->file = ::_wfopen(std::filesystem::path(ahead->path).c_str(), L"rb");
+#else
+                                ahead->file = std::fopen(ahead->path.c_str(), "rb");
+#endif
+                            }
+#if defined(_WIN32)
+                            ok = ahead->file && _fseeki64(ahead->file, static_cast<int64_t>(start), SEEK_SET) == 0;
+#else
+                            ok = ahead->file && fseeko(ahead->file, static_cast<off_t>(start), SEEK_SET) == 0;
+#endif
+                            ok = ok && std::fread(data.data(), 1u, bytes, ahead->file) == bytes;
+                        }
+                        std::lock_guard<std::mutex> lock(ahead->mutex);
+                        slot->loading = false;
+                        if (ok)
+                            slot->bytes = std::move(data);
+                        ahead->loaded.notify_all();
+                    })
+            .detach();
+    }
+
+    // Copies [offset, offset + size) from a window that holds it (waiting for one still loading it); false if none does.
+    bool readFromWindows(PS2IopHostAdapter::ReadAhead &ahead, uint64_t offset, void *destination, size_t size, uint64_t &windowEnd)
+    {
+        using ReadAhead = PS2IopHostAdapter::ReadAhead;
+        std::unique_lock<std::mutex> lock(ahead.mutex);
+        for (;;)
+        {
+            bool waiting = false;
+            for (ReadAhead::Window &w : ahead.windows)
+            {
+                if (offset < w.start || offset + size > w.start + ReadAhead::kWindowBytes)
+                    continue;
+                if (w.loading)
+                {
+                    waiting = true;
+                    continue;
+                }
+                if (offset + size > w.start + w.bytes.size())
+                    continue;
+                std::memcpy(destination, w.bytes.data() + (offset - w.start), size);
+                w.used = ++ahead.clock;
+                windowEnd = w.start + w.bytes.size();
+                return true;
+            }
+            if (!waiting)
+                return false;
+            ahead.loaded.wait(lock);
+        }
+    }
+}
+
 uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
 {
     if (path.empty())
     {
         return 0u;
+    }
+
+    const std::string key{path};
+    {
+        std::lock_guard<std::mutex> lock(m_hostFileMutex);
+        if (const auto cached = m_hostFileCache.find(key); cached != m_hostFileCache.end())
+        {
+            uint64_t handle = m_nextHostFileHandle++;
+            if (handle == 0u)
+                handle = m_nextHostFileHandle++;
+            m_hostFiles.emplace(handle, HostFile{nullptr, cached->second, cached->second->size(), key, nullptr});
+            return handle;
+        }
     }
 
     const std::filesystem::path hostPath{std::string(path)};
@@ -332,13 +471,50 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
         return 0u;
     }
 
+    // Files up to 32 MiB (512 MiB in all) are read whole now and kept: PS2X_HOST_FILE_CACHE=0 reads every time.
+    static const bool s_cache = []
+    {
+        const char *value = std::getenv("PS2X_HOST_FILE_CACHE");
+        return !(value && *value == '0');
+    }();
+    std::shared_ptr<std::vector<uint8_t>> data;
+    if (s_cache && size <= (32ull << 20))
+    {
+        if (hostReadDelayMs() > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(hostReadDelayMs()));
+        data = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(size));
+        if (size != 0u && std::fread(data->data(), 1u, data->size(), stream) != data->size())
+            data.reset();
+        else
+        {
+            std::fclose(stream);
+            stream = nullptr;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+    if (data && m_hostFileCacheBytes + data->size() <= (512ull << 20))
+    {
+        m_hostFileCache.emplace(key, data);
+        m_hostFileCacheBytes += data->size();
+    }
     uint64_t handle = m_nextHostFileHandle++;
     if (handle == 0u)
     {
         handle = m_nextHostFileHandle++;
     }
-    m_hostFiles.emplace(handle, HostFile{stream, size});
+    std::shared_ptr<ReadAhead> ahead;
+    static const bool s_readAhead = []
+    {
+        const char *value = std::getenv("PS2X_HOST_READ_AHEAD");
+        return !(value && *value == '0');
+    }();
+    if (stream && s_readAhead) // PS2X_HOST_READ_AHEAD=0: none
+    {
+        ahead = std::make_shared<ReadAhead>();
+        ahead->path = key;
+    }
+    m_hostFiles.emplace(handle, HostFile{stream, data, size, key, ahead});
     return handle;
 }
 
@@ -347,7 +523,7 @@ bool PS2IopHostAdapter::hostFileSize(uint64_t handle, uint64_t &size) const
     size = 0u;
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
     const auto it = m_hostFiles.find(handle);
-    if (it == m_hostFiles.end() || !it->second.stream)
+    if (it == m_hostFiles.end() || (!it->second.stream && !it->second.data))
     {
         return false;
     }
@@ -369,9 +545,31 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
 
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
     const auto it = m_hostFiles.find(handle);
-    if (it == m_hostFiles.end() || !it->second.stream)
+    if (it == m_hostFiles.end() || (!it->second.stream && !it->second.data))
     {
         return false;
+    }
+    if (it->second.data) // held in memory (openHostFile)
+    {
+        const std::vector<uint8_t> &data = *it->second.data;
+        bytesRead = offset < data.size() ? static_cast<size_t>(std::min<uint64_t>(size, data.size() - offset)) : 0u;
+        if (bytesRead != 0u)
+            std::memcpy(destination, data.data() + offset, bytesRead);
+        return true;
+    }
+    // Read ahead: served from a window when one holds the range; the next window starts loading once a read passes
+    // the middle of this one (sequential streams), or right after a read no window held.
+    if (const std::shared_ptr<ReadAhead> ahead = it->second.ahead; ahead && size != 0u && offset + size <= it->second.size)
+    {
+        uint64_t windowEnd = 0u;
+        if (readFromWindows(*ahead, offset, destination, size, windowEnd))
+        {
+            bytesRead = size;
+            if (offset + size > windowEnd - ReadAhead::kWindowBytes / 2u)
+                readAheadFrom(ahead, windowEnd, it->second.size);
+            return true;
+        }
+        readAheadFrom(ahead, offset + size, it->second.size);
     }
 
 #if defined(_WIN32)
@@ -385,9 +583,25 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
         return false;
     }
 
+    // PS2X_HOST_READ_SLOW=<ms>: each read slower than that, logged with its size (a slow drive stalls the IOP, and the
+    // EE waiting for it). PS2X_HOST_READ_DELAY=<ms>: that much added to every read, to see a slow drive's effect.
+    static const double s_slowMs = []
+    {
+        const char *value = std::getenv("PS2X_HOST_READ_SLOW");
+        return value && *value ? std::atof(value) : 0.0;
+    }();
+    const auto readStart = std::chrono::steady_clock::now();
+    if (hostReadDelayMs() > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(hostReadDelayMs()));
     bytesRead = size == 0u
                     ? 0u
                     : std::fread(destination, 1u, size, it->second.stream);
+    if (s_slowMs > 0.0)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+        if (ms > s_slowMs)
+            std::fprintf(stderr, "[host:read] %.1f ms for %zu bytes at %llu\n", ms, size, static_cast<unsigned long long>(offset));
+    }
     if (bytesRead < size && std::ferror(it->second.stream))
     {
         std::clearerr(it->second.stream);

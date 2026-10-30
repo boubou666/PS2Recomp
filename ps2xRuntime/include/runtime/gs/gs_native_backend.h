@@ -70,6 +70,15 @@ public:
     void NativeDraw(uint64_t group, const GSContext &context) override;
     bool PresentsOnDrawThread() const override { return true; }
 
+    // One axis of a sprite as drawn at an internal scale: corners p0, p1 in window coordinates with texel coordinates
+    // t0, t1. Above 1x the edges move to the boundaries of the GS pixels the GS covers, so every texel of a scaled
+    // pixel is drawn or none is, and the texel coordinates follow the same line. False when the GS draws nothing.
+    struct SpriteSpan
+    {
+        float p0 = 0.0f, p1 = 0.0f, t0 = 0.0f, t1 = 0.0f;
+    };
+    static bool spriteSpan(float p0, float p1, float t0, float t1, uint32_t scale, SpriteSpan &out);
+
 private:
     struct RenderTarget
     {
