@@ -12,6 +12,7 @@
 #include "GLFW/glfw3.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -362,6 +363,22 @@ void main()
 }
 )";
 
+    // PS2X_GS_NATIVE_STATS=1: per 60 presentations, what the GL thread asked of the driver (state read-backs make a
+    // threaded driver catch up first) and how long it waited for the previous composition.
+    struct NativeStats
+    {
+        uint64_t stateReads = 0, uniformLookups = 0, draws = 0, uploads = 0, uploadBlocks = 0, resolves = 0, wraps = 0,
+                 pulls = 0, presents = 0;
+        double fenceWaitMs = 0.0;
+    };
+    NativeStats s_stats;
+
+    GLint countedUniformLocation(GLuint program, const char *name)
+    {
+        ++s_stats.uniformLookups;
+        return glGetUniformLocation(program, name);
+    }
+
     // GL state a helper changes while flushBatch has the draw set up (a resolve or the GPU copy's set-up from inside
     // bindTexture): saved on construction, put back on destruction.
     struct GlStateRestore
@@ -371,6 +388,7 @@ void main()
         GLboolean scissor = GL_FALSE, depth = GL_FALSE, blend = GL_FALSE, colorMask[4] = {};
         GlStateRestore()
         {
+            ++s_stats.stateReads;
             glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
             glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
             glGetIntegerv(GL_CURRENT_PROGRAM, &program);
@@ -1107,16 +1125,16 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
     glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
     glActiveTexture(GL_TEXTURE0);
     const uint32_t zMask = (zbuf.psm & 0x0Fu) == 0x0u ? 0xFFFFFFFFu : (zbuf.psm & 0x0Fu) == 0x1u ? 0xFFFFFFu : 0xFFFFu;
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColor"), 0);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSwizzle"), 3);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uInverse"), 4);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uZRow"), zLayout.row);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColorRow"), colorRow);
-    glUniform2i(glGetUniformLocation(m_depthFromColorProgram, "uPage"), zLayout.pageWidth, zLayout.pageHeight);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uScale"), static_cast<GLint>(m_scale));
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), sixteen ? 1 : 0);
-    glUniform1ui(glGetUniformLocation(m_depthFromColorProgram, "uZMask"), zMask);
-    glUniform1f(glGetUniformLocation(m_depthFromColorProgram, "uZScale"), static_cast<float>(depthScale(zbuf.psm)));
+    glUniform1i(countedUniformLocation(m_depthFromColorProgram, "uColor"), 0);
+    glUniform1i(countedUniformLocation(m_depthFromColorProgram, "uSwizzle"), 3);
+    glUniform1i(countedUniformLocation(m_depthFromColorProgram, "uInverse"), 4);
+    glUniform1i(countedUniformLocation(m_depthFromColorProgram, "uZRow"), zLayout.row);
+    glUniform1i(countedUniformLocation(m_depthFromColorProgram, "uColorRow"), colorRow);
+    glUniform2i(countedUniformLocation(m_depthFromColorProgram, "uPage"), zLayout.pageWidth, zLayout.pageHeight);
+    glUniform1i(countedUniformLocation(m_depthFromColorProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(countedUniformLocation(m_depthFromColorProgram, "uSixteen"), sixteen ? 1 : 0);
+    glUniform1ui(countedUniformLocation(m_depthFromColorProgram, "uZMask"), zMask);
+    glUniform1f(countedUniformLocation(m_depthFromColorProgram, "uZScale"), static_cast<float>(depthScale(zbuf.psm)));
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     return true;
@@ -1186,6 +1204,7 @@ void GSNativeBackend::closeWrappedBlend()
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
     if (!m_wrapDrawn)
         return;
+    ++s_stats.wraps;
     const GSScissorReg &scissor = m_wrapArea;
     if (!m_wrapProgram)
     {
@@ -1208,7 +1227,7 @@ void GSNativeBackend::closeWrappedBlend()
     glUseProgram(m_wrapProgram);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_wrapTexture);
-    glUniform1i(glGetUniformLocation(m_wrapProgram, "uWrapped"), 0);
+    glUniform1i(countedUniformLocation(m_wrapProgram, "uWrapped"), 0);
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
@@ -1233,6 +1252,8 @@ void GSNativeBackend::syncVramToGpu()
         uint32_t end = block;
         while (end < blocks && m_dirtyBlocks[end] && (end == block || end % 16u != 0u))
             m_dirtyBlocks[end++] = 0u;
+        ++s_stats.uploads;
+        s_stats.uploadBlocks += end - block;
         glTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>((block % 16u) * 64u), static_cast<GLint>(block / 16u),
                         static_cast<GLsizei>((end - block) * 64u), 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
                         m_vram + static_cast<size_t>(block) * 256u);
@@ -1251,6 +1272,7 @@ void GSNativeBackend::pullGpuPages(uint32_t firstPage, uint32_t endPage)
     if (!m_anyGpuNewer || !m_vram || !m_vramFramebuffer || !ensureContext())
         return;
     const GlStateRestore restore;
+    ++s_stats.pulls;
     syncVramToGpu();
     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -1282,6 +1304,7 @@ bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
     if (!m_resolveProgram)
         return false;
     const GlStateRestore restore;
+    ++s_stats.resolves;
     // Transfers before this resolve land first, then the target's pixels over them, all on the GPU copy.
     syncVramToGpu();
     const uint32_t pageRows = kind == 0 ? 32u : 64u;
@@ -1304,13 +1327,13 @@ bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
     glActiveTexture(GL_TEXTURE4);
     glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
     glActiveTexture(GL_TEXTURE0);
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uTarget"), 0);
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uInverse"), 4);
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbp"), static_cast<GLint>(target.fbp));
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uKind"), kind);
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.usedHeight));
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(countedUniformLocation(m_resolveProgram, "uTarget"), 0);
+    glUniform1i(countedUniformLocation(m_resolveProgram, "uInverse"), 4);
+    glUniform1i(countedUniformLocation(m_resolveProgram, "uFbp"), static_cast<GLint>(target.fbp));
+    glUniform1i(countedUniformLocation(m_resolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
+    glUniform1i(countedUniformLocation(m_resolveProgram, "uKind"), kind);
+    glUniform1i(countedUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.usedHeight));
+    glUniform1i(countedUniformLocation(m_resolveProgram, "uScale"), static_cast<GLint>(m_scale));
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     for (uint32_t page = first; page < end; ++page)
@@ -2107,6 +2130,7 @@ void GSNativeBackend::flushBatch()
     glBindBuffer(GL_ARRAY_BUFFER, m_vertexBuffer);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_batch.size() * sizeof(Vertex)), m_batch.data(),
                  GL_STREAM_DRAW);
+    ++s_stats.draws;
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
     if (alphaFailPass)
     {
@@ -2118,6 +2142,7 @@ void GSNativeBackend::flushBatch()
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
         else if (afail == 3u)
             glColorMask(r, g, b, GL_FALSE);
+        ++s_stats.draws;
         glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_batch.size()));
         glUniform1i(m_uniforms.alphaFail, 0);
         glDepthMask(depthWrites ? GL_TRUE : GL_FALSE);
@@ -2586,7 +2611,7 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
     glBindTexture(GL_TEXTURE_2D, haveTop ? top.texture : 0u);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, haveBottom ? bottom.texture : 0u);
-    const auto uniform = [this](const char *name) { return glGetUniformLocation(m_presentProgram, name); };
+    const auto uniform = [this](const char *name) { return countedUniformLocation(m_presentProgram, name); };
     glUniform1i(uniform("uTop"), 0);
     glUniform1i(uniform("uBottom"), 1);
     glUniform4i(uniform("uTopRect"), top.x, top.y, top.width, top.height);
@@ -2612,8 +2637,20 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
     // thread never waits for this one: one presentation of latency, as the CPU path's asynchronous read back.
     const int shown = m_presentComposed >= 0 ? m_presentComposed : m_presentNext;
     PresentSlot &ready = m_presentSlots[shown];
+    const auto waitStart = std::chrono::steady_clock::now();
     if (ready.fence)
         glClientWaitSync(static_cast<GLsync>(ready.fence), GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull);
+    s_stats.fenceWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+    if (static const bool stats = std::getenv("PS2X_GS_NATIVE_STATS") != nullptr; stats && ++s_stats.presents == 60u)
+    {
+        std::fprintf(stderr,
+                     "[gs-native:stats] per presentation: %.1f draws, %.1f state reads, %.1f uniform lookups, %.1f "
+                     "uploads (%.1f blocks), %.1f resolves, %.1f wrapped blends, %.1f pulls, %.2f ms in the fence\n",
+                     s_stats.draws / 60.0, s_stats.stateReads / 60.0, s_stats.uniformLookups / 60.0,
+                     s_stats.uploads / 60.0, s_stats.uploadBlocks / 60.0, s_stats.resolves / 60.0, s_stats.wraps / 60.0,
+                     s_stats.pulls / 60.0, s_stats.fenceWaitMs / 60.0);
+        s_stats = {};
+    }
     m_presentComposed = m_presentNext;
     m_presentNext = (m_presentNext + 1) % 3;
     frame.glTexture = ready.texture;
