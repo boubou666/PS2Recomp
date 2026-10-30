@@ -860,6 +860,8 @@ void GSNativeBackend::syncMemoryPages(uint32_t firstPage, uint32_t endPage)
         uint32_t end = page + 1u;
         while (end < endPage && m_memoryVersion[end] != m_pageVersion[end] && holdsNewest(*owner, end))
             ++end;
+        if (m_wrapOpen && owner->fbp == m_wrapFbp)
+            closeWrappedBlend();
         resolveTargetPages(*owner, page, end);
         for (uint32_t p = page; p < end; ++p)
             m_memoryVersion[p] = m_pageVersion[p];
@@ -905,6 +907,8 @@ void GSNativeBackend::reloadTargetPages(RenderTarget &target, const std::vector<
     if (logTargetPages())
         std::fprintf(stderr, "[gs:native] reload fbp=%u fbw=%u psm=0x%x pages=%zu (first %u) serial=%llu\n", target.fbp,
                      target.fbw, target.psm, pages.size(), pages.front(), static_cast<unsigned long long>(m_drawSerial));
+    if (m_wrapOpen && target.fbp == m_wrapFbp)
+        closeWrappedBlend();
     std::vector<Vertex> pending;
     pending.swap(m_batch);
     const GSDrawState pendingState = m_batchState;
