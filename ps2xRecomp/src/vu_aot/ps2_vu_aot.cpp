@@ -748,7 +748,14 @@ namespace
         for (const auto &[first, end] : blocks)
             blockStart[first] = true;
         const bool jitEnabled = std::getenv("PS2X_VU_AOT_NO_JIT") == nullptr;
-        const bool fast = fastVu1() && unit == VU1Interpreter::Unit::VU1;
+        // PS2X_VU_AOT_EXACT=<fragment hash>[,...]: those fragments keep the exact pipeline in fast mode (VP2's field
+        // lights read Q before a DIV issued a few pairs earlier lands, across subroutine calls).
+        const bool exactListed = [&]
+        {
+            const char *list = std::getenv("PS2X_VU_AOT_EXACT");
+            return list && std::string(list).find(hex(fragment.hash, 16)) != std::string::npos;
+        }();
+        const bool fast = fastVu1() && unit == VU1Interpreter::Unit::VU1 && !exactListed;
         // Recompiled blocks first: their pairs only run alone when a block cannot start (or a jump lands inside
         // one), through the interpreter; compiling them pair by pair takes most of the build.
         std::vector<std::string> jitText(fragment.pairCount);

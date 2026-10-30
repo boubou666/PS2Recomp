@@ -176,8 +176,9 @@ public:
     void setPresentNewestDisplayBuffer(bool on) { m_presentNewest = on; }
     // An interlaced game that draws its picture at full height and copies it into a half-height buffer per field
     // (every other line, the next field starting a line lower; VP2): the full-height picture is shown instead, as a
-    // progressive frame. Found from the copy: sprites into a displayed buffer in field mode, from a buffer of the same
-    // width and format at least 1.5 times as tall.
+    // progressive frame at its own size. Found from the copy: sprites into a displayed buffer in field mode, from a
+    // buffer of the same format (at least 256 wide) at least 1.5 times as tall: VP2's menus copy a 640x448 picture, its
+    // field a 512x480 one.
     void setPresentProgressiveSource(bool on) { m_presentProgressive = on; }
     // A native renderer's draws for a skipped VU1 program (runtime/native/native_gs_hook.h): a marker in the queue,
     // in the order of the PATH1 packets around it, that calls the hook on the GS thread with context 0 or 1's
