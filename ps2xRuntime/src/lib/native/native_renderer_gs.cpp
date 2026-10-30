@@ -30,7 +30,8 @@ layout(location = 3) in float aFog;
 uniform vec4 uM[4];
 uniform vec2 uOffset;
 uniform vec2 uTargetSize;
-uniform float uDepthScale;
+uniform float uGsZScale;     // GS Z per unit of the matrix's z / w
+uniform float uTargetZScale; // the target's depth per GS Z (1/2^24 for Z24)
 out vec2 vUv;
 out vec4 vCol;
 out float vFog;
@@ -39,9 +40,12 @@ void main()
     vec4 c = uM[0] * aPos.x + uM[1] * aPos.y + uM[2] * aPos.z + uM[3];
     vec2 s = c.xy / c.w - uOffset;
     vec2 ndc = s / uTargetSize * 2.0 - 1.0;
-    // Depth in clip space (linear, so a triangle crossing the camera plane is clipped and interpolated right; the
-    // program's own VU1 clips those on the PS2), kept in range by GL_DEPTH_CLAMP rather than per vertex.
-    gl_Position = vec4(ndc * c.w, 2.0 * c.z * uDepthScale - c.w, c.w);
+    // GS Z as XYZF2 holds it: 24 bits, so a value past 2^24 wraps (a program's FTOI4 into XYZF2 keeps the low 24
+    // bits; Twisted Metal: Black's HUD drums sit behind their bezel that way). Kept in the target's range by
+    // GL_DEPTH_CLAMP rather than clipped.
+    float gz = c.z / c.w * uGsZScale;
+    gz -= 16777216.0 * floor(gz / 16777216.0);
+    gl_Position = vec4(ndc * c.w, (2.0 * gz * uTargetZScale - 1.0) * c.w, c.w);
     vUv = aUv;
     vCol = aCol;
     vFog = aFog;
@@ -112,7 +116,7 @@ void main()
     struct Renderer::GsPass
     {
         GLuint program = 0, vao = 0, vbo = 0;
-        GLint locM = -1, locOffset = -1, locTargetSize = -1, locDepthScale = -1, locTex = -1, locTextured = -1;
+        GLint locM = -1, locOffset = -1, locTargetSize = -1, locGsZScale = -1, locTargetZScale = -1, locTex = -1, locTextured = -1;
         GLint locTfx = -1, locTcc = -1;
         GLint locAlphaTest = -1, locAlphaRef = -1, locFog = -1, locFogColour = -1;
         bool failed = false;
@@ -141,7 +145,8 @@ void main()
             locM = glGetUniformLocation(program, "uM");
             locOffset = glGetUniformLocation(program, "uOffset");
             locTargetSize = glGetUniformLocation(program, "uTargetSize");
-            locDepthScale = glGetUniformLocation(program, "uDepthScale");
+            locGsZScale = glGetUniformLocation(program, "uGsZScale");
+            locTargetZScale = glGetUniformLocation(program, "uTargetZScale");
             locTex = glGetUniformLocation(program, "uTex");
             locTextured = glGetUniformLocation(program, "uTextured");
             locTfx = glGetUniformLocation(program, "uTfx");
@@ -449,7 +454,8 @@ void main()
         {
             const Material m = entry.batch.material.fromGsContext ? materialFromGs(entry.batch.material, target) : entry.batch.material;
             const GLsizei count = static_cast<GLsizei>(entry.vertices.size());
-            glUniform1f(pass.locDepthScale, static_cast<float>(entry.gsZScale * target.zScale));
+            glUniform1f(pass.locGsZScale, entry.gsZScale);
+            glUniform1f(pass.locTargetZScale, static_cast<float>(target.zScale));
             glUniform4fv(pass.locM, 4, entry.batch.matrix);
             std::shared_ptr<const TextureCache::Texture> texture = entry.batch.texture;
             if (m.textured && !texture)
