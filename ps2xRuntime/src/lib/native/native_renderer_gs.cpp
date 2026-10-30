@@ -493,6 +493,55 @@ void main()
             if (m.textured && !texture)
                 texture = ps2x::native::textures().texture(m.tex0, m.texa, m.region);
             const bool textured = m.textured && texture;
+            // PS2X_NATIVE_TEXSTATS=1: each texture a port's own draw uses, once: TEX0's format, CLUT and size, and the
+            // share of fully transparent texels; over half transparent with TCC set, written out as tex_<tex0>.ppm (RGB)
+            // and .pgm (alpha) in the working directory, to see what was decoded.
+            static const bool s_texStats = std::getenv("PS2X_NATIVE_TEXSTATS") != nullptr;
+            if (s_texStats && textured && !entry.batch.material.fromGsContext)
+            {
+                static std::unordered_map<uint64_t, bool> s_seenTex;
+                if (!s_seenTex[texture->key])
+                {
+                    s_seenTex[texture->key] = true;
+                    size_t clear = 0;
+                    for (uint32_t c : texture->rgba)
+                        clear += (c >> 24) == 0u ? 1u : 0u;
+                    const double share = texture->rgba.empty() ? 0.0 : static_cast<double>(clear) / static_cast<double>(texture->rgba.size());
+                    const uint64_t t0 = m.tex0;
+                    const bool tcc = (t0 >> 34) & 1u;
+                    std::fprintf(stderr, "[native:tex] tex0 %016llx psm %#x tbp %llu cbp %llu cpsm %llu csa %llu tcc %d texa %llx %ux%u: %.0f%% clear\n",
+                                 static_cast<unsigned long long>(t0), static_cast<unsigned>((t0 >> 20) & 0x3f),
+                                 static_cast<unsigned long long>(t0 & 0x3fff), static_cast<unsigned long long>((t0 >> 37) & 0x3fff),
+                                 static_cast<unsigned long long>((t0 >> 51) & 0xf), static_cast<unsigned long long>((t0 >> 56) & 0x1f), tcc ? 1 : 0,
+                                 static_cast<unsigned long long>(m.texa), texture->width, texture->height, share * 100.0);
+                    if (tcc && share > 0.5)
+                    {
+                        char name[96];
+                        std::snprintf(name, sizeof(name), "tex_%016llx", static_cast<unsigned long long>(t0));
+                        const std::string base(name);
+                        if (FILE *f = std::fopen((base + ".ppm").c_str(), "wb"))
+                        {
+                            std::fprintf(f, "P6\n%u %u\n255\n", texture->width, texture->height);
+                            for (uint32_t c : texture->rgba)
+                            {
+                                const unsigned char rgb[3] = {static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c >> 16)};
+                                std::fwrite(rgb, 1, 3, f);
+                            }
+                            std::fclose(f);
+                        }
+                        if (FILE *f = std::fopen((base + ".pgm").c_str(), "wb"))
+                        {
+                            std::fprintf(f, "P5\n%u %u\n255\n", texture->width, texture->height);
+                            for (uint32_t c : texture->rgba)
+                            {
+                                const unsigned char a = static_cast<unsigned char>(c >> 24);
+                                std::fwrite(&a, 1, 1, f);
+                            }
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
             if (textured)
             {
                 glBindTexture(GL_TEXTURE_2D, pass.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull) ^ (m.region * 0xc2b2ae3d27d4eb4full), texture));
