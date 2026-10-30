@@ -1,3 +1,7 @@
+#include <mutex>
+#include <map>
+#include <cstdio>
+#include <chrono>
 #include <algorithm>
 #include <cctype>
 
@@ -399,6 +403,10 @@ namespace
         return true;
     }
 
+    // The game's disc reads (sceCdRead, its streams, the movie player) come here on the thread that asked, the EE's
+    // among them: each file stays open after its first read (an open costs milliseconds on Windows, more with a
+    // virus scanner looking at it, and a streaming game reads every few frames). PS2X_HOST_READ_SLOW=<ms>: each read
+    // slower than that, logged.
     bool readHostRange(const std::filesystem::path &path, uint64_t offsetBytes, uint8_t *dst, size_t byteCount)
     {
         if (!dst)
@@ -412,22 +420,51 @@ namespace
             return true;
         }
 
+        static std::mutex s_mutex;
+        static std::map<std::filesystem::path, std::FILE *> s_open;
+        static const double s_slowMs = []
+        {
+            const char *value = std::getenv("PS2X_HOST_READ_SLOW");
+            return value && *value ? std::atof(value) : 0.0;
+        }();
+        const auto start = std::chrono::steady_clock::now();
         std::memset(dst, 0, byteCount);
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open())
+        std::lock_guard<std::mutex> lock(s_mutex);
+        std::FILE *&file = s_open[path];
+        if (!file)
+        {
+#if defined(_WIN32)
+            file = _wfopen(path.c_str(), L"rb");
+#else
+            file = std::fopen(path.c_str(), "rb");
+#endif
+            if (!file)
+            {
+                s_open.erase(path);
+                g_lastCdError = -1;
+                return false;
+            }
+        }
+
+#if defined(_WIN32)
+        const bool seeked = _fseeki64(file, static_cast<int64_t>(offsetBytes), SEEK_SET) == 0;
+#else
+        const bool seeked = fseeko(file, static_cast<off_t>(offsetBytes), SEEK_SET) == 0;
+#endif
+        if (!seeked)
         {
             g_lastCdError = -1;
             return false;
         }
 
-        file.seekg(static_cast<std::streamoff>(offsetBytes), std::ios::beg);
-        if (!file.good())
+        (void)std::fread(dst, 1u, byteCount, file);
+        std::clearerr(file);
+        if (s_slowMs > 0.0)
         {
-            g_lastCdError = -1;
-            return false;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (ms > s_slowMs)
+                std::fprintf(stderr, "[cd:read] %.1f ms for %zu bytes of %s\n", ms, byteCount, path.filename().string().c_str());
         }
-
-        file.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(byteCount));
         g_lastCdError = 0;
         return true;
     }
