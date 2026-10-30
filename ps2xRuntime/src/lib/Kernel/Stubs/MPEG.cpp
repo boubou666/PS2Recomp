@@ -2168,9 +2168,21 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
+        // The same stream callback registered again on the same sceMpeg replaces itself. A game whose sceMpegDelete
+        // is not routed here (JC2) registers its callbacks again for every movie on the same handle: each copy got
+        // every packet, so its PCM callback took each audio packet once per movie played so far (noise from the
+        // third movie on).
+        std::vector<MpegRegisteredCallback> &callbacks = g_mpeg_stub_state.callbacksByMpeg[mpegAddr];
+        callbacks.erase(std::remove_if(callbacks.begin(), callbacks.end(),
+                                       [&](const MpegRegisteredCallback &callback)
+                                       {
+                                           return callback.stream && callback.type == streamType &&
+                                                  callback.streamId == streamId && callback.func == callbackFunc &&
+                                                  callback.data == callbackData;
+                                       }),
+                        callbacks.end());
         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
-        g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
-            MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
+        callbacks.push_back(MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
         setReturnU32(ctx, 0u);
     }
 
