@@ -1,6 +1,7 @@
 #pragma once
-
-#include "sc3_vu1_port.h"
+// The operations and pipeline helpers the C++ that tools/vu1_lift.py writes for a VU program is made of: each
+// instruction as the operation it does on registers held in locals, the timing VU1Interpreter's pipeline gives it
+// already worked out by the generator.
 
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_lifted.h"
@@ -14,8 +15,11 @@
 #include <cstring>
 #include <limits>
 
-namespace sc3::vu1
+namespace ps2x::vu1lift
 {
+    // Where a lifted program hands each XGKICK packet.
+    using Vu1Kick = void (*)(void *user, const uint8_t *packet, uint32_t bytes);
+
     constexpr uint64_t kUnknownTarget = ~0ull;
 
     constexpr int lanes(int dest) { return ((dest >> 3) & 1) | (((dest >> 2) & 1) << 1) | (((dest >> 1) & 1) << 2) | ((dest & 1) << 3); }
