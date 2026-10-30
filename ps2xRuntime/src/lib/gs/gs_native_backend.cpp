@@ -208,6 +208,8 @@ void main()
         rgb = vec3(factor);
     else if (uBlendOut == 2)
         rgb = c.rgb * (1.0 + factor);
+    else if (uBlendOut == 3)
+        rgb = c.rgb * factor;
     outColor = vec4(clamp(rgb, 0.0, 1.0), clamp(c.a, 0.0, 2.0) * (128.0 / 255.0));
     if (uColorKeep != 0)
     {
@@ -1824,12 +1826,14 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
     }
     else if (a == Cs && b == Cd && d == Cd)
         source = factor, destination = inverse;
+    // Cs * C in the shader: GL clamps a blend factor to 1, and C reaches 2 (As or FIX up to 0xFF; VP2 doubles its
+    // depth of field's blur with Cs * As, As 0xFF).
     else if (a == Cs && b == Zero && d == Cd)
-        source = factor, destination = GL_ONE;
+        m_blendOut = 3, source = GL_ONE, destination = GL_ONE;
     else if (a == Cs && b == Zero && d == Zero)
-        source = factor, destination = GL_ZERO;
+        m_blendOut = 3, source = GL_ONE, destination = GL_ZERO;
     else if (a == Zero && b == Cs && d == Cd)
-        equation = GL_FUNC_REVERSE_SUBTRACT, source = factor, destination = GL_ONE;
+        m_blendOut = 3, equation = GL_FUNC_REVERSE_SUBTRACT, source = GL_ONE, destination = GL_ONE;
     else if (a == Cd && b == Cs && d == Cs)
         source = inverse, destination = factor;
     else if (a == Cd && b == Zero && d == Cs)
