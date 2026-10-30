@@ -2482,8 +2482,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
-        // PS2X_LOG_GS_WRITERS=1: each GS-to-GS copy (TRXDIR 2) and readback (1), once per BITBLTBUF.
-        if (static const bool logWriters = std::getenv("PS2X_LOG_GS_WRITERS") != nullptr; logWriters && m_trxdir != 0u && m_trxdir != 3u)
+        // PS2X_LOG_GS_WRITERS=1: each transfer (TRXDIR 0 upload, 1 readback, 2 GS-to-GS copy), once per BITBLTBUF.
+        if (static const bool logWriters = std::getenv("PS2X_LOG_GS_WRITERS") != nullptr; logWriters && m_trxdir != 3u)
         {
             static std::unordered_map<uint64_t, uint32_t> s_seen;
             const uint64_t bitbltbuf = static_cast<uint64_t>(m_bitbltbuf.sbp) | static_cast<uint64_t>(m_bitbltbuf.sbw) << 16 |
