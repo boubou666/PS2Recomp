@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 namespace ps2x::vu1lift
 {
@@ -393,6 +394,9 @@ namespace ps2x::vu1lift
         uint32_t source = 0u, copied = 0u, tagEnd = 0u, total = 0u;
         int64_t start = 0;
 
+        Path1() = default;
+        explicit Path1(void *) {}
+
         static std::array<uint8_t, kBufferSize> &buffer()
         {
             static thread_local std::array<uint8_t, kBufferSize> s_buffer;
@@ -472,6 +476,39 @@ namespace ps2x::vu1lift
             return start + 2 * static_cast<int64_t>(total / 16u) - 1;
         }
     };
+
+    // PATH1 for a program drawing through a sink (tools/vu1_lift.py's "sink"): the sink takes the kick, the transfer
+    // only times it.
+    template <class Sink>
+    struct DirectPath
+    {
+        Sink *sink;
+        bool pending = false;
+        uint32_t qwords = 0u;
+        int64_t start = 0;
+
+        explicit DirectPath(void *user) : sink(static_cast<Sink *>(user)) {}
+
+        void begin(int32_t vi, int64_t t)
+        {
+            pending = true;
+            qwords = sink->kick(vi);
+            start = t;
+        }
+
+        void advance(const uint8_t *, int64_t) {}
+
+        int64_t finish(const uint8_t *, Vu1Kick, void *)
+        {
+            pending = false;
+            return start + 2 * static_cast<int64_t>(qwords) - 1;
+        }
+    };
+
+    template <bool kDirect, class Sink>
+    using PathOf = std::conditional_t<kDirect, DirectPath<Sink>, Path1>;
+
+    inline __m128 iswValue(int32_t value) { return floats(_mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(value & 0xFFFF)))); }
 
     struct RoundTowardZero
     {

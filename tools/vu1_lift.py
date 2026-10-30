@@ -13,6 +13,13 @@ The spec names the programs, each by the hash of its microcode:
                            "entries": ["0x10", ...], "targets": ["0xd8", ...], "unit": "VU1"}}}
 entries are the start pcs (MSCAL), targets the pcs a JR dispatch reaches; include and namespace default to the
 shared ops header and its namespace, unit to VU1. Numbers are integers or hexadecimal strings.
+
+A spec with {"sink": {"class": "game::DrawSink", "include": "game_draw_sink.h", "limit": "0x19f"}} gives the VU1
+programs marked "sink": true a second form, function<kSticky, true>(..., user = the sink): the packet each builds for
+its XGKICK (found from where its stores land, below TOP + limit) is not written; each store into it goes to
+sink->put<field, dest>(qword, value) instead (field -1 the GIF tag, else the quadword's place in a vertex), the program
+starts with sink->begin(data, top, packet base) and each XGKICK calls sink->kick(vi), which returns the quadwords
+PATH1 would send. Everything else (registers, flags, the rest of VU memory, cycles) is the same in both forms.
 """
 import argparse
 import glob
@@ -710,12 +717,182 @@ class Program:
                 n.succ.append((c, self.node(pc, ns)))
 
 
+UNK = ('unk',)
+
+
+def vi_join(a, b):
+    if a is None:
+        return b
+    if b is None or a == b:
+        return a
+    if a == UNK or b == UNK or a[0] != b[0]:
+        return UNK
+    import math
+    return (a[0], min(a[1], b[1]), math.gcd(a[2], b[2], abs(a[1] - b[1])))
+
+
+def vi_shift(v, d):
+    return v if v == UNK else (v[0], v[1] + d, v[2])
+
+
+def vi_transfer(lo, vis):
+    nm = lo.name
+    v = list(vis)
+
+    def get(r):
+        return ('abs', 0, 0) if r == 0 else v[r]
+
+    def put(r, value):
+        if r:
+            v[r] = value
+    if nm == 'xtop':
+        put(lo.it, ('top', 0, 0))
+    elif nm == 'iaddiu':
+        put(lo.it, vi_shift(get(lo.is_), lo.imm15))
+    elif nm == 'isubiu':
+        put(lo.it, vi_shift(get(lo.is_), -lo.imm15))
+    elif nm in ('iadd', 'isub'):
+        a, b = get(lo.is_), get(lo.it)
+
+        def const(x):
+            return x != UNK and x[0] == 'abs' and x[2] == 0
+        if const(b):
+            put(lo.id, vi_shift(a, b[1] if nm == 'iadd' else -b[1]))
+        elif nm == 'iadd' and const(a):
+            put(lo.id, vi_shift(b, a[1]))
+        else:
+            put(lo.id, UNK)
+    elif nm == 'lqi':
+        put(lo.is_, vi_shift(get(lo.is_), 1))
+    elif nm == 'sqi':
+        put(lo.it, vi_shift(get(lo.it), 1))
+    elif nm == 'iaddi':
+        put(lo.it, vi_shift(get(lo.is_), lo.imm5))
+    else:
+        written = lo.usage().vi_write
+        for r in range(1, 16):
+            if written & (1 << r):
+                v[r] = UNK
+    return v
+
+
+def vi_analysis(prog):
+    """Each node's VI values on entry as TOP or a constant plus c + stride * k (k >= 0), from every start pc."""
+    state = {}
+    visits = {}
+    work = []
+    for n in prog.entries.values():
+        state[n.id] = [UNK] * 16
+        work.append(n)
+    while work:
+        n = work.pop()
+        p = prog.pair(n.pc)
+        vis = state[n.id]
+        dispatch = n.extra is None and p.lower.name == 'xgkick' and n.succ and n.succ[0][0] and n.succ[0][0][0] == 'wait'
+        out = vis if dispatch else vi_transfer(p.lower, vis)
+        lo = p.lower
+        never = None
+        if lo.name in ('ibeq', 'ibne') and lo.is_ == lo.it:
+            never = 'not' if lo.name == 'ibeq' else 'taken'
+        for cond, s in n.succ:
+            if never is not None and cond == never:
+                continue
+            old = state.get(s.id)
+            new = [vi_join(a, b) for a, b in zip(old, out)] if old is not None else list(out)
+            if new != old:
+                visits[s.id] = visits.get(s.id, 0) + 1
+                if visits[s.id] > 64:
+                    new = [x if old is not None and x == o else UNK for x, o in zip(new, old)]
+                state[s.id] = new
+                work.append(s)
+    return state
+
+
+def address_of(lo, vis):
+    if lo.name == 'sq':
+        base, off = lo.it, lo.imm11
+    elif lo.name == 'sqi':
+        base, off = lo.it, 0
+    elif lo.name == 'isw':
+        base, off = lo.is_, lo.imm11
+    elif lo.name == 'lq' or lo.name == 'ilw':
+        base, off = lo.is_, lo.imm11
+    elif lo.name == 'lqi':
+        base, off = lo.is_, 0
+    elif lo.name == 'xgkick':
+        base, off = lo.is_, 0
+    else:
+        return None
+    v = ('abs', 0, 0) if base == 0 else vis[base]
+    return vi_shift(v, off)
+
+
+def store_roles(prog):
+    state = vi_analysis(prog)
+    per_pc = {}
+    for n in prog.nodes:
+        if n.id not in state:
+            continue
+        p = prog.pair(n.pc)
+        a = address_of(p.lower, state[n.id])
+        if a is None:
+            continue
+        per_pc[n.pc] = vi_join(per_pc.get(n.pc), a)
+    return per_pc
+
+
+def packet_roles(prog, limit):
+    """The packet the program builds for its XGKICK, from where its stores land: its base (TOP + P, the XGKICK at a
+    constant address) and, per store into it below TOP + limit, the record field the stored quadword is: -1 the tag
+    at the base, else its offset in the R quadwords each vertex takes, R the stores' common stride."""
+    addresses = store_roles(prog)
+    bases = set()
+    for pc, a in addresses.items():
+        if prog.pair(pc).lower.name == 'xgkick' and a != UNK and a[0] == 'top' and a[2] == 0:
+            bases.add(a[1])
+    if not bases:
+        return None, {}
+    if len(bases) != 1:
+        raise GenError(f'{prog.name}: packets built at several places {sorted(bases)}')
+    base = bases.pop()
+    import math
+    record = 0
+    for pc, a in addresses.items():
+        if prog.pair(pc).lower.is_store() and a != UNK and a[0] == 'top' and base <= a[1] < limit:
+            record = math.gcd(record, a[2])
+    if record == 0:
+        raise GenError(f'{prog.name}: no vertex stores after the packet tag at TOP + {base:#x}')
+    roles = {}
+    for pc, a in sorted(addresses.items()):
+        lo = prog.pair(pc).lower
+        if lo.name == 'xgkick':
+            continue
+        if a == UNK:
+            if lo.is_store():
+                raise GenError(f'{prog.name}: store at {pc:#x} to an unknown address')
+            continue
+        if not (a[0] == 'top' and base - 4 * record <= a[1] < limit):
+            continue
+        if not lo.is_store():
+            raise GenError(f'{prog.name}: {lo.name} at {pc:#x} reads the packet back')
+        if a[2] == 0 and a[1] == base:
+            roles[pc] = -1
+        elif a[2] % record == 0:
+            roles[pc] = (a[1] - base - 1) % record
+        else:
+            raise GenError(f'{prog.name}: store at {pc:#x} lands on no fixed field of a vertex ({a})')
+    return base, roles
+
+
 CPP_OPS = {'add': 'Add', 'sub': 'Sub', 'mul': 'Mul', 'madd': 'Madd', 'msub': 'Msub', 'opmsub': 'CrossMsub',
            'opmula': 'CrossMul'}
 class Emitter:
-    def __init__(self, prog, fn):
+    def __init__(self, prog, fn, packet=None, roles=None, sink=None):
         self.prog = prog
         self.fn = fn
+        self.packet = packet
+        self.sink = sink
+        self.roles = roles or {}
         self.lines = []
         self.need_mac = set()
         self.need_clip = set()
@@ -797,11 +974,13 @@ class Emitter:
         if nm == 'lq':
             return [f'{vf(lo.ft)} = put<{lo.dest}>({vf(lo.ft)}, m.lq({vi(lo.is_)} + {lo.imm11}));'] if lo.ft else []
         if nm == 'sq':
-            return [f'm.sq<{lo.dest}>({vi(lo.it)} + {lo.imm11}, {vf(lo.fs)});']
+            return self.store(p, f'{vi(lo.it)} + {lo.imm11}', vf(lo.fs))
         if nm == 'ilw':
             comp = 0 if lo.dest & 8 else 1 if lo.dest & 4 else 2 if lo.dest & 2 else 3
             return [f'{vi(lo.it)} = m.ilw({vi(lo.is_)} + {lo.imm11}, {comp});'] if lo.it else []
         if nm == 'isw':
+            if p.pc in self.roles:
+                return self.store(p, f'{vi(lo.is_)} + {lo.imm11}', f'iswValue({vi(lo.it)})')
             return [f'm.isw<{lo.dest}>({vi(lo.is_)} + {lo.imm11}, {vi(lo.it)});']
         if nm == 'iaddiu':
             if not lo.is_:
@@ -830,7 +1009,7 @@ class Emitter:
                 out.append(f'{vi(lo.is_)} = i16({vi(lo.is_)} + 1);')
             return out
         if nm == 'sqi':
-            out = [f'm.sq<{lo.dest}>({vi(lo.it)}, {vf(lo.fs)});']
+            out = self.store(p, vi(lo.it), vf(lo.fs))
             if lo.it:
                 out.append(f'{vi(lo.it)} = i16({vi(lo.it)} + 1);')
             return out
@@ -885,6 +1064,14 @@ class Emitter:
         if lo.is_branch():
             return []
         raise GenError(f'lower {nm} at {p.pc:#x} not written')
+
+    def store(self, p, address, value):
+        dest = p.lower.dest
+        role = self.roles.get(p.pc)
+        if role is None:
+            return [f'm.sq<{dest}>({address}, {value});']
+        return ['if constexpr (kDirect)', f'    sink->template put<{role}, {dest}>({address}, {value});', 'else',
+                f'    m.sq<{dest}>({address}, {value});']
 
     def branch_cond(self, n, p):
         lo = p.lower
@@ -1000,12 +1187,19 @@ class Emitter:
     def emit(self):
         prog = self.prog
         name = self.fn
-        self.out('template <bool kSticky>', 0)
+        direct = self.packet is not None
+        self.out('template <bool kSticky, bool kDirect>' if direct else 'template <bool kSticky>', 0)
         self.out(f'uint64_t {name}(uint32_t entry, VU1State &state, uint8_t *data, uint32_t top, Vu1Kick out, void *user)', 0)
         self.out('{', 0)
         self.out(f'const Memory<{self.prog.data_mask:#x}u> m{{data}};', 1)
         self.out('Fmac f;', 1)
-        self.out('Path1 path;', 1)
+        if direct:
+            self.out(f'[[maybe_unused]] {self.sink} *const sink = kDirect ? static_cast<{self.sink} *>(user) : nullptr;', 1)
+            self.out('if constexpr (kDirect)', 1)
+            self.out(f'    sink->begin(data, top, {self.packet:#x}u);', 1)
+            self.out(f'PathOf<kDirect, {self.sink}> path{{user}};', 1)
+        else:
+            self.out('Path1 path;', 1)
         self.out('const __m128 kVf0 = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);', 1)
         self.out('__m128 discard = _mm_setzero_ps();', 1)
         for r in range(1, 32):
@@ -1115,7 +1309,7 @@ def load_spec(path):
         programs[name] = dict(program, hash=number(program['hash']), pairs=number(program['pairs']),
                               entries=[number(pc) for pc in program['entries']],
                               targets=[number(pc) for pc in program.get('targets', [])])
-    return spec.get('include', DEFAULT_INCLUDE), spec.get('namespace', DEFAULT_NAMESPACE), programs
+    return spec.get('include', DEFAULT_INCLUDE), spec.get('namespace', DEFAULT_NAMESPACE), programs, spec.get('sink')
 
 
 def code_hash(data):
@@ -1137,7 +1331,7 @@ def code_from_aot(directory, spec):
     return b''.join(struct.pack('<II', *pairs[i]) for i in range(spec['pairs']))
 
 
-def generate(code, spec, include=DEFAULT_INCLUDE, namespace=DEFAULT_NAMESPACE):
+def generate(code, spec, include=DEFAULT_INCLUDE, namespace=DEFAULT_NAMESPACE, sink=None):
     if code_hash(code[:spec['pairs'] * 8]) != spec['hash']:
         raise GenError(f'the code image does not hash to {spec["hash"]:016x}')
     pairs = parse(code[:spec['pairs'] * 8])
@@ -1146,10 +1340,17 @@ def generate(code, spec, include=DEFAULT_INCLUDE, namespace=DEFAULT_NAMESPACE):
     prog = Program(pairs, spec['function'], has_fmand, has_fcand, spec.get('unit', 'VU1'))
     prog.build(spec['entries'], spec['targets'])
     name = spec['function']
-    lines = [f'#include "{include}"', '', f'namespace {namespace}', '{', Emitter(prog, name).emit(), '']
+    packet, roles = None, {}
+    lines = [f'#include "{include}"']
+    if sink and spec.get('sink'):
+        packet, roles = packet_roles(prog, number(sink.get('limit', 0x400)))
+        if packet is not None:
+            lines.append(f'#include "{sink["include"]}"')
+    emitter = Emitter(prog, name, packet, roles, sink['class'] if packet is not None else None)
+    lines += ['', f'namespace {namespace}', '{', emitter.emit(), '']
     sig = '(uint32_t entry, VU1State &state, uint8_t *data, uint32_t top, Vu1Kick out, void *user);'
-    lines.append(f'    template uint64_t {name}<true>{sig}')
-    lines.append(f'    template uint64_t {name}<false>{sig}')
+    for args in (('true', 'false') if packet is None else ('true, false', 'false, false', 'true, true', 'false, true')):
+        lines.append(f'    template uint64_t {name}<{args}>{sig}')
     lines.append('}')
     return '\n'.join(lines) + '\n', len(prog.nodes)
 
@@ -1169,15 +1370,15 @@ def main():
     ap.add_argument('out')
     a = ap.parse_args()
     try:
-        include, namespace, programs = load_spec(a.spec)
+        include, namespace, programs, sink = load_spec(a.spec)
         if a.code:
             spec = programs[a.source]
-            text, nodes = generate(open(a.code, 'rb').read(), spec, include, namespace)
+            text, nodes = generate(open(a.code, 'rb').read(), spec, include, namespace, sink)
             write(a.out, text)
             return
         os.makedirs(a.out, exist_ok=True)
         for key, spec in programs.items():
-            text, nodes = generate(code_from_aot(a.source, spec), spec, include, namespace)
+            text, nodes = generate(code_from_aot(a.source, spec), spec, include, namespace, sink)
             write(os.path.join(a.out, spec['file']), text)
             print(f'program {key}: {len(spec["entries"])} start pcs, {nodes} timed pairs -> {spec["file"]}')
     except GenError as error:
