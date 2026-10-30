@@ -106,11 +106,20 @@ private:
     uint8_t *m_activeRdram = nullptr;
     uint64_t m_activeToken = 0;
     uint64_t m_nextToken = 1;
+
+public:
+    // Read-ahead for a file too big to hold (a disc image the sound streams from): windows of it read on a worker
+    // thread, ahead of where the reads go, so the IOP (and the EE waiting for it) does not wait on the drive.
+    struct ReadAhead;
+
+private:
     struct HostFile
     {
         std::FILE *stream = nullptr; // or, for a file held in memory, null and `data`
         std::shared_ptr<const std::vector<uint8_t>> data;
         uint64_t size = 0u;
+        std::string path;
+        std::shared_ptr<ReadAhead> ahead;
     };
     mutable std::mutex m_hostFileMutex;
     std::unordered_map<uint64_t, HostFile> m_hostFiles;
