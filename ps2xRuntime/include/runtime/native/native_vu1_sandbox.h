@@ -33,6 +33,7 @@ namespace ps2x::native
         GifToNative &gif() { return m_gif; }
         // VU1 cycles run so far, over every call and resume.
         uint64_t cycles() const;
+        VU1Interpreter &vu();
 
     private:
         std::unique_ptr<VU1Interpreter> m_vu;
