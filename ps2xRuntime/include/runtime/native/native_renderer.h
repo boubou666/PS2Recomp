@@ -29,6 +29,8 @@ namespace ps2x::native
         float u = 0, v = 0;        // texture coordinates, 0..1 across the texture (the GS's S / Q, T / Q)
         uint32_t rgba = 0;         // lit colour, R in the low byte; 0x80 per channel is 1.0, as the GS modulates
         float fog = 1.0f;          // the GS's F / 255: 1 keeps the colour, 0 is all fog colour (Material::fog)
+        float q = 1.0f;            // the GS's Q, for a draw the GS front end makes (fromGsContext): U / V across the
+                                   // triangle in perspective, as the GS interpolates S, T and Q
     };
 
     // How a draw blends and tests, from the GS registers a game sets (ALPHA, TEST) reduced to what a PC GPU does.

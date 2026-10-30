@@ -197,6 +197,7 @@ namespace ps2x::native
             const float q = asFloat(static_cast<uint32_t>(m_rgbaq >> 32));
             k.u = q != 0.0f ? m_s / q : m_s;
             k.v = q != 0.0f ? m_t / q : m_t;
+            k.q = q != 0.0f ? q : 1.0f;
         }
 
         const uint32_t type = m_prim & 7u;
@@ -383,6 +384,7 @@ namespace ps2x::native
             v.z = k.z;
             v.u = k.u;
             v.v = k.v;
+            v.q = m_gsWrites ? k.q : 1.0f;
             v.fog = k.fog;
             v.rgba = fixedAlpha ? (rgba & 0x00ffffffu) | (static_cast<uint32_t>((alpha >> 32) & 0xffu) << 24) : rgba;
             m_triangles.push_back(v);
@@ -400,12 +402,13 @@ namespace ps2x::native
         if (count == 2 && type == 6)
         {
             const Kick &a = kicks[0], &b = kicks[1];
+            const float au = a.u * a.q / b.q, av = a.v * a.q / b.q;
             corner[0] = b;
-            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = a.u, corner[0].v = a.v;
+            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = au, corner[0].v = av;
             corner[1] = b;
-            corner[1].y = a.y, corner[1].v = a.v;
+            corner[1].y = a.y, corner[1].v = av;
             corner[2] = b;
-            corner[2].x = a.x, corner[2].u = a.u;
+            corner[2].x = a.x, corner[2].u = au;
             corner[3] = b;
             for (Kick &c : corner)
                 c.rgba = last;

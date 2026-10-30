@@ -118,6 +118,13 @@ EeScheduler::EeScheduler(PS2Runtime &runtime)
 EeScheduler::~EeScheduler()
 {
     requestStop();
+    {
+        std::lock_guard lock(m_hostDeadlineMutex);
+        m_hostDeadlineQuit = true;
+    }
+    m_hostDeadlineCv.notify_all();
+    if (m_hostDeadlineThread.joinable())
+        m_hostDeadlineThread.join();
 }
 
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
@@ -126,6 +133,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_rdram = rdram;
     m_readyQueues = {};
     m_threads.clear();
+    m_hostDeadlineWakes.clear();
     m_semaphores.clear();
     m_eventFlags.clear();
     m_alarms.clear();
@@ -1651,6 +1659,57 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
     publishSnapshot();
 }
 
+[[noreturn]] void EeScheduler::waitHostDeadline(std::chrono::steady_clock::time_point deadline, std::function<void()> onWake,
+                                                std::function<void(R5900Context &)> completion)
+{
+    assertExecutor();
+    const uint64_t token = ++m_hostDeadlineToken;
+    m_hostDeadlineWakes[token] = std::move(onWake);
+    {
+        std::lock_guard lock(m_hostDeadlineMutex);
+        if (!m_hostDeadlineThread.joinable())
+            m_hostDeadlineThread = std::thread([this] { hostDeadlineLoop(); });
+        m_hostDeadlines.emplace_back(deadline, token);
+    }
+    m_hostDeadlineCv.notify_one();
+    waitExternal(EeWaitReason::External, kHostDeadlineWaitType, token, std::move(completion));
+}
+
+void EeScheduler::hostDeadlineLoop()
+{
+    std::unique_lock lock(m_hostDeadlineMutex);
+    while (!m_hostDeadlineQuit)
+    {
+        if (m_hostDeadlines.empty())
+        {
+            m_hostDeadlineCv.wait(lock);
+            continue;
+        }
+        const auto earliest = std::min_element(m_hostDeadlines.begin(), m_hostDeadlines.end());
+        if (std::chrono::steady_clock::now() < earliest->first)
+        {
+            m_hostDeadlineCv.wait_until(lock, earliest->first);
+            continue;
+        }
+        const uint64_t token = earliest->second;
+        m_hostDeadlines.erase(earliest);
+        lock.unlock();
+        // On the executor: the wake-up first (it may charge EE time or present a frame), then the thread resumes.
+        postTask([this, token]()
+        {
+            const auto it = m_hostDeadlineWakes.find(token);
+            if (it == m_hostDeadlineWakes.end())
+                return; // a reset dropped the wait
+            const std::function<void()> wake = std::move(it->second);
+            m_hostDeadlineWakes.erase(it);
+            if (wake)
+                wake();
+            completeExternalWait(kHostDeadlineWaitType, token, 0);
+        });
+        lock.lock();
+    }
+}
+
 [[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,
                                             uint32_t type,
                                             uint64_t token,
@@ -2559,6 +2618,12 @@ void EeScheduler::waitForEvent()
         const auto next = m_deadlines.begin(); // sorted by cycle, then sequence
         deadlineCycle = next->deadlineCycle;
         hostDeadline = next->hostDeadline;
+        // Native frames leave EE time ahead of the vblank timeline whenever a frame accounts more cycles than it
+        // took: waiting for the timeline's host time would stall the game for the whole lead.
+        if (m_nativeFrames)
+            hostDeadline = std::chrono::steady_clock::now() +
+                           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               eeCyclesToHostDuration(deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u));
         deadlineKind = "deadline:" + std::to_string(static_cast<int>(next->event.type));
     }
     if (hasTimerDeadline)
