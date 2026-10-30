@@ -82,6 +82,12 @@ namespace ps2x::native
     TextureCache &textures();
     bool uploadsWanted();
     void setUploadsWanted(bool wanted);
+    // In GS stream order (a renderer drawing in the GS stream and decoding there: Renderer::setStreamDraws): the GS
+    // front end feeds each upload as its queue reaches it, not when the EE submits it, so a draw decoded at its place
+    // in the stream sees GS memory as the GS has it there (a game rewriting a CLUT ring every frame).
+    void setUploadsInStreamOrder(bool inOrder);
+    bool uploadsAtSubmit();      // wanted, fed when submitted
+    bool uploadsInStreamOrder(); // wanted, fed in stream order
 
     // Index of palette entry `index` in a CSM1 palette stored as a 16-pixel-wide CT32 / CT16 image: (x, y).
     inline void csm1Position(uint32_t index, uint32_t &x, uint32_t &y)

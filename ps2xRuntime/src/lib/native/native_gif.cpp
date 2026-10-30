@@ -200,9 +200,9 @@ namespace ps2x::native
             k.q = q != 0.0f ? q : 1.0f;
         }
         uint32_t offset = 0, extent = 0;
-        if (TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
+        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
             k.u = (k.u * static_cast<float>(tw) - static_cast<float>(offset)) / static_cast<float>(extent);
-        if (TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
+        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
             k.v = (k.v * static_cast<float>(th) - static_cast<float>(offset)) / static_cast<float>(extent);
 
         const uint32_t type = m_prim & 7u;
@@ -450,7 +450,13 @@ namespace ps2x::native
                          s_batches, m_triangles.size(), m_triangles[0].x, m_triangles[0].y, m_triangles[0].z, m_triangles[0].u, m_triangles[0].v,
                          m_triangles[0].rgba, static_cast<unsigned long long>(m_batchMaterial.tex0), m_batchMaterial.textured ? 1 : 0,
                          static_cast<int>(m_batchMaterial.blend));
-        if (!m_triangles.empty())
+        if (!m_triangles.empty() && m_captureVertices)
+        {
+            m_captureVertices->insert(m_captureVertices->end(), m_triangles.begin(), m_triangles.end());
+            if (m_captureMaterials)
+                m_captureMaterials->insert(m_captureMaterials->end(), m_triangles.size() / 3u, m_batchMaterial);
+        }
+        else if (!m_triangles.empty())
             Renderer::instance().draw(m_batchMaterial, kScreenSpace, m_triangles.data(), static_cast<uint32_t>(m_triangles.size()));
         m_triangles.clear();
         m_batchOpen = false;

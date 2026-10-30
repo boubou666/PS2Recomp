@@ -45,7 +45,8 @@ void main()
 )";
 
     // GS colour arithmetic with 0x80 as 1.0. The render target keeps alpha as the GS stores it (0x80 for 1.0), so a
-    // texture read back from a render target doubles it (uTexAlphaScale 2), one from the texture cache does not.
+    // texture read back from a render target doubles it (uTexAlphaScale 2), one from the texture cache (the GS's
+    // alpha in a byte) scales it by 255 / 128.
     constexpr const char *kFragmentShader = R"(#version 330 core
 in vec4 vColor;
 noperspective in vec3 vTex;
@@ -269,6 +270,49 @@ void main()
         colour = over.rgb * a + under * (1.0 - a);
     }
     fragColor = vec4(colour, 1.0);
+}
+)";
+
+    // A render target's depth written into the GPU copy of GS memory as its ZBUF format stores it: each output word
+    // is a word of a Z buffer page, its depth (Z times the format's scale) found through the inverse swizzle. Z24
+    // keeps the word's top byte from uOld (T8H / T4HL textures share those words).
+    constexpr const char *kDepthResolveFragmentShader = R"(#version 330 core
+layout(location = 0) out uint outWord;
+uniform sampler2D uDepth;    // the render target's depth, GL row 0 = GS row 0
+uniform usampler2D uInverse; // page pixel offset -> x | y << 16
+uniform usampler2D uOld;     // GS memory's words before the resolve
+uniform int uZbp;
+uniform int uFbw;
+uniform int uKind;           // 0 Z32, 1 Z24, 2 Z16, 3 Z16S
+uniform int uScale;
+uniform float uRange;        // 2^32, 2^24 or 2^16: the Z of depth 1.0
+
+uint z(ivec2 p)
+{
+    float d = texelFetch(uDepth, p * uScale + uScale / 2, 0).r;
+    return uint(clamp(round(d * uRange), 0.0, uRange - 1.0));
+}
+
+void main()
+{
+    ivec2 f = ivec2(gl_FragCoord.xy);
+    int word = f.y * 1024 + f.x;
+    int rel = word / 2048 - uZbp;
+    int inPage = word % 2048;
+    int prow = rel / uFbw, pcol = rel % uFbw;
+    if (uKind < 2)
+    {
+        uint e = texelFetch(uInverse, ivec2(inPage % 128, 80 + inPage / 128), 0).r;
+        uint value = z(ivec2(pcol * 64 + int(e & 0xFFFFu), prow * 32 + int(e >> 16u)));
+        outWord = uKind == 1 ? (texelFetch(uOld, f, 0).r & 0xFF000000u) | (value & 0xFFFFFFu) : value;
+        return;
+    }
+    int row = uKind == 2 ? 96 : 128;
+    int i0 = inPage * 2, i1 = inPage * 2 + 1;
+    uint e0 = texelFetch(uInverse, ivec2(i0 % 128, row + i0 / 128), 0).r;
+    uint e1 = texelFetch(uInverse, ivec2(i1 % 128, row + i1 / 128), 0).r;
+    outWord = z(ivec2(pcol * 64 + int(e0 & 0xFFFFu), prow * 64 + int(e0 >> 16u))) |
+              (z(ivec2(pcol * 64 + int(e1 & 0xFFFFu), prow * 64 + int(e1 >> 16u))) << 16u);
 }
 )";
 
@@ -744,6 +788,10 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
         m_targets.erase(it);
     }
 
+    // PS2X_LOG_GS_WRITERS=1: each GS memory area drawn into, once (a port's textures drawn by the GS, which the
+    // native texture cache, fed by uploads, never sees).
+    if (static const bool logWriters = std::getenv("PS2X_LOG_GS_WRITERS") != nullptr; logWriters)
+        std::fprintf(stderr, "[gs:writers] target fbp=%u (block %u) psm=0x%x fbw=%u\n", frame.fbp, frame.fbp * 32u, frame.psm, frame.fbw);
     RenderTarget target;
     target.fbp = frame.fbp;
     target.fbw = frame.fbw;
@@ -1560,6 +1608,77 @@ bool GSNativeBackend::resolveTargetPagesGpu(RenderTarget &target, uint32_t first
     return true;
 }
 
+void GSNativeBackend::resolveDepthPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage)
+{
+    if (!m_vram || endPage <= firstPage || !target.depth)
+        return;
+    ensureVram();
+    if (!m_depthResolveProgram)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kDepthResolveFragmentShader);
+        m_depthResolveProgram = glCreateProgram();
+        glAttachShader(m_depthResolveProgram, vertex);
+        glAttachShader(m_depthResolveProgram, fragment);
+        glLinkProgram(m_depthResolveProgram);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+    }
+    const GlStateRestore restore;
+    syncVramToGpu();
+    // The words before the resolve, for Z24's top byte (the shader cannot read the texture it writes).
+    if (!m_vramOld)
+    {
+        glGenTextures(1, &m_vramOld);
+        glBindTexture(GL_TEXTURE_2D, m_vramOld);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glGenFramebuffers(1, &m_vramOldFramebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_vramOldFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_vramOld, 0);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_vramOldFramebuffer);
+    const GLint y0 = static_cast<GLint>(firstPage * 2u), y1 = static_cast<GLint>(endPage * 2u);
+    glBlitFramebuffer(0, y0, 1024, y1, 0, y0, 1024, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_vramFramebuffer);
+    glViewport(0, 0, 1024, 1024);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, y0, 1024, y1 - y0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_depthResolveProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, target.depth);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, m_vramOld);
+    glActiveTexture(GL_TEXTURE0);
+    const uint32_t format = target.zpsm & 0x0Fu;
+    const int kind = format == 0x0u ? 0 : format == 0x1u ? 1 : format == 0xAu ? 3 : 2;
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uDepth"), 0);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uInverse"), 4);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uOld"), 5);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uZbp"), static_cast<GLint>(target.zbp));
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uKind"), kind);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1f(glGetUniformLocation(m_depthResolveProgram, "uRange"), static_cast<float>(1.0 / depthScale(target.zpsm)));
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    for (uint32_t page = firstPage; page < endPage; ++page)
+        m_gpuNewer[page] = 1u;
+    m_anyGpuNewer = true;
+}
+
 void GSNativeBackend::resolveTargetPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage)
 {
     if (logTargetPages())
@@ -1658,6 +1777,44 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
     if (!hook)
         return;
+    // PS2X_NATIVE_VRAM_DIFF=1: every 500th native group, GS memory against the native texture cache's copy, page by
+    // page (8 KiB): each page that differs, logged the first time, with the first differing word in each (the
+    // textures and CLUTs a port's draws decode, where the cache is not the GS's).
+    if (static const bool s_vramDiff = std::getenv("PS2X_NATIVE_VRAM_DIFF") != nullptr; s_vramDiff)
+    {
+        static uint64_t s_calls = 0;
+        static std::vector<uint8_t> s_vram;
+        static std::vector<bool> s_logged(512, false);
+        if (s_calls++ % 500u == 0u)
+        {
+            SnapshotVram(s_vram);
+            const uint8_t *cache = ps2x::native::textures().memory();
+            uint32_t differing = 0;
+            for (uint32_t page = 0; page < 512u && s_vram.size() >= 512u * 8192u; ++page)
+            {
+                const uint8_t *g = s_vram.data() + page * 8192u, *c = cache + page * 8192u;
+                if (std::memcmp(g, c, 8192u) == 0)
+                    continue;
+                ++differing;
+                if (s_logged[page])
+                    continue;
+                s_logged[page] = true;
+                uint32_t at = 0, words = 0;
+                for (uint32_t i = 0; i < 8192u; i += 4u)
+                    if (std::memcmp(g + i, c + i, 4u) != 0)
+                    {
+                        if (words++ == 0u)
+                            at = i;
+                    }
+                uint32_t gw, cw;
+                std::memcpy(&gw, g + at, 4u);
+                std::memcpy(&cw, c + at, 4u);
+                std::fprintf(stderr, "[native:vramdiff] page %u (blocks %u-%u): %u words differ, first at +%u: GS %08x cache %08x\n",
+                             page, page * 32u, page * 32u + 31u, words, at, gw, cw);
+            }
+            std::fprintf(stderr, "[native:vramdiff] call %llu: %u pages differ\n", static_cast<unsigned long long>(s_calls), differing);
+        }
+    }
     const FrameTarget frame = frameTarget(context.frame, context.zbuf, context.scissor.y1 + 1u);
     ps2x::native::GsDrawTarget target;
     fillNativeRegisters(target, context);
@@ -2110,7 +2267,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-    glUniform1f(m_uniforms.fst, fromTarget ? 2.0f : 1.0f);
+    glUniform1f(m_uniforms.fst, fromTarget ? 2.0f : 255.0f / 128.0f); // the cache keeps the GS's alpha (0x80 is 1.0)
     return true;
 }
 
@@ -2591,6 +2748,20 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
         m_readFirstPage = first;
         m_readEndPage = end;
         syncMemoryPages(first, end);
+        // A read of Z pages (TMB's lens flares read a few Z24 pixels around each light): the depth of the targets
+        // whose Z buffer covers them, which GS memory never gets otherwise.
+        if (const uint8_t spsm = command.bitbltbuf.spsm; (spsm & 0x30u) == 0x30u)
+            for (auto &[fbp, target] : m_targets)
+            {
+                if (target.zbp == ~0u || (target.zpsm & 0x30u) != 0x30u)
+                    continue;
+                const uint32_t rows = (target.zpsm & 0x0Fu) >= 2u ? 64u : 32u;
+                const uint32_t zEnd = target.zbp + (std::max(target.usedHeight, 1u) + rows - 1u) / rows *
+                                                       std::max<uint32_t>(target.fbw, 1u);
+                const uint32_t lo = std::max(first, target.zbp), hi = std::min(end, std::min(zEnd, kPages));
+                if (lo < hi)
+                    resolveDepthPages(target, lo, hi);
+            }
         pullGpuPages(first, end);
     }
     // One into GS memory replaces part of its pages: what a target drew in the rest goes there first; the

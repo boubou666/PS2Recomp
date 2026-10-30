@@ -63,7 +63,7 @@ out vec4 fragColor;
 void main()
 {
     vec4 colour = vCol * (255.0 / 128.0);
-    vec4 texel = uTextured != 0 ? texture(uTex, vUv) : vec4(1.0);
+    vec4 texel = uTextured != 0 ? texture(uTex, vUv) * vec4(1.0, 1.0, 1.0, 255.0 / 128.0) : vec4(1.0); // GS alpha
     fragColor = clamp(texel * colour, 0.0, 1.0);
     if (uAlphaTest != 0 && fragColor.a <= uAlphaRef)
         discard;
@@ -167,9 +167,20 @@ void main()
             return;
         Batch batch;
         batch.material = material;
+        if (!material.fromGsContext && material.texa == 0u)
+            batch.material.texa = m_gsTexa.load(std::memory_order_relaxed); // the GS's (setGsTexa)
         std::memcpy(batch.matrix, matrix, sizeof(batch.matrix));
-        if (material.textured && !material.fromGsContext)
-            batch.texture = ps2x::native::textures().texture(material.tex0, material.texa, material.region);
+        // With stream draws, the texture is decoded where the batch is drawn in the GS stream (the GS thread, at its
+        // marker, with the uploads before it in the stream: setUploadsInStreamOrder) rather than now: the game's
+        // texture and CLUT uploads reach GS memory on the GS thread, behind this one (TMB rewrites a CLUT ring every
+        // frame). PS2X_NATIVE_DECODE_AT_DRAW=0: decoded now.
+        static const bool s_atDraw = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_DECODE_AT_DRAW");
+            return !(value && *value == '0');
+        }();
+        if (material.textured && !material.fromGsContext && !(s_atDraw && m_streamDraws))
+            batch.texture = ps2x::native::textures().texture(material.tex0, batch.material.texa, material.region);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
         batch.key = m_key;
