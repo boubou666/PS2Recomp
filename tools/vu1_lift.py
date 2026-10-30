@@ -218,7 +218,7 @@ class Lower:
         if word in (0, 0x8000033C):
             self.name = 'nop'
             return
-        names = {0x00: 'lq', 0x01: 'sq', 0x04: 'ilw', 0x05: 'isw', 0x08: 'iaddiu', 0x09: 'isubiu', 0x12: 'fcand', 0x15: 'fsset', 0x16: 'fsand',
+        names = {0x00: 'lq', 0x01: 'sq', 0x04: 'ilw', 0x05: 'isw', 0x08: 'iaddiu', 0x09: 'isubiu', 0x11: 'fcset', 0x12: 'fcand', 0x13: 'fcor', 0x15: 'fsset', 0x16: 'fsand',
                  0x1A: 'fmand', 0x1C: 'fcget', 0x20: 'b', 0x21: 'bal', 0x24: 'jr', 0x28: 'ibeq', 0x29: 'ibne', 0x2C: 'ibltz', 0x2D: 'ibgtz',
                  0x2E: 'iblez', 0x2F: 'ibgez'}
         if self.op in names:
@@ -275,7 +275,9 @@ class Lower:
             u.pipeline, u.latency, u.delays_branch = 'ialu', 1, True
             rvi(self.is_)
             wvi(self.it)
-        elif n == 'fcand':
+        elif n == 'fcset':
+            u.pipeline, u.latency, u.writes_clip = 'fmac', FMAC_LATENCY, True
+        elif n in ('fcand', 'fcor'):
             u.pipeline, u.latency, u.reads_clip = 'ialu', 1, True
             wvi(1)
         elif n == 'fmand':
@@ -578,7 +580,7 @@ class Program:
                 raise GenError(f'{self.name}: MAC of {s.mac:#x} read at {p.pc:#x} while it is written again')
         if p.lower.name == 'fsand':
             n.stat_src = s.stat
-        if p.lower.name in ('fcand', 'fcget'):
+        if p.lower.name in ('fcand', 'fcor', 'fcget'):
             n.clip_src = s.clip
             if s.clip is not None and any(k == 'c' and pc == s.clip for _, k, pc in flags):
                 raise GenError(f'{self.name}: clip of {s.clip:#x} read at {p.pc:#x} while it is written again')
@@ -588,7 +590,7 @@ class Program:
             s.last = p.pc
         if p.lower.name == 'fsset':
             flags.append((t + FMAC_LATENCY, 's', p.pc))
-        if p.upper.kind == 'clip':
+        if p.upper.kind == 'clip' or p.lower.name == 'fcset':
             flags.append((t + FMAC_LATENCY, 'c', p.pc))
         if len(flags) > MAX_FLAG_ENTRIES:
             raise GenError(f'{self.name}: flag queue overflow at {p.pc:#x}')
@@ -820,6 +822,14 @@ class Emitter:
             return out
         if nm == 'div':
             return [f'qPending = divide(laneValue({vf(lo.fs)}, {lo.fsf}), laneValue({vf(lo.ft)}, {lo.ftf}), diPending);']
+        if nm == 'fcset':
+            out = [f'clipWork = {lo.imm24:#x}u;']
+            if p.pc in self.need_clip:
+                out.append(f'clip_{p.pc:04x} = clipWork;')
+            return out
+        if nm == 'fcor':
+            src = 'clip0' if n.clip_src is None else f'clip_{n.clip_src:04x}'
+            return [f'vi1 = (({src} | {lo.imm24:#x}u) & 0xFFFFFFu) == 0xFFFFFFu ? 1 : 0;']
         if nm == 'fcand':
             src = 'clip0' if n.clip_src is None else f'clip_{n.clip_src:04x}'
             return [f'vi1 = ({src} & {lo.imm24:#x}u) != 0u ? 1 : 0;']
@@ -1110,7 +1120,7 @@ def generate(code, spec, include=DEFAULT_INCLUDE, namespace=DEFAULT_NAMESPACE):
         raise GenError(f'the code image does not hash to {spec["hash"]:016x}')
     pairs = parse(code[:spec['pairs'] * 8])
     has_fmand = any(p is not None and p.lower.name == 'fmand' for p in pairs)
-    has_fcand = any(p is not None and p.lower.name in ('fcand', 'fcget') for p in pairs)
+    has_fcand = any(p is not None and p.lower.name in ('fcand', 'fcor', 'fcget') for p in pairs)
     prog = Program(pairs, spec['function'], has_fmand, has_fcand, spec.get('unit', 'VU1'))
     prog.build(spec['entries'], spec['targets'])
     name = spec['function']
