@@ -180,7 +180,11 @@ namespace ps2x::native
                         i += 16u;
                         if (reg != 0xeu)
                             continue;
-                        if (addr == 0x50u)
+                        if (addr == 0x3bu) // TEXA, FOGCOL: the game's values for materials built from its data
+                            m_gameTexa = data;
+                        else if (addr == 0x3du)
+                            m_gameFogColour = static_cast<uint32_t>(data & 0xffffffu);
+                        else if (addr == 0x50u)
                             m_bitbltbuf = data;
                         else if (addr == 0x51u)
                             m_trxpos = data;
@@ -214,6 +218,144 @@ namespace ps2x::native
         }
     }
 
+    void TextureCache::setStoreMode(bool on)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_storeMode = on;
+    }
+
+    void TextureCache::storeUpload(uint32_t dbp, uint32_t dbw, uint32_t dpsm, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
+                                   const uint8_t *data, size_t bytes)
+    {
+        const size_t wanted = (static_cast<size_t>(w) * h * bitsPerPixel(dpsm) + 7u) / 8u;
+        StoredBase &base = m_store[(static_cast<uint64_t>(dbp) << 6) | dpsm];
+        for (auto it = base.uploads.begin(); it != base.uploads.end();)
+        {
+            if (it->dx == dx && it->dy == dy && it->w == w && it->h == h && it->dbw == dbw && it->data.size() == std::min(bytes, wanted) &&
+                std::memcmp(it->data.data(), data, it->data.size()) == 0)
+                return; // the same pixels again: nothing changes
+            // An older upload this one covers whole is gone.
+            if (it->dx >= dx && it->dy >= dy && it->dx + it->w <= dx + w && it->dy + it->h <= dy + h)
+                it = base.uploads.erase(it);
+            else
+                ++it;
+        }
+        StoredUpload upload;
+        upload.dx = dx;
+        upload.dy = dy;
+        upload.w = w;
+        upload.h = h;
+        upload.dbw = dbw;
+        upload.data.assign(data, data + std::min(bytes, wanted));
+        base.uploads.push_back(std::move(upload));
+        ++base.serial;
+    }
+
+    std::shared_ptr<const TextureCache::Texture> TextureCache::textureFromStore(uint64_t tex0, uint64_t texa)
+    {
+        const uint64_t selected = tex0 & ~((uint64_t{3} << 35) | (uint64_t{7} << 61));
+        const uint32_t psm = (tex0 >> 20) & 0x3fu;
+        const uint64_t key = selected ^ (indexed(psm) || psm == CT32 ? 0u : (texa * 0x9e3779b97f4a7c15ull));
+        const uint32_t tbp = tex0 & 0x3fffu;
+        const uint32_t cbp = (tex0 >> 37) & 0x3fffu, cpsm = (tex0 >> 51) & 0xfu;
+        const auto serialOf = [&](uint32_t bp, uint32_t format) {
+            const auto it = m_store.find((static_cast<uint64_t>(bp) << 6) | format);
+            return it == m_store.end() ? 0u : it->second.serial;
+        };
+        const uint64_t imageSerial = serialOf(tbp, psm), paletteSerial = indexed(psm) ? serialOf(cbp, cpsm) : 0u;
+        if (const auto it = m_storeTextures.find(key);
+            it != m_storeTextures.end() && it->second.imageSerial == imageSerial && it->second.paletteSerial == paletteSerial)
+            return it->second.texture;
+        const auto image = m_store.find((static_cast<uint64_t>(tbp) << 6) | psm);
+        if (image == m_store.end() || image->second.uploads.empty())
+        {
+            ++m_storeMisses;
+            m_storeTextures[key] = {nullptr, imageSerial, paletteSerial};
+            return nullptr;
+        }
+        Texture texture;
+        texture.key = key;
+        texture.version = ++m_decodes;
+        texture.width = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu);
+        texture.height = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
+        uint32_t palette[256] = {};
+        if (indexed(psm))
+        {
+            // The palette as the game uploaded it to CBP: a CSM1 image (16 x 16 entries, or 8 x 2 for 16 colours).
+            const auto clut = m_store.find((static_cast<uint64_t>(cbp) << 6) | cpsm);
+            const uint32_t csa = (tex0 >> 56) & 0x1fu;
+            const bool eight = psm == T8 || psm == T8H;
+            if (clut != m_store.end())
+                for (uint32_t i = 0; i < (eight ? 256u : 16u); ++i)
+                {
+                    uint32_t px = 0, py = 0;
+                    csm1Position(eight ? i : (csa * 16u + i) & 0xffu, px, py);
+                    for (auto u = clut->second.uploads.rbegin(); u != clut->second.uploads.rend(); ++u)
+                        if (px >= u->dx && py >= u->dy && px < u->dx + u->w && py < u->dy + u->h)
+                        {
+                            const size_t at = static_cast<size_t>(py - u->dy) * u->w + (px - u->dx);
+                            if (cpsm == CT32 && at * 4u + 4u <= u->data.size())
+                            {
+                                uint32_t c;
+                                std::memcpy(&c, u->data.data() + at * 4u, 4u);
+                                palette[i] = fromCt32(c);
+                            }
+                            else if (cpsm != CT32 && at * 2u + 2u <= u->data.size())
+                                palette[i] = fromCt16(static_cast<uint32_t>(u->data[at * 2u]) | (u->data[at * 2u + 1u] << 8), texa);
+                            break;
+                        }
+                }
+        }
+        texture.rgba.assign(static_cast<size_t>(texture.width) * texture.height, 0u);
+        const uint32_t bpp = bitsPerPixel(psm);
+        for (const StoredUpload &u : image->second.uploads) // oldest first: newer ones overwrite
+        {
+            const uint32_t x1 = std::min(u.dx + u.w, texture.width), y1 = std::min(u.dy + u.h, texture.height);
+            for (uint32_t y = u.dy; y < y1; ++y)
+                for (uint32_t x = u.dx; x < x1; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y - u.dy) * u.w + (x - u.dx);
+                    uint32_t value = 0u;
+                    switch (bpp)
+                    {
+                    case 32:
+                        if (i * 4u + 4u > u.data.size())
+                            continue;
+                        std::memcpy(&value, u.data.data() + i * 4u, 4u);
+                        break;
+                    case 24:
+                        if (i * 3u + 3u > u.data.size())
+                            continue;
+                        value = u.data[i * 3u] | (u.data[i * 3u + 1u] << 8) | (u.data[i * 3u + 2u] << 16);
+                        break;
+                    case 16:
+                        if (i * 2u + 2u > u.data.size())
+                            continue;
+                        value = u.data[i * 2u] | (u.data[i * 2u + 1u] << 8);
+                        break;
+                    case 8:
+                        if (i >= u.data.size())
+                            continue;
+                        value = u.data[i];
+                        break;
+                    default:
+                        if ((i >> 1) >= u.data.size())
+                            continue;
+                        value = (u.data[i >> 1] >> ((i & 1u) * 4u)) & 0xfu;
+                        break;
+                    }
+                    uint32_t &out = texture.rgba[static_cast<size_t>(y) * texture.width + x];
+                    if (indexed(psm))
+                        out = palette[value & 0xffu];
+                    else
+                        out = psm == CT32 ? fromCt32(value) : psm == CT24 ? fromCt24(value, texa) : fromCt16(value, texa);
+                }
+        }
+        auto shared = std::make_shared<const Texture>(std::move(texture));
+        m_storeTextures[key] = {shared, imageSerial, paletteSerial};
+        return shared;
+    }
+
     void TextureCache::uploadLocked(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, const uint8_t *data, size_t bytes)
     {
         const uint32_t dbp = (bitbltbuf >> 32) & 0x3fffu;
@@ -225,6 +367,12 @@ namespace ps2x::native
         const uint32_t h = (trxreg >> 32) & 0xfffu;
         if (w == 0u || h == 0u)
             return;
+        if (m_storeMode)
+        {
+            storeUpload(dbp, dbw, dpsm, dx, dy, w, h, data, bytes);
+            ++m_uploads;
+            return;
+        }
         const uint32_t bpp = bitsPerPixel(dpsm);
         const size_t pixels = std::min<size_t>(static_cast<size_t>(w) * h, bytes * 8u / bpp);
         for (size_t i = 0; i < pixels; ++i)
@@ -274,6 +422,8 @@ namespace ps2x::native
     std::shared_ptr<const TextureCache::Texture> TextureCache::texture(uint64_t tex0, uint64_t texa)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_storeMode)
+            return textureFromStore(tex0, texa);
         // TBP0 TBW PSM TW TH TCC, CBP CPSM CSM CSA (TFX and CLD do not change the image).
         const uint64_t selected = tex0 & ~((uint64_t{3} << 35) | (uint64_t{7} << 61));
         const uint32_t psm = (tex0 >> 20) & 0x3fu;

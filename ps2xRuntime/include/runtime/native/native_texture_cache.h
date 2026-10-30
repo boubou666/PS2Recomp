@@ -50,6 +50,47 @@ namespace ps2x::native
         uint64_t uploads() const { return m_uploads; }
         uint64_t decodes() const { return m_decodes; }
 
+        // Store mode (a port that takes its textures from the game's own data, no GS memory): each upload is kept as
+        // the game sent it (destination base, width and format, rectangle, pixels); texture() rebuilds an image from
+        // the uploads made to its TBP in its format, and its palette from the upload to its CBP (CSM1 order). An
+        // upload identical to the last one at the same place changes nothing. textureMisses() counts the textures no
+        // upload covers (a sub-image read at another base, a format read as another).
+        void setStoreMode(bool on);
+        bool storeMode() const { return m_storeMode; }
+        uint64_t textureMisses() const { return m_storeMisses; }
+        // TEXA and FOGCOL as the game last wrote them in the packets scanGifPacket saw (A+D), for draws whose
+        // material takes them from the game's data.
+        uint64_t gameTexa() const { return m_gameTexa; }
+        uint32_t gameFogColour() const { return m_gameFogColour; }
+
+    private:
+        struct StoredUpload
+        {
+            uint32_t dx = 0, dy = 0, w = 0, h = 0, dbw = 0;
+            std::vector<uint8_t> data;
+        };
+        // (base << 6 | psm) -> the uploads there, oldest first, and a serial bumped when one changes.
+        struct StoredBase
+        {
+            std::vector<StoredUpload> uploads;
+            uint64_t serial = 0;
+        };
+        std::shared_ptr<const Texture> textureFromStore(uint64_t tex0, uint64_t texa);
+        void storeUpload(uint32_t dbp, uint32_t dbw, uint32_t dpsm, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
+                         const uint8_t *data, size_t bytes);
+        bool storedPixel(uint32_t base, uint32_t psm, uint32_t x, uint32_t y, uint32_t &value) const;
+        bool m_storeMode = false;
+        std::unordered_map<uint64_t, StoredBase> m_store;
+        struct StoredTexture
+        {
+            std::shared_ptr<const Texture> texture;
+            uint64_t imageSerial = 0, paletteSerial = 0;
+        };
+        std::unordered_map<uint64_t, StoredTexture> m_storeTextures;
+        uint64_t m_storeMisses = 0;
+        uint64_t m_gameTexa = 0;
+        uint32_t m_gameFogColour = 0;
+
     private:
         uint32_t decodeTexel(uint32_t psm, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint64_t tex0,
                              uint64_t texa, const uint32_t *palette) const;
