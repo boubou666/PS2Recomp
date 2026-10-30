@@ -196,6 +196,20 @@ void main()
             m_building.batches.push_back(batch);
     }
 
+    void Renderer::drawGs(const GsMaterial &material, const GsVertex *triangles, uint32_t count)
+    {
+        if (count < 3u || !m_streamDraws)
+            return;
+        GsBatch batch;
+        batch.group = m_group;
+        batch.material = material;
+        batch.vertices.assign(triangles, triangles + count - count % 3u);
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        m_gsStream.push_back(std::move(batch));
+        if (m_gsStream.size() > 65536u)
+            m_gsStream.pop_front();
+    }
+
     void Renderer::endFrame()
     {
         auto frame = std::make_shared<Frame>(std::move(m_building));

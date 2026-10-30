@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/gs/gs_registers.h"
 #include "runtime/gs/gs_types.h"
 #include "runtime/native/native_gs_hook.h"
 
@@ -54,6 +55,51 @@ public:
         target.clamp = context.clamp;
         target.fogcol = context.fogcol;
         target.zmask = context.zbuf.zmask;
+    }
+
+    // A native port's triangles (Renderer::drawGs) at their marker: drawn into `target`'s render target, with the
+    // drawing registers the material carries and the target's for the rest (frame, Z buffer, offset, scissor, TEXA,
+    // TEXCLUT, FOGCOL, dithering and the other global ones).
+    virtual void SubmitNative(const GSDrawState &target, const ps2x::native::GsMaterial &material,
+                              const ps2x::native::GsVertex *triangles, uint32_t count)
+    {
+        GSPrimitiveBatch batch{};
+        batch.state = target;
+        GSDrawState &state = batch.state;
+        state.prim = material.prim;
+        state.context.tex0 = material.tex0;
+        state.context.tex1 = material.tex1;
+        state.context.clamp = material.clamp;
+        state.context.alpha = material.alpha;
+        state.context.test = material.test;
+        state.context.miptbp1 = material.miptbp1;
+        state.context.miptbp2 = material.miptbp2;
+        state.textureWidth = static_cast<uint16_t>(1u << (material.tex0.tw < 10u ? material.tex0.tw : 10u));
+        state.textureHeight = static_cast<uint16_t>(1u << (material.tex0.th < 10u ? material.tex0.th : 10u));
+        state.linearFilter = ps2x::gs::linearFilter(material.tex1);
+        if (material.loadClut)
+            LoadClut(material.tex0, target.texclut);
+        batch.vertexCount = 3;
+        for (uint32_t i = 0; i + 2u < count; i += 3u)
+        {
+            for (uint32_t k = 0; k < 3u; ++k)
+            {
+                const ps2x::native::GsVertex &v = triangles[i + k];
+                GSVertex &g = batch.vertices[k];
+                g.x = v.x;
+                g.y = v.y;
+                g.z = static_cast<double>(v.z);
+                g.r = static_cast<uint8_t>(v.rgba);
+                g.g = static_cast<uint8_t>(v.rgba >> 8);
+                g.b = static_cast<uint8_t>(v.rgba >> 16);
+                g.a = static_cast<uint8_t>(v.rgba >> 24);
+                g.s = v.s;
+                g.t = v.t;
+                g.q = v.q;
+                g.fog = v.fog;
+            }
+            Submit(batch);
+        }
     }
 
     virtual void NativeDraw(uint64_t group, const GSContext &context)

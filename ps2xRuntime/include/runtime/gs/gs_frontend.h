@@ -286,6 +286,9 @@ private:
     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
     static bool queueTraceActive();
     static void traceQueuedCommand(const QueuedCommand &command);
+    // Renderer::takeGsBatches's visitor: a native port's triangles into the render target here.
+    static void submitGsBatch(void *user, const ps2x::native::GsMaterial &material, const ps2x::native::GsVertex *triangles,
+                              uint32_t count);
     // Renderer::takeGsContextBatches's visitor: a native object's triangles drawn under this GS state.
     static void submitNativeBatch(void *user, const ps2x::native::Material &material, const float matrix[16], float gsZScale,
                                   const ps2x::native::Vertex *vertices, uint32_t count);
