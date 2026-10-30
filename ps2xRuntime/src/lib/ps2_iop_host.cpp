@@ -8,6 +8,10 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -385,9 +389,30 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
         return false;
     }
 
+    // PS2X_HOST_READ_SLOW=<ms>: each read slower than that, logged with its size (a slow drive stalls the IOP, and the
+    // EE waiting for it). PS2X_HOST_READ_DELAY=<ms>: that much added to every read, to see a slow drive's effect.
+    static const double s_slowMs = []
+    {
+        const char *value = std::getenv("PS2X_HOST_READ_SLOW");
+        return value && *value ? std::atof(value) : 0.0;
+    }();
+    static const int s_delayMs = []
+    {
+        const char *value = std::getenv("PS2X_HOST_READ_DELAY");
+        return value && *value ? std::atoi(value) : 0;
+    }();
+    const auto readStart = std::chrono::steady_clock::now();
+    if (s_delayMs > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(s_delayMs));
     bytesRead = size == 0u
                     ? 0u
                     : std::fread(destination, 1u, size, it->second.stream);
+    if (s_slowMs > 0.0)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+        if (ms > s_slowMs)
+            std::fprintf(stderr, "[host:read] %.1f ms for %zu bytes at %llu\n", ms, size, static_cast<unsigned long long>(offset));
+    }
     if (bytesRead < size && std::ferror(it->second.stream))
     {
         std::clearerr(it->second.stream);
