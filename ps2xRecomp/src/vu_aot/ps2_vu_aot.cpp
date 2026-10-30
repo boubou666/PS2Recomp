@@ -580,6 +580,8 @@ namespace
             {
                 if (!up.str().empty())
                     body << "        " << up.str() << "\n";
+                if (pi.stickyFlags && pi.lower == J::Lower::Fsset)
+                    foldSticky("        ");
                 if (!lo.str().empty())
                     body << "        " << lo.str() << "\n";
             }
