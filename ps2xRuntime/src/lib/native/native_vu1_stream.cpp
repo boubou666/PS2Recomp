@@ -23,14 +23,15 @@ namespace ps2x::native
             uint32_t pc = 0; // an MSCAL's start, or a DIRECT's size in quadwords
             bool skipped = false;
             bool direct = false;
+            uint64_t cycles = 0; // a sandboxed program's VU1 cycles
         };
         std::mutex g_decisionsMutex;
         std::deque<Decision> g_decisions;
 
-        void noteDecision(uint32_t pc, bool skipped, bool direct)
+        void noteDecision(uint32_t pc, bool skipped, bool direct, uint64_t cycles = 0)
         {
             std::lock_guard<std::mutex> lock(g_decisionsMutex);
-            g_decisions.push_back({pc, skipped, direct});
+            g_decisions.push_back({pc, skipped, direct, cycles});
             if (g_decisions.size() > 65536u) // nobody takes them (no gate)
                 g_decisions.pop_front();
         }
@@ -38,15 +39,23 @@ namespace ps2x::native
         bool programGate(const uint8_t *vu1Code, uint32_t startPc)
         {
             (void)vu1Code;
-            std::lock_guard<std::mutex> lock(g_decisionsMutex);
-            while (!g_decisions.empty())
+            Decision found;
             {
-                const Decision decision = g_decisions.front();
-                g_decisions.pop_front();
-                if (!decision.direct && decision.pc == startPc)
-                    return decision.skipped;
+                std::lock_guard<std::mutex> lock(g_decisionsMutex);
+                while (!g_decisions.empty())
+                {
+                    const Decision decision = g_decisions.front();
+                    g_decisions.pop_front();
+                    if (!decision.direct && decision.pc == startPc)
+                    {
+                        found = decision;
+                        break;
+                    }
+                }
             }
-            return false; // a transfer the adapter did not see: VU1 draws it
+            if (found.skipped)
+                advanceVif1Clock(found.cycles);
+            return found.skipped; // not found: a transfer the adapter did not see, VU1 draws it
         }
 
         // A DIRECT the VIF1 interpreter does not ask about (cut, or finishing an image) leaves its entry for
@@ -170,7 +179,7 @@ namespace ps2x::native
         // In the GS stream where VU1's output would have been; with renderers keeping GS memory themselves, present()
         // draws over the GS frame, clipped per group.
         renderer.setStreamDraws(true);
-        setVif1Observer(&onVif1);
+        setVif1Observer(&onVif1, m_config.onVif1Thread);
         setVu1Gate(&programGate);
         setDirectGate(&directGate);
         setMscntGroups(true); // an MSCNT is a group of its own here, so VIF1 must count it too
@@ -204,12 +213,29 @@ namespace ps2x::native
 
     void Vu1StreamAdapter::frameEnd()
     {
-        if (m_installed)
+        if (!m_installed)
+            return;
+        if (m_config.onVif1Thread)
+            runOnVif1Thread([this] { publish(); });
+        else
             publish();
+    }
+
+    void Vu1StreamAdapter::runSandbox(bool resumed, uint32_t pc)
+    {
+        uint8_t *code = m_vu1.code ? m_vu1.code : m_code;
+        uint8_t *data = m_vu1.data ? m_vu1.data : reinterpret_cast<uint8_t *>(m_data);
+        const uint32_t codeSize = m_vu1.code ? m_vu1.codeSize : sizeof(m_code);
+        const uint32_t dataSize = m_vu1.data ? m_vu1.dataSize : sizeof(m_data);
+        if (resumed)
+            m_sandbox->resume(code, codeSize, data, dataSize, m_top, m_itops);
+        else
+            m_sandbox->call(code, codeSize, data, dataSize, pc, m_top, m_itops);
     }
 
     void Vu1StreamAdapter::observe(const uint8_t *stream, size_t bytes)
     {
+        m_vu1 = m_config.onVif1Thread ? vu1Memory() : Vu1Memory{};
         // VIF registers the game set in a transfer the adapter did not see (at boot) come from VIF1's own.
         if (const VIFRegisters *regs = vif1Registers())
         {
@@ -238,7 +264,12 @@ namespace ps2x::native
                 renderer.setKey(0);
             }
             if (m_running == Running::Sandbox)
-                m_sandbox->resume(m_code, sizeof(m_code), reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), m_top, m_itops);
+            {
+                const uint64_t cyclesBefore = m_sandbox->cycles();
+                runSandbox(true, 0);
+                if (m_config.onVif1Thread)
+                    advanceVif1Clock(m_sandbox->cycles() - cyclesBefore);
+            }
             else if (m_running == Running::Port)
                 m_config.draw(*this, m_runningPc, true);
             return;
@@ -248,10 +279,10 @@ namespace ps2x::native
             choice = m_config.choose ? m_config.choose(*this, pc) : Choice::Sandbox;
         if (choice == Choice::Port && !m_config.draw)
             choice = Choice::Sandbox;
-        noteDecision(pc, choice != Choice::Vu1, false);
         m_runningPc = pc;
         if (choice == Choice::Vu1)
         {
+            noteDecision(pc, false, false);
             m_running = Running::None;
             ++g_stats.onVu1[pc];
             return;
@@ -262,6 +293,7 @@ namespace ps2x::native
         renderer.setKey(0);
         if (choice == Choice::Port)
         {
+            noteDecision(pc, true, false);
             m_running = Running::Port;
             ++g_stats.port[pc];
             m_config.draw(*this, pc, false);
@@ -270,7 +302,12 @@ namespace ps2x::native
         m_running = Running::Sandbox;
         ++g_stats.sandboxed[pc];
         m_sandbox->gif().setSource(pc);
-        m_sandbox->call(m_code, sizeof(m_code), reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), pc, m_top, m_itops);
+        const uint64_t cyclesBefore = m_sandbox->cycles();
+        runSandbox(false, pc);
+        const uint64_t cycles = m_sandbox->cycles() - cyclesBefore;
+        if (m_config.onVif1Thread)
+            advanceVif1Clock(cycles);
+        noteDecision(pc, true, false, m_config.onVif1Thread ? 0u : cycles);
     }
 
     void Vu1StreamAdapter::direct(const uint32_t *words, size_t qwords, size_t size)
@@ -355,7 +392,7 @@ namespace ps2x::native
             {
                 m_vif.cycle = m_cl | (m_wl << 8);
                 m_vif.tops = m_tops;
-                const uint32_t used = vifUnpack(m_vif, reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), code,
+                const uint32_t used = vifUnpack(m_vif, m_vu1.data ? nullptr : reinterpret_cast<uint8_t *>(m_data), sizeof(m_data), code,
                                                 reinterpret_cast<const uint8_t *>(words + i), static_cast<uint32_t>((count - i) * 4u));
                 i += (used + 3u) / 4u;
                 continue;
@@ -408,7 +445,7 @@ namespace ps2x::native
             {
                 const size_t size = static_cast<size_t>(num ? num : 256u) * 2u;
                 const size_t at = static_cast<size_t>(imm) * 8u, bytes = std::min(size, count - i) * 4u;
-                if (at < sizeof(m_code))
+                if (at < sizeof(m_code) && !m_vu1.code)
                     std::memcpy(m_code + at, words + i, std::min(bytes, sizeof(m_code) - at));
                 m_sandbox->codeChanged();
                 ++m_codeVersion;

@@ -31,6 +31,8 @@ namespace ps2x::native
         void resume(uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize, uint32_t top, uint32_t itop);
         // The GS registers the stream sets around the programs (DIRECT): the programs' packets draw with them.
         GifToNative &gif() { return m_gif; }
+        // VU1 cycles run so far, over every call and resume.
+        uint64_t cycles() const;
 
     private:
         std::unique_ptr<VU1Interpreter> m_vu;
