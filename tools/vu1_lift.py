@@ -487,6 +487,7 @@ class Node:
         self.landed = []  # status-tracking programs: flag writes that land before the pair, (kind, pc)
         self.stat_src = None  # FSAND: the FMAC whose status flags it reads
         self.end_flags = ()  # END: the flag writes still in flight, (kind, pc)
+        self.end_pc = None  # END: where an MSCNT resumes when a branch, not the next pair, follows the delay slot
 
 
 class Program:
@@ -704,6 +705,9 @@ class Program:
             if ended:
                 tail = max([0, ns.wb] + [r for r, _, _ in ns.flags] + ([ns.fdiv] if ns.fdiv is not None else []))
                 n.end = (tail, ns.kick, ns.fdiv is not None, ns.last, ns.mac)
+                # A branch in the E-bit pair: the program resumes (MSCNT) at its target, past the delay slot.
+                if branch is not None and branch[1] == 0:
+                    n.end_pc = 'jr' if branch[0] == 'jr' else branch[0]
                 n.end_flags = tuple((k, pc) for _, k, pc in ns.flags if k in ('f', 's')) if self.track_status else ()
                 return
             for c, pc in next_pcs:
@@ -975,7 +979,10 @@ class Emitter:
                 self.out(f'lastMac = mac_{last:04x};')
                 self.out(f'lastCur = cur_{last:04x};')
                 self.out('hasFmac = true;')
-            self.out(f'endPc = {(n.pc + 8) & self.prog.mask:#x}u;')
+            if n.end_pc == 'jr':
+                self.out('endPc = jrTarget;')
+            else:
+                self.out(f'endPc = {(n.pc + 8 if n.end_pc is None else n.end_pc) & self.prog.mask:#x}u;')
             self.out('goto done;')
             return
         if len(n.succ) == 1:
