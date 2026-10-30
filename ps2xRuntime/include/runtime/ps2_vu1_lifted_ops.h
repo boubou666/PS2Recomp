@@ -401,7 +401,7 @@ namespace ps2x::vu1lift
 
         bool pending = false, done = false, eop = false;
         uint32_t source = 0u, copied = 0u, tagEnd = 0u, total = 0u;
-        int64_t start = 0;
+        int64_t start = 0, overflowAt = -1;
 
         static std::array<uint8_t, kBufferSize> &buffer()
         {
@@ -409,10 +409,25 @@ namespace ps2x::vu1lift
             return s_buffer;
         }
 
+        static bool &overflowed()
+        {
+            static thread_local bool s_overflowed = false;
+            return s_overflowed;
+        }
+
+        void overflow(uint32_t offset)
+        {
+            done = true;
+            total = 0u;
+            overflowAt = start + 2 * static_cast<int64_t>(offset / 16u) + 1;
+            overflowed() = true;
+        }
+
         void begin(int32_t vi, int64_t t)
         {
             pending = true;
             done = eop = false;
+            overflowAt = -1;
             source = (static_cast<uint32_t>(static_cast<uint16_t>(vi)) * 16u) % kMemory;
             copied = tagEnd = total = 0u;
             start = t;
@@ -423,8 +438,7 @@ namespace ps2x::vu1lift
             std::array<uint8_t, kBufferSize> &packet = buffer();
             if (copied > kBufferSize - 16u)
             {
-                done = true;
-                total = 0u;
+                overflow(copied);
                 return;
             }
             const uint32_t offset = copied;
@@ -445,8 +459,7 @@ namespace ps2x::vu1lift
                     bytes += static_cast<uint64_t>(nloop) * 16u;
                 if (bytes > kBufferSize - offset)
                 {
-                    done = true;
-                    total = 0u;
+                    overflow(offset);
                     return;
                 }
                 tagEnd = offset + static_cast<uint32_t>(bytes);
@@ -477,6 +490,8 @@ namespace ps2x::vu1lift
             while (!done)
                 step(data);
             pending = false;
+            if (overflowAt >= 0)
+                return overflowAt;
             if (total != 0u)
                 out(user, buffer().data(), total);
             return start + 2 * static_cast<int64_t>(total / 16u) - 1;
