@@ -110,11 +110,11 @@ namespace ps2x::native
         } m_running = Running::None;
         uint32_t m_runningPc = 0;
         uint64_t m_group = 0;
-        uint64_t m_codeVersion = 0;
         // A GIF IMAGE a DIRECT left unfinished: its quadwords continue in the next DIRECTs (or right after, without a
         // VIFcode), as the VIF1 interpreter takes them, so neither is read as GIF tags nor asked about.
         uint32_t m_pendingImageQwc = 0;
         bool m_pendingImageRaw = false;
+        uint64_t m_codeVersion = 0;
     };
 }
 

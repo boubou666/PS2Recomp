@@ -197,16 +197,7 @@ void PS2AudioBackend::pushSpu2Frames(const int16_t *frames, size_t count)
 void PS2AudioBackend::setSpu2Source(Spu2Source source)
 {
     if (source)
-    {
         openSpu2Stream();
-        source = [this, spu2 = std::move(source)](int16_t *frames, size_t count)
-        {
-            spu2(frames, count);
-            std::lock_guard<std::mutex> lock(m_spu2MixerMutex);
-            if (m_spu2Mixer)
-                m_spu2Mixer(frames, count);
-        };
-    }
     if (m_spu2)
     {
         std::lock_guard<std::mutex> lock(m_spu2->mutex);

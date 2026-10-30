@@ -200,9 +200,9 @@ namespace ps2x::native
             k.q = q != 0.0f ? q : 1.0f;
         }
         uint32_t offset = 0, extent = 0;
-        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
+        if (TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
             k.u = (k.u * static_cast<float>(tw) - static_cast<float>(offset)) / static_cast<float>(extent);
-        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
+        if (TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
             k.v = (k.v * static_cast<float>(th) - static_cast<float>(offset)) / static_cast<float>(extent);
 
         const uint32_t type = m_prim & 7u;
@@ -378,7 +378,7 @@ namespace ps2x::native
         }
         // A constant alpha (ALPHA.C = FIX) stands in for the source alpha.
         const uint64_t alpha = m_alpha[context];
-        const bool fixedAlpha = !m_gsWrites && m.blend != Material::Blend::Opaque && ((alpha >> 4) & 3u) == 2u;
+        const bool fixedAlpha = m.blend != Material::Blend::Opaque && ((alpha >> 4) & 3u) == 2u;
         const bool flat = !((attributes >> 3) & 1u); // IIP = 0: the last vertex's colour
         auto out = [&](const Kick &k, uint32_t rgba)
         {
