@@ -2366,8 +2366,11 @@ void GSNativeBackend::Submit(const GSPrimitiveBatch &batch)
 
 void GSNativeBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
-    // The CLUT (at most 1 KiB at CBP) is read from GS memory on the CPU: a target may have drawn it.
-    if (tex0.cld >= 1u && tex0.cld <= 5u)
+    // The GPU decoding path reads the CLUT from the GPU copy of GS memory at CBP itself (bindTexture brings those
+    // pages up to date); only the CPU paths read it from GS memory on the CPU, and need a target's pixels there first
+    // (a read back for each CLUT load: SC3 loads dozens a frame).
+    static const bool cpuDecode = std::getenv("PS2X_GS_NATIVE_CPUDECODE") != nullptr;
+    if (cpuDecode && tex0.cld >= 1u && tex0.cld <= 5u)
     {
         const uint32_t first = std::min(tex0.cbp / 32u, kPages), end = std::min((tex0.cbp + 4u) / 32u + 1u, kPages);
         syncMemoryPages(first, end);
@@ -2448,11 +2451,13 @@ bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
     // A local-to-local copy out of a render target (a frame copied to the displayed buffer, a region saved for
     // later): the same copy on the GPU, into the destination render target (made if need be).
     const GSBitBltBuf &b = command.bitbltbuf;
-    const bool colour = [](uint8_t psm) { return psm == 0x00u || psm == 0x01u; }(b.spsm);
+    // Any colour layout a target has (CT32 / CT24 / CT16 / CT16S): a copy through the CPU reads the source back.
+    const bool colour = [](uint8_t psm) { return psm == 0x00u || psm == 0x01u || psm == 0x02u || psm == 0x0Au; }(b.spsm);
     if (!colour || b.spsm != b.dpsm || b.sbp % 32u != 0u || b.dbp % 32u != 0u || !ensureContext())
         return false;
     auto source = m_targets.find(b.sbp / 32u);
-    if (source == m_targets.end() || source->second.fbw != b.sbw)
+    const auto sameLayout = [](uint32_t x, uint32_t y) { return x == y || ((x | y) & ~0x1u) == 0u; };
+    if (source == m_targets.end() || source->second.fbw != b.sbw || !sameLayout(source->second.psm, b.spsm))
         return false;
     GSFrameReg frame{};
     frame.fbp = b.dbp / 32u;
