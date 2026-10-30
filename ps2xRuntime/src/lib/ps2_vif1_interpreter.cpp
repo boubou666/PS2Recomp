@@ -607,6 +607,16 @@ void PS2Memory::submitPendingPath2Image(const uint8_t *data, uint32_t chunkQw, b
     }
 }
 
+void PS2Memory::observeVif1Until(const uint8_t *end)
+{
+    if (!m_vif1ObservedTo || end <= m_vif1ObservedTo || end > m_vif1ObserveEnd)
+        return;
+    ps2x::native::setVu1Memory({m_vu1Code, m_vu1Data, PS2_VU1_CODE_SIZE, PS2_VU1_DATA_SIZE});
+    ps2x::native::observeVif1(m_vif1ObservedTo, static_cast<size_t>(end - m_vif1ObservedTo));
+    ps2x::native::setVu1Memory({});
+    m_vif1ObservedTo = end;
+}
+
 uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
@@ -737,6 +747,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            observeVif1Until(data + pos);
             m_vu1ProgramSkipped = ps2x::native::vu1Skipped(m_vu1Code, startPC);
             if (m_vu1ProgramSkipped && m_vu1SkipCallback)
                 m_vu1SkipCallback(startPC);
@@ -758,6 +769,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            observeVif1Until(data + pos);
             if (m_vu1ProgramSkipped && m_vu1SkipCallback && ps2x::native::mscntGroups()) // the port's next group
                 m_vu1SkipCallback(~0u);
             if (m_vu1MscntCallback && !m_vu1ProgramSkipped)
@@ -821,6 +833,7 @@ uint32_t PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
+            observeVif1Until(data + pos + qwCount * 16u);
             // A whole packet the native port draws: the GS does not get it (numbered as a skipped program).
             if (!truncated && m_vif1PendingPath2ImageQwc == 0u && ps2x::native::directSkipped(imm ? imm : 65536u))
             {
@@ -1128,7 +1141,11 @@ void PS2Memory::vif1WorkerMain()
         switch (job.kind)
         {
         case Vif1Job::Kind::Vif1:
+            m_vif1ObservedTo = job.observe ? job.data.data() : nullptr;
+            m_vif1ObserveEnd = job.data.data() + job.data.size();
             processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
+            observeVif1Until(job.data.data() + job.data.size());
+            m_vif1ObservedTo = nullptr;
             break;
         case Vif1Job::Kind::Path3:
             submitGifPacket(GifPathId::Path3, job.data.data(), static_cast<uint32_t>(job.data.size()), false, false, true);
