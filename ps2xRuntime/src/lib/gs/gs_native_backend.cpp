@@ -1776,6 +1776,44 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
     if (!hook)
         return;
+    // PS2X_NATIVE_VRAM_DIFF=1: every 500th native group, GS memory against the native texture cache's copy, page by
+    // page (8 KiB): each page that differs, logged the first time, with the first differing word in each (the
+    // textures and CLUTs a port's draws decode, where the cache is not the GS's).
+    if (static const bool s_vramDiff = std::getenv("PS2X_NATIVE_VRAM_DIFF") != nullptr; s_vramDiff)
+    {
+        static uint64_t s_calls = 0;
+        static std::vector<uint8_t> s_vram;
+        static std::vector<bool> s_logged(512, false);
+        if (s_calls++ % 500u == 0u)
+        {
+            SnapshotVram(s_vram);
+            const uint8_t *cache = ps2x::native::textures().memory();
+            uint32_t differing = 0;
+            for (uint32_t page = 0; page < 512u && s_vram.size() >= 512u * 8192u; ++page)
+            {
+                const uint8_t *g = s_vram.data() + page * 8192u, *c = cache + page * 8192u;
+                if (std::memcmp(g, c, 8192u) == 0)
+                    continue;
+                ++differing;
+                if (s_logged[page])
+                    continue;
+                s_logged[page] = true;
+                uint32_t at = 0, words = 0;
+                for (uint32_t i = 0; i < 8192u; i += 4u)
+                    if (std::memcmp(g + i, c + i, 4u) != 0)
+                    {
+                        if (words++ == 0u)
+                            at = i;
+                    }
+                uint32_t gw, cw;
+                std::memcpy(&gw, g + at, 4u);
+                std::memcpy(&cw, c + at, 4u);
+                std::fprintf(stderr, "[native:vramdiff] page %u (blocks %u-%u): %u words differ, first at +%u: GS %08x cache %08x\n",
+                             page, page * 32u, page * 32u + 31u, words, at, gw, cw);
+            }
+            std::fprintf(stderr, "[native:vramdiff] call %llu: %u pages differ\n", static_cast<unsigned long long>(s_calls), differing);
+        }
+    }
     const FrameTarget frame = frameTarget(context.frame, context.zbuf, context.scissor.y1 + 1u);
     ps2x::native::GsDrawTarget target;
     fillNativeRegisters(target, context);
