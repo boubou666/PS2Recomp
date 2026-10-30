@@ -36,6 +36,7 @@ add_library(ps2_test_lib STATIC
     src/native_vu1_stream_tests.cpp
     src/native_blend_tests.cpp
     src/native_gif_tests.cpp
+    src/native_sprite_tests.cpp
     src/ps2_iop_tests.cpp
     src/ps2_iop_spu2_tests.cpp
     src/ps2_sif_rpc_tests.cpp

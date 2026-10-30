@@ -6,6 +6,7 @@
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_native_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -14,10 +15,12 @@
 #include "Stubs/Helpers/Support.h"
 #include "Stubs/GS.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1958,6 +1961,57 @@ void register_ps2_gs_tests()
                          "a half-pixel-aligned bilinear copy should reproduce each texel");
             t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 4u, 1u), 0u, "pixel 4 lies outside [-0.5, 3.5)");
             t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 1u, 3u), kTexels[1], "the last row should be drawn");
+        });
+
+        tc.Run("GS 64x16 strips ending at x + 63.5 cover the GS pixels the native renderer's scaled spans do", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, 150ull | (10ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (639ull << 16) | (47ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            auto strip = [&](uint64_t x, uint64_t y, uint32_t rgba)
+            {
+                gs.writeRegister(GS_REG_RGBAQ, rgba);
+                gs.writeRegister(GS_REG_XYZ2, (x * 16u) | ((y * 16u) << 16));
+                gs.writeRegister(GS_REG_XYZ2, ((x + 63u) * 16u + 8u) | (((y + 16u) * 16u) << 16));
+            };
+            auto pixel = [&](uint32_t x, uint32_t y) { return readReferenceFramePSMCT32Pixel(vram, 150u, 10u, x, y); };
+
+            for (uint32_t scale = 2u; scale <= 4u; ++scale)
+            {
+                std::fill(vram.begin(), vram.end(), 0u);
+                const uint32_t colour = 0x80000000u | scale;
+                strip(64u, 16u, colour);
+                GSNativeBackend::SpriteSpan sx, sy;
+                t.IsTrue(GSNativeBackend::spriteSpan(64.0f, 127.5f, 0.0f, 1.0f, scale, sx) &&
+                             GSNativeBackend::spriteSpan(16.0f, 32.0f, 0.0f, 1.0f, scale, sy),
+                         "the native spans are drawn");
+                uint32_t disagree = 0u;
+                for (uint32_t y = 0u; y < 48u; ++y)
+                    for (uint32_t x = 0u; x < 192u; ++x)
+                    {
+                        const float px = static_cast<float>(x), py = static_cast<float>(y);
+                        const bool native = sx.p0 <= px - 0.5f && px + 0.5f <= sx.p1 && sy.p0 <= py - 0.5f && py + 0.5f <= sy.p1;
+                        disagree += (pixel(x, y) == colour) != native ? 1u : 0u;
+                    }
+                t.Equals(disagree, 0u, "the scaled spans' whole GS pixels are the ones the GS covers at " +
+                                           std::to_string(scale) + "x");
+            }
+
+            std::fill(vram.begin(), vram.end(), 0u);
+            for (uint64_t y = 0u; y < 48u; y += 16u)
+                for (uint64_t x = 0u; x < 640u; x += 64u)
+                    strip(x, y, 0x80112233u);
+            uint32_t holes = 0u;
+            for (uint32_t y = 0u; y < 48u; ++y)
+                for (uint32_t x = 0u; x < 640u; ++x)
+                    holes += pixel(x, y) != 0x80112233u ? 1u : 0u;
+            t.Equals(holes, 0u, "strips of [x, x + 63.5) leave no pixel between them");
         });
 
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
