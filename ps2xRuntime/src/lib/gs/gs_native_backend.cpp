@@ -2336,6 +2336,8 @@ void GSNativeBackend::flushBatch()
         }
     }
     glBindVertexArray(0);
+    if (m_wrapOpen)
+        closeWrappedBlend();
     if (!drawnPages.empty())
         wroteTargetPages(target, drawnPages);
     m_batch.clear();
