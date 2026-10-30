@@ -2807,7 +2807,16 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
     if (m_presentNewest && m_privRegs)
     {
         const uint64_t dispfb = (m_privRegs->pmode & 0x2u) != 0u ? m_privRegs->dispfb2 : m_privRegs->dispfb1;
-        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u))
+        // Only buffers the game has shown: VP2's menus also draw a work copy with the display's width and format
+        // (FBP 220), which showed zoomed in, its bottom cut off.
+        const uint32_t shownFbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        if (std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), shownFbp) == m_shownDisplayFbps.end())
+        {
+            std::rotate(m_shownDisplayFbps.rbegin(), m_shownDisplayFbps.rbegin() + 1, m_shownDisplayFbps.rend());
+            m_shownDisplayFbps[0] = shownFbp;
+        }
+        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u) &&
+            std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), ctx.frame.fbp) != m_shownDisplayFbps.end())
             m_newestDisplayFbp = ctx.frame.fbp;
     }
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)

@@ -170,7 +170,8 @@ public:
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
     // A game paced by its own frame ends (a native loop) shows the newest finished picture at each of them: the last
-    // buffer drawn with the width and format of the one DISPFB shows replaces it, whatever buffer the game's vblank
+    // buffer drawn with the width and format of the one DISPFB shows, among the last ones DISPFB showed (not a work
+    // buffer of the same shape), replaces it, whatever buffer the game's vblank
     // handler pointed DISPFB at (an interlaced game flips per field, at vblanks that no longer follow its frames).
     void setPresentNewestDisplayBuffer(bool on) { m_presentNewest = on; }
     // A native renderer's draws for a skipped VU1 program (runtime/native/native_gs_hook.h): a marker in the queue,
@@ -286,6 +287,7 @@ private:
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     bool m_presentNewest = false;          // setPresentNewestDisplayBuffer
     uint32_t m_newestDisplayFbp = ~0u;     // the last buffer drawn with the displayed buffer's width and format
+    std::array<uint32_t, 4> m_shownDisplayFbps{~0u, ~0u, ~0u, ~0u}; // the last distinct FBPs DISPFB showed, newest first
     GSPresentationRequest buildPresentationRequestUnlocked() const;
     void latchHostPresentationFrame(const GSPresentationRequest *displayRegisters);
     std::atomic<uint64_t> m_queuedLatchesDone{0};
