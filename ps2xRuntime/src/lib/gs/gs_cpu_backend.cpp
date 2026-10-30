@@ -820,26 +820,28 @@ namespace
     // S/Q and T/Q stay within the vertices' range while Q keeps one sign; wrapping or mixed signs
     // mean the whole texture.
     // Texel coordinates (in texels, along one axis) a sprite samples at its first and last drawn
-    // pixel centers, as DrawSprite maps them. False when nothing is drawn.
+    // pixels, as DrawSprite maps them. False when nothing is drawn.
     bool spriteTexelCoords(const GSPrimitiveBatch &batch, bool columns, float &low, float &high)
     {
         const GSDrawState &state = batch.state;
         const auto &ctx = state.context;
         const GSVertex &v0 = batch.vertices[0];
         const GSVertex &v1 = batch.vertices[1];
-        const int offset = (columns ? ctx.xyoffset.ofx : ctx.xyoffset.ofy) >> 4;
-        int p0 = static_cast<int>(columns ? v0.x : v0.y) - offset;
-        int p1 = static_cast<int>(columns ? v1.x : v1.y) - offset;
+        const float offset = static_cast<float>(columns ? ctx.xyoffset.ofx : ctx.xyoffset.ofy) / 16.0f;
+        float p0 = (columns ? v0.x : v0.y) - offset;
+        float p1 = (columns ? v1.x : v1.y) - offset;
         const bool flipped = p0 > p1; // the texture coordinates stay at their vertex's corner (DrawSprite)
         if (flipped)
             std::swap(p0, p1);
-        const int span = std::max(1, p1 - p0);
+        const int first = static_cast<int>(std::ceil(p0));
+        const int last = std::max(first, static_cast<int>(std::ceil(p1)) - 1);
         const int scissor0 = columns ? ctx.scissor.x0 : ctx.scissor.y0;
         const int scissor1 = columns ? ctx.scissor.x1 : ctx.scissor.y1;
-        const int draw0 = clampInt(p0, scissor0, scissor1);
-        const int draw1 = clampInt(p0 + span - 1, scissor0, scissor1);
-        if (p0 + span - 1 < scissor0 || p0 > scissor1)
+        if (last < scissor0 || first > scissor1)
             return false;
+        const int draw0 = clampInt(first, scissor0, scissor1);
+        const int draw1 = clampInt(last, scissor0, scissor1);
+        const float span = p1 - p0;
         float c0 = 0.0f;
         float c1 = 0.0f;
         if (state.prim.fst)
@@ -855,8 +857,8 @@ namespace
         }
         if (flipped)
             std::swap(c0, c1);
-        const float a = c0 + (c1 - c0) * ((static_cast<float>(draw0 - p0) + 0.5f) / static_cast<float>(span));
-        const float b = c0 + (c1 - c0) * ((static_cast<float>(draw1 - p0) + 0.5f) / static_cast<float>(span));
+        const float a = c0 + (c1 - c0) * (span > 0.0f ? (static_cast<float>(draw0) - p0) / span : 0.0f);
+        const float b = c0 + (c1 - c0) * (span > 0.0f ? (static_cast<float>(draw1) - p0) / span : 0.0f);
         low = std::min(a, b);
         high = std::max(a, b);
         return true;
@@ -3266,8 +3268,6 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
     const int unclippedY0 = static_cast<int>(std::ceil(fy0));
     const int unclippedX1 = std::max(unclippedX0, static_cast<int>(std::ceil(fx1)) - 1);
     const int unclippedY1 = std::max(unclippedY0, static_cast<int>(std::ceil(fy1)) - 1);
-    const int spanX = unclippedX1 - unclippedX0 + 1;
-    const int spanY = unclippedY1 - unclippedY0 + 1;
 
     // If the sprite rectangle is fully outside scissor, nothing should render.
     if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
@@ -3340,16 +3340,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
         if (flipY)
             std::swap(v0f, v1f);
 
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
+        const float spriteW = fx1 - fx0;
+        const float spriteH = fy1 - fy0;
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+            const float ty = spriteH > 0.0f ? (static_cast<float>(y) - fy0) / spriteH : 0.0f;
             float texVf = v0f + (v1f - v0f) * ty;
 
             for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
@@ -3365,7 +3361,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
                     uint16_t iu[N], iv[N];
                     for (int i = 0; i < N; ++i)
                     {
-                        const float tx = (static_cast<float>(xb + i - unclippedX0) + 0.5f) / spriteW;
+                        const float tx = spriteW > 0.0f ? (static_cast<float>(xb + i) - fx0) / spriteW : 0.0f;
                         const float texUf = u0f + (u1f - u0f) * tx;
                         if (state.prim.fst)
                         {
@@ -3405,7 +3401,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
             }
             for (int x = runStart; x <= runEnd; ++x)
             {
-                float tx =(static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+                const float tx = spriteW > 0.0f ? (static_cast<float>(x) - fx0) / spriteW : 0.0f;
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
                 if (state.prim.fst)
