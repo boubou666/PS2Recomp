@@ -582,8 +582,9 @@ void GS::workerLoop()
             {
                 const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
                 // No image transfer in flight: none set up, or the last one complete (a game uploading every frame
-                // never goes back to "none").
-                if (transfer.direction == 3u || transfer.totalPixels == 0u || transfer.copiedPixels >= transfer.totalPixels)
+                // never goes back to "none"), or a readback (VRAM unchanged: TMB's flares read the Z buffer back).
+                if (transfer.direction == 3u || transfer.direction == 1u || transfer.totalPixels == 0u ||
+                    transfer.copiedPixels >= transfer.totalPixels)
                 {
                     GsTraceHeader header;
                     m_backend->SnapshotVram(header.vram);
