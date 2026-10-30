@@ -213,6 +213,7 @@ class Lower:
         self.imm11 = sext(word, 11)
         self.imm15 = (word & 0x7FF) | ((word >> 10) & 0x7800)
         self.imm24 = word & 0xFFFFFF
+        self.imm5 = sext(word >> 6, 5)
         self.imm12 = (((word >> 21) & 1) << 11) | (word & 0x7FF)
         self.name = None
         if word in (0, 0x8000033C):
@@ -227,7 +228,7 @@ class Lower:
         if self.op != 0x40:
             raise ValueError(f'unsupported lower {word:#010x}')
         funct = word & 0x3F
-        f1 = {0x30: 'iadd', 0x31: 'isub', 0x34: 'iand', 0x35: 'ior'}
+        f1 = {0x30: 'iadd', 0x31: 'isub', 0x32: 'iaddi', 0x34: 'iand', 0x35: 'ior'}
         if funct in f1:
             self.name = f1[funct]
             return
@@ -235,7 +236,7 @@ class Lower:
             raise ValueError(f'unsupported lower {word:#010x}')
         sp = (word & 3) | ((word >> 4) & 0x7C)
         f2 = {0x30: 'move', 0x31: 'mr32', 0x34: 'lqi', 0x35: 'sqi', 0x38: 'div', 0x39: 'sqrt', 0x3A: 'rsqrt', 0x3B: 'waitq',
-              0x3C: 'mtir', 0x3D: 'mfir', 0x68: 'xtop', 0x69: 'xitop', 0x6C: 'xgkick'}
+              0x3C: 'mtir', 0x3D: 'mfir', 0x41: 'rget', 0x42: 'rinit', 0x68: 'xtop', 0x69: 'xitop', 0x6C: 'xgkick'}
         if sp not in f2:
             raise ValueError(f'unsupported lower {word:#010x}')
         self.name = f2[sp]
@@ -304,6 +305,10 @@ class Lower:
         elif n in ('ibltz', 'ibgtz', 'iblez', 'ibgez'):
             u.pipeline = 'branch'
             rvi(self.is_)
+        elif n == 'iaddi':
+            u.pipeline, u.latency, u.delays_branch = 'ialu', 1, True
+            rvi(self.is_)
+            wvi(self.it)
         elif n in ('iadd', 'isub', 'iand', 'ior'):
             u.pipeline, u.latency, u.delays_branch = 'ialu', 1, True
             rvi(self.is_)
@@ -350,6 +355,12 @@ class Lower:
         elif n in ('xtop', 'xitop'):
             u.pipeline, u.latency = 'ialu', 1
             wvi(self.it)
+        elif n == 'rget':
+            u.pipeline, u.latency = 'fmac', 4
+            u.add_vf_write(self.ft, self.dest)
+        elif n == 'rinit':
+            u.pipeline, u.latency = 'ialu', 1
+            u.add_vf_read(self.fs, lane_for_component(self.fsf))
         elif n == 'mfir':
             u.pipeline, u.latency = 'fmac', 4
             rvi(self.is_)
@@ -708,6 +719,7 @@ class Emitter:
         self.lines = []
         self.need_mac = set()
         self.need_clip = set()
+        self.uses_r = any(p is not None and p.lower.name in ('rget', 'rinit') for p in prog.pairs)
         for n in prog.nodes:
             if n.mac_src is not None:
                 self.need_mac.add(n.mac_src)
@@ -800,6 +812,8 @@ class Emitter:
         if nm == 'iadd' and (lo.is_ == 0 or lo.it == 0) and lo.id:
             src = lo.it if lo.is_ == 0 else lo.is_
             return [f'{vi(lo.id)} = {vi(src)};'] if src else [f'{vi(lo.id)} = 0;']
+        if nm == 'iaddi':
+            return [f'{vi(lo.it)} = i16({vi(lo.is_)} + {lo.imm5});'] if lo.it else []
         if nm in ('iadd', 'isub'):
             sign = '+' if nm == 'iadd' else '-'
             return [f'{vi(lo.id)} = i16({vi(lo.is_)} {sign} {vi(lo.it)});'] if lo.id else []
@@ -833,6 +847,10 @@ class Emitter:
         if nm == 'fcand':
             src = 'clip0' if n.clip_src is None else f'clip_{n.clip_src:04x}'
             return [f'vi1 = ({src} & {lo.imm24:#x}u) != 0u ? 1 : 0;']
+        if nm == 'rget':
+            return [f'{vf(lo.ft)} = put<{lo.dest}>({vf(lo.ft)}, floats(_mm_set1_epi32(static_cast<int32_t>(rReg))));'] if lo.ft else []
+        if nm == 'rinit':
+            return [f'rReg = 0x3F800000u | (laneBits({vf(lo.fs)}, {lo.fsf}) & 0x007FFFFFu);']
         if nm == 'fcget':
             src = 'clip0' if n.clip_src is None else f'clip_{n.clip_src:04x}'
             return [f'{vi(lo.it)} = static_cast<int32_t>({src} & 0xFFFu);'] if lo.it else []
@@ -996,6 +1014,8 @@ class Emitter:
         for r in range(1, 16):
             self.out(f'int32_t vi{r} = state.vi[{r}];', 1)
         self.out('float q = state.q, iReg = state.i, qPending = 0.0f;', 1)
+        if self.uses_r:
+            self.out('uint32_t rReg = state.r;', 1)
         self.out('uint32_t diPending = 0u, clipWork = state.clip & 0xFFFFFFu, clip0 = clipWork, mac0 = state.mac;', 1)
         self.out('uint32_t unusedMac = 0u, unusedCur = 0u, lastMac = 0u, lastCur = 0u, endPc = 0u;', 1)
         self.out('[[maybe_unused]] int32_t viBack = 0;', 1)
@@ -1064,6 +1084,8 @@ class Emitter:
             self.out(f'state.vi[{r}] = vi{r};', 1)
         self.out('state.q = q;', 1)
         self.out('state.i = iReg;', 1)
+        if self.uses_r:
+            self.out('state.r = rReg;', 1)
         self.out('state.clip = clipWork;', 1)
         self.out('if (hasFmac)', 1)
         self.out('state.mac = lastMac;', 2)
