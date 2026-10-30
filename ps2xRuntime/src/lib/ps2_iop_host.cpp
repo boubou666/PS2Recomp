@@ -317,6 +317,19 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
         return 0u;
     }
 
+    const std::string key{path};
+    {
+        std::lock_guard<std::mutex> lock(m_hostFileMutex);
+        if (const auto cached = m_hostFileCache.find(key); cached != m_hostFileCache.end())
+        {
+            uint64_t handle = m_nextHostFileHandle++;
+            if (handle == 0u)
+                handle = m_nextHostFileHandle++;
+            m_hostFiles.emplace(handle, HostFile{nullptr, cached->second, cached->second->size()});
+            return handle;
+        }
+    }
+
     const std::filesystem::path hostPath{std::string(path)};
 #if defined(_WIN32)
     std::FILE *stream = ::_wfopen(hostPath.c_str(), L"rb");
@@ -336,13 +349,44 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
         return 0u;
     }
 
+    // Files up to 32 MiB (512 MiB in all) are read whole now and kept: PS2X_HOST_FILE_CACHE=0 reads every time.
+    static const bool s_cache = []
+    {
+        const char *value = std::getenv("PS2X_HOST_FILE_CACHE");
+        return !(value && *value == '0');
+    }();
+    std::shared_ptr<std::vector<uint8_t>> data;
+    if (s_cache && size <= (32ull << 20))
+    {
+        static const int s_delayMs = []
+        {
+            const char *value = std::getenv("PS2X_HOST_READ_DELAY");
+            return value && *value ? std::atoi(value) : 0;
+        }();
+        if (s_delayMs > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(s_delayMs));
+        data = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(size));
+        if (size != 0u && std::fread(data->data(), 1u, data->size(), stream) != data->size())
+            data.reset();
+        else
+        {
+            std::fclose(stream);
+            stream = nullptr;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+    if (data && m_hostFileCacheBytes + data->size() <= (512ull << 20))
+    {
+        m_hostFileCache.emplace(key, data);
+        m_hostFileCacheBytes += data->size();
+    }
     uint64_t handle = m_nextHostFileHandle++;
     if (handle == 0u)
     {
         handle = m_nextHostFileHandle++;
     }
-    m_hostFiles.emplace(handle, HostFile{stream, size});
+    m_hostFiles.emplace(handle, HostFile{stream, data, size});
     return handle;
 }
 
@@ -351,7 +395,7 @@ bool PS2IopHostAdapter::hostFileSize(uint64_t handle, uint64_t &size) const
     size = 0u;
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
     const auto it = m_hostFiles.find(handle);
-    if (it == m_hostFiles.end() || !it->second.stream)
+    if (it == m_hostFiles.end() || (!it->second.stream && !it->second.data))
     {
         return false;
     }
@@ -373,9 +417,17 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
 
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
     const auto it = m_hostFiles.find(handle);
-    if (it == m_hostFiles.end() || !it->second.stream)
+    if (it == m_hostFiles.end() || (!it->second.stream && !it->second.data))
     {
         return false;
+    }
+    if (it->second.data) // held in memory (openHostFile)
+    {
+        const std::vector<uint8_t> &data = *it->second.data;
+        bytesRead = offset < data.size() ? static_cast<size_t>(std::min<uint64_t>(size, data.size() - offset)) : 0u;
+        if (bytesRead != 0u)
+            std::memcpy(destination, data.data() + offset, bytesRead);
+        return true;
     }
 
 #if defined(_WIN32)
