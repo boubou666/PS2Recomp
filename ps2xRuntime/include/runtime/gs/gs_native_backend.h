@@ -85,8 +85,9 @@ private:
         bool dirty = false;      // drawn since its pixels were last written to GS memory (resolveTarget)
         uint32_t zbp = ~0u;      // the ZBUF its depth buffer was last written as (pages), for depth read as a texture
         uint8_t zpsm = 0;
-        bool alphaWritten = false; // a draw wrote its alpha (else GS memory's top bytes stay what they were)
-        uint64_t lastDraw = 0;     // m_drawSerial of its last batch: overlapping targets resolve oldest first
+        uint64_t lastDraw = 0;     // m_drawSerial of its last batch
+        // Per GS memory page it covers (fbp + i, m_pageVersion's numbering): the version its texture holds.
+        std::vector<uint64_t> pages;
     };
 
     struct Vertex
@@ -110,25 +111,41 @@ private:
     bool ensureContext(bool create = false);
     RenderTarget &renderTarget(const GSFrameReg &frame);
     RenderTarget *renderTargetAtBlock(uint32_t block);
-    // A texture read the GPU cannot serve from a render target (another format, an offset base) sees GS memory:
-    // first write back there the drawn pixels of every render target it overlaps.
-    void resolveTargetsUnder(const GSTex0Reg &tex0);
-    void resolveTarget(RenderTarget &target);
-    // An image transfer into GS memory overwrites what the render targets under it hold: those are dropped (the
-    // texture cache has the uploaded image; a later draw starts the target again).
-    void dropTargetsUnder(const GSTransferCommand &command);
+    // Coherence between render targets and GS memory, page by page (8 KiB: 64 x 32 pixels in CT32, 64 x 64 in
+    // CT16). Every write to a page gives it a new version (m_pageVersion): a draw into a render target over it, a
+    // transfer, a CPU write. GS memory (m_vram and its GPU copy, kept in step by m_dirtyBlocks / m_gpuNewer) holds
+    // version m_memoryVersion of each page, each render target the versions in its `pages`. Before GS memory is read
+    // (a texture in another format than the target's, a transfer, a CLUT, the display of a buffer no target drew),
+    // the target holding a page's newest version writes it there (syncMemoryPages); before a target is drawn into or
+    // sampled, its pages that are not the newest are reloaded from GS memory (syncTargetPages). Targets sharing
+    // memory in different formats or widths (VP2's CT16 / CT32 views of one buffer and the blur levels inside its
+    // pages, SCTPT2's 4-bit font in a frame buffer's alpha bits) then see each other's pixels as the GS would.
+    std::vector<uint64_t> m_pageVersion = std::vector<uint64_t>(512u, 1u);
+    std::vector<uint64_t> m_memoryVersion = std::vector<uint64_t>(512u, 1u);
+    uint64_t m_version = 1;
+    uint32_t targetPageCount(const RenderTarget &target) const;
+    bool holdsNewest(const RenderTarget &target, uint32_t page) const;
+    // The target's pages a rectangle of its pixels touches (x1, y1 exclusive).
+    void targetPagesIn(const RenderTarget &target, int x0, int y0, int x1, int y1, std::vector<uint32_t> &pages) const;
+    void syncMemoryPages(uint32_t firstPage, uint32_t endPage);
+    void syncTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages);
+    void wroteTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages);
+    void wroteMemoryPages(uint32_t firstPage, uint32_t endPage);
+    // A target's pages [first, end) written into GS memory: on the GPU copy, or through the CPU (diagnostics).
+    void resolveTargetPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
+    bool resolveTargetPagesGpu(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
+    // The target's pages drawn again from what GS memory holds, in its format (a sprite per page sampling memory).
+    void reloadTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages);
+    // A texture sampled straight from a render target (its base, format layout and width); null when the read goes
+    // through GS memory.
+    RenderTarget *directSource(const GSDrawState &state);
+    std::vector<uint32_t> m_scratchPages;
     // A local-to-local transfer whose source is a render target, done on the GPU; false when it is not one.
     bool copyBetweenTargets(const GSTransferCommand &command);
     void appendPrimitive(const GSPrimitiveBatch &batch);
     void flushBatch();
     // Binds the batch's texture to unit 0 and gives its size in texels; false when it has none to sample.
     bool bindTexture(const GSDrawState &state, const RenderTarget &target, float &width, float &height);
-    // A target that replaces another at the same address (another format or width) starts with what GS memory holds.
-    void fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows);
-    // Targets sharing GS memory (VP2 draws a blur level at FBP 402, inside FBP 400's pages): when another one drew
-    // there after this one, both go to GS memory in drawing order and this one is reloaded from it.
-    void ensureCoherent(RenderTarget &target);
-    void resolveInDrawOrder(std::vector<RenderTarget *> &targets);
     uint64_t m_drawSerial = 0;
     // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
@@ -141,6 +158,7 @@ private:
     uint32_t m_vramTexture = 0;
     uint32_t m_inverseTexture = 0;
     uint32_t m_vramFramebuffer = 0;
+    uint32_t m_vramOld = 0, m_vramOldFramebuffer = 0; // CT24 resolves: GS memory's words before them
     uint32_t m_resolveProgram = 0;
     // A draw whose ZBUF is another render target's colour tests against that colour read as Z, in m_borrowedDepth,
     // attached to the draw's framebuffer for that draw. False when no colour target is there.
@@ -153,9 +171,6 @@ private:
     uint32_t m_borrowedDepthHeight = 0;
     void ensureVram();
     void syncVramToGpu();
-    // A render target written into the GPU copy of GS memory (CT32 / CT16 / CT16S); false for what only the CPU
-    // path does (CT24 keeps the top byte, which a GPU write cannot).
-    bool resolveTargetGpu(RenderTarget &target);
     // Pages the GPU copy has newer than m_vram (resolved there): read back before the CPU reads or partly rewrites
     // GS memory (transfers, CLUT, local-to-host, presentation from memory).
     std::vector<uint8_t> m_gpuNewer = std::vector<uint8_t>(512u, 0u);
@@ -234,7 +249,7 @@ private:
     {
         int targetSize = -1, texSize = -1, textured = -1, fst = -1, tfx = -1, tcc = -1, fog = -1, fogColor = -1;
         int alphaTest = -1, alphaRef = -1, alphaFail = -1, sampler = -1, blendOut = -1, blendFactor = -1, blendFix = -1;
-        int dest = -1, date = -1, alphaKeep = -1;
+        int dest = -1, date = -1, colorKeep = -1;
         int vram = -1, swizzle = -1, decode = -1, texFmt = -1, texSel = -1, texKind = -1, clutFmt = -1, cbp = -1;
         int texa = -1, wrapU = -1, wrapV = -1, linear = -1, targetWrap = -1, sampleShift = -1;
     } m_uniforms;
@@ -263,7 +278,7 @@ private:
 
     // The batch being collected: draws whose state draws the same way (sameDrawState).
     std::vector<Vertex> m_batch;
-    bool m_fillingFromMemory = false; // fillTargetFromMemory's draw: textures from GS memory, never a target
+    bool m_fillingFromMemory = false; // reloadTargetPages' draw: textures from GS memory, never a target
     float m_batchMaxY = 0.0f; // the batch's lowest row, for its render target's usedHeight
     GSDrawState m_batchState{};
 };
