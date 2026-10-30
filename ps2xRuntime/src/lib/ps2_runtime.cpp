@@ -3618,6 +3618,7 @@ void PS2Runtime::run()
         stateDumpPeriod = std::max(0.25, std::atof(period));
     }
     auto nextStateDump = std::chrono::steady_clock::now();
+    bool windowClosed = false;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         if (stateDumpPeriod > 0.0 && std::chrono::steady_clock::now() >= nextStateDump)
@@ -3764,11 +3765,23 @@ void PS2Runtime::run()
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();
+            windowClosed = true;
             break;
         }
     }
 
     requestStop();
+    // A game thread parked in a wait nothing will end any more (JC2) kept the process alive after its window closed,
+    // still running and capturing: give it a few seconds to stop, then end the process.
+    if (windowClosed)
+    {
+        std::thread([]
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }).detach();
+    }
     if (gameThread.joinable())
     {
         gameThread.join();
