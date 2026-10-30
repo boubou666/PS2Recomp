@@ -1499,7 +1499,11 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         uint64_t &display = second ? request.display2 : request.display1;
         dispfb = static_cast<uint64_t>(m_progressiveSource.fbp) | static_cast<uint64_t>(m_progressiveSource.fbw) << 9 |
                  static_cast<uint64_t>(m_progressiveSource.psm) << 15;
-        display = (display & ~(0x7FFull << 44 | 0x3ull << 27)) | static_cast<uint64_t>(m_progressiveHeight - 1u) << 44;
+        // Its own width (VP2's field picture is 512 wide, stretched to 640 by the copy; the window scales it to 4:3).
+        const uint64_t magh = (display >> 23 & 0xFu) + 1u;
+        const uint64_t width = static_cast<uint64_t>(std::max<uint32_t>(m_progressiveSource.fbw, 1u)) * 64u;
+        display = (display & ~(0x7FFull << 44 | 0x3ull << 27 | 0xFFFull << 32)) |
+                  static_cast<uint64_t>(m_progressiveHeight - 1u) << 44 | ((width * magh - 1u) & 0xFFFu) << 32;
         request.smode2 &= ~0x2ull; // frame mode: each line of the picture once
     }
     {
@@ -2833,7 +2837,7 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
         // A field made from a full-height picture (setPresentProgressiveSource): VP2 copies its 640x448 picture into
         // a 640x256 buffer per field, starting a line lower for the second one.
         if (m_presentProgressive && (m_privRegs->smode2 & 0x3u) == 0x3u && state.prim.type == GS_PRIM_SPRITE &&
-            state.prim.tme && state.prim.fst && batch.vertexCount >= 2u && ctx.tex0.tbw == ctx.frame.fbw &&
+            state.prim.tme && state.prim.fst && batch.vertexCount >= 2u && ctx.tex0.tbw >= 4u &&
             (ctx.tex0.psm | 1u) == (ctx.frame.psm | 1u) && (ctx.tex0.tbp0 & 31u) == 0u &&
             ctx.tex0.tbp0 / 32u != ctx.frame.fbp &&
             std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), ctx.frame.fbp) != m_shownDisplayFbps.end())
