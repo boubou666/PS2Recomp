@@ -1610,14 +1610,27 @@ void GSNativeBackend::resolveAllTargets()
 
 namespace
 {
-    // The GS memory pages a texture may read: TBW * 64 texels by its height at its format's size, from TBP0 (a
+    // The rows a texture read may reach: 2^TH, or further with REGION_CLAMP (up to MAXV) or REGION_REPEAT (up to
+    // MINV | MAXV), which address the texture beyond its size (SC3 samples 448 rows of a TH = 32 buffer).
+    uint32_t textureRows(const GSTex0Reg &tex0, uint64_t clamp)
+    {
+        uint32_t rows = 1u << std::min<uint32_t>(tex0.th, 10u);
+        const uint32_t wmt = clamp >> 2 & 0x3u, minv = clamp >> 24 & 0x3FFu, maxv = clamp >> 34 & 0x3FFu;
+        if (wmt == 2u)
+            rows = std::max(rows, maxv + 1u);
+        else if (wmt == 3u)
+            rows = std::max(rows, (minv | maxv) + 1u);
+        return rows;
+    }
+
+    // The GS memory pages a texture may read: TBW * 64 texels by its rows at its format's size, from TBP0 (a
     // conservative extent).
-    std::pair<uint32_t, uint32_t> texturePages(const GSTex0Reg &tex0)
+    std::pair<uint32_t, uint32_t> texturePages(const GSTex0Reg &tex0, uint64_t clamp)
     {
         static constexpr uint32_t kBits[64] = {32, 24, 16, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 4, 0, 0, 0,
                                                0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4};
         const uint32_t bits = kBits[tex0.psm & 0x3Fu] ? kBits[tex0.psm & 0x3Fu] : 32u;
-        const uint64_t rows = 1ull << std::min<uint32_t>(tex0.th, 10u);
+        const uint64_t rows = textureRows(tex0, clamp);
         const uint64_t blocks = (std::max<uint32_t>(tex0.tbw, 1u) * 64ull * rows * bits / 8u + 255u) / 256u;
         const uint64_t first = tex0.tbp0 / 32u, end = (tex0.tbp0 + blocks + 31u) / 32u;
         return {static_cast<uint32_t>(std::min<uint64_t>(first, kPages)), static_cast<uint32_t>(std::min<uint64_t>(end, kPages))};
@@ -1849,7 +1862,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     if (!fromTarget)
     {
         // (A reload's own read: reloadTargetPages brought its pages up to date.)
-        const auto [firstPage, endPage] = m_fillingFromMemory ? std::pair<uint32_t, uint32_t>{0u, 0u} : texturePages(context.tex0);
+        const auto [firstPage, endPage] = m_fillingFromMemory ? std::pair<uint32_t, uint32_t>{0u, 0u} : texturePages(context.tex0, context.clamp);
         syncMemoryPages(firstPage, endPage);
         if (const uint32_t psm = context.tex0.psm; psm == 0x13u || psm == 0x14u || psm == 0x1Bu || psm == 0x24u || psm == 0x2Cu)
             syncMemoryPages(std::min(context.tex0.cbp / 32u, kPages), std::min((context.tex0.cbp + 4u) / 32u + 1u, kPages));
@@ -2041,7 +2054,8 @@ void GSNativeBackend::flushBatch()
         if (state.prim.tme)
             if (RenderTarget *source = directSource(state))
             {
-                const int w = 1 << std::min<uint32_t>(context.tex0.tw, 10u), h = 1 << std::min<uint32_t>(context.tex0.th, 10u);
+                const int w = std::max(1 << std::min<uint32_t>(context.tex0.tw, 10u), static_cast<int>((context.clamp & 0x3u) == 2u ? (context.clamp >> 14 & 0x3FFu) + 1u : 0u));
+                const int h = static_cast<int>(textureRows(context.tex0, context.clamp));
                 targetPagesIn(*source, 0, 0, w, h, m_scratchPages);
                 const std::vector<uint32_t> sourcePages = m_scratchPages;
                 syncTargetPages(*source, sourcePages);
