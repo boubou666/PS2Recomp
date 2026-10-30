@@ -596,9 +596,12 @@ void main()
             if (m.textured && (!texture || m.texaFromGs))
                 texture = ps2x::native::textures().texture(m.tex0, m.texa);
             const bool textured = m.textured && texture;
-            // PS2X_NATIVE_GS_LOG=<n>: the first n batches drawn: material, texture, target.
+            // PS2X_NATIVE_GS_LOG=<n>: the first n batches drawn: material, texture, target (PS2X_NATIVE_GS_LOG_EVERY=<k>:
+            // one batch in k).
             static int s_logLeft = [] { const char *v = std::getenv("PS2X_NATIVE_GS_LOG"); return v ? std::atoi(v) : 0; }();
-            if (s_logLeft > 0)
+            static const uint64_t s_logEvery = [] { const char *v = std::getenv("PS2X_NATIVE_GS_LOG_EVERY"); return v ? std::max<uint64_t>(1u, std::strtoull(v, nullptr, 0)) : 1u; }();
+            static uint64_t s_logSeen = 0;
+            if (s_logLeft > 0 && (s_logSeen++ % s_logEvery) == 0u)
             {
                 --s_logLeft;
                 std::fprintf(stderr,
