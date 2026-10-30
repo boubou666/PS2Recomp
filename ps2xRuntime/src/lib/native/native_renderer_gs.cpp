@@ -593,7 +593,7 @@ void main()
                 continue;
             }
             std::shared_ptr<const TextureCache::Texture> texture = entry.batch.texture;
-            if (m.textured && !texture)
+            if (m.textured && (!texture || m.texaFromGs))
                 texture = ps2x::native::textures().texture(m.tex0, m.texa);
             const bool textured = m.textured && texture;
             if (textured)

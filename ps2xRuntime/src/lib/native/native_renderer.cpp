@@ -158,7 +158,8 @@ void main()
         Batch batch;
         batch.material = material;
         std::memcpy(batch.matrix, matrix, sizeof(batch.matrix));
-        if (material.textured && !material.fromGsContext)
+        // A material whose TEXA is the GS's gets its texture where the GS stream reaches the draw (the TEXA there).
+        if (material.textured && !material.fromGsContext && !material.texaFromGs)
             batch.texture = ps2x::native::textures().texture(material.tex0, material.texa);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
