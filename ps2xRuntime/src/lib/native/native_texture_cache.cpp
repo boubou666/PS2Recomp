@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -306,7 +308,11 @@ namespace ps2x::native
         }
         if (const auto it = m_storeTextures.find(key);
             it != m_storeTextures.end() && it->second.imageSerial == imageSerial && it->second.paletteSerial == paletteSerial)
+        {
+            m_lastSource = 3;
             return it->second.texture;
+        }
+        m_lastSource = imageLaid ? 2 : image ? 1 : 0;
         if (!image && !imageLaid)
         {
             ++m_storeMisses;
@@ -440,8 +446,11 @@ namespace ps2x::native
         if (m_storeMode)
         {
             storeUpload(dbp, dbw, dpsm, dx, dy, w, h, data, bytes);
-            ++m_uploads;
-            return;
+            if (!compareStore())
+            {
+                ++m_uploads;
+                return;
+            }
         }
         const uint32_t bpp = bitsPerPixel(dpsm);
         const size_t pixels = std::min<size_t>(static_cast<size_t>(w) * h, bytes * 8u / bpp);
@@ -463,6 +472,39 @@ namespace ps2x::native
         }
         forEachPage(dpsm, dbp, dbw, dx, dy, w, h, nullptr);
         ++m_uploads;
+    }
+
+    bool TextureCache::compareStore()
+    {
+        // PS2X_NATIVE_TEX_COMPARE=<n>: store mode also keeps the GS memory copy, and logs the first n textures whose
+        // store decode differs from the GS memory decode (a diagnosis of the store, never a drawing path).
+        static const int limit = [] { const char *v = std::getenv("PS2X_NATIVE_TEX_COMPARE"); return v ? std::atoi(v) : 0; }();
+        return limit > 0;
+    }
+
+    void TextureCache::compareWithMemory(uint64_t tex0, uint64_t texa, const Texture *stored)
+    {
+        static int left = [] { const char *v = std::getenv("PS2X_NATIVE_TEX_COMPARE"); return v ? std::atoi(v) : 0; }();
+        static uint64_t compared = 0, differing = 0;
+        ++compared;
+        if (left <= 0)
+            return;
+        const auto reference = memoryTexture(tex0, texa);
+        size_t wrong = 0, first = 0;
+        if (stored)
+            for (size_t i = 0; i < reference->rgba.size() && i < stored->rgba.size(); ++i)
+                if (reference->rgba[i] != stored->rgba[i] && wrong++ == 0)
+                    first = i;
+        if (stored && wrong == 0)
+            return;
+        ++differing;
+        --left;
+        const uint32_t width = reference->width;
+        std::fprintf(stderr, "[tex-compare] tex0=%016llx psm=%02x source=%d %s wrong=%zu/%zu first=(%zu,%zu) store=%08x gs=%08x (%llu/%llu differ)\n",
+                     static_cast<unsigned long long>(tex0), static_cast<unsigned>((tex0 >> 20) & 0x3fu), m_lastSource,
+                     stored ? "decoded" : "missing", wrong, reference->rgba.size(), first % width, first / width,
+                     stored && first < stored->rgba.size() ? stored->rgba[first] : 0u, reference->rgba[first],
+                     static_cast<unsigned long long>(differing), static_cast<unsigned long long>(compared));
     }
 
     bool TextureCache::stillValid(const Texture &texture) const
@@ -492,8 +534,16 @@ namespace ps2x::native
     std::shared_ptr<const TextureCache::Texture> TextureCache::texture(uint64_t tex0, uint64_t texa)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_storeMode)
-            return textureFromStore(tex0, texa);
+        if (!m_storeMode)
+            return memoryTexture(tex0, texa);
+        auto stored = textureFromStore(tex0, texa);
+        if (compareStore())
+            compareWithMemory(tex0, texa, stored.get());
+        return stored;
+    }
+
+    std::shared_ptr<const TextureCache::Texture> TextureCache::memoryTexture(uint64_t tex0, uint64_t texa)
+    {
         // TBP0 TBW PSM TW TH TCC, CBP CPSM CSM CSA (TFX and CLD do not change the image).
         const uint64_t selected = tex0 & ~((uint64_t{3} << 35) | (uint64_t{7} << 61));
         const uint32_t psm = (tex0 >> 20) & 0x3fu;

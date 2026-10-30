@@ -76,6 +76,10 @@ namespace ps2x::native
             uint64_t serial = 0;
         };
         std::shared_ptr<const Texture> textureFromStore(uint64_t tex0, uint64_t texa);
+        std::shared_ptr<const Texture> memoryTexture(uint64_t tex0, uint64_t texa);
+        static bool compareStore();
+        void compareWithMemory(uint64_t tex0, uint64_t texa, const Texture *stored);
+        int m_lastSource = 0; // the last store decode: 0 none, 1 an upload in its format, 2 a laid-out CT32 asset, 3 cached
         void storeUpload(uint32_t dbp, uint32_t dbw, uint32_t dpsm, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                          const uint8_t *data, size_t bytes);
         // A CT32 upload holding `base` in the GS's layout (an asset stored that way), and that asset read back at
