@@ -63,6 +63,19 @@ void register_native_vu1_stream_tests()
             t.IsFalse(ps2x::native::vu1Skipped(code, 0), "nothing more decided: VU1 runs it");
         });
 
+        tc.Run("each MPG moves the code version on, nothing else does", [](TestCase &t)
+        {
+            install();
+            const uint64_t before = Vu1StreamAdapter::instance().codeVersion();
+            send({vif(0x01, 0, 0x0101), vif(0x6c, 1, 5), 1, 2, 3, 4});
+            t.Equals(Vu1StreamAdapter::instance().codeVersion(), before, "an UNPACK leaves it");
+            std::vector<uint32_t> stream;
+            mpgEndingProgram(stream);
+            mpgEndingProgram(stream);
+            send(stream);
+            t.Equals(Vu1StreamAdapter::instance().codeVersion(), before + 2u, "one per MPG");
+        });
+
         tc.Run("UNPACK fills the adapter's copy of VU1 data memory at its address", [](TestCase &t)
         {
             install();
