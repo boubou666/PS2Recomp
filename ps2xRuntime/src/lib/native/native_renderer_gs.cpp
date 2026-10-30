@@ -596,6 +596,21 @@ void main()
             if (m.textured && (!texture || m.texaFromGs))
                 texture = ps2x::native::textures().texture(m.tex0, m.texa);
             const bool textured = m.textured && texture;
+            // PS2X_NATIVE_GS_LOG=<n>: the first n batches drawn: material, texture, target.
+            static int s_logLeft = [] { const char *v = std::getenv("PS2X_NATIVE_GS_LOG"); return v ? std::atoi(v) : 0; }();
+            if (s_logLeft > 0)
+            {
+                --s_logLeft;
+                std::fprintf(stderr,
+                             "[native-gs] batch group %llu: %d vertices, blend %d tex0 %#llx textured %d/%d (%ux%u) texa %#llx alphaTest %d ref %u "
+                             "depth %d/%d clamp %#llx fog %d; target fb %u %ux%u scale %u zScale %g offset %u,%u scissor %u,%u-%u,%u; m3 %g %g %g %g\n",
+                             static_cast<unsigned long long>(entry.group), count, static_cast<int>(m.blend), static_cast<unsigned long long>(m.tex0),
+                             m.textured ? 1 : 0, textured ? 1 : 0, textured ? texture->width : 0u, textured ? texture->height : 0u,
+                             static_cast<unsigned long long>(m.texa), m.alphaTest ? 1 : 0, m.alphaRef, m.depthTest ? 1 : 0, m.depthWrite ? 1 : 0,
+                             static_cast<unsigned long long>(m.clamp), m.fog ? 1 : 0, target.framebuffer, target.width, target.height, target.scale,
+                             target.zScale, target.xOffset, target.yOffset, target.scissorX0, target.scissorY0, target.scissorX1, target.scissorY1,
+                             entry.batch.matrix[12], entry.batch.matrix[13], entry.batch.matrix[14], entry.batch.matrix[15]);
+            }
             if (textured)
             {
                 glBindTexture(GL_TEXTURE_2D, pass.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), texture));
