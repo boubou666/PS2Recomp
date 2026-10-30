@@ -39,8 +39,9 @@ void main()
     vec4 c = uM[0] * aPos.x + uM[1] * aPos.y + uM[2] * aPos.z + uM[3];
     vec2 s = c.xy / c.w - uOffset;
     vec2 ndc = s / uTargetSize * 2.0 - 1.0;
-    float z = clamp(c.z / c.w * uDepthScale, 0.0, 1.0);
-    gl_Position = vec4(ndc * c.w, (z * 2.0 - 1.0) * c.w, c.w);
+    // Depth in clip space (linear, so a triangle crossing the camera plane is clipped and interpolated right; the
+    // program's own VU1 clips those on the PS2), kept in range by GL_DEPTH_CLAMP rather than per vertex.
+    gl_Position = vec4(ndc * c.w, 2.0 * c.z * uDepthScale - c.w, c.w);
     vUv = aUv;
     vCol = aCol;
     vFog = aFog;
@@ -488,6 +489,7 @@ void main()
             else
                 glDisable(GL_DEPTH_TEST);
             glDepthMask(m.depthWrite ? GL_TRUE : GL_FALSE);
+            glEnable(GL_DEPTH_CLAMP); // depth beyond the target's range clamped, not clipped (see the vertex shader)
             glDrawArrays(GL_TRIANGLES, first, count);
             if (m.blend == Material::Blend::AdditiveByDestination) // DST_ALPHA is Ad / 255, half the GS's Ad / 128
             {
@@ -496,6 +498,7 @@ void main()
             }
             first += count;
         }
+        glDisable(GL_DEPTH_CLAMP);
         glBindSampler(0, static_cast<GLuint>(sampler));
         glBindVertexArray(0);
         glUseProgram(0);
