@@ -787,6 +787,10 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
         m_targets.erase(it);
     }
 
+    // PS2X_LOG_GS_WRITERS=1: each GS memory area drawn into, once (a port's textures drawn by the GS, which the
+    // native texture cache, fed by uploads, never sees).
+    if (static const bool logWriters = std::getenv("PS2X_LOG_GS_WRITERS") != nullptr; logWriters)
+        std::fprintf(stderr, "[gs:writers] target fbp=%u (block %u) psm=0x%x fbw=%u\n", frame.fbp, frame.fbp * 32u, frame.psm, frame.fbw);
     RenderTarget target;
     target.fbp = frame.fbp;
     target.fbw = frame.fbw;

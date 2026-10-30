@@ -1,6 +1,7 @@
 #include "runtime/native/native_texture_cache.h"
 #include "runtime/native/native_renderer.h"
 #include "ThreadNaming.h"
+#include <unordered_map>
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_parallel.h"
@@ -2481,6 +2482,18 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        // PS2X_LOG_GS_WRITERS=1: each GS-to-GS copy (TRXDIR 2) and readback (1), once per BITBLTBUF.
+        if (static const bool logWriters = std::getenv("PS2X_LOG_GS_WRITERS") != nullptr; logWriters && m_trxdir != 0u && m_trxdir != 3u)
+        {
+            static std::unordered_map<uint64_t, uint32_t> s_seen;
+            const uint64_t bitbltbuf = static_cast<uint64_t>(m_bitbltbuf.sbp) | static_cast<uint64_t>(m_bitbltbuf.sbw) << 16 |
+                                       static_cast<uint64_t>(m_bitbltbuf.spsm) << 24 | static_cast<uint64_t>(m_bitbltbuf.dbp) << 32 |
+                                       static_cast<uint64_t>(m_bitbltbuf.dbw) << 48 | static_cast<uint64_t>(m_bitbltbuf.dpsm) << 56;
+            if (s_seen[bitbltbuf ^ m_trxdir]++ == 0u)
+                std::fprintf(stderr, "[gs:writers] trxdir %u sbp %u sbw %u spsm 0x%x -> dbp %u dbw %u dpsm 0x%x, %ux%u\n", m_trxdir,
+                             m_bitbltbuf.sbp, m_bitbltbuf.sbw, m_bitbltbuf.spsm, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                             m_trxreg.rrw, m_trxreg.rrh);
+        }
 
         if (m_backend)
         {
