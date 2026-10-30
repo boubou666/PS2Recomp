@@ -139,6 +139,16 @@ void main()
     Renderer::Renderer() = default;
     Renderer::~Renderer() = default;
 
+    Material::Blend blendOf(uint64_t alpha)
+    {
+        const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, c = (alpha >> 4) & 3u, d = (alpha >> 6) & 3u;
+        if (a == b && d == 0u)
+            return Material::Blend::Opaque;
+        if (a == 0u && b == 2u && d == 1u)
+            return c == 1u ? Material::Blend::AdditiveByDestination : Material::Blend::Additive;
+        return Material::Blend::Alpha;
+    }
+
     Renderer &Renderer::instance()
     {
         static Renderer renderer;
@@ -159,7 +169,7 @@ void main()
         batch.material = material;
         std::memcpy(batch.matrix, matrix, sizeof(batch.matrix));
         if (material.textured && !material.fromGsContext)
-            batch.texture = ps2x::native::textures().texture(material.tex0, material.texa);
+            batch.texture = ps2x::native::textures().texture(material.tex0, material.texa, material.region);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
         batch.key = m_key;
@@ -382,7 +392,7 @@ void main()
             else
             {
                 rlEnableColorBlend();
-                rlSetBlendFactorsSeparate(kGlSrcAlpha, m.blend == Material::Blend::Additive ? kGlOne : kGlOneMinusSrcAlpha,
+                rlSetBlendFactorsSeparate(kGlSrcAlpha, m.blend == Material::Blend::Alpha ? kGlOneMinusSrcAlpha : kGlOne,
                                           kGlOne, kGlOneMinusSrcAlpha, kGlFuncAdd, kGlFuncAdd);
                 rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
             }
@@ -398,7 +408,7 @@ void main()
             rlSetUniform(gpu.locM, matrix, RL_SHADER_UNIFORM_VEC4, 4);
             std::shared_ptr<const TextureCache::Texture> texture = batch.texture;
             if (m.textured && !texture)
-                texture = ps2x::native::textures().texture(m.tex0, m.texa);
+                texture = ps2x::native::textures().texture(m.tex0, m.texa, m.region);
             // PS2X_NATIVE_DUMP_TEXTURE=<tex0, hex>: that texture as the cache decoded it, once, as texture_<tex0>.png
             // (in PS2X_NATIVE_CAPTURE_DIR, or the current folder).
             static const uint64_t s_dumpTex0 = []
@@ -431,7 +441,7 @@ void main()
             rlSetUniform(gpu.locAlphaRef, &alphaRef, RL_SHADER_UNIFORM_FLOAT, 1);
             if (textured)
             {
-                const unsigned int id = gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull), texture);
+                const unsigned int id = gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull) ^ (m.region * 0xc2b2ae3d27d4eb4full), texture);
                 // Wrap per draw (rlTextureParameters binds and unbinds the texture: before enabling it).
                 rlTextureParameters(id, RL_TEXTURE_WRAP_S, m.clampU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
                 rlTextureParameters(id, RL_TEXTURE_WRAP_T, m.clampV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
