@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 
 namespace ps2x::native
@@ -454,6 +455,37 @@ void main()
         {
             const Material m = entry.batch.material.fromGsContext ? materialFromGs(entry.batch.material, target) : entry.batch.material;
             const GLsizei count = static_cast<GLsizei>(entry.vertices.size());
+            // PS2X_NATIVE_STATE_DIFF=1: a port's own material against the GS's state at the batch's marker (what
+            // materialFromGs would give), field by field; each distinct difference logged once, with a count every
+            // 20000 batches (a port finding the state its translation gets wrong).
+            static const bool s_stateDiff = std::getenv("PS2X_NATIVE_STATE_DIFF") != nullptr;
+            if (s_stateDiff && !entry.batch.material.fromGsContext)
+            {
+                const Material g = materialFromGs(entry.batch.material, target);
+                char what[256];
+                const int n = std::snprintf(what, sizeof(what), "%s%s%s%s%s%s%s",
+                                            m.blend != g.blend ? " blend" : "", m.alphaTest != g.alphaTest || (m.alphaTest && m.alphaRef != g.alphaRef) ? " alphaTest" : "",
+                                            m.depthTest != g.depthTest ? " depthTest" : "", m.depthWrite != g.depthWrite ? " depthWrite" : "",
+                                            m.clampU != g.clampU || m.clampV != g.clampV ? " clamp" : "", m.texa != g.texa ? " texa" : "",
+                                            m.fog && m.fogColour != g.fogColour ? " fogColour" : "");
+                if (n > 0 && what[0])
+                {
+                    static std::unordered_map<std::string, uint64_t> s_seen;
+                    char key[512];
+                    std::snprintf(key, sizeof(key), "%s | mine blend %d at %d/%u dt %d dw %d clamp %d%d texa %llx | GS blend %d at %d/%u dt %d dw %d clamp %d%d texa %llx (alpha %llx test %llx clamp %llx)",
+                                  what, static_cast<int>(m.blend), m.alphaTest ? 1 : 0, m.alphaRef, m.depthTest ? 1 : 0, m.depthWrite ? 1 : 0,
+                                  m.clampU ? 1 : 0, m.clampV ? 1 : 0, static_cast<unsigned long long>(m.texa), static_cast<int>(g.blend),
+                                  g.alphaTest ? 1 : 0, g.alphaRef, g.depthTest ? 1 : 0, g.depthWrite ? 1 : 0, g.clampU ? 1 : 0, g.clampV ? 1 : 0,
+                                  static_cast<unsigned long long>(g.texa), static_cast<unsigned long long>(target.alpha),
+                                  static_cast<unsigned long long>(target.test), static_cast<unsigned long long>(target.clamp));
+                    if (s_seen[key]++ == 0u)
+                        std::fprintf(stderr, "[native:statediff] new:%s\n", key);
+                    static uint64_t s_batches = 0;
+                    if (++s_batches % 20000u == 0u)
+                        for (const auto &[k, c] : s_seen)
+                            std::fprintf(stderr, "[native:statediff] %llu x%s\n", static_cast<unsigned long long>(c), k.c_str());
+                }
+            }
             glUniform1f(pass.locGsZScale, entry.gsZScale);
             glUniform1f(pass.locTargetZScale, static_cast<float>(target.zScale));
             glUniform4fv(pass.locM, 4, entry.batch.matrix);
