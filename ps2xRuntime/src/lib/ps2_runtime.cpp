@@ -2457,6 +2457,11 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     ctx->vu0_itop = m_memory.vif0_regs.itops;
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    if (m_vu0MicroHook && m_vu0MicroHook(m_vu0.state(), vu0Code, vu0Data, startPC))
+    {
+        copyVu0StateToContext(m_vu0.state(), ctx);
+        return;
+    }
     if (s_check)
     {
         before = m_vu0.state();
