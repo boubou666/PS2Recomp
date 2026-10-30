@@ -154,6 +154,11 @@ public:
     void SignalException(R5900Context *ctx, PS2Exception exception);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
+    // A game's own code for its VU0 microprograms (VCALLMS): called with the state VU0 starts from (copied from the
+    // context) and VU0's code and data memories; returning true means it ran the program and left the state as VU0
+    // would have, so the interpreter does not.
+    using Vu0MicroHook = std::function<bool(VU1State &state, uint8_t *code, uint8_t *data, uint32_t startPc)>;
+    void setVu0MicroHook(Vu0MicroHook hook) { m_vu0MicroHook = std::move(hook); }
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     // COP0 Count (MFC0/MTC0 $9): the EE clock, one tick per EE cycle the scheduler has accounted.
     uint32_t readCop0Count() const noexcept;
@@ -361,6 +366,7 @@ private:
     PS2RomDevice m_romDevice;
     PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
+    Vu0MicroHook m_vu0MicroHook;
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;
