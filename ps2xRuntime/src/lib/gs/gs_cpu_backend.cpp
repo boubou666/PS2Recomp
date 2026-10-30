@@ -2251,9 +2251,10 @@ void GSCpuBackend::DrawWith(const GSPrimitiveBatch &batch, const RasterContext &
     {
         const GSVertex &v = batch.vertices[0];
         const auto &ctx = state.context;
-        int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
-        int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        if (raster.owns(px, py))
+        const int px = static_cast<int>(std::floor(v.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f + 0.5f));
+        const int py = static_cast<int>(std::floor(v.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f + 0.5f));
+        if (px >= ctx.scissor.x0 && px <= ctx.scissor.x1 && py >= ctx.scissor.y0 && py <= ctx.scissor.y1 &&
+            raster.owns(px, py))
             WritePixel(*raster.pixel, px, py, gsDepthBits(v.z), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
@@ -3807,64 +3808,105 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch, const RasterContext &
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    const float ofx = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+    const float ofy = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+    const float x0 = v0.x - ofx;
+    const float y0 = v0.y - ofy;
+    const float x1 = v1.x - ofx;
+    const float y1 = v1.y - ofy;
+    const float deltaX = x1 - x0;
+    const float deltaY = y1 - y0;
 
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    // Endpoints rounded to the nearest pixel; the diamond exit rule decides whether the first and last are drawn.
+    const bool stepX = std::fabs(deltaX) >= std::fabs(deltaY);
+    const bool posX = deltaX >= 0.0f;
+    const bool posY = deltaY >= 0.0f;
+    const int dxi = posX ? 1 : -1;
+    const int dyi = posY ? 1 : -1;
 
-    int dx = std::abs(x1 - x0);
-    int dy = -std::abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
+    float rx0 = std::floor(x0 + 0.5f);
+    float ry0 = std::floor(y0 + 0.5f);
+    float rx1 = std::floor(x1 + 0.5f);
+    float ry1 = std::floor(y1 + 0.5f);
 
-    int totalSteps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-    if (totalSteps == 0)
-        totalSteps = 1;
-    int step = 0;
-
-    for (;;)
+    const auto leftDiamond = [&](float dx, float dy)
     {
-        float t = static_cast<float>(step) / static_cast<float>(totalSteps);
-        uint8_t r, g, b, a;
-        if (state.prim.iip)
+        const float dist = std::fabs(dx) + std::fabs(dy);
+        if (dist < 0.5f)
+            return false;
+        if (stepX)
+            return (posX ? dx > 0.0f : dx < 0.0f) && (dist > 0.5f || dy >= 0.0f);
+        return (posY ? dy > 0.0f : dy < 0.0f) && (dist > 0.5f || dx >= 0.0f);
+    };
+    if (leftDiamond(x0 - rx0, y0 - ry0))
+    {
+        rx0 += stepX ? static_cast<float>(dxi) : 0.0f;
+        ry0 += stepX ? 0.0f : static_cast<float>(dyi);
+    }
+    if (!leftDiamond(x1 - rx1, y1 - ry1))
+    {
+        rx1 -= stepX ? static_cast<float>(dxi) : 0.0f;
+        ry1 -= stepX ? 0.0f : static_cast<float>(dyi);
+    }
+    if ((stepX ? static_cast<float>(dxi) * (rx1 - rx0) : static_cast<float>(dyi) * (ry1 - ry0)) < 0.0f)
+        return;
+
+    const float major = std::fabs(stepX ? deltaX : deltaY);
+    const int scaleD = static_cast<int>(2 * 16 * 16 * major);
+    const int dD = static_cast<int>(2 * 16 * 16 * (stepX ? deltaY : deltaX));
+    int D = static_cast<int>(static_cast<float>(scaleD) * (stepX ? (y0 - ry0) : (x0 - rx0)));
+    int xi = static_cast<int>(rx0);
+    int yi = static_cast<int>(ry0);
+    const int last = static_cast<int>(stepX ? rx1 : ry1);
+    const bool posD = stepX ? posY : posX;
+    const auto stepDependent = [&](int sign)
+    {
+        D -= scaleD * sign;
+        xi += stepX ? 0 : sign;
+        yi += stepX ? sign : 0;
+    };
+
+    const float prestep = stepX ? static_cast<float>(dxi) * (rx0 - x0) : static_cast<float>(dyi) * (ry0 - y0);
+    D += static_cast<int>(static_cast<float>(dD) * prestep);
+    while (D >= scaleD / 2)
+        stepDependent(1);
+    while (D < -scaleD / 2)
+        stepDependent(-1);
+
+    for (int step = 0;; ++step)
+    {
+        const float t = (prestep + static_cast<float>(step)) / major;
+        if (xi >= ctx.scissor.x0 && xi <= ctx.scissor.x1 && yi >= ctx.scissor.y0 && yi <= ctx.scissor.y1 &&
+            raster.owns(xi, yi))
         {
-            r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * t));
-            g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * t));
-            b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * t));
-            a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * t));
-        }
-        else
-        {
-            r = v1.r;
-            g = v1.g;
-            b = v1.b;
-            a = v1.a;
+            uint8_t r, g, b, a;
+            if (state.prim.iip)
+            {
+                r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * t));
+                g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * t));
+                b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * t));
+                a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * t));
+            }
+            else
+            {
+                r = v1.r;
+                g = v1.g;
+                b = v1.b;
+                a = v1.a;
+            }
+            const double z = v0.z + (v1.z - v0.z) * t;
+            const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
+            WritePixel(*raster.pixel, xi, yi, gsDepthBits(z), r, g, b, a, fog);
         }
 
-        double z = (v0.z + (v1.z - v0.z) * t);
-        const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        if (raster.owns(x0, y0))
-            WritePixel(*raster.pixel, x0, y0, gsDepthBits(z), r, g, b, a, fog);
-
-        if (x0 == x1 && y0 == y1)
+        if ((stepX ? xi : yi) == last)
             break;
 
-        int e2 = 2 * err;
-        if (e2 >= dy)
-        {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
-        }
-        ++step;
+        D += dD;
+        xi += stepX ? dxi : 0;
+        yi += stepX ? 0 : dyi;
+        if (posD ? D >= scaleD / 2 : D < -scaleD / 2)
+            stepDependent(posD ? 1 : -1);
     }
 }
 
