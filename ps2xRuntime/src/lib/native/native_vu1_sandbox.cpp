@@ -16,6 +16,8 @@ namespace ps2x::native
 
     uint64_t Vu1Sandbox::cycles() const { return m_vu->state().cycles; }
 
+    VU1Interpreter &Vu1Sandbox::vu() { return *m_vu; }
+
     void Vu1Sandbox::codeChanged() { m_vu->invalidateDecodedCode(); }
 
     // As the runtime runs VU1 for VIF1 (to the program's end: the budget is only a safety limit).

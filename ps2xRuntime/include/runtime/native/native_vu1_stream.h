@@ -78,6 +78,10 @@ namespace ps2x::native
         const uint32_t *data() const { return m_vu1.data ? reinterpret_cast<const uint32_t *>(m_vu1.data) : m_data; }
         uint32_t top() const { return m_top; }
         uint32_t itop() const { return m_itops; }
+        // A port running a program in the sandbox's place: the sandbox's VU state carries over between programs.
+        Vu1Sandbox &sandbox();
+        uint8_t *dataMemory() { return m_vu1.data ? m_vu1.data : reinterpret_cast<uint8_t *>(m_data); }
+        void addPortCycles(uint64_t cycles) { m_portCycles += cycles; }
 
         // VIF1's stream, from the observer.
         void observe(const uint8_t *stream, size_t bytes);
@@ -109,6 +113,7 @@ namespace ps2x::native
             Port,       // the port's draw hook
         } m_running = Running::None;
         uint32_t m_runningPc = 0;
+        uint64_t m_portCycles = 0;
         uint64_t m_group = 0;
         uint64_t m_codeVersion = 0;
         // A GIF IMAGE a DIRECT left unfinished: its quadwords continue in the next DIRECTs (or right after, without a

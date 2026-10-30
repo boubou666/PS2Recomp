@@ -662,6 +662,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const uint64_t currentTick = nativeFrames ? (1ull << 63) | rt->gsForPresentation().queuedLatchesDone()
                                               : rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    // PS2X_PRESENT_HITCH=<ms>: each wait longer than that for a new picture (the window repeating the last one), with
+    // its length and when it ended: freezes that a frame rate averaged over seconds hides.
+    static const double s_hitchSeconds = []
+    {
+        const char *value = std::getenv("PS2X_PRESENT_HITCH");
+        return value && *value ? std::atof(value) / 1000.0 : 0.0;
+    }();
+    if (s_hitchSeconds > 0.0 && needsLatch && !overridden)
+    {
+        static const auto s_start = std::chrono::steady_clock::now();
+        static double s_lastNew = -1.0;
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count();
+        if (s_lastNew >= 0.0 && now - s_lastNew > s_hitchSeconds)
+            std::fprintf(stderr, "[present:hitch] %.0f ms without a new picture, until t=%.2f\n", (now - s_lastNew) * 1000.0, now);
+        s_lastNew = now;
+    }
     if (overridden)
     {
         s_hasLatchedInitialFrame = false;

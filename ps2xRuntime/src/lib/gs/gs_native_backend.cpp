@@ -324,6 +324,32 @@ void main()
 }
 )";
 
+    // A render target's depth as the colour texels a Z-format texture read gives (bindDepthAsTexture), at 1x.
+    constexpr const char *kDepthAsColorFragmentShader = R"(#version 330 core
+layout(location = 0) out vec4 outColor;
+uniform sampler2D uDepth;
+uniform int uKind;   // 0 Z32 as CT32, 1 Z24 as CT24, 2 Z16 as CT16
+uniform int uScale;
+uniform float uRange; // the Z buffer's 2^32, 2^24 or 2^16
+uniform ivec3 uTexa;  // TA0, TA1, AEM
+void main()
+{
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float d = texelFetch(uDepth, p * uScale + uScale / 2, 0).r;
+    uint z = uint(min(floor(d * uRange), uRange - 1.0));
+    uvec4 t;
+    if (uKind == 0)
+        t = uvec4(z & 0xFFu, (z >> 8u) & 0xFFu, (z >> 16u) & 0xFFu, z >> 24u);
+    else if (uKind == 1)
+        t = uvec4(z & 0xFFu, (z >> 8u) & 0xFFu, (z >> 16u) & 0xFFu,
+                  uTexa.z != 0 && (z & 0xFFFFFFu) == 0u ? 0u : uint(uTexa.x));
+    else
+        t = uvec4((z & 0x1Fu) << 3u, ((z >> 5u) & 0x1Fu) << 3u, ((z >> 10u) & 0x1Fu) << 3u,
+                  (z & 0x8000u) != 0u ? uint(uTexa.y) : (uTexa.z != 0 && (z & 0x7FFFu) == 0u ? 0u : uint(uTexa.x)));
+    outColor = vec4(t) / 255.0;
+}
+)";
+
     // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment. Z
     // formats order a page's blocks unlike the colour ones: Z pixel (x, y) is the colour pixel stored in the word Z
     // puts (x, y) in (uColorRow -1: pixel sizes differ, read in place). One Z per GS pixel, from its middle texel as a
@@ -726,9 +752,9 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
         if (existing.dirty && existing.usedHeight != 0u)
             resolveTarget(existing);
         refillRows = existing.usedHeight;
-        glDeleteFramebuffers(1, &existing.framebuffer);
-        glDeleteTextures(1, &existing.color);
-        glDeleteTextures(1, &existing.depth);
+        // Its GL objects wait for the next target of the same size (VP2 switches one buffer between CT16 and CT32
+        // several times a frame: deleting and allocating them each time stalled the GS thread in the driver).
+        m_spareTargets.push_back({existing.width, existing.height, existing.color, existing.depth, existing.framebuffer});
         m_targets.erase(it);
     }
 
@@ -738,6 +764,17 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     target.psm = frame.psm;
     target.width = std::clamp<uint32_t>(frame.fbw * 64u, 64u, kMaxTargetWidth);
     target.height = kTargetHeight;
+    const auto spare = std::find_if(m_spareTargets.begin(), m_spareTargets.end(), [&](const SpareTarget &t) {
+        return t.width == target.width && t.height == target.height;
+    });
+    if (spare != m_spareTargets.end())
+    {
+        target.color = spare->color, target.depth = spare->depth, target.framebuffer = spare->framebuffer;
+        m_spareTargets.erase(spare);
+        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    }
+    else
+    {
     glGenTextures(1, &target.color);
     glBindTexture(GL_TEXTURE_2D, target.color);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width * m_scale, target.height * m_scale, 0, GL_RGBA, GL_UNSIGNED_BYTE,
@@ -753,6 +790,7 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, target.depth, 0);
+    }
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClearDepth(0.0);
     glDisable(GL_SCISSOR_TEST);
@@ -1608,42 +1646,65 @@ bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width,
             source = &target;
     if (!source)
         return false;
+    // On the GPU: a pass turns the target's depth back into GS Z in the Z buffer's range and lays it out as the texture
+    // format reads it (Z32 as CT32, Z24 as CT24 with TEXA's alpha, Z16 as CT16) into m_depthTexture, at 1x. (It was
+    // read back to the CPU and converted there: 65% of the GS thread in VP2's first dungeon.)
     const uint32_t w = source->width, h = source->usedHeight;
-    std::vector<float> depth(static_cast<size_t>(w) * h);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(*source, 0u, 0u, w, h, true));
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
-    // Back to GS Z in the Z buffer's range, then laid out as the texture format reads it: Z32 as CT32, Z24 as CT24
-    // (alpha from TEXA), Z16 as CT16.
-    const double range = 1.0 / depthScale(source->zpsm);
-    const uint8_t ta0 = static_cast<uint8_t>(state.texa.ta0), ta1 = static_cast<uint8_t>(state.texa.ta1);
-    std::vector<uint8_t> texels(depth.size() * 4u);
-    for (size_t i = 0; i < depth.size(); ++i)
+    if (!m_depthTextureProgram)
     {
-        const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(depth[i]) * range, range - 1.0));
-        uint8_t *t = &texels[i * 4u];
-        switch (tex0.psm)
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kDepthAsColorFragmentShader);
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glLinkProgram(program);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE)
         {
-        case 0x30u:
-            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu, t[3] = z >> 24 & 0xFFu;
-            break;
-        case 0x31u:
-            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu;
-            t[3] = state.texa.aem && (z & 0xFFFFFFu) == 0u ? 0u : ta0;
-            break;
-        default:
-            t[0] = static_cast<uint8_t>((z & 0x1Fu) << 3), t[1] = static_cast<uint8_t>((z >> 5 & 0x1Fu) << 3);
-            t[2] = static_cast<uint8_t>((z >> 10 & 0x1Fu) << 3);
-            t[3] = (z & 0x8000u) ? ta1 : (state.texa.aem && (z & 0x7FFFu) == 0u ? 0u : ta0);
-            break;
+            glDeleteProgram(program);
+            return false;
         }
+        m_depthTextureProgram = program;
     }
     if (!m_depthTexture)
+    {
         glGenTextures(1, &m_depthTexture);
+        glGenFramebuffers(1, &m_depthTextureFramebuffer);
+    }
+    const GlStateRestore restore;
     glBindTexture(GL_TEXTURE_2D, m_depthTexture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, texels.data());
+    if (m_depthTextureWidth != w || m_depthTextureHeight != h)
+    {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        m_depthTextureWidth = w;
+        m_depthTextureHeight = h;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, m_depthTextureFramebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_depthTexture, 0);
+    glViewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_depthTextureProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source->depth);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    const int kind = tex0.psm == 0x30u ? 0 : tex0.psm == 0x31u ? 1 : 2;
+    glUniform1i(glGetUniformLocation(m_depthTextureProgram, "uDepth"), 0);
+    glUniform1i(glGetUniformLocation(m_depthTextureProgram, "uKind"), kind);
+    glUniform1i(glGetUniformLocation(m_depthTextureProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1f(glGetUniformLocation(m_depthTextureProgram, "uRange"), static_cast<float>(1.0 / depthScale(source->zpsm)));
+    glUniform3i(glGetUniformLocation(m_depthTextureProgram, "uTexa"), static_cast<GLint>(state.texa.ta0),
+                static_cast<GLint>(state.texa.ta1), state.texa.aem ? 1 : 0);
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     width = static_cast<float>(w);
     height = static_cast<float>(h);
     return true;

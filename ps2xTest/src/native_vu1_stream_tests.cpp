@@ -1,6 +1,8 @@
 #include "MiniTest.h"
 #include "runtime/native/native_vif1.h"
+#include "runtime/native/native_vu1_sandbox.h"
 #include "runtime/native/native_vu1_stream.h"
+#include "runtime/ps2_vu1.h"
 
 #include <cstdint>
 #include <cstring>
@@ -30,6 +32,7 @@ namespace
     bool g_active = true;
     std::vector<uint32_t> g_tops;
     bool g_translate = false;
+    uint64_t g_portCycles = 0;
 
     void install()
     {
@@ -37,7 +40,11 @@ namespace
         config.active = [] { return g_active; };
         config.choose = [](Vu1StreamAdapter &, uint32_t)
         { return g_translate ? Vu1StreamAdapter::Choice::Port : Vu1StreamAdapter::Choice::Sandbox; };
-        config.draw = [](Vu1StreamAdapter &adapter, uint32_t, bool) { g_tops.push_back(adapter.top()); };
+        config.draw = [](Vu1StreamAdapter &adapter, uint32_t, bool)
+        {
+            g_tops.push_back(adapter.top());
+            adapter.addPortCycles(g_portCycles);
+        };
         Vu1StreamAdapter::instance().install(config);
     }
 }
@@ -92,6 +99,37 @@ void register_native_vu1_stream_tests()
             t.IsTrue(ps2x::native::vu1Skipped(Vu1StreamAdapter::instance().code(), 0), "VU1 skips it");
             ps2x::native::setVif1ClockAdvance(nullptr, nullptr);
             t.IsTrue(s_cycles > 0u, "the clock moved on by the program's cycles");
+        });
+
+        tc.Run("a program the port ran moves the VIF1 clock on by the cycles its hook gave", [](TestCase &t)
+        {
+            install();
+            g_translate = true;
+            g_active = true;
+            g_portCycles = 1234;
+            std::vector<uint32_t> stream;
+            mpgEndingProgram(stream);
+            send(stream);
+            send({vif(0x14, 0, 0)});
+            g_translate = false;
+            g_portCycles = 0;
+            static uint64_t s_cycles = 0;
+            s_cycles = 0;
+            ps2x::native::setVif1ClockAdvance([](void *, uint64_t cycles) { s_cycles += cycles; }, nullptr);
+            t.IsTrue(ps2x::native::vu1Skipped(Vu1StreamAdapter::instance().code(), 0), "VU1 skips it");
+            ps2x::native::setVif1ClockAdvance(nullptr, nullptr);
+            t.Equals(s_cycles, uint64_t{1234}, "the clock moved on by the port's cycles");
+        });
+
+        tc.Run("a port writes VU1 data memory and the sandbox's VU registers where the next program sees them", [](TestCase &t)
+        {
+            install();
+            Vu1StreamAdapter &adapter = Vu1StreamAdapter::instance();
+            adapter.dataMemory()[7 * 16 + 4] = 0x5a;
+            t.Equals(adapter.data()[7 * 4 + 1], 0x5au, "the adapter's copy of VU1 memory");
+            adapter.sandbox().vu().state().vi[5] = 77;
+            t.Equals(adapter.sandbox().vu().state().vi[5], int32_t{77}, "the sandbox's VU keeps it");
+            adapter.dataMemory()[7 * 16 + 4] = 0;
         });
 
         tc.Run("UNPACK fills the adapter's copy of VU1 data memory at its address", [](TestCase &t)
