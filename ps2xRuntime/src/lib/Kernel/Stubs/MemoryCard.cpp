@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "MemoryCard.h"
 
+#include <cstdlib>
+
 namespace ps2_stubs
 {
     uint64_t mcHostCreationTime(const std::filesystem::path &path); // MemoryCardHostTime.cpp
@@ -110,9 +112,20 @@ namespace ps2_stubs
             cvMcKilobytes(kCvMcIconInfoBytes) +
             cvMcKilobytes(kCvMcIconFileBytes) + 11;
 
+        bool &mcAnySlot()
+        {
+            static bool anySlot = []
+            {
+                const char *value = std::getenv("PS2X_MC_ANY_SLOT");
+                return value && value[0] == '1';
+            }();
+            return anySlot;
+        }
+
         bool isValidMcPortSlot(int32_t port, int32_t slot)
         {
-            return port >= 0 && port < static_cast<int32_t>(g_mcPorts.size()) && slot == 0;
+            const bool slotOk = mcAnySlot() ? (slot >= 0 && slot < 4) : slot == 0;
+            return port >= 0 && port < static_cast<int32_t>(g_mcPorts.size()) && slotOk;
         }
 
         std::filesystem::path getMcRootPath(int32_t port)
@@ -1590,5 +1603,10 @@ namespace ps2_stubs
     void mcWriteStartSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
+    }
+
+    void setMcAnySlot(bool anySlot)
+    {
+        mcAnySlot() = anySlot;
     }
 }
