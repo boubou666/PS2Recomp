@@ -1012,7 +1012,9 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
     // PS2X_IOP_WALLCLOCK=1: the IOP's time follows the host's clock (in EE cycles, the IOP running at an eighth),
     // not the EE cycles the game ran: its timers, vblank interrupts and scheduler, and so the sound drivers' ticks,
-    // keep real time whatever the frame rate. A gap longer than 50 ms (a pause, a debugger) counts as 50 ms.
+    // keep real time whatever the frame rate. A gap longer than 50 ms (a pause, a debugger) counts as 50 ms. The host
+    // clock is read once per kIopWakeEeCycles the EE accounts, not at every account: reading it there cost a quarter
+    // of SC3's EE thread.
     static const bool s_wallClock = []
     {
         const char *value = std::getenv("PS2X_IOP_WALLCLOCK");
@@ -1020,6 +1022,11 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
     }();
     if (s_wallClock)
     {
+        static uint64_t s_unsampled = 0u;
+        s_unsampled += eeCycles;
+        if (s_unsampled < kIopWakeEeCycles)
+            return;
+        s_unsampled = 0u;
         using Clock = std::chrono::steady_clock;
         static Clock::time_point s_last = Clock::now();
         static double s_carry = 0.0;
