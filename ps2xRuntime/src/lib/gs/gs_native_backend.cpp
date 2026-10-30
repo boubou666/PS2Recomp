@@ -903,6 +903,24 @@ GSNativeBackend::RenderTarget *GSNativeBackend::renderTargetAtBlock(uint32_t blo
     return it == m_targets.end() ? nullptr : &it->second;
 }
 
+bool GSNativeBackend::spriteSpan(float p0, float p1, float t0, float t1, uint32_t scale, SpriteSpan &out)
+{
+    out = {p0, p1, t0, t1};
+    if (scale <= 1u)
+        return true;
+    // The vertex shader samples scaled pixel k of GS pixel X within (X - 1/2, X + 1/2), and the GS covers X when
+    // p0 <= X < p1.
+    const float low = std::ceil(std::min(p0, p1)) - 0.5f, high = std::ceil(std::max(p0, p1)) - 0.5f;
+    if (low >= high)
+        return false;
+    const float slope = (t1 - t0) / (p1 - p0);
+    out.p0 = p0 > p1 ? high : low;
+    out.p1 = p0 > p1 ? low : high;
+    out.t0 = t0 + (out.p0 - p0) * slope;
+    out.t1 = t0 + (out.p1 - p0) * slope;
+    return true;
+}
+
 void GSNativeBackend::appendPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
@@ -978,12 +996,17 @@ void GSNativeBackend::appendPrimitive(const GSPrimitiveBatch &batch)
             {
                 s0 /= q0, t0 /= q0, s1 /= q1, t1 /= q1;
             }
-            vertex(b, b, a.x, a.y, s0, t0, 1.0f);
-            vertex(b, b, b.x, a.y, s1, t0, 1.0f);
-            vertex(b, b, a.x, b.y, s0, t1, 1.0f);
-            vertex(b, b, b.x, a.y, s1, t0, 1.0f);
-            vertex(b, b, b.x, b.y, s1, t1, 1.0f);
-            vertex(b, b, a.x, b.y, s0, t1, 1.0f);
+            SpriteSpan sx, sy;
+            if (!spriteSpan(a.x - ofx, b.x - ofx, s0, s1, m_scale, sx) ||
+                !spriteSpan(a.y - ofy, b.y - ofy, t0, t1, m_scale, sy))
+                break;
+            const float ax = sx.p0 + ofx, bx = sx.p1 + ofx, ay = sy.p0 + ofy, by = sy.p1 + ofy;
+            vertex(b, b, ax, ay, sx.t0, sy.t0, 1.0f);
+            vertex(b, b, bx, ay, sx.t1, sy.t0, 1.0f);
+            vertex(b, b, ax, by, sx.t0, sy.t1, 1.0f);
+            vertex(b, b, bx, ay, sx.t1, sy.t0, 1.0f);
+            vertex(b, b, bx, by, sx.t1, sy.t1, 1.0f);
+            vertex(b, b, ax, by, sx.t0, sy.t1, 1.0f);
         }
         break;
     case GS_PRIM_POINT:
