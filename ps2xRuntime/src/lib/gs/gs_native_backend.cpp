@@ -156,7 +156,7 @@ void main()
     // tests with GREATER (Jade Cocoon 2: a movie sprite at Z 1 over a clear at Z 0, Z32) fell on the clear's depth.
     gl_FragDepth = vDepth;
     vec4 vc = vColor * (255.0 / 128.0);
-    vec4 c = vc;
+    vec4 c = uTextured != 0 ? vc : vec4(vColor.rgb, vc.a);
     if (uTextured != 0)
     {
         vec2 tc = vTex.xy / vTex.z;
@@ -324,19 +324,47 @@ void main()
 }
 )";
 
-    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment.
+    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment. Z
+    // formats order a page's blocks unlike the colour ones: Z pixel (x, y) is the colour pixel stored in the word Z
+    // puts (x, y) in (uColorRow -1: pixel sizes differ, read in place). One Z per GS pixel, from its middle texel as a
+    // resolve takes it: a mask the GS drew at 1x leaves the texels a scaled sprite's half-pixel edges skip.
     constexpr const char *kDepthFromColorFragmentShader = R"(#version 330 core
 uniform sampler2D uColor;
+uniform usampler2D uSwizzle;
+uniform usampler2D uInverse;
+uniform int uZRow;
+uniform int uColorRow;
+uniform ivec2 uPage;
+uniform int uScale;
 uniform int uSixteen;
 uniform uint uZMask;
 uniform float uZScale;
 void main()
 {
-    ivec2 p = min(ivec2(gl_FragCoord.xy), textureSize(uColor, 0) - 1);
+    ivec2 g = ivec2(gl_FragCoord.xy) / uScale;
+    if (uColorRow >= 0)
+    {
+        ivec2 inPage = g % uPage;
+        uint address = texelFetch(uSwizzle, ivec2(inPage.x, uZRow + inPage.y), 0).r;
+        uint e = texelFetch(uInverse, ivec2(int(address % 128u), uColorRow + int(address / 128u)), 0).r;
+        g += ivec2(int(e & 0xFFFFu), int(e >> 16u)) - inPage;
+    }
+    ivec2 p = min(g * uScale + uScale / 2, textureSize(uColor, 0) - 1);
     uvec4 c = uvec4(round(texelFetch(uColor, p, 0) * 255.0));
     uint z = uSixteen != 0 ? (c.r >> 3u) | (c.g >> 3u) << 5u | (c.b >> 3u) << 10u | (c.a >> 7u) << 15u
                            : c.r | c.g << 8u | c.b << 16u | c.a << 24u;
     gl_FragDepth = clamp(float(z & uZMask) * uZScale, 0.0, 1.0);
+}
+)";
+
+    constexpr const char *kWrapFragmentShader = R"(#version 330 core
+uniform sampler2D uWrapped;
+out vec4 outColor;
+void main()
+{
+    vec4 c = texelFetch(uWrapped, ivec2(gl_FragCoord.xy), 0);
+    vec3 v = round(c.rgb * 255.0);
+    outColor = vec4((v - 256.0 * floor(v / 256.0)) / 255.0, c.a);
 }
 )";
 
@@ -502,6 +530,18 @@ void main()
         return alpha;
     }
 
+    // COLCLAMP off with a blend that adds or subtracts two colours: the GS keeps the low 8 bits of what leaves 0-255.
+    bool blendWraps(const GSDrawState &state)
+    {
+        if (!state.prim.abe || (state.colclamp & 0x1u) != 0u)
+            return false;
+        const uint64_t alpha = effectiveAlpha(state.context);
+        const uint32_t a = alpha & 0x3u, b = alpha >> 2 & 0x3u, d = alpha >> 6 & 0x3u;
+        constexpr uint32_t zero = 2u;
+        return a != b && ((b == zero && a != d && d != zero) || (a == zero && b != d && d != zero) ||
+                          (d == zero && a != zero && b != zero));
+    }
+
     // Everything in a draw's state that changes how it is drawn, compared to decide when a batch ends.
     bool sameDrawState(const GSDrawState &a, const GSDrawState &b)
     {
@@ -513,7 +553,7 @@ void main()
             return false;
         if (a.prim.tme != b.prim.tme || a.prim.fge != b.prim.fge || a.prim.abe != b.prim.abe || a.prim.fst != b.prim.fst)
             return false;
-        if (a.prim.abe && x.alpha != y.alpha)
+        if (a.prim.abe && (x.alpha != y.alpha || ((a.colclamp ^ b.colclamp) & 0x1u) != 0u))
             return false;
         if (a.prim.fge && (a.fogR != b.fogR || a.fogG != b.fogG || a.fogB != b.fogB))
             return false;
@@ -1047,6 +1087,13 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
         m_borrowedDepthWidth = width;
         m_borrowedDepthHeight = height;
     }
+    ensureVram();
+    const bool sixteen = (source.psm & 0x2u) != 0u;
+    const GpuLayout zLayout = (zbuf.psm & 0x0Fu) == 0x2u ? kLayoutZ16 : (zbuf.psm & 0x0Fu) == 0xAu ? kLayoutZ16S : kLayoutZ32;
+    const int colorRow = (zLayout.bits == 16) != sixteen ? -1
+                         : !sixteen                      ? kInverseRowC32
+                         : source.psm == 0x0Au           ? kInverseRowC16S
+                                                         : kInverseRowC16;
     GlStateRestore restore;
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_borrowedDepth, 0);
@@ -1060,14 +1107,116 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
     glUseProgram(m_depthFromColorProgram);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, source.color);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glActiveTexture(GL_TEXTURE0);
     const uint32_t zMask = (zbuf.psm & 0x0Fu) == 0x0u ? 0xFFFFFFFFu : (zbuf.psm & 0x0Fu) == 0x1u ? 0xFFFFFFu : 0xFFFFu;
     glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColor"), 0);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), (source.psm & 0x2u) != 0u ? 1 : 0);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSwizzle"), 3);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uInverse"), 4);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uZRow"), zLayout.row);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColorRow"), colorRow);
+    glUniform2i(glGetUniformLocation(m_depthFromColorProgram, "uPage"), zLayout.pageWidth, zLayout.pageHeight);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), sixteen ? 1 : 0);
     glUniform1ui(glGetUniformLocation(m_depthFromColorProgram, "uZMask"), zMask);
     glUniform1f(glGetUniformLocation(m_depthFromColorProgram, "uZScale"), static_cast<float>(depthScale(zbuf.psm)));
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     return true;
+}
+
+void GSNativeBackend::beginWrappedBlend(RenderTarget &target, const GSScissorReg &scissor)
+{
+    const uint32_t width = target.width * m_scale, height = target.height * m_scale;
+    if (!m_wrapTexture || m_wrapWidth != width || m_wrapHeight != height)
+    {
+        if (!m_wrapTexture)
+        {
+            glGenTextures(1, &m_wrapTexture);
+            glGenFramebuffers(1, &m_wrapFramebuffer);
+        }
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, m_wrapTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glActiveTexture(GL_TEXTURE0);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_wrapFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_wrapTexture, 0);
+        m_wrapWidth = width;
+        m_wrapHeight = height;
+    }
+    const GLint s = static_cast<GLint>(m_scale);
+    const GLint x0 = scissor.x0 * s, y0 = scissor.y0 * s, x1 = (scissor.x1 + 1) * s, y1 = (scissor.y1 + 1) * s;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_wrapFramebuffer);
+    glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_wrapTexture, 0);
+    m_wrapOpen = true;
+    m_wrapDrawn = false;
+    m_wrapFbp = target.fbp;
+    m_wrapScissor = scissor;
+}
+
+bool GSNativeBackend::continuesWrappedBlend() const
+{
+    if (m_batch.empty() || m_fillingFromMemory)
+        return false;
+    const GSDrawState &state = m_batchState;
+    const GSContext &context = state.context;
+    const auto it = m_targets.find(m_wrapFbp);
+    static const char *s_off = std::getenv("PS2X_GS_NATIVE_OFF");
+    const uint32_t keptAlpha = context.frame.fbmsk >> 24;
+    return it != m_targets.end() && context.frame.fbp == m_wrapFbp && context.frame.psm == it->second.psm &&
+           context.frame.fbw == it->second.fbw &&
+           std::memcmp(&context.scissor, &m_wrapScissor, sizeof(GSScissorReg)) == 0 && blendWraps(state) &&
+           !state.prim.tme && (context.test >> 14 & 0x1u) == 0u && (keptAlpha == 0u || keptAlpha == 0xFFu) &&
+           (effectiveAlpha(context) >> 4 & 0x3u) != 1u && !(s_off && std::strstr(s_off, "blend"));
+}
+
+void GSNativeBackend::closeWrappedBlend()
+{
+    if (!m_wrapOpen)
+        return;
+    m_wrapOpen = false;
+    const auto it = m_targets.find(m_wrapFbp);
+    if (it == m_targets.end())
+        return;
+    RenderTarget &target = it->second;
+    const GlStateRestore restore;
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
+    if (!m_wrapDrawn)
+        return;
+    const GSScissorReg &scissor = m_wrapArea;
+    if (!m_wrapProgram)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kWrapFragmentShader);
+        m_wrapProgram = glCreateProgram();
+        glAttachShader(m_wrapProgram, vertex);
+        glAttachShader(m_wrapProgram, fragment);
+        glLinkProgram(m_wrapProgram);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+    }
+    const GLint s = static_cast<GLint>(m_scale);
+    glViewport(0, 0, static_cast<GLsizei>(target.width * m_scale), static_cast<GLsizei>(target.height * m_scale));
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(scissor.x0 * s, scissor.y0 * s, (scissor.x1 - scissor.x0 + 1) * s, (scissor.y1 - scissor.y0 + 1) * s);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_wrapProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_wrapTexture);
+    glUniform1i(glGetUniformLocation(m_wrapProgram, "uWrapped"), 0);
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
 void GSNativeBackend::syncVramToGpu()
@@ -1753,6 +1902,8 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
 
 void GSNativeBackend::flushBatch()
 {
+    if (m_wrapOpen && !continuesWrappedBlend())
+        closeWrappedBlend();
     if (m_batch.empty())
         return;
     if (!ensureContext(true))
@@ -1854,7 +2005,7 @@ void GSNativeBackend::flushBatch()
                          "[gs:draw] #%llu fbp=%u psm=0x%x fbmsk=0x%x prim=%d tme=%d textured=%d tex0 psm=0x%x tbp=%u tbw=%u "
                          "tw=%u th=%u tfx=%u tcc=%u cbp=%u abe=%d alpha=0x%llx test=0x%llx fst=%d verts=%zu "
                          "v0=(%.1f,%.1f z=%.6f rgba=%u,%u,%u,%u st=%.1f,%.1f,%.2f) zbuf=%u/0x%x/%d ctxt=%d iip=%d "
-                         "scissor=%u-%u,%u-%u\n",
+                         "scissor=%u-%u,%u-%u colclamp=%d\n",
                          static_cast<unsigned long long>(index), context.frame.fbp, context.frame.psm,
                          context.frame.fbmsk, static_cast<int>(state.prim.type), state.prim.tme ? 1 : 0,
                          textured ? 1 : 0, context.tex0.psm, context.tex0.tbp0, context.tex0.tbw, context.tex0.tw,
@@ -1863,7 +2014,8 @@ void GSNativeBackend::flushBatch()
                          state.prim.fst ? 1 : 0, m_batch.size(), m_batch[0].x, m_batch[0].y, m_batch[0].z, m_batch[0].r,
                          m_batch[0].g, m_batch[0].b, m_batch[0].a, m_batch[0].s, m_batch[0].t, m_batch[0].q,
                          context.zbuf.zbp, context.zbuf.psm, context.zbuf.zmask ? 1 : 0, state.prim.ctxt ? 1 : 0,
-                         state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1);
+                         state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1,
+                         static_cast<int>(state.colclamp & 0x1u));
     }
     glUniform1i(m_uniforms.textured, textured ? 1 : 0);
     glUniform1f(m_uniforms.sampleShift,
@@ -1935,6 +2087,26 @@ void GSNativeBackend::flushBatch()
         glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, destWidth, destHeight);
         glActiveTexture(GL_TEXTURE0);
+    }
+    if (!offBlend && !m_fillingFromMemory && blendWraps(state))
+    {
+        if (!m_wrapOpen)
+            beginWrappedBlend(target, context.scissor);
+        float minX = m_batch[0].x, maxX = minX, minY = m_batch[0].y, maxY = minY;
+        for (const Vertex &v : m_batch)
+            minX = std::min(minX, v.x), maxX = std::max(maxX, v.x), minY = std::min(minY, v.y), maxY = std::max(maxY, v.y);
+        const auto clip = [](float v, uint16_t lo, uint16_t hi) {
+            return static_cast<uint16_t>(std::clamp(v, static_cast<float>(lo), static_cast<float>(hi)));
+        };
+        const GSScissorReg &sc = context.scissor;
+        const uint16_t x0 = clip(std::floor(minX), sc.x0, sc.x1), x1 = clip(std::ceil(maxX), sc.x0, sc.x1);
+        const uint16_t y0 = clip(std::floor(minY), sc.y0, sc.y1), y1 = clip(std::ceil(maxY), sc.y0, sc.y1);
+        if (!m_wrapDrawn)
+            m_wrapArea = {x0, x1, y0, y1};
+        else
+            m_wrapArea = {std::min(m_wrapArea.x0, x0), std::max(m_wrapArea.x1, x1), std::min(m_wrapArea.y0, y0),
+                          std::max(m_wrapArea.y1, y1)};
+        m_wrapDrawn = true;
     }
 
     glBindVertexArray(m_vertexArray);
