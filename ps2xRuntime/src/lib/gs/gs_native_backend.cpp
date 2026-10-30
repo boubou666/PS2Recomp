@@ -823,6 +823,88 @@ void GSNativeBackend::syncMemoryPages(uint32_t firstPage, uint32_t endPage)
     }
 }
 
+bool GSNativeBackend::textureCacheRead(const std::vector<uint32_t> &pages)
+{
+    static const bool s_off = std::getenv("PS2X_GS_NATIVE_NOTEXCACHE") != nullptr;
+    if (s_off)
+        return false;
+    // A read wider than the cache leaves its last pages in it, as an LRU cache does.
+    const size_t keepFrom = pages.size() > m_texCache.size() ? pages.size() - m_texCache.size() : 0u;
+    bool stale = false;
+    for (size_t i = 0; i < pages.size(); ++i)
+    {
+        const uint32_t page = pages[i];
+        TexCachePage *slot = nullptr, *victim = &m_texCache[0];
+        for (TexCachePage &entry : m_texCache)
+        {
+            if (entry.page == page)
+                slot = &entry;
+            if (entry.lastUse < victim->lastUse)
+                victim = &entry;
+        }
+        if (slot)
+        {
+            slot->lastUse = ++m_texCacheClock;
+            stale |= slot->saved && slot->version != m_pageVersion[page];
+            continue;
+        }
+        if (i >= keepFrom)
+            *victim = {page, m_pageVersion[page], ++m_texCacheClock, false};
+    }
+    return stale;
+}
+
+void GSNativeBackend::textureCacheBeforeWrite(uint32_t firstPage, uint32_t endPage)
+{
+    std::vector<uint32_t> pages;
+    for (uint32_t page = firstPage; page < std::min(endPage, kPages); ++page)
+        pages.push_back(page);
+    textureCacheBeforeWrite(pages);
+}
+
+void GSNativeBackend::textureCacheBeforeWrite(const std::vector<uint32_t> &pages)
+{
+    std::vector<uint32_t> save;
+    for (TexCachePage &entry : m_texCache)
+        if (entry.page != ~0u && !entry.saved && entry.version == m_pageVersion[entry.page] &&
+            std::find(pages.begin(), pages.end(), entry.page) != pages.end())
+        {
+            save.push_back(entry.page);
+            entry.saved = true;
+        }
+    if (!save.empty())
+        copyPagesToTextureCache(save);
+}
+
+void GSNativeBackend::copyPagesToTextureCache(const std::vector<uint32_t> &pages)
+{
+    if (pages.empty() || !ensureContext())
+        return;
+    ensureVram();
+    for (const uint32_t page : pages)
+        syncMemoryPages(page, page + 1u);
+    syncVramToGpu();
+    const GlStateRestore restore;
+    if (!m_texCacheTexture)
+    {
+        glGenTextures(1, &m_texCacheTexture);
+        glBindTexture(GL_TEXTURE_2D, m_texCacheTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glGenFramebuffers(1, &m_texCacheFramebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_texCacheFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texCacheTexture, 0);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_texCacheFramebuffer);
+    for (const uint32_t page : pages) // a page is two rows of the 1024-word-wide copy
+        glBlitFramebuffer(0, static_cast<GLint>(page * 2u), 1024, static_cast<GLint>(page * 2u + 2u), 0,
+                          static_cast<GLint>(page * 2u), 1024, static_cast<GLint>(page * 2u + 2u), GL_COLOR_BUFFER_BIT,
+                          GL_NEAREST);
+}
+
 void GSNativeBackend::syncTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages)
 {
     std::vector<uint32_t> stale;
@@ -1385,6 +1467,7 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     targetPagesIn(target, 0, 0, static_cast<int>(target.width), static_cast<int>(rows), m_scratchPages);
     const std::vector<uint32_t> pages = m_scratchPages;
     syncTargetPages(target, pages);
+    textureCacheBeforeWrite(pages);
     wroteTargetPages(target, pages);
     target.zbp = zbuf.zbp;
     target.zpsm = zbuf.psm;
@@ -1496,9 +1579,25 @@ namespace
         const uint64_t end = (bp + 31u) / 32u + static_cast<uint64_t>((y + std::max<uint32_t>(h, 1u) + pageHeight - 1u) / pageHeight) * pagesPerRow;
         return {static_cast<uint32_t>(std::min<uint64_t>(first, kPages)), static_cast<uint32_t>(std::min<uint64_t>(end, kPages))};
     }
+
+    // The GS memory pages a rectangle of texels (x0..x1, y0..y1 inclusive) lies in, row by row of pages.
+    void texelPages(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                    std::vector<uint32_t> &pages)
+    {
+        const bool fourBit = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
+        const bool eightBit = psm == 0x13u || psm == 0x1Bu;
+        const bool sixteen = psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au;
+        const uint32_t pageWidth = (fourBit || eightBit) && psm != 0x1Bu && psm != 0x24u && psm != 0x2Cu ? 128u : 64u;
+        const uint32_t pageHeight = psm == 0x14u ? 128u : (psm == 0x13u || sixteen) ? 64u : 32u;
+        const uint32_t pagesPerRow = std::max<uint32_t>(std::max<uint32_t>(bw, 1u) * 64u / pageWidth, 1u);
+        pages.clear();
+        for (uint32_t py = y0 / pageHeight; py <= y1 / pageHeight; ++py)
+            for (uint32_t px = x0 / pageWidth; px <= std::min(x1 / pageWidth, pagesPerRow - 1u); ++px)
+                pages.push_back((bp / 32u + py * pagesPerRow + px) % kPages);
+    }
 }
 
-bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
+bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state, uint32_t vram)
 {
     const GSContext &context = state.context;
     const GSTex0Reg &tex0 = context.tex0;
@@ -1523,6 +1622,8 @@ bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
     }
     ensureVram();
     syncVramToGpu();
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, vram ? vram : m_vramTexture);
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
     glActiveTexture(GL_TEXTURE0);
@@ -1647,6 +1748,48 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
                              "tw=%u th=%u into fbp=%u\n",
                              fbp, rt.fbw, rt.psm, context.tex0.psm, context.tex0.tbp0 - base, context.tex0.tbw,
                              context.tex0.tw, context.tex0.th, target.fbp);
+        }
+    }
+    // The GS texture buffer (textureCacheRead): pages drawn over since this TEXFLUSH interval first read them read as
+    // they were then, decoded from the copy saved before that write; the texture's other pages and its CLUT as now.
+    if (!m_fillingFromMemory && !m_batch.empty())
+    {
+        // The texels the batch reads (a texel's margin for bilinear taps), not the texture's whole extent: the cache
+        // keeps the pages read, and 2^TW x 2^TH texels would push them out.
+        float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
+        for (const Vertex &v : m_batch)
+        {
+            const float s = v.q != 0.0f ? v.s / v.q : v.s, t = v.q != 0.0f ? v.t / v.q : v.t;
+            u0 = std::min(u0, s), u1 = std::max(u1, s), v0 = std::min(v0, t), v1 = std::max(v1, t);
+        }
+        const float columns = static_cast<float>(1u << std::min<uint32_t>(context.tex0.tw, 10u));
+        const float rows = static_cast<float>(textureRows(context.tex0, context.clamp));
+        const auto texel = [](float c, float last) { return static_cast<uint32_t>(std::clamp(c, 0.0f, last)); };
+        std::vector<uint32_t> readPages;
+        texelPages(context.tex0.tbp0, context.tex0.tbw, context.tex0.psm, texel(std::floor(u0) - 1.0f, columns - 1.0f),
+                   texel(std::floor(v0) - 1.0f, rows - 1.0f), texel(std::ceil(u1) + 1.0f, columns - 1.0f),
+                   texel(std::ceil(v1) + 1.0f, rows - 1.0f), readPages);
+        if (textureCacheRead(readPages))
+        {
+            std::vector<uint32_t> current;
+            const auto keepsOld = [this](uint32_t page) {
+                for (const TexCachePage &entry : m_texCache)
+                    if (entry.page == page)
+                        return entry.saved && entry.version != m_pageVersion[page];
+                return false;
+            };
+            for (const uint32_t page : readPages)
+                if (!keepsOld(page))
+                    current.push_back(page);
+            for (uint32_t page = context.tex0.cbp / 32u; page <= (context.tex0.cbp + 4u) / 32u && page < kPages; ++page)
+                if (!keepsOld(page))
+                    current.push_back(page);
+            copyPagesToTextureCache(current);
+            if (bindDecodedTexture(state, m_texCacheTexture))
+            {
+                width = height = 1.0f;
+                return true;
+            }
         }
     }
     if ((context.tex0.psm & 0x30u) == 0x30u && bindDepthAsTexture(state, width, height))
@@ -1924,6 +2067,7 @@ void GSNativeBackend::flushBatch()
             }
         targetPagesIn(target, left, top, right, bottom, drawnPages);
         syncTargetPages(target, drawnPages);
+        textureCacheBeforeWrite(drawnPages);
     }
     target.dirty = true;
     target.lastDraw = ++m_drawSerial;
@@ -2262,6 +2406,7 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
         written = transferPages(command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsay,
                                 command.trxreg.rrh);
         syncMemoryPages(written.first, written.second);
+        textureCacheBeforeWrite(written.first, written.second);
     }
     if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
     {
@@ -2319,6 +2464,7 @@ bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
     std::vector<uint32_t> destinationPages;
     targetPagesIn(destination, dx, dy, dx + w, dy + h, destinationPages);
     syncTargetPages(destination, destinationPages);
+    textureCacheBeforeWrite(destinationPages);
     const GLint s = static_cast<GLint>(m_scale);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination.framebuffer);
@@ -2350,6 +2496,8 @@ void GSNativeBackend::Flush()
 
 void GSNativeBackend::TextureFlush()
 {
+    flushBatch();
+    m_texCache.fill(TexCachePage{});
     m_memory->TextureFlush();
 }
 
@@ -2799,6 +2947,7 @@ bool GSNativeBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     if (!ensureContext())
         return false;
     RenderTarget &target = renderTarget(context.frame);
+    textureCacheBeforeWrite(target.fbp, target.fbp + static_cast<uint32_t>(target.pages.size()));
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -2831,6 +2980,7 @@ void GSNativeBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     {
         syncMemoryPages(page, page + 1u);
         pullGpuPages(page, page + 1u);
+        textureCacheBeforeWrite(page, page + 1u);
     }
     wroteMemoryPages(page, page + 1u);
     markDirty(psm, base, bw, x, y, 1u, 1u);
