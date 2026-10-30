@@ -411,6 +411,7 @@ namespace ps2x::native
                 if (at < sizeof(m_code))
                     std::memcpy(m_code + at, words + i, std::min(bytes, sizeof(m_code) - at));
                 m_sandbox->codeChanged();
+                ++m_codeVersion;
                 i += size;
                 break;
             }
