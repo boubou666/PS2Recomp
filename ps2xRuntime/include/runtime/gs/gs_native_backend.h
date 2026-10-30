@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_backend.h"
 #include "runtime/native/native_texture_cache.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -163,7 +164,28 @@ private:
     uint32_t m_depthTextureWidth = 0, m_depthTextureHeight = 0;
     // The GPU decoding path (default; PS2X_GS_NATIVE_CPUDECODE=1 uses the texture cache's images): GS memory on the
     // GPU, brought up to date page by page from m_vram, and the formats' swizzle tables.
-    bool bindDecodedTexture(const GSDrawState &state);
+    bool bindDecodedTexture(const GSDrawState &state, uint32_t vram = 0);
+    // The GS texture buffer, as the CPU GS models it (an 8-page cache that TEXFLUSH empties): a page a texture read
+    // since the last TEXFLUSH keeps the content it had then, even once drawn over (VP2's depth of field reads a
+    // buffer it has just redrawn and gets the picture from before). That content is copied into m_texCacheTexture
+    // when the page is first overwritten; a read that needs it decodes from there.
+    struct TexCachePage
+    {
+        uint32_t page = ~0u;
+        uint64_t version = 0; // m_pageVersion when read
+        uint64_t lastUse = 0;
+        bool saved = false;   // its content at that version is in m_texCacheTexture
+    };
+    std::array<TexCachePage, 8> m_texCache{};
+    uint64_t m_texCacheClock = 0;
+    uint32_t m_texCacheTexture = 0, m_texCacheFramebuffer = 0;
+    // Notes a texture read of these pages; true when one of them is to be read as it was before a later write.
+    bool textureCacheRead(const std::vector<uint32_t> &pages);
+    // Before pages are written: the cached ones still holding the content they were read with save it.
+    void textureCacheBeforeWrite(const std::vector<uint32_t> &pages);
+    void textureCacheBeforeWrite(uint32_t firstPage, uint32_t endPage);
+    // GS memory pages from the GPU copy into m_texCacheTexture, as they are now.
+    void copyPagesToTextureCache(const std::vector<uint32_t> &pages);
     uint32_t m_vramTexture = 0;
     uint32_t m_inverseTexture = 0;
     uint32_t m_vramFramebuffer = 0;

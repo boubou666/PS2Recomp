@@ -1496,6 +1496,18 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         else if ((request.pmode & 0x1u) != 0u)
             request.dispfb1 = newest(request.dispfb1);
     }
+    // The full-height picture the fields are copied from, as a progressive frame, while the game keeps copying it.
+    if (m_presentProgressive && m_progressiveHeight != 0u && (request.smode2 & 0x3u) == 0x3u &&
+        m_progressiveAge != ~0u && m_progressiveAge++ <= 2u)
+    {
+        const bool second = (request.pmode & 0x2u) != 0u;
+        uint64_t &dispfb = second ? request.dispfb2 : request.dispfb1;
+        uint64_t &display = second ? request.display2 : request.display1;
+        dispfb = static_cast<uint64_t>(m_progressiveSource.fbp) | static_cast<uint64_t>(m_progressiveSource.fbw) << 9 |
+                 static_cast<uint64_t>(m_progressiveSource.psm) << 15;
+        display = (display & ~(0x7FFull << 44 | 0x3ull << 27)) | static_cast<uint64_t>(m_progressiveHeight - 1u) << 44;
+        request.smode2 &= ~0x2ull; // frame mode: each line of the picture once
+    }
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         if (request.dispfb1 != m_lastLatchedDispfb1 || request.dispfb2 != m_lastLatchedDispfb2)
@@ -2810,11 +2822,45 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
-    if (m_presentNewest && m_privRegs)
+    if ((m_presentNewest || m_presentProgressive) && m_privRegs)
     {
         const uint64_t dispfb = (m_privRegs->pmode & 0x2u) != 0u ? m_privRegs->dispfb2 : m_privRegs->dispfb1;
-        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u))
+        // Only buffers the game has shown: VP2's menus also draw a work copy with the display's width and format
+        // (FBP 220), which showed zoomed in, its bottom cut off.
+        const uint32_t shownFbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        if (std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), shownFbp) == m_shownDisplayFbps.end())
+        {
+            std::rotate(m_shownDisplayFbps.rbegin(), m_shownDisplayFbps.rbegin() + 1, m_shownDisplayFbps.rend());
+            m_shownDisplayFbps[0] = shownFbp;
+        }
+        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u) &&
+            std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), ctx.frame.fbp) != m_shownDisplayFbps.end())
             m_newestDisplayFbp = ctx.frame.fbp;
+        // A field made from a full-height picture (setPresentProgressiveSource): VP2 copies its 640x448 picture into
+        // a 640x256 buffer per field, starting a line lower for the second one.
+        if (m_presentProgressive && (m_privRegs->smode2 & 0x3u) == 0x3u && state.prim.type == GS_PRIM_SPRITE &&
+            state.prim.tme && state.prim.fst && batch.vertexCount >= 2u && ctx.tex0.tbw == ctx.frame.fbw &&
+            (ctx.tex0.psm | 1u) == (ctx.frame.psm | 1u) && (ctx.tex0.tbp0 & 31u) == 0u &&
+            ctx.tex0.tbp0 / 32u != ctx.frame.fbp &&
+            std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), ctx.frame.fbp) != m_shownDisplayFbps.end())
+        {
+            float yMin = batch.vertices[0].y, yMax = yMin, vMin = batch.vertices[0].v / 16.0f, vMax = vMin;
+            for (size_t i = 1; i < batch.vertexCount; ++i)
+            {
+                yMin = std::min(yMin, batch.vertices[i].y), yMax = std::max(yMax, batch.vertices[i].y);
+                vMin = std::min(vMin, batch.vertices[i].v / 16.0f), vMax = std::max(vMax, batch.vertices[i].v / 16.0f);
+            }
+            if (yMax - yMin >= 2.0f && vMax - vMin >= 1.5f * (yMax - yMin))
+            {
+                const GSFrameReg source{ctx.tex0.tbp0 / 32u, ctx.tex0.tbw, ctx.tex0.psm, 0u};
+                if (source.fbp != m_progressiveSource.fbp || source.psm != m_progressiveSource.psm)
+                    m_progressiveHeight = 0u;
+                m_progressiveSource = source;
+                m_progressiveHeight = std::max(m_progressiveHeight, static_cast<uint32_t>(vMax));
+                m_progressiveDest = ctx.frame.fbp;
+                m_progressiveAge = 0u;
+            }
+        }
     }
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
         m_hasPreferredDisplaySource = false;
