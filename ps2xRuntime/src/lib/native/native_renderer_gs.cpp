@@ -672,7 +672,9 @@ void main()
                 glBlendFuncSeparate(GL_SRC_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
                 break;
             }
-            if (m.depthTest)
+            // PS2X_NATIVE_NO_DEPTH=1 (diagnosis): native draws without the depth test.
+            static const bool s_noDepth = std::getenv("PS2X_NATIVE_NO_DEPTH") != nullptr;
+            if (m.depthTest && !s_noDepth)
             {
                 glEnable(GL_DEPTH_TEST);
                 glDepthFunc(GL_GEQUAL);
