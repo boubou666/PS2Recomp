@@ -15,4 +15,8 @@ namespace ps2_stubs
 #undef PS2_DECLARE_STUB
 
     void resetSifState();
+
+    // libmc: accept any multitap slot (0-3) for the card in each port, as MCSERV does without a multitap. Off by
+    // default (only slot 0 has a card); Dark Cloud passes slot 1 to every sceMc call. PS2X_MC_ANY_SLOT=1 also sets it.
+    void setMcAnySlot(bool anySlot);
 }

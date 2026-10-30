@@ -661,7 +661,25 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool nativeFrames = rt->eeScheduler().nativeFrames();
     const uint64_t currentTick = nativeFrames ? (1ull << 63) | rt->gsForPresentation().queuedLatchesDone()
                                               : rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    // Native frames: a game that ends no frame for a while (a load's screen, a movie, a menu waiting on the disc)
+    // still shows what the GS has: after PS2X_NATIVE_IDLE_PRESENT_MS (default 50, 0: never) without a new picture
+    // the host latches the GS's display itself, as for the first frame. On the host's clock, no vblank involved.
+    bool idleLatch = false;
+    {
+        static const double s_idleSeconds = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_IDLE_PRESENT_MS");
+            return (value && *value ? std::atof(value) : 50.0) / 1000.0;
+        }();
+        static auto s_lastNewPicture = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (needsLatch)
+            s_lastNewPicture = now;
+        else if (nativeFrames && !overridden && s_idleSeconds > 0.0 &&
+                 std::chrono::duration<double>(now - s_lastNewPicture).count() > s_idleSeconds)
+            idleLatch = true;
+    }
     // PS2X_PRESENT_HITCH=<ms>: each wait longer than that for a new picture (the window repeating the last one), with
     // its length and when it ended: freezes that a frame rate averaged over seconds hides.
     static const double s_hitchSeconds = []
@@ -681,6 +699,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     if (overridden)
     {
         s_hasLatchedInitialFrame = false;
+    }
+    else if (idleLatch)
+    {
+        rt->gsForPresentation().latchHostPresentationFrame();
     }
     else if (needsLatch)
     {
@@ -990,7 +1012,9 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
     // PS2X_IOP_WALLCLOCK=1: the IOP's time follows the host's clock (in EE cycles, the IOP running at an eighth),
     // not the EE cycles the game ran: its timers, vblank interrupts and scheduler, and so the sound drivers' ticks,
-    // keep real time whatever the frame rate. A gap longer than 50 ms (a pause, a debugger) counts as 50 ms.
+    // keep real time whatever the frame rate. A gap longer than 50 ms (a pause, a debugger) counts as 50 ms. The host
+    // clock is read once per kIopWakeEeCycles the EE accounts, not at every account: reading it there cost a quarter
+    // of SC3's EE thread.
     static const bool s_wallClock = []
     {
         const char *value = std::getenv("PS2X_IOP_WALLCLOCK");
@@ -998,6 +1022,11 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
     }();
     if (s_wallClock)
     {
+        static uint64_t s_unsampled = 0u;
+        s_unsampled += eeCycles;
+        if (s_unsampled < kIopWakeEeCycles)
+            return;
+        s_unsampled = 0u;
         using Clock = std::chrono::steady_clock;
         static Clock::time_point s_last = Clock::now();
         static double s_carry = 0.0;
@@ -3645,6 +3674,7 @@ void PS2Runtime::run()
         stateDumpPeriod = std::max(0.25, std::atof(period));
     }
     auto nextStateDump = std::chrono::steady_clock::now();
+    bool windowClosed = false;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         if (stateDumpPeriod > 0.0 && std::chrono::steady_clock::now() >= nextStateDump)
@@ -3791,11 +3821,23 @@ void PS2Runtime::run()
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();
+            windowClosed = true;
             break;
         }
     }
 
     requestStop();
+    // A game thread parked in a wait nothing will end any more (JC2) kept the process alive after its window closed,
+    // still running and capturing: give it a few seconds to stop, then end the process.
+    if (windowClosed)
+    {
+        std::thread([]
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }).detach();
+    }
     if (gameThread.joinable())
     {
         gameThread.join();

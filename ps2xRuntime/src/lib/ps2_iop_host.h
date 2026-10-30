@@ -4,7 +4,10 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <string>
 #include <mutex>
+#include <vector>
 #include <unordered_map>
 
 class PS2Runtime;
@@ -103,12 +106,26 @@ private:
     uint8_t *m_activeRdram = nullptr;
     uint64_t m_activeToken = 0;
     uint64_t m_nextToken = 1;
+
+public:
+    // Read-ahead for a file too big to hold (a disc image the sound streams from): windows of it read on a worker
+    // thread, ahead of where the reads go, so the IOP (and the EE waiting for it) does not wait on the drive.
+    struct ReadAhead;
+
+private:
     struct HostFile
     {
-        std::FILE *stream = nullptr;
+        std::FILE *stream = nullptr; // or, for a file held in memory, null and `data`
+        std::shared_ptr<const std::vector<uint8_t>> data;
         uint64_t size = 0u;
+        std::string path;
+        std::shared_ptr<ReadAhead> ahead;
     };
     mutable std::mutex m_hostFileMutex;
     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+    // The game's files as first read, by host path (they do not change while it runs): openHostFile serves them from
+    // here, so the IOP's reads, which the EE waits for, never wait on the drive or the file system again.
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<uint8_t>>> m_hostFileCache;
+    uint64_t m_hostFileCacheBytes = 0u;
     uint64_t m_nextHostFileHandle = 1u;
 };

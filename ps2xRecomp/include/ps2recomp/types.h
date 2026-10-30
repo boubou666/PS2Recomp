@@ -187,6 +187,9 @@ namespace ps2recomp
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
+        // Functions recompiled from the guest code although their name matches a runtime handler ("name" or
+        // "name@0xaddr"): an unstripped ELF names its SDK functions, which would otherwise all be stubbed by name.
+        std::vector<std::string> nativeFunctions;
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
