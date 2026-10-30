@@ -494,6 +494,7 @@ class Node:
         self.landed = []  # status-tracking programs: flag writes that land before the pair, (kind, pc)
         self.stat_src = None  # FSAND: the FMAC whose status flags it reads
         self.end_flags = ()  # END: the flag writes still in flight, (kind, pc)
+        self.end_pc = None  # END: where an MSCNT resumes when a branch, not the next pair, follows the delay slot
 
 
 class Program:
@@ -711,6 +712,9 @@ class Program:
             if ended:
                 tail = max([0, ns.wb] + [r for r, _, _ in ns.flags] + ([ns.fdiv] if ns.fdiv is not None else []))
                 n.end = (tail, ns.kick, ns.fdiv is not None, ns.last, ns.mac)
+                # A branch in the E-bit pair: the program resumes (MSCNT) at its target, past the delay slot.
+                if branch is not None and branch[1] == 0:
+                    n.end_pc = 'jr' if branch[0] == 'jr' else branch[0]
                 n.end_flags = tuple((k, pc) for _, k, pc in ns.flags if k in ('f', 's')) if self.track_status else ()
                 return
             for c, pc in next_pcs:
@@ -896,6 +900,7 @@ class Emitter:
         self.lines = []
         self.need_mac = set()
         self.need_clip = set()
+        self.need_stk = set()
         self.uses_r = any(p is not None and p.lower.name in ('rget', 'rinit') for p in prog.pairs)
         for n in prog.nodes:
             if n.mac_src is not None:
@@ -906,7 +911,7 @@ class Emitter:
                 self.need_mac.add(n.end[3])
             for kind, pc in n.landed + list(n.end_flags):
                 if kind == 'f':
-                    self.need_mac.add(pc)
+                    self.need_stk.add(pc)
             if n.stat_src is not None:
                 self.need_mac.add(n.stat_src)
 
@@ -939,6 +944,8 @@ class Emitter:
                 right, rkind = 'iReg', 'Scalar'
             live = p.pc in self.need_mac and d != 0
             flags = f'mac_{p.pc:04x}, cur_{p.pc:04x}' if live else 'unusedMac, unusedCur'
+            if self.prog.track_status and p.pc in self.need_stk:
+                flags += f', &stk_{p.pc:04x}'
             expr = (f'fmac<Op::{CPP_OPS[u.fmac]}, R::{rkind}, {d}, kSticky, {"true" if live else "false"}>'
                     f'(f, {dst}, {self.vf(u.fs)}, {right}, acc, {flags})')
             return dst, expr
@@ -1092,7 +1099,7 @@ class Emitter:
     def land_status(self, landed):
         for kind, pc in landed:
             if kind == 'f':
-                self.out(f'stickyAcc |= (cur_{pc:04x} & 0xFu) << 6;')
+                self.out(f'stickyAcc |= stk_{pc:04x} << 6;')
             else:
                 self.out(f'stickyAcc = {self.prog.pair(pc).lower.imm12 & 0xFC0:#x}u;')
 
@@ -1162,7 +1169,10 @@ class Emitter:
                 self.out(f'lastMac = mac_{last:04x};')
                 self.out(f'lastCur = cur_{last:04x};')
                 self.out('hasFmac = true;')
-            self.out(f'endPc = {(n.pc + 8) & self.prog.mask:#x}u;')
+            if n.end_pc == 'jr':
+                self.out('endPc = jrTarget;')
+            else:
+                self.out(f'endPc = {(n.pc + 8 if n.end_pc is None else n.end_pc) & self.prog.mask:#x}u;')
             self.out('goto done;')
             return
         if len(n.succ) == 1:
@@ -1223,6 +1233,8 @@ class Emitter:
         self.out('int64_t endCycle = 0;', 1)
         for pc in sorted(self.need_mac):
             self.out(f'uint32_t mac_{pc:04x} = 0u, cur_{pc:04x} = 0u;', 1)
+        for pc in sorted(self.need_stk):
+            self.out(f'uint32_t stk_{pc:04x} = 0u;', 1)
         for pc in sorted(self.need_clip):
             self.out(f'uint32_t clip_{pc:04x} = 0u;', 1)
         self.out('switch (entry)', 1)
