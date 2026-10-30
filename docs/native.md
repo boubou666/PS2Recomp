@@ -114,6 +114,19 @@ themselves (paraLLEl, CPU), what VU1 still draws is under the native frame: cove
   renderer (paraLLEl-GS gives its own registers): a rear-view camera's strip, split screens.
 - TMB: `TMB_NATIVE_SANDBOX=0` keeps them on VU1.
 
+## Lifted microprograms drawing directly (sc3/native-direct-draws, native/vu1-lift-sink)
+
+A microprogram lifted to C++ (`tools/vu1_lift.py`) can draw without its GIF packet. With a `"sink"` in the lifter's
+spec, the marked programs get a second form whose stores into the packet they build go to the game's sink, a field of
+a vertex at a time, and whose XGKICKs call `sink->kick` (`DirectPath` keeps the PATH1 timing). The sink turns them into
+triangles in the GS's own terms (`ps2x::native::GsVertex`) and the drawing registers it knows into a
+`ps2x::native::GsMaterial` (`ps2x::gs::decodeTex0` / `decodePrim` from `runtime/gs/gs_registers.h`), and hands them to
+`Renderer::drawGs` in the program's group. At the group's GS marker `GSRasterBackend::SubmitNative` draws them into
+the render target there with the material's TEX0 (its CLUT loaded at the first draw after it was set), TEX1, CLAMP,
+ALPHA, TEST and MIPTBP, the target's frame, Z buffer, offset, scissor and global registers: no `GifToNative`, no GS
+front end register writes. The default implementation submits triangles to any back end, so the CPU GS renderer draws
+them too (the reference to compare with). SC3 does this for its two VU1 programs (`runtime/sc3_draw_sink.cpp`).
+
 ## IOP modules recompiled (native/renderer)
 
 The IOP's own code (IRX modules: sound drivers, streaming, the game's helpers) runs as native C++ instead of being
