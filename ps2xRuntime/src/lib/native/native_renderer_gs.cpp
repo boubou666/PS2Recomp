@@ -309,12 +309,34 @@ void main()
         return left;
     }
 
+    void Renderer::takeGsBatches(uint64_t group, GsVisitor visit, void *user)
+    {
+        std::vector<GsBatch> taken;
+        {
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            while (!m_gsStream.empty() && m_gsStream.front().group <= group)
+            {
+                taken.push_back(std::move(m_gsStream.front()));
+                m_gsStream.pop_front();
+            }
+        }
+        if (taken.empty())
+            return;
+        m_drewIntoGs.store(true, std::memory_order_relaxed);
+        for (const GsBatch &batch : taken)
+            visit(user, batch.material, batch.vertices.data(), static_cast<uint32_t>(batch.vertices.size()));
+    }
+
     bool Renderer::hasGroup(uint64_t group)
     {
         std::lock_guard<std::mutex> lock(m_streamMutex);
         const auto it = std::lower_bound(m_stream.begin(), m_stream.end(), group,
                                          [](const StreamBatch &entry, uint64_t g) { return entry.group < g; });
-        return it != m_stream.end() && it->group == group;
+        if (it != m_stream.end() && it->group == group)
+            return true;
+        const auto gs = std::lower_bound(m_gsStream.begin(), m_gsStream.end(), group,
+                                         [](const GsBatch &entry, uint64_t g) { return entry.group < g; });
+        return gs != m_gsStream.end() && gs->group == group;
     }
 
     void Renderer::drawGroups(uint64_t group, const GsDrawTarget &target)

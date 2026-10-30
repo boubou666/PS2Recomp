@@ -116,6 +116,11 @@ namespace ps2x::native
         // Returns whether batches up to `group` are left for the hook (GsDrawHook): none, and the GS front end needs
         // no target for this marker.
         bool takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user);
+        // Triangles (three vertices each) of the group begun last, with the drawing state they carry (GsMaterial).
+        void drawGs(const GsMaterial &material, const GsVertex *triangles, uint32_t count);
+        // GS thread, at a group's marker: hands the GS renderer the drawGs batches of the groups up to `group`.
+        using GsVisitor = void (*)(void *user, const GsMaterial &material, const GsVertex *triangles, uint32_t count);
+        void takeGsBatches(uint64_t group, GsVisitor visit, void *user);
         // Frames faster than the game's (PS2X_NATIVE_INTERPOLATE=1): the native port keys each object's batches by
         // something stable from one game frame to the next (its own data, not its place in the stream); present()
         // then draws a key found in the previous frame too with its matrix between the two, by how far the window's
@@ -193,6 +198,13 @@ namespace ps2x::native
         uint64_t m_group = 0;
         std::mutex m_streamMutex;
         std::deque<StreamBatch> m_stream; // batches waiting for their group's point of the GS stream
+        struct GsBatch
+        {
+            uint64_t group = 0;
+            GsMaterial material;
+            std::vector<GsVertex> vertices;
+        };
+        std::deque<GsBatch> m_gsStream; // drawGs's batches waiting for their group's marker (m_streamMutex)
         GsPass *m_gsPass = nullptr;       // its GL objects live in the GS thread's context: kept to the end
         std::atomic<bool> m_drewIntoGs{false};
         // Without GL targets (present() draws the frame over the GS one): each group's GS scissor, in primitive

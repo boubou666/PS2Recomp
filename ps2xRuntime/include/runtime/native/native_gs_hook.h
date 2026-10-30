@@ -6,6 +6,8 @@
 // On the GS thread the marker calls the hook with the render target the GS output would have gone to, so the native
 // draws sort with the GS draws around them (particles in front of a mesh, a HUD over it).
 
+#include "runtime/gs/gs_types.h"
+
 #include <atomic>
 #include <cstdint>
 
@@ -30,6 +32,26 @@ namespace ps2x::native
         uint64_t tex0 = 0, texa = 0, alpha = 0, test = 0, clamp = 0;
         uint32_t fogcol = 0;
         bool zmask = false;
+    };
+
+    // A draw a port computes in the GS's own terms (a microprogram's output, translated to C++): vertices as the GS
+    // takes them and the drawing registers the port knows, drawn at its group's point of the GS stream into the
+    // render target there (Renderer::drawGs), by the GS renderer itself, with its textures, CLUTs and blending.
+    struct GsVertex
+    {
+        float x = 0, y = 0; // primitive coordinates (the GS's 12.4 X and Y over 16)
+        uint32_t z = 0;
+        float s = 0, t = 0, q = 1.0f;
+        uint32_t rgba = 0; // R in the low byte
+        uint8_t fog = 0xFF;
+    };
+    struct GsMaterial
+    {
+        GSPrimReg prim{};
+        GSTex0Reg tex0{};
+        uint64_t tex1 = 0, clamp = 0, alpha = 0, test = 0, miptbp1 = 0, miptbp2 = 0;
+        // The first draw with this TEX0 since the game set it: its CLUT load (CLD) happens here.
+        bool loadClut = false;
     };
 
     using GsDrawHook = void (*)(uint64_t group, const GsDrawTarget &target);

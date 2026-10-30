@@ -395,6 +395,17 @@ void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+void GS::submitGsBatch(void *user, const ps2x::native::GsMaterial &material, const ps2x::native::GsVertex *triangles,
+                       uint32_t count)
+{
+    GS &gs = *static_cast<GS *>(user);
+    if (!gs.m_backend)
+        return;
+    GSDrawState target = gs.buildDrawBatch(0).state;
+    target.context = gs.m_ctx[material.prim.ctxt ? 1 : 0];
+    gs.m_backend->SubmitNative(target, material, triangles, count);
+}
+
 void GS::submitNativeBatch(void *user, const ps2x::native::Material &material, const float m[16], float gsZScale,
                            const ps2x::native::Vertex *vertices, uint32_t count)
 {
@@ -823,6 +834,8 @@ void GS::queueNativeDraw(uint64_t group, int context)
         if (g_queueTraceLeft.load(std::memory_order_relaxed) > 0)
             std::fprintf(stderr, "[gs-queue]   native group %llu ctx %d test %#llx zbuf %u\n", static_cast<unsigned long long>(group), index,
                          static_cast<unsigned long long>(m_ctx[index].test), m_ctx[index].zbuf.zbp);
+        if (!m_parallel)
+            ps2x::native::Renderer::instance().takeGsBatches(group, &GS::submitGsBatch, this);
         if (!m_parallel && !ps2x::native::Renderer::instance().takeGsContextBatches(group, &GS::submitNativeBatch, this))
             return;
         m_backend->NativeDraw(group, context);
