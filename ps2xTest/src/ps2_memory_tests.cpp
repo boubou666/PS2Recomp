@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/native/native_vif1.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
@@ -2363,6 +2364,63 @@ void register_ps2_memory_tests()
             for (uint32_t i = 0; i < 64u && unpacked; ++i)
                 unpacked = mem.read8(PS2_VU1_DATA_BASE + i * 16u + 7u) == static_cast<uint8_t>(i + 1u);
             t.IsTrue(unpacked, "reading VU1 memory should see every queued unpack, each with its own source data");
+            mem.setVif1Threaded(false);
+        });
+
+        tc.Run("VIF1 worker thread: an observer on the VIF1 thread sees a transfer there, up to each MSCAL before its gate", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setVif1Threaded(true);
+
+            static std::vector<size_t> s_pieces;
+            static std::atomic<int> s_offThread{0}, s_piecesAtGate{-1}, s_jobsAfter{0}, s_vu1Unpacked{0};
+            static PS2Memory *s_mem = nullptr;
+            s_pieces.clear();
+            s_offThread = 0, s_piecesAtGate = -1, s_jobsAfter = 0, s_vu1Unpacked = 0;
+            s_mem = &mem;
+            ps2x::native::setVif1Observer(
+                [](const uint8_t *, size_t bytes)
+                {
+                    s_pieces.push_back(bytes);
+                    s_offThread += s_mem->onVif1Worker() ? 1 : 0;
+                    const ps2x::native::Vu1Memory vu1 = ps2x::native::vu1Memory();
+                    if (s_pieces.size() == 1u && vu1.data == s_mem->getVU1Data() && vu1.code == s_mem->getVU1Code())
+                        s_vu1Unpacked = vu1.data[0] == 1u && vu1.data[16] == 0u ? 1 : 0;
+                },
+                true);
+            ps2x::native::setVu1Gate([](const uint8_t *, uint32_t)
+                                     {
+                                         s_piecesAtGate = static_cast<int>(s_pieces.size());
+                                         return true;
+                                     });
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kSrc = 0x00024000u;
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+            std::vector<uint32_t> stream = {makeVifCmd(0x6Cu, 1u, 0u), 1, 2, 3, 4, makeVifCmd(0x14u, 0u, 0u),
+                                            makeVifCmd(0x6Cu, 1u, 1u), 5, 6, 7, 8, 0};
+            std::memcpy(rdram + kSrc, stream.data(), stream.size() * 4u);
+            mem.writeIORegister(kVif1Ch + 0x10u, kSrc);
+            mem.writeIORegister(kVif1Ch + 0x20u, 3u);
+            mem.writeIORegister(kVif1Ch + 0x00u, 0x100u);
+            ps2x::native::runOnVif1Thread([] { s_jobsAfter += s_pieces.size() == 2u && s_mem->onVif1Worker() ? 1 : 0; });
+
+            t.Equals(mem.read8(PS2_VU1_DATA_BASE + 16u), static_cast<uint8_t>(5u), "VIF1 ran the transfer");
+            t.Equals(s_pieces.size(), size_t{2}, "two pieces: up to the MSCAL, then the rest");
+            if (s_pieces.size() == 2u)
+            {
+                t.Equals(s_pieces[0], size_t{24}, "the first ends with the MSCAL");
+                t.Equals(s_pieces[1], size_t{24}, "the second has the rest");
+            }
+            t.Equals(s_piecesAtGate.load(), 1, "the gate is asked once the observer has the MSCAL");
+            t.Equals(s_offThread.load(), 2, "on the VIF1 thread");
+            t.Equals(s_vu1Unpacked.load(), 1, "with VU1's memory as VIF1 left it at the MSCAL");
+            t.IsTrue(ps2x::native::vu1Memory().data == nullptr, "VU1's memory only handed out while observed");
+            t.Equals(s_jobsAfter.load(), 1, "a job run on the VIF1 thread comes after the transfer");
+            ps2x::native::setVu1Gate(nullptr);
+            ps2x::native::setVif1Observer(nullptr);
             mem.setVif1Threaded(false);
         });
 

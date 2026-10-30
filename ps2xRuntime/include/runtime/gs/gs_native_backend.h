@@ -192,6 +192,22 @@ private:
     void applyBlend(const GSDrawState &state);
     // What applyBlend asks of the shader: 0 its colour, 1 the blend factor as colour, 2 the colour times (1 + factor).
     int m_blendOut = 0;
+    // COLCLAMP off with a blend that adds or subtracts colours: the GS keeps the low 8 bits of each result, which a
+    // clamping RGBA8 blend cannot. Such draws blend into a float copy of the target (m_wrapTexture), attached in its
+    // place while the next batches do the same into it; the first other batch writes it back modulo 256.
+    void beginWrappedBlend(RenderTarget &target, const GSScissorReg &scissor);
+    bool continuesWrappedBlend() const;
+    void closeWrappedBlend();
+    bool m_wrapOpen = false;
+    bool m_wrapDrawn = false;
+    uint32_t m_wrapFbp = 0;
+    GSScissorReg m_wrapScissor{};
+    GSScissorReg m_wrapArea{}; // what the batches drew since the copy, in GS pixels
+    uint32_t m_wrapTexture = 0;
+    uint32_t m_wrapFramebuffer = 0;
+    uint32_t m_wrapWidth = 0;
+    uint32_t m_wrapHeight = 0;
+    uint32_t m_wrapProgram = 0;
     // One PCRTC read circuit's picture (RGBA8, alpha as the GS stores it), from its render target or else GS memory.
     // The presentation on the GPU (default; PS2X_GS_NATIVE_CPUPRESENT=1 reads the circuits back and merges them on the
     // CPU): the two read circuits merged as PMODE says into a texture the window draws (PresentationFrame::glTexture),
