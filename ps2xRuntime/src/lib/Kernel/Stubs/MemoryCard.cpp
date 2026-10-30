@@ -846,8 +846,9 @@ namespace ps2_stubs
                             entries.push_back(tableEntry);
                         }
 
+                        // MCMAN compares the count unsigned: a negative maxent (VP2 passes -1) has no limit.
                         const size_t entryCount =
-                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
+                            std::min(entries.size(), maxEntries < 0 ? entries.size() : static_cast<size_t>(maxEntries));
                         if (entryCount == 0u || tableAddr == 0u)
                         {
                             result = static_cast<int32_t>(entryCount);
