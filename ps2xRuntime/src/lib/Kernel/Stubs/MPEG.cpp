@@ -42,6 +42,35 @@ namespace ps2_stubs
         // Decoding stands in for the IPU, which works beside the EE: the host time it takes is
         // credited as EE cycles, otherwise VSync (which waits for both cycles and host time)
         // and therefore movie playback slow down by the decode cost.
+        // The picture clock pictures are paced by, in vsync ticks (Q32): the emulated vsync count, or on native frames
+        // (EeScheduler::nativeFrames, the game's frames on the host clock) host time at the field rate, so movies keep
+        // their pace without the vblank.
+        std::chrono::steady_clock::time_point pictureClockEpoch()
+        {
+            static const std::chrono::steady_clock::time_point s_epoch = std::chrono::steady_clock::now();
+            return s_epoch;
+        }
+
+        uint64_t pictureTickQ32(PS2Runtime *runtime)
+        {
+            EeScheduler &ee = runtime->eeScheduler();
+            if (!ee.nativeFrames())
+                return ee.currentVSyncTick() << 32u;
+            const EeScheduler::FieldRate rate = ee.fieldRate();
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pictureClockEpoch()).count();
+            return static_cast<uint64_t>(seconds * static_cast<double>(rate.numerator) /
+                                         static_cast<double>(rate.denominator) * 4294967296.0);
+        }
+
+        std::chrono::steady_clock::time_point pictureTickTime(PS2Runtime *runtime, uint64_t tick)
+        {
+            const EeScheduler::FieldRate rate = runtime->eeScheduler().fieldRate();
+            return pictureClockEpoch() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                             std::chrono::duration<double>(static_cast<double>(tick) *
+                                                                           static_cast<double>(rate.denominator) /
+                                                                           static_cast<double>(rate.numerator)));
+        }
+
         void accountHostDecodeTime(PS2Runtime *runtime, std::chrono::steady_clock::time_point start)
         {
             if (!runtime)
@@ -2584,8 +2613,7 @@ namespace ps2_stubs
 
             if (!playback.decodedFrames.empty())
             {
-                const uint64_t currentTick = runtime->eeScheduler().currentVSyncTick();
-                const uint64_t currentTickQ32 = currentTick << 32u;
+                const uint64_t currentTickQ32 = pictureTickQ32(runtime);
                 const MpegDecodedFrame &nextFrame = playback.decodedFrames.front();
                 const uint64_t frameIntervalQ32 = decodedFrameIntervalQ32(playback, nextFrame);
                 uint64_t presentationTargetQ32 = presentationTickForFrame(playback, nextFrame, currentTickQ32);
@@ -2605,6 +2633,12 @@ namespace ps2_stubs
                 {
                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
                     lock.unlock();
+                    if (runtime->eeScheduler().nativeFrames())
+                    {
+                        runtime->eeScheduler().waitHostDeadline(
+                            pictureTickTime(runtime, eligibleTick), [] {},
+                            [rdram, runtime](R5900Context &resumeContext) { sceMpegGetPicture(rdram, &resumeContext, runtime); });
+                    }
                     runtime->eeScheduler().waitVSync(
                         eligibleTick - 1u,
                         -1,
@@ -2743,7 +2777,7 @@ namespace ps2_stubs
                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
         const uint64_t currentTickQ32 = runtime != nullptr
-                                            ? (runtime->eeScheduler().currentVSyncTick() << 32u)
+                                            ? pictureTickQ32(runtime)
                                             : std::numeric_limits<uint64_t>::max();
         const bool presentationComplete =
             presentationEnd == std::numeric_limits<uint64_t>::max() ||
