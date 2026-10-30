@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""SC3's VU1 programs A and B and its VU0 microprograms as C++, from the microcode ps2_vu_aot compiled
-(generated/vu1): each instruction as the operation it does on registers held in locals, with what VU1Interpreter's
-pipeline makes timing-dependent (stalls and cycles, when Q, MAC and clip results become visible, the VI a branch
-reads, XGKICK waits) worked out here for every path from each start pc, so the C++ runs no pipeline.
-scripts/recomp.sh runs it.
+"""A game's VU programs as C++, from the microcode ps2_vu_aot compiled: each instruction as the operation it does on
+registers held in locals, with what VU1Interpreter's pipeline makes timing-dependent (stalls and cycles, when Q, MAC
+and clip results become visible, the VI a branch reads, XGKICK waits) worked out here for every path from each start
+pc, so the C++ runs no pipeline. The C++ is made of runtime/ps2_vu1_lifted_ops.h.
 
-  scripts/vu1_port_gen.py <ps2_vu_aot output dir> <out dir>     writes sc3_vu1_a.cpp, sc3_vu1_b.cpp and sc3_vu0_program.cpp
-  scripts/vu1_port_gen.py --code <image.bin> <A|B|VU0> <out.cpp>   from a code image instead
+  tools/vu1_lift.py <spec.json> <ps2_vu_aot output dir> <out dir>        every program of the spec
+  tools/vu1_lift.py <spec.json> --code <image.bin> <program> <out.cpp>   one program, from a code image instead
+
+The spec names the programs, each by the hash of its microcode:
+  {"include": "runtime/ps2_vu1_lifted_ops.h", "namespace": "ps2x::vu1lift",
+   "programs": {"<name>": {"hash": "0x95e81f9a833c1b45", "pairs": 1177, "function": "programA", "file": "a.cpp",
+                           "entries": ["0x10", ...], "targets": ["0xd8", ...], "unit": "VU1"}}}
+entries are the start pcs (MSCAL), targets the pcs a JR dispatch reaches; include and namespace default to the
+shared ops header and its namespace, unit to VU1. Numbers are integers or hexadecimal strings.
 """
 import argparse
 import glob
+import json
 import os
 import re
 import struct
@@ -996,20 +1003,23 @@ class Emitter:
         return '\n'.join(self.lines)
 
 
-PROGRAMS = {
-    'A': dict(hash=0x95e81f9a833c1b45, pairs=1177, function='programA', file='sc3_vu1_a.cpp',
-              entries=[0x10, 0xd8, 0x2b0, 0x450, 0x768, 0xa48, 0xc18, 0xda8, 0xf68, 0x1268, 0x1558, 0x1730, 0x18c0, 0x1ab8,
-                       0x1c80, 0x1d28, 0x1f00, 0x2098, 0x2140, 0x2330],
-              targets=[0xd8, 0x2b0, 0x450, 0x768, 0xa48, 0xc18, 0xda8, 0xf68, 0x1268, 0x1558, 0x1730, 0x18c0, 0x1ab8, 0x1d28,
-                       0x1f00, 0x2140, 0x2330]),
-    'B': dict(hash=0xd2fbf7af837a8df4, pairs=1352, function='programB', file='sc3_vu1_b.cpp',
-              entries=[0x10, 0xd8, 0x350, 0x5b0, 0x910, 0xb78, 0xdd0, 0x10f0, 0x1388, 0x15e8, 0x1990, 0x1a40, 0x1ca8, 0x1ef0,
-                       0x21e0, 0x2290, 0x24f8, 0x2740],
-              targets=[0xd8, 0x350, 0x5b0, 0x910, 0xb78, 0xdd0, 0x10f0, 0x1388, 0x15e8, 0x1a40, 0x1ca8, 0x1ef0, 0x2290, 0x24f8,
-                       0x2740]),
-    'VU0': dict(hash=0x5f8cbf2471656edf, pairs=172, function='programVu0', file='sc3_vu0_program.cpp', unit='VU0',
-                entries=[0x0, 0x18, 0x38, 0x60, 0xf0, 0x360, 0x3c8, 0x3e8, 0x438], targets=[]),
-}
+DEFAULT_INCLUDE = 'runtime/ps2_vu1_lifted_ops.h'
+DEFAULT_NAMESPACE = 'ps2x::vu1lift'
+
+
+def number(value):
+    return int(value, 0) if isinstance(value, str) else int(value)
+
+
+def load_spec(path):
+    with open(path) as source:
+        spec = json.load(source)
+    programs = {}
+    for name, program in spec['programs'].items():
+        programs[name] = dict(program, hash=number(program['hash']), pairs=number(program['pairs']),
+                              entries=[number(pc) for pc in program['entries']],
+                              targets=[number(pc) for pc in program.get('targets', [])])
+    return spec.get('include', DEFAULT_INCLUDE), spec.get('namespace', DEFAULT_NAMESPACE), programs
 
 
 def code_hash(data):
@@ -1031,7 +1041,7 @@ def code_from_aot(directory, spec):
     return b''.join(struct.pack('<II', *pairs[i]) for i in range(spec['pairs']))
 
 
-def generate(code, spec):
+def generate(code, spec, include=DEFAULT_INCLUDE, namespace=DEFAULT_NAMESPACE):
     if code_hash(code[:spec['pairs'] * 8]) != spec['hash']:
         raise GenError(f'the code image does not hash to {spec["hash"]:016x}')
     pairs = parse(code[:spec['pairs'] * 8])
@@ -1040,7 +1050,7 @@ def generate(code, spec):
     prog = Program(pairs, spec['function'], has_fmand, has_fcand, spec.get('unit', 'VU1'))
     prog.build(spec['entries'], spec['targets'])
     name = spec['function']
-    lines = ['#include "sc3_vu1_ops.h"', '', 'namespace sc3::vu1', '{', Emitter(prog, name).emit(), '']
+    lines = [f'#include "{include}"', '', f'namespace {namespace}', '{', Emitter(prog, name).emit(), '']
     sig = '(uint32_t entry, VU1State &state, uint8_t *data, uint32_t top, Vu1Kick out, void *user);'
     lines.append(f'    template uint64_t {name}<true>{sig}')
     lines.append(f'    template uint64_t {name}<false>{sig}')
@@ -1057,23 +1067,25 @@ def write(path, text):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('spec')
     ap.add_argument('--code', metavar='IMAGE')
     ap.add_argument('source')
     ap.add_argument('out')
     a = ap.parse_args()
     try:
+        include, namespace, programs = load_spec(a.spec)
         if a.code:
-            spec = PROGRAMS[a.source]
-            text, nodes = generate(open(a.code, 'rb').read(), spec)
+            spec = programs[a.source]
+            text, nodes = generate(open(a.code, 'rb').read(), spec, include, namespace)
             write(a.out, text)
             return
         os.makedirs(a.out, exist_ok=True)
-        for key, spec in PROGRAMS.items():
-            text, nodes = generate(code_from_aot(a.source, spec), spec)
+        for key, spec in programs.items():
+            text, nodes = generate(code_from_aot(a.source, spec), spec, include, namespace)
             write(os.path.join(a.out, spec['file']), text)
             print(f'program {key}: {len(spec["entries"])} start pcs, {nodes} timed pairs -> {spec["file"]}')
     except GenError as error:
-        sys.exit(f'vu1_port_gen: {error}')
+        sys.exit(f'vu1_lift: {error}')
 
 
 if __name__ == '__main__':
