@@ -167,6 +167,13 @@ namespace ps2x::native
 
     Vu1StreamAdapter::~Vu1StreamAdapter() { delete m_sandbox; }
 
+    Vu1Sandbox &Vu1StreamAdapter::sandbox()
+    {
+        if (!m_sandbox)
+            m_sandbox = new Vu1Sandbox();
+        return *m_sandbox;
+    }
+
     void Vu1StreamAdapter::install(Config config)
     {
         m_config = std::move(config);
@@ -271,7 +278,12 @@ namespace ps2x::native
                     advanceVif1Clock(m_sandbox->cycles() - cyclesBefore);
             }
             else if (m_running == Running::Port)
+            {
+                m_portCycles = 0;
                 m_config.draw(*this, m_runningPc, true);
+                if (m_config.onVif1Thread)
+                    advanceVif1Clock(m_portCycles);
+            }
             return;
         }
         Choice choice = Choice::Vu1;
@@ -293,10 +305,13 @@ namespace ps2x::native
         renderer.setKey(0);
         if (choice == Choice::Port)
         {
-            noteDecision(pc, true, false);
             m_running = Running::Port;
             ++g_stats.port[pc];
+            m_portCycles = 0;
             m_config.draw(*this, pc, false);
+            if (m_config.onVif1Thread)
+                advanceVif1Clock(m_portCycles);
+            noteDecision(pc, true, false, m_config.onVif1Thread ? 0u : m_portCycles);
             return;
         }
         m_running = Running::Sandbox;
