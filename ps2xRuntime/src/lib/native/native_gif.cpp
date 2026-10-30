@@ -277,7 +277,7 @@ namespace ps2x::native
         const bool alphaTest = test & 1u;
         const uint32_t atst = (test >> 1) & 7u, aref = (test >> 4) & 0xffu, afail = (test >> 12) & 3u;
         m.depthWrite = !((m_zbuf[context] >> 32) & 1u);
-        if (alphaTest && atst == 0u && afail == 1u) // never passes, the colour still written (FB_ONLY): no depth
+        if (alphaTest && atst == 0u && (afail == 1u || afail == 3u)) // never passes, the colour still written (FB_ONLY, RGB_ONLY): no depth
             m.depthWrite = false;
         else if (alphaTest && (atst == 5u || atst == 6u)) // GEQUAL, GREATER
         {
@@ -353,8 +353,9 @@ namespace ps2x::native
         const uint64_t attributes = m_prmodecont ? m_prim : m_prmode;
         const int context = (attributes >> 9) & 1u;
         const uint64_t test = m_test[context];
-        if ((test & 1u) && ((test >> 1) & 7u) == 0u && ((test >> 12) & 3u) != 1u)
-            return; // the alpha test never passes and nothing is written (KEEP), or only depth (ZB_ONLY)
+        const uint32_t afail = (test >> 12) & 3u;
+        if ((test & 1u) && ((test >> 1) & 7u) == 0u && (afail == 0u || (afail == 2u && !m_gsWrites)))
+            return; // the alpha test never passes and nothing is written (KEEP), or only depth (ZB_ONLY) the material cannot mask
         if (((test >> 16) & 1u) && ((test >> 17) & 3u) == 0u)
             return; // depth test NEVER
         Material m = material();
