@@ -67,7 +67,10 @@ talks to the GS through the same GIF/register interface, so nothing here is game
 - **Geometry:** vertex kicks assembled into points/lines/triangles/strips/fans/sprites, batched while the state
   does not change; positions from the 12.4 fixed-point XY with the XYOFFSET, Z as 24/32-bit depth.
 - **Render targets:** a cache keyed by FBP/FBW/PSM (and ZBP/PSM for depth) of GPU textures at an internal scale
-  (1x first, then the player's choice). Overlaps and format reinterpretations resolve by copy passes on the GPU.
+  (1x first, then the player's choice). Overlaps and format reinterpretations resolve by copy passes on the GPU,
+  page by page: each 8 KiB page of GS memory has a version bumped by every write (a draw, a transfer); GS memory and
+  each target know the version they hold. A read of GS memory (another format, a transfer, a CLUT) first gets the
+  pages a target holds newer written there; a target drawn into or sampled first reloads its older pages from it.
 - **Textures:** a CPU shadow of GS local memory takes the uploads (swizzle via `ps2_gs_memory`); textures are
   decoded from it per TBP/TBW/PSM/CLUT and cached on the GPU, invalidated by uploads that overlap them. A texture
   whose TBP is a live render target samples that GPU texture directly (feedback effects: blur, bloom, DOF).
