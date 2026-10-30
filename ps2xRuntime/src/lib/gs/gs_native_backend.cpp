@@ -2588,6 +2588,20 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
     const uint32_t lines = static_cast<uint32_t>(std::max(haveTop ? top.height : 0, haveBottom ? bottom.height : 0));
     const uint32_t height = (fieldMode ? lines * 2u : lines) * m_scale;
     const uint32_t outWidth = width * m_scale;
+    if (static const bool logPresents = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logPresents)
+    {
+        static uint32_t s_presents = 0;
+        if ((s_presents++ % 100u) == 0u)
+            std::fprintf(stderr,
+                         "[gs:native] gpu present #%u pmode=0x%llx smode2=0x%llx dispfb1=0x%llx display1=0x%llx "
+                         "dispfb2=0x%llx display2=0x%llx top=%d %d,%d %dx%d s%d bottom=%d %d,%d %dx%d out %ux%u\n",
+                         s_presents, static_cast<unsigned long long>(pmode),
+                         static_cast<unsigned long long>(request.smode2), static_cast<unsigned long long>(request.dispfb1),
+                         static_cast<unsigned long long>(request.display1), static_cast<unsigned long long>(request.dispfb2),
+                         static_cast<unsigned long long>(request.display2), haveTop ? 1 : 0, top.x, top.y, top.width,
+                         top.height, top.scale, haveBottom ? 1 : 0, bottom.x, bottom.y, bottom.width, bottom.height,
+                         outWidth, height);
+    }
 
     PresentSlot &slot = m_presentSlots[m_presentNext];
     if (slot.fence)
