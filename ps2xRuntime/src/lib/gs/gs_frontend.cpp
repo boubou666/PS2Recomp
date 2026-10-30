@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_parallel.h"
+#include "runtime/gs/gs_registers.h"
 #include "runtime/gs/gs_trace.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
@@ -27,21 +28,6 @@
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
-
-    GSPrimReg decodePrimRegister(uint64_t value)
-    {
-        GSPrimReg prim{};
-        prim.type = static_cast<GSPrimType>(value & 0x7u);
-        prim.iip = ((value >> 3) & 1u) != 0u;
-        prim.tme = ((value >> 4) & 1u) != 0u;
-        prim.fge = ((value >> 5) & 1u) != 0u;
-        prim.abe = ((value >> 6) & 1u) != 0u;
-        prim.aa1 = ((value >> 7) & 1u) != 0u;
-        prim.fst = ((value >> 8) & 1u) != 0u;
-        prim.ctxt = ((value >> 9) & 1u) != 0u;
-        prim.fix = ((value >> 10) & 1u) != 0u;
-        return prim;
-    }
 
     static inline uint64_t loadLE64(const uint8_t *p)
     {
@@ -239,24 +225,6 @@ bool GS::shouldQueue() const
     return m_asyncEnabled && !t_onGsWorker;
 }
 
-
-namespace
-{
-    // TEX0 / TEX2 PSM. A value the GS does not define is read as PSMCT32 (GSdx's format table defaults every entry
-    // to it; paraLLEl-GS shows such textures): The Third Age draws its movie pictures with PSM 0x20.
-    uint8_t textureFormat(uint64_t tex0)
-    {
-        const uint8_t psm = static_cast<uint8_t>((tex0 >> 20) & 0x3F);
-        switch (psm)
-        {
-        case 0x00: case 0x01: case 0x02: case 0x0A: case 0x13: case 0x14: case 0x1B: case 0x24: case 0x2C:
-        case 0x30: case 0x31: case 0x32: case 0x3A:
-            return psm;
-        default:
-            return 0x00;
-        }
-    }
-}
 
 void GS::postCpuEvent(GsCpuEvent event, uint64_t value, uint64_t delayCycles)
 {
@@ -2235,7 +2203,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
     case GS_REG_PRIM:
     {
-        m_primRegister = decodePrimRegister(value);
+        m_primRegister = ps2x::gs::decodePrim(value);
         if (m_prmodecont)
         {
             m_prim = m_primRegister;
@@ -2321,18 +2289,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_TEX0_2) ? 1 : 0;
         auto &t = m_ctx[ci].tex0;
-        t.tbp0 = static_cast<uint32_t>(value & 0x3FFF);
-        t.tbw = static_cast<uint8_t>((value >> 14) & 0x3F);
-        t.psm = textureFormat(value);
-        t.tw = static_cast<uint8_t>((value >> 26) & 0xF);
-        t.th = static_cast<uint8_t>((value >> 30) & 0xF);
-        t.tcc = static_cast<uint8_t>((value >> 34) & 0x1);
-        t.tfx = static_cast<uint8_t>((value >> 35) & 0x3);
-        t.cbp = static_cast<uint32_t>((value >> 37) & 0x3FFF);
-        t.cpsm = static_cast<uint8_t>((value >> 51) & 0xF);
-        t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
-        t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
-        t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        t = ps2x::gs::decodeTex0(value);
         m_backend->LoadClut(t, m_texclut);
         break;
     }
@@ -2358,7 +2315,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_TEX2_2) ? 1 : 0;
         auto &t = m_ctx[ci].tex0;
-        t.psm = textureFormat(value);
+        t.psm = ps2x::gs::textureFormat(value);
         t.cbp = static_cast<uint32_t>((value >> 37) & 0x3FFF);
         t.cpsm = static_cast<uint8_t>((value >> 51) & 0xF);
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
@@ -2385,7 +2342,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_PRMODE:
     {
-        m_prmodeRegister = decodePrimRegister(value);
+        m_prmodeRegister = ps2x::gs::decodePrim(value);
         if (!m_prmodecont)
         {
             const GSPrimType type = m_primRegister.type;
@@ -2811,10 +2768,7 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     batch.state.fogB = m_fogB;
     batch.state.textureWidth = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.tw, 10u));
     batch.state.textureHeight = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.th, 10u));
-    const uint64_t tex1 = batch.state.context.tex1;
-    const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
-    const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
-    batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
+    batch.state.linearFilter = ps2x::gs::linearFilter(batch.state.context.tex1);
     return batch;
 }
 
