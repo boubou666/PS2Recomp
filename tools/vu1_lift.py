@@ -213,12 +213,13 @@ class Lower:
         self.imm11 = sext(word, 11)
         self.imm15 = (word & 0x7FF) | ((word >> 10) & 0x7800)
         self.imm24 = word & 0xFFFFFF
+        self.imm12 = (((word >> 21) & 1) << 11) | (word & 0x7FF)
         self.name = None
         if word in (0, 0x8000033C):
             self.name = 'nop'
             return
-        names = {0x00: 'lq', 0x01: 'sq', 0x04: 'ilw', 0x05: 'isw', 0x08: 'iaddiu', 0x09: 'isubiu', 0x12: 'fcand',
-                 0x1A: 'fmand', 0x1C: 'fcget', 0x20: 'b', 0x24: 'jr', 0x28: 'ibeq', 0x29: 'ibne', 0x2C: 'ibltz', 0x2D: 'ibgtz',
+        names = {0x00: 'lq', 0x01: 'sq', 0x04: 'ilw', 0x05: 'isw', 0x08: 'iaddiu', 0x09: 'isubiu', 0x12: 'fcand', 0x15: 'fsset', 0x16: 'fsand',
+                 0x1A: 'fmand', 0x1C: 'fcget', 0x20: 'b', 0x21: 'bal', 0x24: 'jr', 0x28: 'ibeq', 0x29: 'ibne', 0x2C: 'ibltz', 0x2D: 'ibgtz',
                  0x2E: 'iblez', 0x2F: 'ibgez'}
         if self.op in names:
             self.name = names[self.op]
@@ -234,7 +235,7 @@ class Lower:
             raise ValueError(f'unsupported lower {word:#010x}')
         sp = (word & 3) | ((word >> 4) & 0x7C)
         f2 = {0x30: 'move', 0x31: 'mr32', 0x34: 'lqi', 0x35: 'sqi', 0x38: 'div', 0x39: 'sqrt', 0x3A: 'rsqrt', 0x3B: 'waitq',
-              0x3C: 'mtir', 0x68: 'xtop', 0x6C: 'xgkick'}
+              0x3C: 'mtir', 0x3D: 'mfir', 0x68: 'xtop', 0x69: 'xitop', 0x6C: 'xgkick'}
         if sp not in f2:
             raise ValueError(f'unsupported lower {word:#010x}')
         self.name = f2[sp]
@@ -283,6 +284,14 @@ class Lower:
             wvi(self.it)
         elif n == 'b':
             u.pipeline = 'branch'
+        elif n == 'bal':
+            u.pipeline, u.latency = 'branch', 1
+            wvi(self.it)
+        elif n == 'fsset':
+            u.pipeline, u.latency = 'fmac', FMAC_LATENCY
+        elif n == 'fsand':
+            u.pipeline, u.latency = 'ialu', 1
+            wvi(self.it)
         elif n == 'jr':
             u.pipeline = 'branch'
             rvi(self.is_)
@@ -336,16 +345,20 @@ class Lower:
             u.pipeline, u.latency, u.delays_branch = 'ialu', 1, True
             u.add_vf_read(self.fs, lane_for_component(self.fsf))
             wvi(self.it)
-        elif n == 'xtop':
+        elif n in ('xtop', 'xitop'):
             u.pipeline, u.latency = 'ialu', 1
             wvi(self.it)
+        elif n == 'mfir':
+            u.pipeline, u.latency = 'fmac', 4
+            rvi(self.is_)
+            u.add_vf_write(self.ft, self.dest)
         elif n == 'xgkick':
             u.pipeline, u.latency = 'xgkick', 2
             rvi(self.is_)
         return u
 
     def is_branch(self):
-        return self.name in ('b', 'jr', 'ibeq', 'ibne', 'ibltz', 'ibgtz', 'iblez', 'ibgez')
+        return self.name in ('b', 'bal', 'jr', 'ibeq', 'ibne', 'ibltz', 'ibgtz', 'iblez', 'ibgez')
 
     def is_store(self):
         return self.name in ('sq', 'isw', 'sqi')
@@ -397,7 +410,7 @@ class GenError(Exception):
 
 class TState:
     __slots__ = ('vf', 'vi', 'acc', 'wb', 'fdiv', 'flags', 'mac', 'clip', 'last', 'kick', 'branch', 'ebit',
-                 'backup', '_key')
+                 'backup', 'stat', '_key')
 
     def __init__(self):
         self.vf = [0] * 128
@@ -413,6 +426,7 @@ class TState:
         self.branch = None
         self.ebit = False
         self.backup = 0
+        self.stat = None
         self._key = None
 
     def copy(self):
@@ -421,13 +435,13 @@ class TState:
         s.vi = list(self.vi)
         s.acc = list(self.acc)
         s.wb, s.fdiv, s.flags, s.mac, s.clip, s.last = self.wb, self.fdiv, self.flags, self.mac, self.clip, self.last
-        s.kick, s.branch, s.ebit, s.backup = self.kick, self.branch, self.ebit, self.backup
+        s.kick, s.branch, s.ebit, s.backup, s.stat = self.kick, self.branch, self.ebit, self.backup, self.stat
         return s
 
     def key(self):
         if self._key is None:
             self._key = (tuple(self.vf), tuple(self.vi), tuple(self.acc), self.wb, self.fdiv, self.flags, self.mac,
-                         self.clip, self.last, self.kick, self.branch, self.ebit, self.backup)
+                         self.clip, self.last, self.kick, self.branch, self.ebit, self.backup, self.stat)
         return self._key
 
     def horizon(self):
@@ -457,11 +471,16 @@ class Node:
         self.path1_store = False
         self.branch_backup = 0
         self.preds = []
+        self.landed = []  # status-tracking programs: flag writes that land before the pair, (kind, pc)
+        self.stat_src = None  # FSAND: the FMAC whose status flags it reads
+        self.end_flags = ()  # END: the flag writes still in flight, (kind, pc)
 
 
 class Program:
     def __init__(self, pairs, name, track_mac, track_clip, unit='VU1'):
         self.pairs = pairs
+        # FSSET and FSAND need the status flags mid-program: sticky bits gathered as the flag writes land.
+        self.track_status = any(p is not None and p.lower.name in ('fsset', 'fsand') for p in pairs)
         self.mask = 0x3FFF if unit == 'VU1' else 0xFFF
         self.data_mask = 0x3FF if unit == 'VU1' else 0xFF
         self.name = name
@@ -544,21 +563,31 @@ class Program:
         flags = list(s.flags)
         while flags and flags[0][0] <= t:
             _, kind, pc = flags.pop(0)
-            if kind == 'f':
+            if kind in ('f', 'g'):
                 s.mac = pc
+                if kind == 'f' and self.track_status:
+                    s.stat = pc
+                    n.landed.append(('f', pc))
+            elif kind == 's':
+                n.landed.append(('s', pc))
             else:
                 s.clip = pc
         if p.lower.name == 'fmand':
             n.mac_src = s.mac
             if s.mac is not None and any(k == 'f' and pc == s.mac for _, k, pc in flags):
                 raise GenError(f'{self.name}: MAC of {s.mac:#x} read at {p.pc:#x} while it is written again')
+        if p.lower.name == 'fsand':
+            n.stat_src = s.stat
         if p.lower.name in ('fcand', 'fcget'):
             n.clip_src = s.clip
             if s.clip is not None and any(k == 'c' and pc == s.clip for _, k, pc in flags):
                 raise GenError(f'{self.name}: clip of {s.clip:#x} read at {p.pc:#x} while it is written again')
         if p.upper.writes_flags():
-            flags.append((t + FMAC_LATENCY, 'f', p.pc))
+            # An FSSET in the same pair takes the place of the upper instruction's status write.
+            flags.append((t + FMAC_LATENCY, 'g' if p.lower.name == 'fsset' else 'f', p.pc))
             s.last = p.pc
+        if p.lower.name == 'fsset':
+            flags.append((t + FMAC_LATENCY, 's', p.pc))
         if p.upper.kind == 'clip':
             flags.append((t + FMAC_LATENCY, 'c', p.pc))
         if len(flags) > MAX_FLAG_ENTRIES:
@@ -608,7 +637,7 @@ class Program:
         if lo.is_branch():
             if lo.name in ('ibeq', 'ibne'):
                 branch_reads = (1 << lo.is_) | (1 << lo.it)
-            elif lo.name != 'b' and lo.name != 'jr':
+            elif lo.name not in ('b', 'bal', 'jr'):
                 branch_reads = 1 << lo.is_
         if s.backup and branch_reads & (1 << s.backup):
             n.branch_backup = s.backup
@@ -636,7 +665,7 @@ class Program:
                 raise GenError(f'{self.name}: branch in a delay slot at {p.pc:#x}')
             if lo.name == 'jr':
                 outcomes.append((None, ('jr', 1)))
-            elif lo.name == 'b':
+            elif lo.name in ('b', 'bal'):
                 outcomes.append((None, ((p.pc + 8 + lo.imm11 * 8) & self.mask, 1)))
             else:
                 outcomes.append(('taken', ((p.pc + 8 + lo.imm11 * 8) & self.mask, 1)))
@@ -662,6 +691,7 @@ class Program:
             if ended:
                 tail = max([0, ns.wb] + [r for r, _, _ in ns.flags] + ([ns.fdiv] if ns.fdiv is not None else []))
                 n.end = (tail, ns.kick, ns.fdiv is not None, ns.last, ns.mac)
+                n.end_flags = tuple((k, pc) for _, k, pc in ns.flags if k in ('f', 's')) if self.track_status else ()
                 return
             for c, pc in next_pcs:
                 n.succ.append((c, self.node(pc, ns)))
@@ -683,6 +713,11 @@ class Emitter:
                 self.need_clip.add(n.clip_src)
             if n.end is not None and n.end[3] is not None:
                 self.need_mac.add(n.end[3])
+            for kind, pc in n.landed + list(n.end_flags):
+                if kind == 'f':
+                    self.need_mac.add(pc)
+            if n.stat_src is not None:
+                self.need_mac.add(n.stat_src)
 
     def vf(self, r):
         return 'kVf0' if r == 0 else f'vf{r}'
@@ -734,6 +769,9 @@ class Emitter:
             return dst, f'ftoi<{u.scale}, {d}>({dst}, {self.vf(u.fs)})'
         if k == 'clip':
             return 'clip', f'clipFlags({self.vf(u.fs)}, {self.vf(u.ft)})'
+        if k == 'abs':
+            dst = f'vf{u.ft}' if u.ft else 'discard'
+            return dst, f'put<{d}>({dst}, _mm_and_ps({self.vf(u.fs)}, floats(_mm_set1_epi32(0x7FFFFFFF))))'
         raise GenError(f'upper {k} at {p.pc:#x} not written')
 
     def lower(self, n, p):
@@ -801,6 +839,17 @@ class Emitter:
             return [f'{vi(lo.it)} = static_cast<int32_t>({src} & static_cast<uint32_t>(static_cast<uint16_t>({vi(lo.is_)})));'] if lo.it else []
         if nm == 'xtop':
             return [f'{vi(lo.it)} = static_cast<int32_t>(top & 0x3FFu);'] if lo.it else []
+        if nm == 'xitop':
+            return [f'{vi(lo.it)} = static_cast<int32_t>(state.itop & 0x3FFu);'] if lo.it else []
+        if nm == 'mfir':
+            return [f'{vf(lo.ft)} = put<{lo.dest}>({vf(lo.ft)}, floats(_mm_set1_epi32(i16({vi(lo.is_)}))));'] if lo.ft else []
+        if nm == 'bal':
+            return [f'{vi(lo.it)} = {((p.pc + 16) & self.prog.mask) >> 3};'] if lo.it else []
+        if nm == 'fsset':
+            return []
+        if nm == 'fsand':
+            cur = '(status0 & 0xFu)' if n.stat_src is None else f'cur_{n.stat_src:04x}'
+            return [f'{vi(lo.it)} = static_cast<int32_t>((stickyAcc | {cur} | (f.hasDi ? f.di : (status0 & 0x30u))) & {lo.imm12:#x}u);'] if lo.it else []
         if nm == 'xgkick':
             return [f'path.begin({vi(lo.is_)}, t);']
         if nm == 'jr':
@@ -825,6 +874,13 @@ class Emitter:
     def label(self, n):
         return f'n{n.id}'
 
+    def land_status(self, landed):
+        for kind, pc in landed:
+            if kind == 'f':
+                self.out(f'stickyAcc |= (cur_{pc:04x} & 0xFu) << 6;')
+            else:
+                self.out(f'stickyAcc = {self.prog.pair(pc).lower.imm12 & 0xFC0:#x}u;')
+
     def emit_node(self, n):
         p = self.prog.pair(n.pc)
         self.out(f'{self.label(n)}:', 1)
@@ -847,6 +903,7 @@ class Emitter:
         if n.land_q:
             self.out('q = qPending;')
             self.out('landDi(f, diPending);')
+        self.land_status(n.landed)
         lower = self.lower(n, p)
         if n.save_backup:
             self.out(f'viBack = vi{n.save_backup};')
@@ -877,6 +934,7 @@ class Emitter:
             if fdiv:
                 self.out('q = qPending;')
                 self.out('landDi(f, diPending);')
+            self.land_status(n.end_flags)
             self.out(f'endCycle = t + 1 + {tail};')
             if kick:
                 self.out('if (path.pending)')
@@ -933,6 +991,9 @@ class Emitter:
         self.out('[[maybe_unused]] int32_t viBack = 0;', 1)
         self.out('[[maybe_unused]] uint32_t jrTarget = 0u;', 1)
         self.out('bool hasFmac = false;', 1)
+        if prog.track_status:
+            self.out('const uint32_t status0 = state.status;', 1)
+            self.out('uint32_t stickyAcc = status0 & 0xFC0u;', 1)
         self.out('int64_t t = -1;', 1)
         self.out('[[maybe_unused]] int64_t kickDone = 0, wait = 0;', 1)
         self.out('int64_t endCycle = 0;', 1)
@@ -996,7 +1057,10 @@ class Emitter:
         self.out('state.clip = clipWork;', 1)
         self.out('if (hasFmac)', 1)
         self.out('state.mac = lastMac;', 2)
-        self.out('state.status = f.status(state.status, hasFmac, lastCur);', 1)
+        if prog.track_status:
+            self.out('state.status = (f.status(state.status, hasFmac, lastCur) & 0x3Fu) | stickyAcc;', 1)
+        else:
+            self.out('state.status = f.status(state.status, hasFmac, lastCur);', 1)
         self.out('state.pc = endPc;', 1)
         self.out('return static_cast<uint64_t>(endCycle);', 1)
         self.out('}', 0)
