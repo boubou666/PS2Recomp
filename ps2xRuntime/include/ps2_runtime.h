@@ -288,6 +288,9 @@ public:
     }
     // Without waiting: presentation, which shows whatever is drawn by then.
     inline GS &gsForPresentation() { return m_gs; }
+    // The native GS renderer (GSNativeBackend: the GS stream as OpenGL draws), asked for by a game override, on the
+    // main thread after initialize(); PS2X_GS_RENDERER, when set, decides instead. True when it is in use.
+    bool requestNativeGsRenderer();
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
     inline VU1Interpreter &vu0() { return m_vu0; }
@@ -376,6 +379,8 @@ private:
     uint32_t m_guestHeapHardLimit = 0x01F00000u;
     bool m_guestHeapConfigured = false;
     bool m_guestHeapPinned = false;
+    bool useNativeGsRenderer();
+    bool m_nativeGsRenderer = false;
     uint64_t m_cop0CountBase = 0; // EE cycle at which Count read 0 (MTC0 Count moves it)
     uint32_t m_cop0Pccr = 0;
     uint64_t m_cop0PcrBase[2] = {}; // EE cycle at which the counter read 0, while counting

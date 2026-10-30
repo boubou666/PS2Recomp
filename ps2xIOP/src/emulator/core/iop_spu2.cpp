@@ -18,6 +18,8 @@ namespace ps2x::iop::detail
         constexpr uint32_t kOutputChunk = 256u;
         // Samples mixed in one go when nothing needs a tighter schedule (about 5 ms).
         constexpr uint64_t kBatchSamples = 256u;
+        constexpr size_t kWallClockMargin = 512u;
+        constexpr int64_t kWallClockCorrectionFrames = 4800;
         // Sound data input buffers (words): core n L at 0x2000 + n * 0x400, R 0x200 words further.
         constexpr uint32_t kInputBase = 0x2000u;
 
@@ -155,6 +157,9 @@ namespace ps2x::iop::detail
         m_nextSampleCycle = CyclesPerSample;
         m_reverbPhase = false;
         m_pending.clear();
+        m_pullFrames = 0u;
+        m_mixedSamples = 0u;
+        m_wallCyclesPerSample = CyclesPerSample;
         m_stats = Stats{};
         updateNextEvent();
     }
@@ -1008,6 +1013,7 @@ namespace ps2x::iop::detail
         m_pending.push_back(static_cast<int16_t>(out.right));
         m_stats.peak = std::max({m_stats.peak, std::abs(out.left), std::abs(out.right)});
         ++m_stats.samples;
+        ++m_mixedSamples;
         if (!m_wallClock && m_pending.size() >= kOutputChunk * 2u)
             flush();
     }
@@ -1039,16 +1045,55 @@ namespace ps2x::iop::detail
     void IopSpu2::pull(int16_t *frames, size_t count)
     {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
-        m_pending.clear();
-        for (size_t i = 0; i < count; ++i)
+        const size_t ready = std::min(m_pending.size() / 2u, count);
+        std::copy_n(m_pending.begin(), ready * 2u, frames);
+        m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(ready * 2u));
+        if (ready < count)
+        {
+            size_t mixed = ready;
+            for (; mixed < count && wallClockLead() < static_cast<int64_t>(kWallClockMargin); ++mixed)
+                renderSample();
+            std::copy_n(m_pending.begin(), (mixed - ready) * 2u, frames + ready * 2u);
+            std::fill(frames + mixed * 2u, frames + count * 2u, int16_t{0});
+            m_pending.clear();
+            m_stats.lateFrames += mixed - ready;
+            m_stats.gapFrames += count - mixed;
+        }
+        m_pullFrames = count;
+        const int64_t base = static_cast<int64_t>(CyclesPerSample);
+        const int64_t error = static_cast<int64_t>(m_pending.size() / 2u) - static_cast<int64_t>(kWallClockMargin);
+        m_wallCyclesPerSample = static_cast<uint64_t>(
+            std::clamp(base + base * error / kWallClockCorrectionFrames, base * 7 / 8, base * 9 / 8));
+    }
+
+    bool IopSpu2::wallClockQueueFull() const noexcept
+    {
+        return m_pending.size() / 2u >= m_pullFrames + 2u * kWallClockMargin;
+    }
+
+    int64_t IopSpu2::wallClockLead() const noexcept
+    {
+        return static_cast<int64_t>(m_mixedSamples) - static_cast<int64_t>(m_cycle / CyclesPerSample);
+    }
+
+    void IopSpu2::mixWallClock()
+    {
+        constexpr int64_t margin = static_cast<int64_t>(kWallClockMargin);
+        if (wallClockLead() < margin && !wallClockQueueFull())
             renderSample();
-        std::copy_n(m_pending.begin(), std::min(m_pending.size(), count * 2u), frames);
-        m_pending.clear();
+        while (wallClockLead() < -margin)
+            renderSample();
+        const size_t full = m_pullFrames + 2u * kWallClockMargin;
+        if (m_pending.size() / 2u >= full + kOutputChunk)
+        {
+            m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(kOutputChunk * 2u));
+            m_stats.droppedFrames += kOutputChunk;
+        }
     }
 
     void IopSpu2::flush()
     {
-        if (m_output && !m_pending.empty())
+        if (!m_wallClock && m_output && !m_pending.empty())
             m_output(m_pending.data(), m_pending.size() / 2u);
         m_pending.clear();
     }
@@ -1056,21 +1101,6 @@ namespace ps2x::iop::detail
     void IopSpu2::advanceTo(uint64_t cycle)
     {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
-        if (m_wallClock)
-        {
-            // Mixing is the audio callback's (pull): the IOP clock only ends the transfers that are not AutoDMA.
-            if (cycle > m_cycle)
-                m_cycle = cycle;
-            for (int coreIndex = 0; coreIndex < 2; ++coreIndex)
-            {
-                const Core &core = m_cores[coreIndex];
-                if (core.dmaBusy && !core.admaRunning && core.dmaCompletionCycle <= m_cycle)
-                    finishDma(coreIndex);
-            }
-            deliverDeferred();
-            updateNextEvent();
-            return;
-        }
         while (m_cycle < cycle)
         {
             uint64_t next = std::min(cycle, m_nextSampleCycle);
@@ -1086,26 +1116,24 @@ namespace ps2x::iop::detail
             }
             if (m_cycle >= m_nextSampleCycle)
             {
-                renderSample();
-                m_nextSampleCycle += CyclesPerSample;
+                if (m_wallClock)
+                    mixWallClock();
+                else
+                    renderSample();
+                m_nextSampleCycle += m_wallClock ? m_wallCyclesPerSample : CyclesPerSample;
             }
         }
+        if (m_wallClock)
+            deliverDeferred();
         updateNextEvent();
     }
 
     void IopSpu2::updateNextEvent() noexcept
     {
+        const uint64_t step = m_wallClock ? m_wallCyclesPerSample : CyclesPerSample;
+        uint64_t next = m_nextSampleCycle + (kBatchSamples - 1u) * step;
         if (m_wallClock)
-        {
-            // Often enough for the IOP to see the interrupts the mixing raised soon (1 ms of IOP time).
-            uint64_t next = m_cycle + SampleRate / 1000u * CyclesPerSample;
-            for (const Core &core : m_cores)
-                if (core.dmaBusy && !core.admaRunning)
-                    next = std::min(next, core.dmaCompletionCycle);
-            m_nextEvent = next;
-            return;
-        }
-        uint64_t next = m_nextSampleCycle + (kBatchSamples - 1u) * CyclesPerSample;
+            next = std::min(next, m_cycle + SampleRate / 1000u * CyclesPerSample);
         for (const Core &core : m_cores)
         {
             if ((core.attr & kAttrIrqEnable) != 0u)
@@ -1119,7 +1147,7 @@ namespace ps2x::iop::detail
             {
                 // The half-buffer boundary where the next chunk is fetched (and the DMA may end).
                 const uint64_t samples = 0xFFu - (core.inputPosition & 0xFFu);
-                next = std::min(next, m_nextSampleCycle + samples * CyclesPerSample);
+                next = std::min(next, m_nextSampleCycle + samples * step);
             }
         }
         m_nextEvent = next;
@@ -1135,7 +1163,10 @@ namespace ps2x::iop::detail
         out << "[SPU2] samples=" << m_stats.samples << " keyOn=" << m_stats.keyOns << " keyOff=" << m_stats.keyOffs
             << " dmaW=" << m_stats.dmaWrites << " (" << m_stats.dmaWriteBytes << " B) dmaR=" << m_stats.dmaReads
             << " adma=" << m_stats.admaTransfers << " (" << m_stats.admaBytes << " B, underruns "
-            << m_stats.admaUnderruns << ") io=" << m_stats.ioWrites << " irq=" << m_stats.irqs
+            << m_stats.admaUnderruns << ")";
+        if (m_wallClock)
+            out << " late=" << m_stats.lateFrames << " gap=" << m_stats.gapFrames << " drop=" << m_stats.droppedFrames;
+        out << " io=" << m_stats.ioWrites << " irq=" << m_stats.irqs
             << " regW=" << m_stats.registerWrites << " peak=" << m_stats.peak;
         lines.push_back(out.str());
         for (int coreIndex = 0; coreIndex < 2; ++coreIndex)

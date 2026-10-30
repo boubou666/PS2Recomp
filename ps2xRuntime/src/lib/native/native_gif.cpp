@@ -23,7 +23,7 @@ namespace ps2x::native
         {
             return a.tex0 == b.tex0 && a.texa == b.texa && a.textured == b.textured && a.blend == b.blend && a.alphaRef == b.alphaRef &&
                    a.alphaTest == b.alphaTest && a.depthTest == b.depthTest && a.depthWrite == b.depthWrite && a.fog == b.fog &&
-                   a.fogColour == b.fogColour && a.clampU == b.clampU && a.clampV == b.clampV;
+                   a.fogColour == b.fogColour && a.clampU == b.clampU && a.clampV == b.clampV && a.region == b.region;
         }
     }
 
@@ -133,6 +133,9 @@ namespace ps2x::native
 
     void GifToNative::write(uint32_t reg, uint64_t value, bool draw)
     {
+        // The drawing state a packet sets (not the vertex queue's registers), for the GS to set too (setGsWrites).
+        if (m_gsWrites && draw && reg >= 0x06u && reg != 0x0cu && reg != 0x0du)
+            m_pendingWrites.emplace_back(static_cast<uint8_t>(reg), value);
         switch (reg)
         {
         case 0x00: // PRIM: a new primitive
@@ -183,18 +186,24 @@ namespace ps2x::native
         k.fog = static_cast<float>(withFog ? (xyz >> 56) & 0xffu : m_fog) / 255.0f;
         k.rgba = static_cast<uint32_t>(m_rgbaq);
         const uint64_t tex0 = m_tex0[context];
+        const uint32_t tw = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu), th = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
         if ((attributes >> 8) & 1u) // FST: UV in texels (10.4)
         {
-            const float tw = static_cast<float>(1u << ((tex0 >> 26) & 0xfu)), th = static_cast<float>(1u << ((tex0 >> 30) & 0xfu));
-            k.u = static_cast<float>(m_uv & 0x3fffu) / 16.0f / tw;
-            k.v = static_cast<float>((m_uv >> 16) & 0x3fffu) / 16.0f / th;
+            k.u = static_cast<float>(m_uv & 0x3fffu) / 16.0f / static_cast<float>(tw);
+            k.v = static_cast<float>((m_uv >> 16) & 0x3fffu) / 16.0f / static_cast<float>(th);
         }
         else
         {
             const float q = asFloat(static_cast<uint32_t>(m_rgbaq >> 32));
             k.u = q != 0.0f ? m_s / q : m_s;
             k.v = q != 0.0f ? m_t / q : m_t;
+            k.q = q != 0.0f ? q : 1.0f;
         }
+        uint32_t offset = 0, extent = 0;
+        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
+            k.u = (k.u * static_cast<float>(tw) - static_cast<float>(offset)) / static_cast<float>(extent);
+        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
+            k.v = (k.v * static_cast<float>(th) - static_cast<float>(offset)) / static_cast<float>(extent);
 
         const uint32_t type = m_prim & 7u;
         switch (type)
@@ -259,18 +268,16 @@ namespace ps2x::native
         const uint32_t wms = m_clamp[context] & 3u, wmt = (m_clamp[context] >> 2) & 3u;
         m.clampU = wms == 1u || wms == 2u; // CLAMP, REGION_CLAMP (its region taken as the texture)
         m.clampV = wmt == 1u || wmt == 2u;
+        if (m.textured && (wms >= 2u || wmt >= 2u))
+            m.region = m_clamp[context];
         m.blend = Material::Blend::Opaque;
         if ((attributes >> 6) & 1u) // ABE
-        {
-            const uint64_t alpha = m_alpha[context];
-            const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
-            m.blend = a == 0u && b == 2u && d == 1u ? Material::Blend::Additive : Material::Blend::Alpha;
-        }
+            m.blend = blendOf(m_alpha[context]);
         const uint64_t test = m_test[context];
         const bool alphaTest = test & 1u;
         const uint32_t atst = (test >> 1) & 7u, aref = (test >> 4) & 0xffu, afail = (test >> 12) & 3u;
         m.depthWrite = !((m_zbuf[context] >> 32) & 1u);
-        if (alphaTest && atst == 0u && afail == 1u) // never passes, the colour still written (FB_ONLY): no depth
+        if (alphaTest && atst == 0u && (afail == 1u || afail == 3u)) // never passes, the colour still written (FB_ONLY, RGB_ONLY): no depth
             m.depthWrite = false;
         else if (alphaTest && (atst == 5u || atst == 6u)) // GEQUAL, GREATER
         {
@@ -346,20 +353,32 @@ namespace ps2x::native
         const uint64_t attributes = m_prmodecont ? m_prim : m_prmode;
         const int context = (attributes >> 9) & 1u;
         const uint64_t test = m_test[context];
-        if ((test & 1u) && ((test >> 1) & 7u) == 0u && ((test >> 12) & 3u) != 1u)
-            return; // the alpha test never passes and nothing is written (KEEP), or only depth (ZB_ONLY)
+        const uint32_t afail = (test >> 12) & 3u;
+        if ((test & 1u) && ((test >> 1) & 7u) == 0u && (afail == 0u || (afail == 2u && !m_gsWrites)))
+            return; // the alpha test never passes and nothing is written (KEEP), or only depth (ZB_ONLY) the material cannot mask
         if (((test >> 16) & 1u) && ((test >> 17) & 3u) == 0u)
             return; // depth test NEVER
-        const Material m = material();
-        if (!m_batchOpen || !sameMaterial(m, m_batchMaterial))
+        Material m = material();
+        if (m_gsWrites)
+        {
+            m.fromGsContext = true;
+            m.context = static_cast<uint8_t>(context);
+            m.alphaBlend = (attributes >> 6) & 1u;
+        }
+        if (!m_batchOpen || !sameMaterial(m, m_batchMaterial) || !m_pendingWrites.empty())
         {
             flush();
             m_batchMaterial = m;
             m_batchOpen = true;
+            if (!m_pendingWrites.empty())
+            {
+                m_batchMaterial.gsWrites = std::make_shared<const std::vector<std::pair<uint8_t, uint64_t>>>(std::move(m_pendingWrites));
+                m_pendingWrites.clear();
+            }
         }
         // A constant alpha (ALPHA.C = FIX) stands in for the source alpha.
         const uint64_t alpha = m_alpha[context];
-        const bool fixedAlpha = m.blend != Material::Blend::Opaque && ((alpha >> 4) & 3u) == 2u;
+        const bool fixedAlpha = !m_gsWrites && m.blend != Material::Blend::Opaque && ((alpha >> 4) & 3u) == 2u;
         const bool flat = !((attributes >> 3) & 1u); // IIP = 0: the last vertex's colour
         auto out = [&](const Kick &k, uint32_t rgba)
         {
@@ -369,6 +388,7 @@ namespace ps2x::native
             v.z = k.z;
             v.u = k.u;
             v.v = k.v;
+            v.q = m_gsWrites ? k.q : 1.0f;
             v.fog = k.fog;
             v.rgba = fixedAlpha ? (rgba & 0x00ffffffu) | (static_cast<uint32_t>((alpha >> 32) & 0xffu) << 24) : rgba;
             m_triangles.push_back(v);
@@ -386,12 +406,13 @@ namespace ps2x::native
         if (count == 2 && type == 6)
         {
             const Kick &a = kicks[0], &b = kicks[1];
+            const float au = a.u * a.q / b.q, av = a.v * a.q / b.q;
             corner[0] = b;
-            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = a.u, corner[0].v = a.v;
+            corner[0].x = a.x, corner[0].y = a.y, corner[0].u = au, corner[0].v = av;
             corner[1] = b;
-            corner[1].y = a.y, corner[1].v = a.v;
+            corner[1].y = a.y, corner[1].v = av;
             corner[2] = b;
-            corner[2].x = a.x, corner[2].u = a.u;
+            corner[2].x = a.x, corner[2].u = au;
             corner[3] = b;
             for (Kick &c : corner)
                 c.rgba = last;

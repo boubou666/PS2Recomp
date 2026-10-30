@@ -31,11 +31,16 @@ namespace ps2x::native
         void flush();
         // What the next packets come from (a microprogram's address, for PS2X_NATIVE_LOG_GIF=2's statistics).
         void setSource(uint32_t source) { m_source = source; }
+        // Draws for a GS renderer that keeps its own textures and targets (the native GL one): primitives become
+        // fromGsContext batches, drawn by the GS front end with its state at their group's marker, each carrying the
+        // register writes its packet made since the batch before (Material::gsWrites). Textures, CLUTs, render
+        // targets and blending are then the GS renderer's, as for the GS's own draws.
+        void setGsWrites(bool on) { m_gsWrites = on; }
 
     private:
         struct Kick
         {
-            float x = 0, y = 0, z = 0, u = 0, v = 0, fog = 1.0f;
+            float x = 0, y = 0, z = 0, u = 0, v = 0, fog = 1.0f, q = 1.0f;
             uint32_t rgba = 0;
         };
         void parse(const uint8_t *data, size_t bytes, bool draw);
@@ -57,6 +62,8 @@ namespace ps2x::native
         bool m_batchOpen = false;
         std::vector<Vertex> m_triangles;
         uint32_t m_source = 0;
+        bool m_gsWrites = false;
+        std::vector<std::pair<uint8_t, uint64_t>> m_pendingWrites; // setGsWrites: the packets' writes not yet drawn with
     };
 }
 

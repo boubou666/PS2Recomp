@@ -30,7 +30,8 @@ public:
     // played through one raylib stream that follows the emulation speed.
     void pushSpu2Frames(const int16_t *frames, size_t count);
     // Adds host audio (e.g. a movie soundtrack) into the SPU2 output, in place, so it follows
-    // emulated time. Called on the thread that pushes SPU2 frames.
+    // emulated time. Called on the thread that pushes SPU2 frames, or the audio callback's with the SPU2 on the
+    // wall clock (setSpu2Source).
     using Spu2Mixer = std::function<void(int16_t *frames, size_t count)>;
     void setSpu2Mixer(Spu2Mixer mixer);
     // The SPU2 on the wall clock: the stream's callback takes its frames from source as it plays them (no time

@@ -76,7 +76,12 @@ talks to the GS through the same GIF/register interface, so nothing here is game
   whose TBP is a live render target samples that GPU texture directly (feedback effects: blur, bloom, DOF).
 - **Shading:** one shader family with specialisation by state: TFX (modulate/decal/highlight/highlight2), TCC,
   texture function, alpha test and its fail modes, fog, FBA, dithering. GS blending (A-B)*C+D maps to fixed-function
-  blending for the common cases; the rest uses a framebuffer copy and a shader blend.
+  blending for the common cases; the rest uses a framebuffer copy and a shader blend. With COLCLAMP off, a blend that
+  adds or subtracts two colours runs on a float copy of the target and is written back modulo 256, as the GS keeps
+  the low 8 bits (Soulcalibur III counts its shadow volumes that way).
+- **Z from a colour target:** a draw whose ZBUF is another target's colour tests against that colour read as Z, in
+  the Z format's block order (Z16S blocks are the CT16S ones XOR 24), so a mask copied through a Z-format texture
+  read comes back in place.
 - **Transfers:** host-to-local writes the shadow and invalidates; local-to-local copies run on the GPU;
   local-to-host (readbacks, e.g. VP2's per-frame StoreImage) reads the render target back (one sync per readback,
   later async with a frame of latency where the game allows).
@@ -132,9 +137,21 @@ interpreted, the way the EE's code is recompiled.
 
 ## Sound on the wall clock (native/renderer)
 
-`PS2X_SPU2_WALLCLOCK=1`: the SPU2 mixes when the host's audio callback asks for frames, at 48 kHz of real time, as
-the console's SPU2 runs on its own clock whatever the CPUs do. Voices, envelopes, the AutoDMA input and reverb
-advance by the frames played, not by IOP cycles or the game's frame rate; transfers that are not AutoDMA still end
-on the IOP clock (`PS2X_SPU2_DMA_CYCLES_PER_2BYTES`), and the interrupts the mixing raises reach the IOP at its next
-advance (within 1 ms of IOP time). Register and DMA accesses and the mixing share a lock. Without the switch the
-SPU2 mixes a sample per 768 IOP cycles and the host stretches the output to its rate, as before.
+`PS2X_SPU2_WALLCLOCK=1`: the SPU2 runs at 48 kHz of real time, the rate the host's audio device plays, as the
+console's SPU2 runs on its own clock whatever the CPUs do. The IOP's advances mix sample by sample into a queue the
+host's audio callback takes its frames from, so an AutoDMA half (256 samples, 5.3 ms) ends, raises its interrupt and
+is refilled by the driver before the next one plays, as on the console, even though the callback takes several
+hundred frames at once (up to 1024, 21 ms). The queue's depth paces the SPU2: it aims at one pull plus 512 frames
+ahead (the IOP's advances can be ~10 ms apart in real time), the samples coming up to 12.5% faster or slower on the
+IOP clock to keep it there, and the SPU2 stops while the queue holds a pull plus 1024 frames: the sound is about
+15 ms behind the IOP on average, 30 to 43 ms at most depending on the device's pull. Frames the queue lacks when the
+callback pulls (the IOP late or slower than real time) are mixed by the callback itself, their interrupts reaching
+the IOP at its next advance; the state dump's `late=` counts them. Either way the SPU2 stays within 512 samples
+(10.7 ms) of the IOP clock, since games fill their sound streams on that clock and a sound data input that runs
+further ahead plays what is not written yet (white noise on a movie's PCM): the callback plays silence for the frames
+it cannot mix that far ahead (`gap=`), and an SPU2 that a full queue held 512 samples behind mixes on while the queue
+drops its oldest frames (`drop=`). An IOP slower than real time is thus heard at its own pace with short silences.
+Transfers that are not AutoDMA end on the IOP
+clock (`PS2X_SPU2_DMA_CYCLES_PER_2BYTES`). Register and DMA accesses and the mixing share a lock. Best with
+`PS2X_IOP_WALLCLOCK=1`, which keeps the IOP's time on the host's. Without the switch the SPU2 mixes a sample per 768
+IOP cycles and the host stretches the output to its rate, as before.

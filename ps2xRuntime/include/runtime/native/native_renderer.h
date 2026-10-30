@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ps2x::native
@@ -28,6 +29,8 @@ namespace ps2x::native
         float u = 0, v = 0;        // texture coordinates, 0..1 across the texture (the GS's S / Q, T / Q)
         uint32_t rgba = 0;         // lit colour, R in the low byte; 0x80 per channel is 1.0, as the GS modulates
         float fog = 1.0f;          // the GS's F / 255: 1 keeps the colour, 0 is all fog colour (Material::fog)
+        float q = 1.0f;            // the GS's Q, for a draw the GS front end makes (fromGsContext): U / V across the
+                                   // triangle in perspective, as the GS interpolates S, T and Q
     };
 
     // How a draw blends and tests, from the GS registers a game sets (ALPHA, TEST) reduced to what a PC GPU does.
@@ -41,12 +44,14 @@ namespace ps2x::native
             Opaque,   // no blending
             Alpha,    // (Cs - Cd) * As + Cd
             Additive, // Cs * As + Cd
+            AdditiveByDestination, // Cs * Ad + Cd, Ad the target's alpha (0x80 is 1.0)
         } blend = Blend::Alpha;
         uint8_t alphaRef = 0;   // texels at or below are discarded when alphaTest
         bool alphaTest = false;
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
         bool depthWrite = true;
         bool clampU = false, clampV = false; // CLAMP's WMS / WMT: the texture's edge past 0..1 (else it repeats)
+        uint64_t region = 0; // CLAMP, for a REGION_REPEAT window (TextureCache::regionWindow): the texture is that window
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
         // The GS state where the draw's group sits in the stream (a stream draw, beginGroup) gives tex0, texa, blend,
@@ -55,7 +60,14 @@ namespace ps2x::native
         bool fromGsContext = false;
         bool alphaBlend = true;
         uint8_t context = 0; // PRIM.CTXT of a fromGsContext draw
+        // GS register writes (address, value) the GS front end makes before a fromGsContext draw, in order: the A+D
+        // and packed register writes of the packet it came from (a sandboxed microprogram's TEX0 with its CLUT load,
+        // CLAMP, TEX1, ALPHA, ...), so it draws with the state the packet would have set. Not part of batching.
+        std::shared_ptr<const std::vector<std::pair<uint8_t, uint64_t>>> gsWrites;
     };
+
+    // The blend of a draw with PRIM.ABE set, from the GS's ALPHA register.
+    Material::Blend blendOf(uint64_t alpha);
 
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size
     // that fills the window (the GS XYOFFSET and the frame size; a 640 x 448 / 512 or 640 x 256 picture).
