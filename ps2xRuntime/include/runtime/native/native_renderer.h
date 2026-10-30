@@ -41,21 +41,35 @@ namespace ps2x::native
             Opaque,   // no blending
             Alpha,    // (Cs - Cd) * As + Cd
             Additive, // Cs * As + Cd
+            Subtract, // Cd - Cs * As
+            Darken,   // Cd * (1 - As)
+            Brighten, // Cd * (1 + As)
         } blend = Blend::Alpha;
         uint8_t alphaRef = 0;   // texels at or below are discarded when alphaTest
         bool alphaTest = false;
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
         bool depthWrite = true;
         bool clampU = false, clampV = false; // CLAMP's WMS / WMT: the texture's edge past 0..1 (else it repeats)
+        // The CLAMP register as written, for its region modes (WMS / WMT 2 REGION_CLAMP to MINU..MAXU, 3 REGION_REPEAT
+        // (u & MINU) | MAXU): a texture atlas's part. 0: clampU / clampV alone.
+        uint64_t clamp = 0;
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
         // The GS state where the draw's group sits in the stream (a stream draw, beginGroup) gives tex0, texa, blend,
         // the alpha and depth tests, clampU / clampV and fogColour, for games whose meshes take their material from
         // GS packets around them; textured, fog and alphaBlend (PRIM.ABE) stay the draw's own.
         bool fromGsContext = false;
+        // A draw with its own material but the fog colour and TEXA the GS has where it sits (FOGCOL, TEXA: registers
+        // a game may set outside the data its adapter reads).
+        bool fogColourFromGs = false;
+        bool texaFromGs = false;
         bool alphaBlend = true;
         uint8_t context = 0; // PRIM.CTXT of a fromGsContext draw
     };
+
+    // The blend of a draw whose PRIM.ABE is set, from the GS's ALPHA register ((A - B) * C + D): Opaque when A = B,
+    // else the matching mode (C = As or FIX, taken as As); Alpha for a combination these modes do not cover.
+    Material::Blend blendFromAlpha(uint64_t alpha);
 
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size
     // that fills the window (the GS XYOFFSET and the frame size; a 640 x 448 / 512 or 640 x 256 picture).

@@ -61,11 +61,28 @@ uniform int uOpaque;
 uniform int uFog;
 uniform vec3 uFogColour;
 uniform int uDebug;
+uniform int uAlphaAsColour;
+uniform ivec2 uWrap;      // CLAMP WMS / WMT: 0 repeat, 1 clamp, 2 region clamp, 3 region repeat
+uniform ivec4 uRegion;    // MINU, MAXU, MINV, MAXV
+uniform vec2 uTexSize;
 out vec4 fragColor;
+float wrap(float t, int mode, int lo, int hi, float size)
+{
+    if (mode == 2)
+        return clamp(t * size, float(lo) + 0.5, float(hi) + 0.5) / size;
+    if (mode == 3)
+    {
+        float f = t * size;
+        int i = int(floor(f));
+        return (float((i & lo) | hi) + fract(f)) / size;
+    }
+    return t;
+}
 void main()
 {
     vec4 colour = vCol * (255.0 / 128.0);
-    vec4 texel = uTextured != 0 ? texture(uTex, vUv) : vec4(1.0);
+    vec2 uv = vec2(wrap(vUv.x, uWrap.x, uRegion.x, uRegion.y, uTexSize.x), wrap(vUv.y, uWrap.y, uRegion.z, uRegion.w, uTexSize.y));
+    vec4 texel = uTextured != 0 ? texture(uTex, uv) : vec4(1.0);
     vec4 c = clamp(texel * colour, 0.0, 1.0);
     if (uAlphaTest != 0 && c.a <= uAlphaRef)
         discard;
@@ -73,6 +90,8 @@ void main()
         c.rgb = mix(uFogColour, c.rgb, clamp(vFog, 0.0, 1.0));
     if (uOpaque != 0)
         c.a *= 128.0 / 255.0;
+    if (uAlphaAsColour != 0)
+        c.rgb = vec3(c.a);
     if (uDebug != 0)
         c = vec4(1.0, 0.0, 1.0, 128.0 / 255.0);
     fragColor = c;
@@ -102,7 +121,8 @@ void main()
     {
         GLuint program = 0, vao = 0, vbo = 0;
         GLint locM = -1, locOffset = -1, locTargetSize = -1, locDepthScale = -1, locTex = -1, locTextured = -1;
-        GLint locAlphaTest = -1, locAlphaRef = -1, locOpaque = -1, locFog = -1, locFogColour = -1;
+        GLint locAlphaTest = -1, locAlphaRef = -1, locOpaque = -1, locFog = -1, locFogColour = -1, locAlphaAsColour = -1;
+        GLint locWrap = -1, locRegion = -1, locTexSize = -1;
         bool failed = false;
         struct GpuTexture
         {
@@ -135,6 +155,10 @@ void main()
             locAlphaTest = glGetUniformLocation(program, "uAlphaTest");
             locAlphaRef = glGetUniformLocation(program, "uAlphaRef");
             locOpaque = glGetUniformLocation(program, "uOpaque");
+            locAlphaAsColour = glGetUniformLocation(program, "uAlphaAsColour");
+            locWrap = glGetUniformLocation(program, "uWrap");
+            locRegion = glGetUniformLocation(program, "uRegion");
+            locTexSize = glGetUniformLocation(program, "uTexSize");
             locFog = glGetUniformLocation(program, "uFog");
             locFogColour = glGetUniformLocation(program, "uFogColour");
             glGenVertexArrays(1, &vao);
@@ -242,15 +266,7 @@ void main()
         {
             m.tex0 = target.tex0;
             m.texa = target.texa;
-            const uint32_t a = target.alpha & 3u, b = (target.alpha >> 2) & 3u, c = (target.alpha >> 4) & 3u,
-                           d = (target.alpha >> 6) & 3u;
-            if (!m.alphaBlend)
-                m.blend = Material::Blend::Opaque;
-            else if (a == 0u && b == 2u && d == 1u) // (Cs - 0) * As/FIX + Cd
-                m.blend = Material::Blend::Additive;
-            else
-                m.blend = Material::Blend::Alpha; // (Cs - Cd) * As + Cd, and the cases this renderer does not have
-            (void)c;
+            m.blend = m.alphaBlend ? blendFromAlpha(target.alpha) : Material::Blend::Opaque;
             const bool ate = target.test & 1u;
             const uint32_t atst = (target.test >> 1) & 7u, aref = (target.test >> 4) & 0xFFu;
             m.alphaTest = ate && (atst == 5u || atst == 6u); // GEQUAL / GREATER (the others: drawn as always)
@@ -261,9 +277,29 @@ void main()
             m.depthWrite = !target.zmask;
             m.clampU = (target.clamp & 3u) == 1u;
             m.clampV = ((target.clamp >> 2) & 3u) == 1u;
+            m.clamp = target.clamp;
             m.fogColour = target.fogcol;
             return m;
         }
+    }
+
+    Material::Blend blendFromAlpha(uint64_t alpha)
+    {
+        // A, B, D: 0 Cs, 1 Cd, 2 zero; C: 0 As, 1 Ad, 2 FIX.
+        const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
+        if (a == b)
+            return Material::Blend::Opaque; // 0 * C + D: D, Cs as it is for the D = Cs games use
+        if (a == 0u && b == 1u && d == 1u)
+            return Material::Blend::Alpha;
+        if (a == 0u && b == 2u && d == 1u)
+            return Material::Blend::Additive;
+        if (a == 2u && b == 0u && d == 1u)
+            return Material::Blend::Subtract;
+        if (a == 2u && b == 1u && d == 1u)
+            return Material::Blend::Darken;
+        if (a == 1u && b == 2u && d == 1u)
+            return Material::Blend::Brighten;
+        return Material::Blend::Alpha;
     }
 
     void Renderer::gsDraw(uint64_t group, const GsDrawTarget &target)
@@ -442,7 +478,9 @@ void main()
         GLint first = 0;
         for (const StreamBatch &entry : batches)
         {
-            const Material m = entry.batch.material.fromGsContext ? materialFromGs(entry.batch.material, target) : entry.batch.material;
+            Material m = entry.batch.material.fromGsContext ? materialFromGs(entry.batch.material, target) : entry.batch.material;
+            if (m.texaFromGs)
+                m.texa = target.texa;
             const GLsizei count = static_cast<GLsizei>(entry.vertices.size());
             glUniform1f(pass.locDepthScale, static_cast<float>(entry.gsZScale * target.zScale));
             glUniform4fv(pass.locM, 4, entry.batch.matrix);
@@ -456,21 +494,49 @@ void main()
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, m.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
             }
+            // The region modes in the shader (a sub-rectangle of the texture, clamped or repeated); the plain modes
+            // stay the sampler's.
+            const int wms = static_cast<int>(m.clamp & 3u), wmt = static_cast<int>((m.clamp >> 2) & 3u);
+            glUniform2i(pass.locWrap, textured && wms >= 2 ? wms : 0, textured && wmt >= 2 ? wmt : 0);
+            glUniform4i(pass.locRegion, static_cast<int>((m.clamp >> 4) & 0x3FFu), static_cast<int>((m.clamp >> 14) & 0x3FFu),
+                        static_cast<int>((m.clamp >> 24) & 0x3FFu), static_cast<int>((m.clamp >> 34) & 0x3FFu));
+            glUniform2f(pass.locTexSize, textured ? static_cast<float>(texture->width) : 1.0f,
+                        textured ? static_cast<float>(texture->height) : 1.0f);
             glUniform1i(pass.locTextured, textured ? 1 : 0);
             glUniform1i(pass.locAlphaTest, m.alphaTest ? 1 : 0);
             glUniform1f(pass.locAlphaRef, m.alphaRef / 128.0f);
             glUniform1i(pass.locOpaque, m.blend == Material::Blend::Opaque ? 1 : 0);
             glUniform1i(pass.locFog, m.fog ? 1 : 0);
-            const float fogColour[3] = {static_cast<float>(m.fogColour & 0xffu) / 255.0f, static_cast<float>((m.fogColour >> 8) & 0xffu) / 255.0f,
-                                        static_cast<float>((m.fogColour >> 16) & 0xffu) / 255.0f};
+            const uint32_t fog = m.fogColourFromGs ? target.fogcol : m.fogColour;
+            const float fogColour[3] = {static_cast<float>(fog & 0xffu) / 255.0f, static_cast<float>((fog >> 8) & 0xffu) / 255.0f,
+                                        static_cast<float>((fog >> 16) & 0xffu) / 255.0f};
             glUniform3fv(pass.locFogColour, 1, fogColour);
-            if (m.blend == Material::Blend::Opaque)
-                glDisable(GL_BLEND);
-            else
+            glUniform1i(pass.locAlphaAsColour, m.blend == Material::Blend::Brighten ? 1 : 0);
+            switch (m.blend)
             {
+            case Material::Blend::Opaque:
+                glDisable(GL_BLEND);
+                break;
+            case Material::Blend::Subtract: // Cd - Cs * As
+                glEnable(GL_BLEND);
+                glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+                break;
+            case Material::Blend::Darken: // Cd * (1 - As)
+                glEnable(GL_BLEND);
+                glBlendEquation(GL_FUNC_ADD);
+                glBlendFuncSeparate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                break;
+            case Material::Blend::Brighten: // Cd + Cd * As: the shader outputs As as the colour, times Cd
+                glEnable(GL_BLEND);
+                glBlendEquation(GL_FUNC_ADD);
+                glBlendFuncSeparate(GL_DST_COLOR, GL_ONE, GL_ZERO, GL_ONE);
+                break;
+            default:
                 glEnable(GL_BLEND);
                 glBlendEquation(GL_FUNC_ADD);
                 glBlendFuncSeparate(GL_SRC_ALPHA, m.blend == Material::Blend::Additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                break;
             }
             if (m.depthTest)
             {
