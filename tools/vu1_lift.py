@@ -723,6 +723,7 @@ class Emitter:
         self.lines = []
         self.need_mac = set()
         self.need_clip = set()
+        self.need_stk = set()
         self.uses_r = any(p is not None and p.lower.name in ('rget', 'rinit') for p in prog.pairs)
         for n in prog.nodes:
             if n.mac_src is not None:
@@ -733,7 +734,7 @@ class Emitter:
                 self.need_mac.add(n.end[3])
             for kind, pc in n.landed + list(n.end_flags):
                 if kind == 'f':
-                    self.need_mac.add(pc)
+                    self.need_stk.add(pc)
             if n.stat_src is not None:
                 self.need_mac.add(n.stat_src)
 
@@ -766,6 +767,8 @@ class Emitter:
                 right, rkind = 'iReg', 'Scalar'
             live = p.pc in self.need_mac and d != 0
             flags = f'mac_{p.pc:04x}, cur_{p.pc:04x}' if live else 'unusedMac, unusedCur'
+            if self.prog.track_status and p.pc in self.need_stk:
+                flags += f', &stk_{p.pc:04x}'
             expr = (f'fmac<Op::{CPP_OPS[u.fmac]}, R::{rkind}, {d}, kSticky, {"true" if live else "false"}>'
                     f'(f, {dst}, {self.vf(u.fs)}, {right}, acc, {flags})')
             return dst, expr
@@ -909,7 +912,7 @@ class Emitter:
     def land_status(self, landed):
         for kind, pc in landed:
             if kind == 'f':
-                self.out(f'stickyAcc |= (cur_{pc:04x} & 0xFu) << 6;')
+                self.out(f'stickyAcc |= stk_{pc:04x} << 6;')
             else:
                 self.out(f'stickyAcc = {self.prog.pair(pc).lower.imm12 & 0xFC0:#x}u;')
 
@@ -1036,6 +1039,8 @@ class Emitter:
         self.out('int64_t endCycle = 0;', 1)
         for pc in sorted(self.need_mac):
             self.out(f'uint32_t mac_{pc:04x} = 0u, cur_{pc:04x} = 0u;', 1)
+        for pc in sorted(self.need_stk):
+            self.out(f'uint32_t stk_{pc:04x} = 0u;', 1)
         for pc in sorted(self.need_clip):
             self.out(f'uint32_t clip_{pc:04x} = 0u;', 1)
         self.out('switch (entry)', 1)

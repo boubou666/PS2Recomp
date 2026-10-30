@@ -144,7 +144,7 @@ namespace ps2x::vu1lift
     }
 
     __attribute__((noinline, cold)) inline __m128 fmacCold(Fmac &f, __m128 value, int dest, ps2_vu1_detail::FmacKind kind, __m128 left,
-                                                         __m128 right, __m128 acc, uint32_t &mac, uint32_t &cur)
+                                                         __m128 right, __m128 acc, uint32_t &mac, uint32_t &cur, uint32_t &stk)
     {
         alignas(16) float result[4];
         _mm_store_ps(result, value);
@@ -154,11 +154,15 @@ namespace ps2x::vu1lift
         Vu1Lifted::fmacFlags(result, static_cast<uint8_t>(dest), operation, left, right, acc, mac, status, sticky);
         f.sticky |= status | sticky;
         cur = status;
+        stk = (status | sticky) & 0xFu;
         return _mm_load_ps(result);
     }
 
+    // stk, when given: the status bits this instruction adds to the sticky flags once its flag write lands (a zero or
+    // negative product of a multiply-add counts, as the sticky bits it gathers into f do).
     template <Op kOp, R kRight, int kDest, bool kSticky, bool kLive, typename Right>
-    inline __m128 fmac(Fmac &f, __m128 target, __m128 vs, Right vt, __m128 accIn, uint32_t &mac, uint32_t &cur)
+    inline __m128 fmac(Fmac &f, __m128 target, __m128 vs, Right vt, __m128 accIn, uint32_t &mac, uint32_t &cur,
+                       uint32_t *stk = nullptr)
     {
         constexpr int kActive = lanes(kDest);
         constexpr bool kProductSum = kOp == Op::Madd || kOp == Op::Msub || kOp == Op::CrossMsub;
@@ -222,17 +226,23 @@ namespace ps2x::vu1lift
             _mm_or_si128(_mm_andnot_si128(_mm_or_si128(inRange, _mm_and_si128(zeroResult, zeroExact)), activeLanes), oddProduct);
         if (_mm_movemask_ps(floats(exact)) != 0) [[unlikely]]
         {
-            uint32_t m = 0u, c = 0u;
-            value = fmacCold(f, value, kDest, fmacKind(kOp), left, right, a, m, c);
+            uint32_t m = 0u, c = 0u, k = 0u;
+            value = fmacCold(f, value, kDest, fmacKind(kOp), left, right, a, m, c, k);
             if constexpr (kLive)
                 mac = m, cur = c;
+            if (stk)
+                *stk = k;
             return put<kDest>(target, value);
         }
+        const __m128i stickySign = _mm_and_si128(negative, activeLanes);
+        const __m128i stickyZero = _mm_and_si128(kProductSum ? _mm_or_si128(zeroResult, zeroProduct) : zeroResult, activeLanes);
         if constexpr (kSticky)
         {
-            f.stickySign = _mm_or_si128(f.stickySign, _mm_and_si128(negative, activeLanes));
-            f.stickyZero = _mm_or_si128(f.stickyZero, _mm_and_si128(kProductSum ? _mm_or_si128(zeroResult, zeroProduct) : zeroResult, activeLanes));
+            f.stickySign = _mm_or_si128(f.stickySign, stickySign);
+            f.stickyZero = _mm_or_si128(f.stickyZero, stickyZero);
         }
+        if (stk)
+            *stk = (_mm_movemask_ps(floats(stickyZero)) != 0 ? 0x1u : 0u) | (_mm_movemask_ps(floats(stickySign)) != 0 ? 0x2u : 0u);
         if constexpr (kLive)
         {
             static constexpr uint8_t kReverse4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE, 0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
