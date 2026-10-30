@@ -128,6 +128,13 @@ namespace ps2x::native
 
     bool uploadsWanted() { return g_uploadsWanted.load(std::memory_order_relaxed); }
     void setUploadsWanted(bool wanted) { g_uploadsWanted.store(wanted, std::memory_order_relaxed); }
+    namespace
+    {
+        std::atomic<bool> g_uploadsInStreamOrder{false};
+    }
+    void setUploadsInStreamOrder(bool inOrder) { g_uploadsInStreamOrder.store(inOrder, std::memory_order_relaxed); }
+    bool uploadsAtSubmit() { return uploadsWanted() && !g_uploadsInStreamOrder.load(std::memory_order_relaxed); }
+    bool uploadsInStreamOrder() { return uploadsWanted() && g_uploadsInStreamOrder.load(std::memory_order_relaxed); }
 
     TextureCache::TextureCache()
         : m_memory(kMemoryBytes, 0u), m_pageGeneration(kMemoryBytes / kPageBytes, 0u)

@@ -608,6 +608,14 @@ void GS::workerLoop()
         }
         if (queueTraceActive())
             traceQueuedCommand(command);
+        // The native textures in stream order (setUploadsInStreamOrder): the uploads as the GS reaches them.
+        if (!m_isShadow && ps2x::native::uploadsInStreamOrder() && size != 0u)
+        {
+            if (command.kind == QueuedCommand::Kind::GifPacket || command.kind == QueuedCommand::Kind::NativePackedGifPacket)
+                ps2x::native::textures().scanGifPacket(data, size);
+            else if (command.kind == QueuedCommand::Kind::NativeImageUpload && (command.registers[3] & 3u) == 0u)
+                ps2x::native::textures().upload(command.registers[0], command.registers[1], command.registers[2], data, size);
+        }
         if (m_parallel)
             processWithParallel(command);
         else
@@ -674,10 +682,12 @@ void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     if (!data || sizeBytes < 16u)
         return;
-    if (ps2x::native::uploadsWanted()) // the native textures: the game's own uploads
+    if (ps2x::native::uploadsAtSubmit()) // the native textures: the game's own uploads
         ps2x::native::textures().scanGifPacket(data, sizeBytes);
     if (!shouldQueue())
     {
+        if (ps2x::native::uploadsInStreamOrder())
+            ps2x::native::textures().scanGifPacket(data, sizeBytes);
         processGIFPacket(data, sizeBytes);
         return;
     }
@@ -1766,10 +1776,14 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (data && sizeBytes >= 16u && ps2x::native::uploadsWanted())
+    if (data && sizeBytes >= 16u && ps2x::native::uploadsAtSubmit())
         ps2x::native::textures().scanGifPacket(data, sizeBytes);
     if (!shouldQueue())
+    {
+        if (data && sizeBytes >= 16u && ps2x::native::uploadsInStreamOrder())
+            ps2x::native::textures().scanGifPacket(data, sizeBytes);
         return processNativePackedGIFPacketNow(data, sizeBytes);
+    }
     // Validation only looks at the packet, so the EE can still fall back when it fails.
     if (!data || sizeBytes < 16u || !m_backend || !validatePackedGifPacket(data, sizeBytes))
         return false;
@@ -1839,10 +1853,12 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
-    if (data && sizeBytes != 0u && (trxdir & 3u) == 0u && ps2x::native::uploadsWanted())
+    if (data && sizeBytes != 0u && (trxdir & 3u) == 0u && ps2x::native::uploadsAtSubmit())
         ps2x::native::textures().upload(bitbltbuf, trxpos, trxreg, data, sizeBytes);
     if (!shouldQueue())
     {
+        if (data && sizeBytes != 0u && (trxdir & 3u) == 0u && ps2x::native::uploadsInStreamOrder())
+            ps2x::native::textures().upload(bitbltbuf, trxpos, trxreg, data, sizeBytes);
         uploadImageNativeNow(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
         return;
     }

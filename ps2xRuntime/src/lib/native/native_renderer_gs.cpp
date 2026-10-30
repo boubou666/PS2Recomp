@@ -286,6 +286,7 @@ void main()
     {
         m_streamDraws = on;
         setGsDrawHook(on ? &Renderer::gsDraw : nullptr);
+        setUploadsInStreamOrder(on);
     }
 
     bool Renderer::takeGsContextBatches(uint64_t group, StreamVisitor visit, void *user)
