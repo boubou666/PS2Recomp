@@ -44,6 +44,10 @@ namespace ps2x::native
             Subtract, // Cd - Cs * As
             Darken,   // Cd * (1 - As)
             Brighten, // Cd * (1 + As)
+            // A shadow volume (closed, faces outward): counted per pixel where it is in front of the scene (faces
+            // seen from the front +1, from the back -1), then the target darkened once where the count is not 0, by
+            // the alpha of the vertices' colour (0x80 = black).
+            ShadowVolume,
         } blend = Blend::Alpha;
         uint8_t alphaRef = 0;   // texels at or below are discarded when alphaTest
         bool alphaTest = false;

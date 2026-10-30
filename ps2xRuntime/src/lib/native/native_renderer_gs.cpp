@@ -65,6 +65,7 @@ uniform int uAlphaAsColour;
 uniform ivec2 uWrap;      // CLAMP WMS / WMT: 0 repeat, 1 clamp, 2 region clamp, 3 region repeat
 uniform ivec4 uRegion;    // MINU, MAXU, MINV, MAXV
 uniform vec2 uTexSize;
+uniform int uShadowCount; // a shadow volume's faces: +1 seen from the front, -1 from the back (a float count image)
 out vec4 fragColor;
 float wrap(float t, int mode, int lo, int hi, float size)
 {
@@ -80,6 +81,11 @@ float wrap(float t, int mode, int lo, int hi, float size)
 }
 void main()
 {
+    if (uShadowCount != 0)
+    {
+        fragColor = vec4(gl_FrontFacing ? 1.0 : -1.0, 0.0, 0.0, 0.0);
+        return;
+    }
     vec4 colour = vCol * (255.0 / 128.0);
     vec2 uv = vec2(wrap(vUv.x, uWrap.x, uRegion.x, uRegion.y, uTexSize.x), wrap(vUv.y, uWrap.y, uRegion.z, uRegion.w, uTexSize.y));
     vec4 texel = uTextured != 0 ? texture(uTex, uv) : vec4(1.0);
@@ -95,6 +101,26 @@ void main()
     if (uDebug != 0)
         c = vec4(1.0, 0.0, 1.0, 128.0 / 255.0);
     fragColor = c;
+}
+)";
+
+        // A shadow volume's darkening: one triangle over the target, black at uAlpha where the count is not 0.
+        const char *kShadowCompositeVertex = R"(#version 330
+void main()
+{
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+        const char *kShadowCompositeFragment = R"(#version 330
+uniform sampler2D uCount;
+uniform float uAlpha;
+out vec4 fragColor;
+void main()
+{
+    if (abs(texelFetch(uCount, ivec2(gl_FragCoord.xy), 0).r) < 0.5)
+        discard;
+    fragColor = vec4(0.0, 0.0, 0.0, uAlpha);
 }
 )";
 
@@ -172,7 +198,50 @@ void main()
             for (GLuint i = 0; i < 4; ++i)
                 glEnableVertexAttribArray(i);
             glBindVertexArray(0);
+            locShadowCount = glGetUniformLocation(program, "uShadowCount");
+            const GLuint cvs = compile(GL_VERTEX_SHADER, kShadowCompositeVertex), cfs = compile(GL_FRAGMENT_SHADER, kShadowCompositeFragment);
+            if (cvs == 0 || cfs == 0)
+                return false;
+            shadowProgram = glCreateProgram();
+            glAttachShader(shadowProgram, cvs);
+            glAttachShader(shadowProgram, cfs);
+            glLinkProgram(shadowProgram);
+            glDeleteShader(cvs);
+            glDeleteShader(cfs);
+            glGetProgramiv(shadowProgram, GL_LINK_STATUS, &ok);
+            if (!ok)
+                return false;
+            locShadowTex = glGetUniformLocation(shadowProgram, "uCount");
+            locShadowAlpha = glGetUniformLocation(shadowProgram, "uAlpha");
+            glGenVertexArrays(1, &shadowVao);
             return true;
+        }
+
+        // Shadow volumes: a float count image the size of the target, with the target's depth attached (tested, not
+        // written), to count each volume's faces where it is in front of the scene.
+        GLint locShadowCount = -1, locShadowTex = -1, locShadowAlpha = -1;
+        GLuint shadowProgram = 0, shadowVao = 0, shadowFbo = 0, shadowCount = 0;
+        GLsizei shadowWidth = 0, shadowHeight = 0;
+
+        bool shadowTarget(GLsizei width, GLsizei height, GLuint depth)
+        {
+            if (shadowFbo == 0)
+                glGenFramebuffers(1, &shadowFbo);
+            if (shadowCount == 0 || shadowWidth != width || shadowHeight != height)
+            {
+                if (shadowCount == 0)
+                    glGenTextures(1, &shadowCount);
+                glBindTexture(GL_TEXTURE_2D, shadowCount);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, width, height, 0, GL_RED, GL_FLOAT, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                shadowWidth = width;
+                shadowHeight = height;
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, shadowCount, 0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
+            return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
         }
 
         GLuint texture(uint64_t key, const std::shared_ptr<const TextureCache::Texture> &source)
@@ -484,6 +553,45 @@ void main()
             const GLsizei count = static_cast<GLsizei>(entry.vertices.size());
             glUniform1f(pass.locDepthScale, static_cast<float>(entry.gsZScale * target.zScale));
             glUniform4fv(pass.locM, 4, entry.batch.matrix);
+            if (m.blend == Material::Blend::ShadowVolume)
+            {
+                // Its faces counted where the volume is in front of the scene (the target's depth, tested, not
+                // written), then the target darkened once where the count is not 0.
+                const GLsizei width = static_cast<GLsizei>(target.width * scale), height = static_cast<GLsizei>(target.height * scale);
+                if (count > 0 && pass.shadowTarget(width, height, target.depth))
+                {
+                    GLfloat clear[4];
+                    glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+                    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    glClearColor(clear[0], clear[1], clear[2], clear[3]);
+                    glUniform1i(pass.locShadowCount, 1);
+                    glEnable(GL_DEPTH_TEST);
+                    glDepthFunc(GL_GEQUAL);
+                    glDepthMask(GL_FALSE);
+                    glEnable(GL_BLEND);
+                    glBlendEquation(GL_FUNC_ADD);
+                    glBlendFunc(GL_ONE, GL_ONE);
+                    glDrawArrays(GL_TRIANGLES, first, count);
+                    glUniform1i(pass.locShadowCount, 0);
+                    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+                    glDisable(GL_DEPTH_TEST);
+                    glBlendFuncSeparate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                    glUseProgram(pass.shadowProgram);
+                    glBindVertexArray(pass.shadowVao);
+                    glBindTexture(GL_TEXTURE_2D, pass.shadowCount);
+                    glUniform1i(pass.locShadowTex, 0);
+                    glUniform1f(pass.locShadowAlpha, std::min(1.0f, static_cast<float>(entry.vertices[0].rgba >> 24) / 128.0f));
+                    glDrawArrays(GL_TRIANGLES, 0, 3);
+                    glUseProgram(pass.program);
+                    glBindVertexArray(pass.vao);
+                    glBindBuffer(GL_ARRAY_BUFFER, pass.vbo);
+                }
+                else
+                    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+                first += count;
+                continue;
+            }
             std::shared_ptr<const TextureCache::Texture> texture = entry.batch.texture;
             if (m.textured && !texture)
                 texture = ps2x::native::textures().texture(m.tex0, m.texa);
