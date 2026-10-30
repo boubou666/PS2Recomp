@@ -4794,9 +4794,7 @@ void register_ps2_gs_tests()
                 int last = -1;
                 for (uint32_t x = 6u; x <= 26u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, y);
                     if ((pixel & 0x00FFFFFFu) != 0u)
                     {
                         if (first < 0)
@@ -4815,9 +4813,7 @@ void register_ps2_gs_tests()
                 sawFilledRow = true;
                 for (int x = first; x <= last; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, y);
                     if ((pixel & 0x00FFFFFFu) == 0u)
                     {
                         t.Fail("triangle fan quad should not leave interior holes within a covered row");
