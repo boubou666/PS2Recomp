@@ -1128,7 +1128,7 @@ def code_hash(data):
 def code_from_aot(directory, spec):
     pairs = {}
     unit = spec.get('unit', 'VU1')
-    for path in glob.glob(os.path.join(directory, f'{unit.lower()}_aot_*_{spec["hash"]:016x}*.cpp')):
+    for path in glob.glob(os.path.join(directory, f'{unit.lower()}_*_{spec["hash"]:016x}*.cpp')):
         text = open(path).read()
         for m in re.finditer(r'kPair(\d+) = Vu::decodePair\(Vu::Unit::' + unit + r', 0x([0-9a-f]+)u, 0x([0-9a-f]+)u\)', text):
             pairs[int(m[1])] = (int(m[2], 16), int(m[3], 16))
