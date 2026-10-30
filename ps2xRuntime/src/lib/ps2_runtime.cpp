@@ -3758,6 +3758,9 @@ void PS2Runtime::run()
         }();
         if (!(s_nativeOnly && ps2x::native::Renderer::instance().enabled() && ps2x::native::Renderer::instance().hasDraws()))
             DrawTexturePro(shownTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        // raylib batches its draws: sent now, before the native renderer's own GL calls change the state they need
+        // (without the debug window, nothing else sent them before the end of the frame, and the window was black).
+        rlDrawRenderBatchActive();
         ps2x::native::Renderer::instance().setGsFrame(shownTex.id, shownTex.width, shownTex.height, shownTex.format);
         ps2x::native::Renderer::instance().present(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
         DrawFpsOverlay(gameFrames(), gsForPresentation().displayFlips(), eeScheduler().currentCycle(), screenWidth, screenHeight);
@@ -3782,6 +3785,7 @@ void PS2Runtime::run()
             if (elapsed >= s_next)
             {
                 s_next += s_interval;
+                rlDrawRenderBatchActive(); // the frame's queued draws, so the capture has them
                 Image image = LoadImageFromScreen();
                 char path[1024];
                 std::snprintf(path, sizeof(path), "%s/window_%06d.png", s_windowCaptureDir, static_cast<int>(elapsed * 10.0));
