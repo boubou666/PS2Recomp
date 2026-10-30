@@ -135,6 +135,10 @@ private:
     // A target's pages [first, end) written into GS memory: on the GPU copy, or through the CPU (diagnostics).
     void resolveTargetPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
     bool resolveTargetPagesGpu(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
+    // A target's depth written into the GPU copy of GS memory as its ZBUF format stores it, for the pages of
+    // firstPage..endPage its Z buffer covers (a host read of Z pages: TMB tests its lens flares' occlusion that way).
+    void resolveDepthPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage);
+    uint32_t m_depthResolveProgram = 0;
     // The target's pages drawn again from what GS memory holds, in its format (a sprite per page sampling memory).
     void reloadTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages);
     // A texture sampled straight from a render target (its base, format layout and width); null when the read goes
