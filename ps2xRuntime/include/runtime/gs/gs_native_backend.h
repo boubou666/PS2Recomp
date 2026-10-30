@@ -133,7 +133,8 @@ private:
     // A Z-format texture over the Z buffer a render target drew (depth of field, fog from depth): that depth as the
     // GS would read it as texels, into m_depthTexture. False when no render target wrote that Z buffer.
     bool bindDepthAsTexture(const GSDrawState &state, float &width, float &height);
-    uint32_t m_depthTexture = 0;
+    uint32_t m_depthTexture = 0, m_depthTextureFramebuffer = 0, m_depthTextureProgram = 0;
+    uint32_t m_depthTextureWidth = 0, m_depthTextureHeight = 0;
     // The GPU decoding path (default; PS2X_GS_NATIVE_CPUDECODE=1 uses the texture cache's images): GS memory on the
     // GPU, brought up to date page by page from m_vram, and the formats' swizzle tables.
     bool bindDecodedTexture(const GSDrawState &state);
@@ -255,6 +256,11 @@ private:
     } m_uniforms;
 
     std::unordered_map<uint32_t, RenderTarget> m_targets;
+    struct SpareTarget
+    {
+        uint32_t width, height, color, depth, framebuffer;
+    };
+    std::vector<SpareTarget> m_spareTargets; // GL objects of replaced targets, reused by the next one of their size
     struct ReadbackBuffers
     {
         uint32_t pbo[2] = {0, 0};
