@@ -25,6 +25,7 @@
 #include "runtime/gs/gs_native_backend.h"
 #include "runtime/native/native_texture_cache.h"
 #include "raylib.h"
+#include "rlgl.h"
 #endif
 
 #include <algorithm>
@@ -273,6 +274,18 @@ namespace
             pixels = std::move(frame.pixels);
             width = frame.width;
             height = frame.height;
+#if defined(PS2X_HAVE_NATIVE_GS)
+            // Composed on the GPU (the native back end's default): read its texture back.
+            if (pixels.empty() && frame.glTexture != 0u)
+            {
+                if (void *read = rlReadTexturePixels(frame.glTexture, static_cast<int>(width), static_cast<int>(height),
+                                                     PIXELFORMAT_UNCOMPRESSED_R8G8B8A8))
+                {
+                    pixels.assign(static_cast<uint8_t *>(read), static_cast<uint8_t *>(read) + size_t(width) * height * 4u);
+                    MemFree(read);
+                }
+            }
+#endif
         }
         else
         {
