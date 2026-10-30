@@ -49,6 +49,17 @@ struct Vu1Lifted
         vu.catchUpXgkick();
     }
 
+    // fmacFlags() of an FMAC instruction on its normalized operands (right: broadcast, Q or I already spread; cross
+    // products unshuffled): the result as the interpreter leaves it, its MAC and status bits and its sticky bits.
+    static bool fmacFlags(float *result, uint8_t dest, ps2_vu1_detail::FmacOperation operation, __m128 left, __m128 right,
+                          __m128 acc, uint32_t &mac, uint32_t &status, uint32_t &sticky)
+    {
+        static const Vu s_vu(Vu::Unit::VU1);
+        return s_vu.fmacFlagsWith(
+            result, dest, operation, [&]() { return left; }, [&]() { return right; }, [&]() { return acc; }, mac, status,
+            sticky);
+    }
+
     static float normalizeOperand(const Vu &vu, float value) { return vu.normalizeOperand(value); }
     static float normalizeResult(const Vu &vu, float value)
     {
