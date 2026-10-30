@@ -200,9 +200,9 @@ namespace ps2x::native
             k.q = q != 0.0f ? q : 1.0f;
         }
         uint32_t offset = 0, extent = 0;
-        if (TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
+        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
             k.u = (k.u * static_cast<float>(tw) - static_cast<float>(offset)) / static_cast<float>(extent);
-        if (TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
+        if (!m_gsWrites && TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
             k.v = (k.v * static_cast<float>(th) - static_cast<float>(offset)) / static_cast<float>(extent);
 
         const uint32_t type = m_prim & 7u;

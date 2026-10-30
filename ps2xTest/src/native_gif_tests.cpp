@@ -61,6 +61,18 @@ namespace
         return packet;
     }
 
+    std::vector<uint32_t> regionClamp()
+    {
+        std::vector<uint32_t> packet;
+        const uint64_t tag = 2u | (1ull << 60);
+        const uint64_t tex0 = (8ull << 26) | (8ull << 30);
+        const uint64_t clamp = 2u | (2u << 2) | (16ull << 4) | (207ull << 14) | (32ull << 24) | (95ull << 34);
+        quad(packet, static_cast<uint32_t>(tag), static_cast<uint32_t>(tag >> 32), 0xeeu, 0);
+        quad(packet, static_cast<uint32_t>(tex0), static_cast<uint32_t>(tex0 >> 32), 0x06u, 0);
+        quad(packet, static_cast<uint32_t>(clamp), static_cast<uint32_t>(clamp >> 32), 0x08u, 0);
+        return packet;
+    }
+
     std::vector<Vertex> drawSprite(bool gsWrites, const std::vector<uint32_t> &before = {})
     {
         Renderer &renderer = Renderer::instance();
@@ -103,6 +115,21 @@ void register_native_gif_tests()
             }
             t.IsTrue(sameQ, "Q of the second vertex on every corner");
             t.IsTrue(uv, "S and T over that Q");
+        });
+        tc.Run("a REGION_CLAMP the GS applies leaves the texture coordinates over the whole texture", [](TestCase &t)
+        {
+            const std::vector<Vertex> vertices = drawSprite(true, regionClamp());
+            t.Equals(vertices.size(), size_t{6}, "two triangles");
+            float left = vertices.empty() ? 0.0f : vertices[0].x;
+            for (const Vertex &v : vertices)
+                left = std::min(left, v.x);
+            bool uv = true;
+            for (const Vertex &v : vertices)
+            {
+                const bool first = near(v.x, left);
+                uv = uv && near(v.u * v.q, first ? 0.5f : 1.0f) && (near(v.v * v.q, 0.25f) || near(v.v * v.q, 1.0f));
+            }
+            t.IsTrue(uv, "S and T as the packet sent them");
         });
         tc.Run("an alpha test that never passes still draws what its AFAIL writes", [](TestCase &t)
         {
