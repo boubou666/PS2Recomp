@@ -23,7 +23,7 @@ namespace ps2x::native
         {
             return a.tex0 == b.tex0 && a.texa == b.texa && a.textured == b.textured && a.blend == b.blend && a.alphaRef == b.alphaRef &&
                    a.alphaTest == b.alphaTest && a.depthTest == b.depthTest && a.depthWrite == b.depthWrite && a.fog == b.fog &&
-                   a.fogColour == b.fogColour && a.clampU == b.clampU && a.clampV == b.clampV;
+                   a.fogColour == b.fogColour && a.clampU == b.clampU && a.clampV == b.clampV && a.region == b.region;
         }
     }
 
@@ -186,11 +186,11 @@ namespace ps2x::native
         k.fog = static_cast<float>(withFog ? (xyz >> 56) & 0xffu : m_fog) / 255.0f;
         k.rgba = static_cast<uint32_t>(m_rgbaq);
         const uint64_t tex0 = m_tex0[context];
+        const uint32_t tw = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu), th = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
         if ((attributes >> 8) & 1u) // FST: UV in texels (10.4)
         {
-            const float tw = static_cast<float>(1u << ((tex0 >> 26) & 0xfu)), th = static_cast<float>(1u << ((tex0 >> 30) & 0xfu));
-            k.u = static_cast<float>(m_uv & 0x3fffu) / 16.0f / tw;
-            k.v = static_cast<float>((m_uv >> 16) & 0x3fffu) / 16.0f / th;
+            k.u = static_cast<float>(m_uv & 0x3fffu) / 16.0f / static_cast<float>(tw);
+            k.v = static_cast<float>((m_uv >> 16) & 0x3fffu) / 16.0f / static_cast<float>(th);
         }
         else
         {
@@ -199,6 +199,11 @@ namespace ps2x::native
             k.v = q != 0.0f ? m_t / q : m_t;
             k.q = q != 0.0f ? q : 1.0f;
         }
+        uint32_t offset = 0, extent = 0;
+        if (TextureCache::regionWindow(m_clamp[context], false, tw, offset, extent))
+            k.u = (k.u * static_cast<float>(tw) - static_cast<float>(offset)) / static_cast<float>(extent);
+        if (TextureCache::regionWindow(m_clamp[context], true, th, offset, extent))
+            k.v = (k.v * static_cast<float>(th) - static_cast<float>(offset)) / static_cast<float>(extent);
 
         const uint32_t type = m_prim & 7u;
         switch (type)
@@ -263,13 +268,11 @@ namespace ps2x::native
         const uint32_t wms = m_clamp[context] & 3u, wmt = (m_clamp[context] >> 2) & 3u;
         m.clampU = wms == 1u || wms == 2u; // CLAMP, REGION_CLAMP (its region taken as the texture)
         m.clampV = wmt == 1u || wmt == 2u;
+        if (m.textured && (wms >= 2u || wmt >= 2u))
+            m.region = m_clamp[context];
         m.blend = Material::Blend::Opaque;
         if ((attributes >> 6) & 1u) // ABE
-        {
-            const uint64_t alpha = m_alpha[context];
-            const uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
-            m.blend = a == 0u && b == 2u && d == 1u ? Material::Blend::Additive : Material::Blend::Alpha;
-        }
+            m.blend = blendOf(m_alpha[context]);
         const uint64_t test = m_test[context];
         const bool alphaTest = test & 1u;
         const uint32_t atst = (test >> 1) & 7u, aref = (test >> 4) & 0xffu, afail = (test >> 12) & 3u;

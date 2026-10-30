@@ -271,13 +271,44 @@ namespace ps2x::native
         }
     }
 
-    std::shared_ptr<const TextureCache::Texture> TextureCache::texture(uint64_t tex0, uint64_t texa)
+    bool TextureCache::regionWindow(uint64_t clamp, bool v, uint32_t size, uint32_t &offset, uint32_t &extent)
+    {
+        const uint32_t mode = (clamp >> (v ? 2u : 0u)) & 3u;
+        const uint32_t min = (clamp >> (v ? 24u : 4u)) & 0x3ffu, max = (clamp >> (v ? 34u : 14u)) & 0x3ffu;
+        if (mode == 2u)
+        {
+            if (max < min || max >= size || (min == 0u && max + 1u == size))
+                return false;
+            offset = min;
+            extent = max - min + 1u;
+            return true;
+        }
+        if (mode != 3u || ((min + 1u) & min) != 0u || (max & min) != 0u || min + 1u >= size)
+            return false;
+        offset = max & (size - 1u);
+        extent = min + 1u;
+        return offset + extent <= size;
+    }
+
+    std::shared_ptr<const TextureCache::Texture> TextureCache::texture(uint64_t tex0, uint64_t texa, uint64_t clamp)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         // TBP0 TBW PSM TW TH TCC, CBP CPSM CSM CSA (TFX and CLD do not change the image).
         const uint64_t selected = tex0 & ~((uint64_t{3} << 35) | (uint64_t{7} << 61));
         const uint32_t psm = (tex0 >> 20) & 0x3fu;
-        const uint64_t key = selected ^ (indexed(psm) || psm == CT32 ? 0u : (texa * 0x9e3779b97f4a7c15ull));
+        const uint32_t fullWidth = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu);
+        const uint32_t fullHeight = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
+        uint32_t x0 = 0, y0 = 0, width = fullWidth, height = fullHeight;
+        const bool windowU = regionWindow(clamp, false, fullWidth, x0, width);
+        const bool windowV = regionWindow(clamp, true, fullHeight, y0, height);
+        if (!windowU)
+            x0 = 0, width = fullWidth;
+        if (!windowV)
+            y0 = 0, height = fullHeight;
+        const uint64_t window =
+            windowU || windowV ? (uint64_t{x0} | uint64_t{width} << 11 | uint64_t{y0} << 22 | uint64_t{height} << 33) + 1u : 0u;
+        const uint64_t key = selected ^ (indexed(psm) || psm == CT32 ? 0u : (texa * 0x9e3779b97f4a7c15ull)) ^
+                             (window * 0xc2b2ae3d27d4eb4full);
         auto found = m_textures.find(key);
         if (found != m_textures.end() && stillValid(*found->second))
             return found->second;
@@ -287,8 +318,8 @@ namespace ps2x::native
         texture.version = ++m_decodes;
         const uint32_t tbp = tex0 & 0x3fffu;
         const uint32_t tbw = (tex0 >> 14) & 0x3fu;
-        texture.width = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu);
-        texture.height = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
+        texture.width = width;
+        texture.height = height;
 
         uint32_t palette[256] = {};
         if (indexed(psm))
@@ -312,8 +343,8 @@ namespace ps2x::native
         texture.rgba.resize(static_cast<size_t>(texture.width) * texture.height);
         for (uint32_t y = 0; y < texture.height; ++y)
             for (uint32_t x = 0; x < texture.width; ++x)
-                texture.rgba[static_cast<size_t>(y) * texture.width + x] = decodeTexel(psm, tbp, tbw, x, y, tex0, texa, palette);
-        forEachPage(psm, tbp, tbw, 0, 0, texture.width, texture.height, &texture.pages);
+                texture.rgba[static_cast<size_t>(y) * texture.width + x] = decodeTexel(psm, tbp, tbw, x0 + x, y0 + y, tex0, texa, palette);
+        forEachPage(psm, tbp, tbw, x0, y0, texture.width, texture.height, &texture.pages);
         std::sort(texture.pages.begin(), texture.pages.end());
         texture.pages.erase(std::unique(texture.pages.begin(), texture.pages.end()), texture.pages.end());
         auto shared = std::make_shared<const Texture>(std::move(texture));

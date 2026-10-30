@@ -44,12 +44,14 @@ namespace ps2x::native
             Opaque,   // no blending
             Alpha,    // (Cs - Cd) * As + Cd
             Additive, // Cs * As + Cd
+            AdditiveByDestination, // Cs * Ad + Cd, Ad the target's alpha (0x80 is 1.0)
         } blend = Blend::Alpha;
         uint8_t alphaRef = 0;   // texels at or below are discarded when alphaTest
         bool alphaTest = false;
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
         bool depthWrite = true;
         bool clampU = false, clampV = false; // CLAMP's WMS / WMT: the texture's edge past 0..1 (else it repeats)
+        uint64_t region = 0; // CLAMP, for a REGION_REPEAT window (TextureCache::regionWindow): the texture is that window
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
         // The GS state where the draw's group sits in the stream (a stream draw, beginGroup) gives tex0, texa, blend,
@@ -63,6 +65,9 @@ namespace ps2x::native
         // CLAMP, TEX1, ALPHA, ...), so it draws with the state the packet would have set. Not part of batching.
         std::shared_ptr<const std::vector<std::pair<uint8_t, uint64_t>>> gsWrites;
     };
+
+    // The blend of a draw with PRIM.ABE set, from the GS's ALPHA register.
+    Material::Blend blendOf(uint64_t alpha);
 
     // PS2 screen space as the game draws to it: the screen point at the window's top-left corner and the size
     // that fills the window (the GS XYOFFSET and the frame size; a 640 x 448 / 512 or 640 x 256 picture).
