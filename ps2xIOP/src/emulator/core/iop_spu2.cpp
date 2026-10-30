@@ -709,6 +709,16 @@ namespace ps2x::iop::detail
         std::array<uint16_t, 0x200u> chunk{};
         const uint32_t bytes = std::min<uint32_t>(core.admaRemaining, 0x400u);
         (void)m_memory.readRam(core.admaAddress, chunk.data(), bytes);
+        // PS2X_SPU2_ADMA_DUMP=<path>: the raw AutoDMA input bytes, as the cores take them (local bring-up aid).
+        static std::FILE *s_admaDump = [] {
+            const char *path = std::getenv("PS2X_SPU2_ADMA_DUMP");
+            return path && *path ? std::fopen(path, "wb") : nullptr;
+        }();
+        if (s_admaDump)
+        {
+            std::fwrite(chunk.data(), 1, bytes, s_admaDump);
+            std::fflush(s_admaDump);
+        }
         std::copy_n(chunk.begin(), 0x100u, m_ram.begin() + left);
         std::copy_n(chunk.begin() + 0x100u, 0x100u, m_ram.begin() + right);
         core.inputHalfFilled[half] = true;

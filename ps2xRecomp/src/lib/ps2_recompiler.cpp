@@ -882,6 +882,18 @@ namespace ps2recomp
                     m_skipFunctionStarts.insert(*selector.start);
                 }
             }
+            for (const auto &name : m_config.nativeFunctions)
+            {
+                const FunctionSelector selector = parseFunctionSelector(name);
+                if (!selector.name.empty())
+                {
+                    m_nativeFunctions.insert(selector.name);
+                }
+                if (selector.start.has_value())
+                {
+                    m_nativeFunctionStarts.insert(*selector.start);
+                }
+            }
             for (const auto &name : m_config.stubImplementations)
             {
                 const FunctionSelector selector = parseFunctionSelector(name);
@@ -1018,11 +1030,27 @@ namespace ps2recomp
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
             m_codeGenerator->setReporter(&m_reporter);
+            // A relocated call binds to the runtime handler of the same name (an undefined symbol has no code here).
+            // A function the ELF defines is recompiled unless the config stubs it: an unstripped link that kept its
+            // relocations (Dark Cloud) otherwise sent every call to sceSdRemote to the runtime stub, though the
+            // config left it to the game's code so that SDRDRV gets its RPCs.
+            std::unordered_set<std::string> definedFunctionNames;
+            for (const auto &symbol : m_symbols)
+            {
+                if (symbol.isFunction && !symbol.isImported)
+                {
+                    definedFunctionNames.insert(symbol.name);
+                }
+            }
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
             for (const auto &reloc : m_relocations)
             {
                 if (reloc.symbolName.empty())
+                {
+                    continue;
+                }
+                if (definedFunctionNames.contains(reloc.symbolName) && !m_stubFunctions.contains(reloc.symbolName))
                 {
                     continue;
                 }
@@ -2404,6 +2432,11 @@ namespace ps2recomp
 
     bool PS2Recompiler::isStubFunction(const Function &function) const
     {
+        if (m_nativeFunctionStarts.contains(function.start) || m_nativeFunctions.contains(function.name))
+        {
+            return false;
+        }
+
         if (m_stubFunctionStarts.contains(function.start))
         {
             return true;
