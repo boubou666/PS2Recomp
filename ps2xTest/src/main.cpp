@@ -17,6 +17,7 @@ void register_native_texture_cache_tests();
 void register_native_vu1_stream_tests();
 void register_native_gif_tests();
 void register_native_blend_tests();
+void register_native_sprite_tests();
 void register_ps2_iop_tests();
 void register_ps2_sif_rpc_tests();
 void register_ps2_sif_dma_tests();
@@ -46,6 +47,7 @@ int main()
     register_native_vu1_stream_tests();
     register_native_gif_tests();
     register_native_blend_tests();
+    register_native_sprite_tests();
     register_ps2_iop_tests();
     register_ps2_sif_rpc_tests();
     register_ps2_sif_dma_tests();
