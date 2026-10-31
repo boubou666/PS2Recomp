@@ -67,6 +67,8 @@ namespace ps2x::native
         struct StoredUpload
         {
             uint32_t dx = 0, dy = 0, w = 0, h = 0, dbw = 0;
+            uint64_t seq = 0; // when the game last sent it (an identical upload again counts)
+            uint64_t id = 0;  // its pixels: new for every upload that changes them
             std::vector<uint8_t> data;
         };
         // (base << 6 | psm) -> the uploads there, oldest first, and a serial bumped when one changes.
@@ -96,6 +98,7 @@ namespace ps2x::native
         };
         std::unordered_map<uint64_t, StoredTexture> m_storeTextures;
         uint64_t m_storeMisses = 0;
+        uint64_t m_uploadSeq = 0, m_contentSerial = 0;
         uint64_t m_gameTexa = 0;
         uint32_t m_gameFogColour = 0;
 

@@ -235,7 +235,10 @@ namespace ps2x::native
         {
             if (it->dx == dx && it->dy == dy && it->w == w && it->h == h && it->dbw == dbw && it->data.size() == std::min(bytes, wanted) &&
                 std::memcmp(it->data.data(), data, it->data.size()) == 0)
-                return; // the same pixels again: nothing changes
+            {
+                it->seq = ++m_uploadSeq; // the same pixels again: newest at its place, nothing to decode again
+                return;
+            }
             // An older upload this one covers whole is gone.
             if (it->dx >= dx && it->dy >= dy && it->dx + it->w <= dx + w && it->dy + it->h <= dy + h)
                 it = base.uploads.erase(it);
@@ -249,8 +252,10 @@ namespace ps2x::native
         upload.h = h;
         upload.dbw = dbw;
         upload.data.assign(data, data + std::min(bytes, wanted));
+        upload.seq = ++m_uploadSeq;
+        upload.id = ++m_contentSerial;
         base.uploads.push_back(std::move(upload));
-        ++base.serial;
+        base.serial = m_contentSerial;
     }
 
     const TextureCache::StoredUpload *TextureCache::laidOutSource(uint32_t base, uint32_t &sourceBase, uint64_t &serial) const
@@ -265,11 +270,11 @@ namespace ps2x::native
             for (const StoredUpload &u : stored.uploads)
             {
                 const uint32_t end = dbp + ((u.dy + u.h + 31u) / 32u) * std::max(u.dbw, 1u) * 32u;
-                if (base >= dbp && base < end && (!source || stored.serial >= serial))
+                if (base >= dbp && base < end && (!source || u.seq > source->seq))
                 {
                     source = &u;
                     sourceBase = dbp;
-                    serial = stored.serial;
+                    serial = u.id;
                 }
             }
         }
@@ -292,19 +297,48 @@ namespace ps2x::native
             const auto it = m_store.find((static_cast<uint64_t>(bp) << 6) | format);
             return it == m_store.end() || it->second.uploads.empty() ? nullptr : &it->second;
         };
-        const StoredBase *image = direct(tbp, psm);
+        // The newer of the two wins: the game reuses its texture area for one asset after another.
+        const auto newest = [](const StoredBase *b) {
+            uint64_t seq = 0;
+            for (const StoredUpload &u : b->uploads)
+                seq = std::max(seq, u.seq);
+            return seq;
+        };
+        const auto pick = [&](uint32_t bp, uint32_t format, const StoredBase *&base, const StoredUpload *&laid,
+                              uint32_t &laidBase, uint64_t &serial) {
+            base = direct(bp, format);
+            uint64_t laidSerial = 0;
+            laid = format == CT32 ? nullptr : laidOutSource(bp, laidBase, laidSerial);
+            if (base && laid && newest(base) > laid->seq)
+                laid = nullptr;
+            if (laid)
+                base = nullptr;
+            serial = laid ? laidSerial : base ? base->serial : 0u;
+        };
+        const StoredBase *image = nullptr, *palette = nullptr;
+        const StoredUpload *imageLaid = nullptr, *paletteLaid = nullptr;
         uint32_t imageLaidBase = 0, paletteLaidBase = 0;
-        uint64_t imageSerial = image ? image->serial : 0u, paletteSerial = 0u;
-        const StoredUpload *imageLaid = image || psm == CT32 ? nullptr : laidOutSource(tbp, imageLaidBase, imageSerial);
-        const StoredBase *palette = nullptr;
-        const StoredUpload *paletteLaid = nullptr;
+        uint64_t imageSerial = 0u, paletteSerial = 0u;
+        pick(tbp, psm, image, imageLaid, imageLaidBase, imageSerial);
         if (indexed(psm))
         {
-            palette = direct(cbp, cpsm);
-            if (palette)
-                paletteSerial = palette->serial;
-            else if (cpsm == CT32)
-                paletteLaid = laidOutSource(cbp, paletteLaidBase, paletteSerial);
+            if (cpsm == CT32)
+            {
+                // A CT32 palette is either its own upload or a part of a CT32 asset: the newest upload holding it.
+                palette = direct(cbp, cpsm);
+                uint64_t laidSerial = 0;
+                paletteLaid = laidOutSource(cbp, paletteLaidBase, laidSerial);
+                if (paletteLaid && palette && newest(palette) >= paletteLaid->seq && paletteLaidBase == cbp)
+                    paletteLaid = nullptr;
+                if (paletteLaid)
+                    palette = nullptr;
+                paletteSerial = paletteLaid ? laidSerial : palette ? palette->serial : 0u;
+            }
+            else
+            {
+                palette = direct(cbp, cpsm);
+                paletteSerial = palette ? palette->serial : 0u;
+            }
         }
         if (const auto it = m_storeTextures.find(key);
             it != m_storeTextures.end() && it->second.imageSerial == imageSerial && it->second.paletteSerial == paletteSerial)
