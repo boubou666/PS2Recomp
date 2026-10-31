@@ -740,6 +740,12 @@ namespace ps2x::native
 
     std::shared_ptr<const TextureCache::Texture> TextureCache::texture(uint64_t tex0, uint64_t texa)
     {
+        if (const Provider provider = m_provider.load(std::memory_order_acquire))
+        {
+            std::shared_ptr<const Texture> provided = provider(tex0, texa);
+            if (provided || m_providerOnly.load(std::memory_order_relaxed))
+                return provided;
+        }
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_storeMode)
             return memoryTexture(tex0, texa);

@@ -8,6 +8,7 @@
 // of its pages or its palette's.
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -46,6 +47,15 @@ namespace ps2x::native
         // The texture a draw selects: TEX0 (the CLD bits are ignored), and TEXA for the alpha of CT24 / CT16 texels.
         // Shared, never modified once decoded: uploads may arrive from the GS thread while another thread draws.
         std::shared_ptr<const Texture> texture(uint64_t tex0, uint64_t texa = 0);
+
+        // A port's own textures (from the game's data, not from GS transfers): texture() asks the provider first; with
+        // `only`, it never falls back to the uploads it saw (a texture the provider does not have is none).
+        using Provider = std::shared_ptr<const Texture> (*)(uint64_t tex0, uint64_t texa);
+        void setProvider(Provider provider, bool only)
+        {
+            m_providerOnly.store(only, std::memory_order_relaxed);
+            m_provider.store(provider, std::memory_order_release);
+        }
 
         const uint8_t *memory() const { return m_memory.data(); }
         uint64_t uploads() const { return m_uploads; }
@@ -117,6 +127,8 @@ namespace ps2x::native
         uint64_t m_gameTexa = 0;
         uint32_t m_gameFogColour = 0;
         std::array<uint64_t, 0x80> m_gameRegisters{};
+        std::atomic<Provider> m_provider{nullptr};
+        std::atomic<bool> m_providerOnly{false};
         // The pictures the game draws (its FRAME writes): the blocks, and when (the uploads' order). A texture there
         // newer than its uploads is not one of the game's assets.
         struct Target
