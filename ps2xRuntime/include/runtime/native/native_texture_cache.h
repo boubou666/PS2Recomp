@@ -51,6 +51,9 @@ namespace ps2x::native
         // A port's own textures (from the game's data, not from GS transfers): texture() asks the provider first; with
         // `only`, it never falls back to the uploads it saw (a texture the provider does not have is none).
         using Provider = std::shared_ptr<const Texture> (*)(uint64_t tex0, uint64_t texa);
+        // The texture as the uploads seen made it, without the provider: a reference to compare a provider with
+        // (diagnosis only).
+        std::shared_ptr<const Texture> uploadedTexture(uint64_t tex0, uint64_t texa = 0);
         void setProvider(Provider provider, bool only)
         {
             m_providerOnly.store(only, std::memory_order_relaxed);

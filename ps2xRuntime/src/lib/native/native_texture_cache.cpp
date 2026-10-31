@@ -746,6 +746,11 @@ namespace ps2x::native
             if (provided || m_providerOnly.load(std::memory_order_relaxed))
                 return provided;
         }
+        return uploadedTexture(tex0, texa);
+    }
+
+    std::shared_ptr<const TextureCache::Texture> TextureCache::uploadedTexture(uint64_t tex0, uint64_t texa)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_storeMode)
             return memoryTexture(tex0, texa);
