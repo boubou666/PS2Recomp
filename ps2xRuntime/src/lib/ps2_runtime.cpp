@@ -2503,15 +2503,13 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
                     {
                         report.worst = worst;
                         std::memcpy(report.what, what, sizeof(what));
-                        std::fprintf(stderr, "[vu0:hle] pc %#x call %llu: worst so far %s
-", startPC,
+                        std::fprintf(stderr, "[vu0:hle] pc %#x call %llu: worst so far %s\n", startPC,
                                      static_cast<unsigned long long>(report.calls), what);
                     }
                 }
                 if (++s_calls % 50000u == 0u)
                     for (const auto &[pc, r] : s_reports)
-                        std::fprintf(stderr, "[vu0:hle] pc %#x: %llu calls, %llu differ (worst %s)
-", pc,
+                        std::fprintf(stderr, "[vu0:hle] pc %#x: %llu calls, %llu differ (worst %s)\n", pc,
                                      static_cast<unsigned long long>(r.calls), static_cast<unsigned long long>(r.differing),
                                      r.differing ? r.what : "-");
                 return;
