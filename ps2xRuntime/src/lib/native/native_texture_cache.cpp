@@ -421,12 +421,31 @@ namespace ps2x::native
         for (const StoredUpload *u : parts)
             signature = (signature ^ u->id) * 1099511628211ull;
 
+        // PS2X_NATIVE_TEX_STATS=1: every 2000 decodes, the lookups, the uploads kept and the textures decoded most.
+        static const bool s_stats = std::getenv("PS2X_NATIVE_TEX_STATS") != nullptr;
+        static uint64_t s_lookups = 0;
+        static std::unordered_map<uint64_t, uint32_t> s_decoded;
+        ++s_lookups;
         if (const auto it = m_storeTextures.find(key); it != m_storeTextures.end() && it->second.signature == signature)
         {
             m_lastSource = 3;
             return it->second.texture;
         }
         m_lastSource = parts.empty() ? 0 : parts.size() == 1u ? 1 : 2;
+        if (s_stats && ++s_decoded[tex0 & 0x3fffffffffull] && (m_decodes + 1u) % 2000u == 0u)
+        {
+            std::vector<std::pair<uint32_t, uint64_t>> top;
+            for (const auto &[t, n] : s_decoded)
+                top.emplace_back(n, t);
+            std::sort(top.rbegin(), top.rend());
+            std::fprintf(stderr, "[native-textures] %llu decodes / %llu lookups, %zu uploads kept, %zu parts now; most:",
+                         static_cast<unsigned long long>(m_decodes + 1u), static_cast<unsigned long long>(s_lookups),
+                         m_stored.size(), parts.size());
+            for (size_t i = 0; i < top.size() && i < 6u; ++i)
+                std::fprintf(stderr, " %010llx x%u", static_cast<unsigned long long>(top[i].second), top[i].first);
+            std::fprintf(stderr, "\n");
+            s_decoded.clear();
+        }
         if (!imageCovered)
         {
             ++m_storeMisses;
