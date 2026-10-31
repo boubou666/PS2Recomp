@@ -290,6 +290,11 @@ void main()
 
     void Renderer::publishOverlay()
     {
+        publishOverlay(m_building.screen);
+    }
+
+    void Renderer::publishOverlay(const Screen &screen)
+    {
         auto overlay = std::make_shared<Frame>(std::move(m_overlayBuilding));
         m_overlayBuilding = Frame{};
         // PS2X_NATIVE_STATS=1: the overlay's batches every 250 publishes.
@@ -298,7 +303,7 @@ void main()
         if (s_stats && ++s_publishes % 250u == 0u)
             std::fprintf(stderr, "[native] overlay publish %u: %zu batches, %zu vertices\n", s_publishes, overlay->batches.size(),
                          overlay->vertices.size());
-        overlay->screen = m_building.screen;
+        overlay->screen = screen;
         overlay->time = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
         std::lock_guard<std::mutex> lock(m_mutex);
         m_overlayPublished = std::move(overlay);
@@ -313,6 +318,13 @@ void main()
         for (uint32_t i = 0; i < frame->batches.size(); ++i)
             if (frame->batches[i].key != 0u)
                 frame->keys.emplace(frame->batches[i].key, i);
+        if (m_streamDraws && frame->lastGroup != 0u)
+        {
+            std::lock_guard<std::mutex> lock(m_probeMutex);
+            m_frameLastGroups.push_back(frame->lastGroup);
+            if (m_frameLastGroups.size() > 64u)
+                m_frameLastGroups.pop_front();
+        }
         std::lock_guard<std::mutex> lock(m_mutex);
         m_previous = std::move(m_published);
         m_published = std::move(frame);
@@ -339,6 +351,17 @@ void main()
 
     bool Renderer::depthAt(float gsX, float gsY, uint32_t &gsZ)
     {
+        if (m_streamDraws) // the frame is in the GS's targets: a probe, read there after the frame (one frame late)
+        {
+            const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(gsX)) << 16) | static_cast<uint32_t>(gsY);
+            std::lock_guard<std::mutex> lock(m_probeMutex);
+            m_probeWanted[key] = 0u;
+            const auto it = m_probeResults.find(key);
+            if (it == m_probeResults.end())
+                return false;
+            gsZ = it->second;
+            return true;
+        }
         std::lock_guard<std::mutex> lock(m_depthMutex);
         if (m_depth.empty() || m_depthScreen.width <= 0.0f || m_depthScreen.height <= 0.0f)
             return false;

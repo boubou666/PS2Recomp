@@ -330,8 +330,55 @@ void main()
         return it != m_stream.end() && it->group == group;
     }
 
+    void Renderer::readProbes()
+    {
+        std::vector<uint64_t> keys;
+        {
+            std::lock_guard<std::mutex> lock(m_probeMutex);
+            for (const auto &entry : m_probeWanted)
+                keys.push_back(entry.first);
+            m_probeWanted.clear();
+        }
+        const ProbeTarget &t = m_probeTarget;
+        if (keys.empty() || t.framebuffer == 0u || t.zScale <= 0.0)
+            return;
+        GLint readFramebuffer = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, t.framebuffer);
+        std::vector<std::pair<uint64_t, uint32_t>> results;
+        for (const uint64_t key : keys)
+        {
+            const int x = static_cast<int>(key >> 16) - static_cast<int>(t.xOffset / 16u), y = static_cast<int>(key & 0xffffu) - static_cast<int>(t.yOffset / 16u);
+            if (x < 0 || y < 0 || x >= static_cast<int>(t.width) || y >= static_cast<int>(t.height))
+                continue;
+            float depth = 0.0f;
+            glReadPixels(x * static_cast<int>(t.scale), y * static_cast<int>(t.scale), 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+            results.emplace_back(key, static_cast<uint32_t>(std::min(4294967295.0, static_cast<double>(depth) / t.zScale)));
+        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFramebuffer));
+        std::lock_guard<std::mutex> lock(m_probeMutex);
+        for (const auto &[key, z] : results)
+            m_probeResults[key] = z;
+        if (m_probeResults.size() > 4096u)
+            m_probeResults.clear();
+    }
+
     void Renderer::drawGroups(uint64_t group, const GsDrawTarget &target)
     {
+        // A group past a published frame's last: that frame is drawn, its probes read from the target it ended in.
+        {
+            bool frameDone = false;
+            {
+                std::lock_guard<std::mutex> lock(m_probeMutex);
+                while (!m_frameLastGroups.empty() && group > m_frameLastGroups.front())
+                {
+                    m_frameLastGroups.pop_front();
+                    frameDone = true;
+                }
+            }
+            if (frameDone)
+                readProbes();
+        }
         // PS2X_NATIVE_GS_STATS=1: every 2 s, the markers drawn, their batches and vertices, the time spent drawing
         // them on the GS thread and the textures the cache decoded meanwhile.
         static const bool s_stats = [] { const char *v = std::getenv("PS2X_NATIVE_GS_STATS"); return v && *v == '1'; }();
@@ -425,6 +472,7 @@ void main()
         s_window.vertices += vertices.size();
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
         const uint32_t scale = std::max(target.scale, 1u);
+        m_probeTarget = {target.framebuffer, target.width, target.height, scale, target.xOffset, target.yOffset, target.zScale};
         glViewport(0, 0, static_cast<GLsizei>(target.width * scale), static_cast<GLsizei>(target.height * scale));
         glEnable(GL_SCISSOR_TEST);
         const uint32_t x0 = std::min(target.scissorX0, target.width), y0 = std::min(target.scissorY0, target.height);

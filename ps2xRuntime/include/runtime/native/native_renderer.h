@@ -105,6 +105,9 @@ namespace ps2x::native
         void drawOverlay(const Material &material, const Vertex *vertices, uint32_t count,
                          std::shared_ptr<const TextureCache::Texture> texture);
         void publishOverlay();
+        // The same, the overlay's GS coordinates mapped to the window by this screen (the game's own view) instead of the
+        // frame being built's.
+        void publishOverlay(const Screen &screen);
         // The GS's TEXA as the game last wrote it (GS front end): a draw whose material sets no TEXA of its own (texa
         // 0, not fromGsContext) decodes its texture with it, as the GS would (16- and 24-bit texels take their alpha
         // from it; a game may write TEXA once, outside the stream a port reads).
@@ -230,6 +233,18 @@ namespace ps2x::native
         static constexpr size_t kClips = 1u << 14;
         std::unique_ptr<Clip[]> m_clips{new Clip[kClips]};
         std::atomic<uint64_t> m_markedGroup{0}; // the latest group whose marker the GS reached
+        // Depth probes with stream draws (depthAt): the points asked for, read on the GS thread from the frame's target
+        // once its last group is drawn (the first group of the next frame), their GS Z kept for the next asks.
+        struct ProbeTarget
+        {
+            uint32_t framebuffer = 0, width = 0, height = 0, scale = 1, xOffset = 0, yOffset = 0;
+            double zScale = 0.0;
+        };
+        std::mutex m_probeMutex;
+        std::unordered_map<uint64_t, uint32_t> m_probeWanted, m_probeResults; // (x << 16 | y) in GS pixels -> GS Z
+        std::deque<uint64_t> m_frameLastGroups; // each published frame's last group, oldest first
+        ProbeTarget m_probeTarget;              // GS thread: the target the last group drew into
+        void readProbes();                      // GS thread
         std::shared_ptr<Frame> m_shown, m_shownPrevious; // present thread: the frame drawn and the one before it
         std::atomic<double> m_depthWantedAt{-10.0};      // wantDepth()'s time (seconds)
         std::mutex m_depthMutex;
