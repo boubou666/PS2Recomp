@@ -104,6 +104,15 @@ namespace ps2x::native
         uint64_t m_gameTexa = 0;
         uint32_t m_gameFogColour = 0;
         std::array<uint64_t, 0x80> m_gameRegisters{};
+        // The pictures the game draws (its FRAME writes): the blocks, and when (the uploads' order). A texture there
+        // newer than its uploads is not one of the game's assets.
+        struct Target
+        {
+            uint32_t begin = 0, end = 0;
+            uint64_t seq = 0;
+        };
+        std::vector<Target> m_targets;
+        void noteTarget(uint64_t frame);
 
     private:
         uint32_t decodeTexel(uint32_t psm, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint64_t tex0,

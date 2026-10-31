@@ -184,6 +184,8 @@ namespace ps2x::native
                             continue;
                         if (addr < m_gameRegisters.size())
                             m_gameRegisters[addr] = data;
+                        if (addr == 0x4cu || addr == 0x4du)
+                            noteTarget(data);
                         if (addr == 0x3bu) // TEXA, FOGCOL: the game's values for materials built from its data
                             m_gameTexa = data;
                         else if (addr == 0x3du)
@@ -253,6 +255,22 @@ namespace ps2x::native
             begin = bp + ((y / ph) * across + x / pw) * 32u;
             end = bp + (((y + h - 1u) / ph) * across + (x + w - 1u) / pw + 1u) * 32u;
         }
+    }
+
+    void TextureCache::noteTarget(uint64_t frame)
+    {
+        // FRAME: FBP (pages), FBW (64 pixels), PSM. Its pages up to 512 lines down.
+        const uint32_t fbp = static_cast<uint32_t>(frame & 0x1FFu), fbw = static_cast<uint32_t>((frame >> 16) & 0x3Fu);
+        const uint32_t psm = static_cast<uint32_t>((frame >> 24) & 0x3Fu);
+        uint32_t begin = 0, end = 0;
+        blockSpan(psm == CT16 || psm == CT16S ? psm : CT32, fbp * 32u, std::max(fbw, 1u), 0, 0, std::max(fbw, 1u) * 64u, 512u, begin, end);
+        for (Target &target : m_targets)
+            if (target.begin == begin && target.end == end)
+            {
+                target.seq = ++m_uploadSeq;
+                return;
+            }
+        m_targets.push_back({begin, end, ++m_uploadSeq});
     }
 
     void TextureCache::storeUpload(uint32_t dbp, uint32_t dbw, uint32_t dpsm, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
@@ -419,6 +437,21 @@ namespace ps2x::native
         for (const uint16_t block : needed)
             marks[block] = 0u;
         std::reverse(parts.begin(), parts.end()); // oldest first
+        // A picture the game drew there since its last upload (a copy of the frame it samples): not an asset, no
+        // texture from the store.
+        {
+            uint64_t newestUpload = 0;
+            for (const StoredUpload *u : parts)
+                if (u->begin < imageEnd && imageBegin < u->end)
+                    newestUpload = std::max(newestUpload, u->seq);
+            for (const Target &target : m_targets)
+                if (target.begin < imageEnd && imageBegin < target.end && target.seq > newestUpload)
+                {
+                    ++m_storeMisses;
+                    m_lastSource = 0;
+                    return nullptr;
+                }
+        }
         uint64_t signature = 1469598103934665603ull;
         for (const StoredUpload *u : parts)
             signature = (signature ^ u->id) * 1099511628211ull;
