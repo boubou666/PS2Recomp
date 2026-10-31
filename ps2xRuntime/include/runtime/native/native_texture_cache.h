@@ -112,7 +112,7 @@ namespace ps2x::native
             uint64_t seq = 0;
         };
         std::vector<Target> m_targets;
-        void noteTarget(uint64_t frame);
+        void noteTarget(uint64_t frame, uint64_t scissor);
 
     private:
         uint32_t decodeTexel(uint32_t psm, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint64_t tex0,

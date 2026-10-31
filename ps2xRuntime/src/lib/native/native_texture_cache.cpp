@@ -170,8 +170,11 @@ namespace ps2x::native
             const uint32_t nloop = lo & 0x7fffu;
             const uint32_t flg = (lo >> 58) & 3u;
             const uint32_t nreg = ((lo >> 60) & 0xfu) ? static_cast<uint32_t>((lo >> 60) & 0xfu) : 16u;
+            if ((lo >> 46) & 1u) // PRE
+                m_gameRegisters[0] = (lo >> 47) & 0x7ffu;
             if (flg == 0u) // PACKED: only A+D can address the transfer registers
             {
+                bool drew = false; // a picture drawn by this tag: its target noted once, with FRAME and SCISSOR then
                 for (uint32_t n = 0; n < nloop; ++n)
                     for (uint32_t r = 0; r < nreg; ++r)
                     {
@@ -180,12 +183,24 @@ namespace ps2x::native
                         const uint32_t reg = (hi >> (4u * r)) & 0xfu;
                         const uint64_t data = u64(i), addr = u64(i + 8u) & 0xffu;
                         i += 16u;
+                        if (reg == 0x0u)
+                            m_gameRegisters[0] = data & 0x7ffu;
+                        if ((reg == 0x4u || reg == 0x5u) && !drew)
+                        {
+                            drew = true;
+                            const bool second = (m_gameRegisters[0] >> 9) & 1u;
+                            noteTarget(m_gameRegisters[second ? 0x4du : 0x4cu], m_gameRegisters[second ? 0x41u : 0x40u]);
+                        }
                         if (reg != 0xeu)
                             continue;
                         if (addr < m_gameRegisters.size())
                             m_gameRegisters[addr] = data;
-                        if (addr == 0x4cu || addr == 0x4du)
-                            noteTarget(data);
+                        if ((addr == 0x04u || addr == 0x05u) && !drew)
+                        {
+                            drew = true;
+                            const bool second = (m_gameRegisters[0] >> 9) & 1u;
+                            noteTarget(m_gameRegisters[second ? 0x4du : 0x4cu], m_gameRegisters[second ? 0x41u : 0x40u]);
+                        }
                         if (addr == 0x3bu) // TEXA, FOGCOL: the game's values for materials built from its data
                             m_gameTexa = data;
                         else if (addr == 0x3du)
@@ -257,13 +272,19 @@ namespace ps2x::native
         }
     }
 
-    void TextureCache::noteTarget(uint64_t frame)
+    void TextureCache::noteTarget(uint64_t frame, uint64_t scissor)
     {
-        // FRAME: FBP (pages), FBW (64 pixels), PSM. Its pages up to 512 lines down.
+        // FRAME: FBP (pages), FBW (64 pixels), PSM; SCISSOR the rectangle drawn: its pages are the picture.
+        if (frame == 0u)
+            return;
         const uint32_t fbp = static_cast<uint32_t>(frame & 0x1FFu), fbw = static_cast<uint32_t>((frame >> 16) & 0x3Fu);
         const uint32_t psm = static_cast<uint32_t>((frame >> 24) & 0x3Fu);
+        const uint32_t x0 = static_cast<uint32_t>(scissor & 0x7FFu), x1 = static_cast<uint32_t>((scissor >> 16) & 0x7FFu);
+        const uint32_t y0 = static_cast<uint32_t>((scissor >> 32) & 0x7FFu), y1 = static_cast<uint32_t>((scissor >> 48) & 0x7FFu);
+        if (x1 < x0 || y1 < y0)
+            return;
         uint32_t begin = 0, end = 0;
-        blockSpan(psm == CT16 || psm == CT16S ? psm : CT32, fbp * 32u, std::max(fbw, 1u), 0, 0, std::max(fbw, 1u) * 64u, 512u, begin, end);
+        blockSpan(psm == CT16 || psm == CT16S ? psm : CT32, fbp * 32u, std::max(fbw, 1u), x0, y0, x1 - x0 + 1u, y1 - y0 + 1u, begin, end);
         for (Target &target : m_targets)
             if (target.begin == begin && target.end == end)
             {
