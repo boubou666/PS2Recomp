@@ -76,6 +76,13 @@ namespace ps2x::native
             std::lock_guard<std::mutex> lock(m_mutex);
             return m_gameRegisters;
         }
+        // A picture drawn without a packet this cache scans (a port's native draw of the game's primitives), into the
+        // FRAME and SCISSOR the game set for `context`.
+        void noteDraw(uint32_t context)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            noteTarget(m_gameRegisters[context ? 0x4du : 0x4cu], m_gameRegisters[context ? 0x41u : 0x40u]);
+        }
 
     private:
         struct StoredUpload
