@@ -1,4 +1,5 @@
 #include "runtime/native/native_renderer.h"
+#include "runtime/native/native_vu0_hle.h"
 
 #include "raylib.h"
 #include "rlgl.h"
@@ -33,6 +34,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -2417,6 +2419,104 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     {
         seedVu0IdleSuccess(ctx);
         return;
+    }
+
+    // The port's native version of this microprogram (runtime/native/native_vu0_hle.h).
+    if (const ps2x::native::Vu0Hle hle = ps2x::native::vu0Hle())
+    {
+        static const bool s_hleCheck = []
+        {
+            const char *value = std::getenv("PS2X_VU0_HLE_CHECK");
+            return value && value[0] == '1';
+        }();
+        if (!s_hleCheck)
+        {
+            if (hle(ctx, vu0Code, vu0Data, startPC))
+                return;
+        }
+        else
+        {
+            const R5900Context saved = *ctx;
+            std::vector<uint8_t> dataSaved(vu0Data, vu0Data + PS2_VU0_DATA_SIZE);
+            if (hle(ctx, vu0Code, vu0Data, startPC))
+            {
+                const R5900Context native = *ctx;
+                std::vector<uint8_t> dataNative(vu0Data, vu0Data + PS2_VU0_DATA_SIZE);
+                *ctx = saved;
+                std::memcpy(vu0Data, dataSaved.data(), PS2_VU0_DATA_SIZE);
+                ctx->vu0_itop = m_memory.vif0_regs.itops;
+                m_vu0.reset();
+                copyVu0ContextToState(ctx, m_vu0.state());
+                m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory, startPC, 0u,
+                              ctx->vu0_itop, 4096, true);
+                copyVu0StateToContext(m_vu0.state(), ctx);
+                // Per program: calls, and the worst relative difference of each register (and of data memory).
+                struct Report
+                {
+                    uint64_t calls = 0, differing = 0;
+                    float worst = 0.0f;
+                    char what[160] = {};
+                };
+                static std::unordered_map<uint32_t, Report> s_reports;
+                static uint64_t s_calls = 0;
+                Report &report = s_reports[startPC];
+                ++report.calls;
+                float worst = 0.0f;
+                char what[160] = {};
+                const auto note = [&](float a, float b, const char *name, int index, int lane)
+                {
+                    if (std::memcmp(&a, &b, 4) == 0)
+                        return;
+                    const float scale = std::max({std::fabs(a), std::fabs(b), 1e-3f});
+                    const float d = std::isfinite(a) && std::isfinite(b) ? std::fabs(a - b) / scale : 1e9f;
+                    if (d > worst)
+                    {
+                        worst = d;
+                        std::snprintf(what, sizeof(what), "%s%d.%c native %g interpreter %g", name, index, "xyzw"[lane], a, b);
+                    }
+                };
+                for (int r = 1; r < 32; ++r)
+                {
+                    alignas(16) float a[4], b[4];
+                    _mm_store_ps(a, native.vu0_vf[r]);
+                    _mm_store_ps(b, ctx->vu0_vf[r]);
+                    for (int l = 0; l < 4; ++l)
+                        note(a[l], b[l], "vf", r, l);
+                }
+                for (int r = 1; r < 16; ++r)
+                    if (native.vi[r] != ctx->vi[r] && worst < 1e9f)
+                    {
+                        worst = 1e9f;
+                        std::snprintf(what, sizeof(what), "vi%d native %#x interpreter %#x", r, native.vi[r], ctx->vi[r]);
+                    }
+                for (uint32_t at = 0; at + 4u <= PS2_VU0_DATA_SIZE; at += 4u)
+                {
+                    float a, b;
+                    std::memcpy(&a, dataNative.data() + at, 4);
+                    std::memcpy(&b, vu0Data + at, 4);
+                    note(a, b, "data@", static_cast<int>(at / 16u), static_cast<int>((at / 4u) & 3u));
+                }
+                if (worst > 1e-4f)
+                {
+                    ++report.differing;
+                    if (worst > report.worst)
+                    {
+                        report.worst = worst;
+                        std::memcpy(report.what, what, sizeof(what));
+                        std::fprintf(stderr, "[vu0:hle] pc %#x call %llu: worst so far %s
+", startPC,
+                                     static_cast<unsigned long long>(report.calls), what);
+                    }
+                }
+                if (++s_calls % 50000u == 0u)
+                    for (const auto &[pc, r] : s_reports)
+                        std::fprintf(stderr, "[vu0:hle] pc %#x: %llu calls, %llu differ (worst %s)
+", pc,
+                                     static_cast<unsigned long long>(r.calls), static_cast<unsigned long long>(r.differing),
+                                     r.differing ? r.what : "-");
+                return;
+            }
+        }
     }
 
     // PS2X_VU0_CHECK=1: every microprogram also runs through the interpreter from the same state; a difference
