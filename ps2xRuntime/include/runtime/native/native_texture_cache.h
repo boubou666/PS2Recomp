@@ -7,6 +7,7 @@
 // CT32 / CT16 palette in CSM1 order, CT32, CT24, CT16). A decoded texture stays cached until an upload touches one
 // of its pages or its palette's.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -63,6 +64,13 @@ namespace ps2x::native
         // material takes them from the game's data.
         uint64_t gameTexa() const { return m_gameTexa; }
         uint32_t gameFogColour() const { return m_gameFogColour; }
+        // Any GS register (A+D address below 0x80) as the game last wrote it in those packets: for draws a port builds
+        // from a program's output, whose material registers the game may have sent in other packets.
+        uint64_t gameRegister(uint32_t address) const
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return address < m_gameRegisters.size() ? m_gameRegisters[address] : 0u;
+        }
 
     private:
         struct StoredUpload
@@ -95,6 +103,7 @@ namespace ps2x::native
         std::vector<uint64_t> m_blockSeq = std::vector<uint64_t>(kMemoryBytes / 256u, 0u); // the last upload filling each block whole
         uint64_t m_gameTexa = 0;
         uint32_t m_gameFogColour = 0;
+        std::array<uint64_t, 0x80> m_gameRegisters{};
 
     private:
         uint32_t decodeTexel(uint32_t psm, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint64_t tex0,

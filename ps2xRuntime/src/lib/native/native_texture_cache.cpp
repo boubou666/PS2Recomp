@@ -182,6 +182,8 @@ namespace ps2x::native
                         i += 16u;
                         if (reg != 0xeu)
                             continue;
+                        if (addr < m_gameRegisters.size())
+                            m_gameRegisters[addr] = data;
                         if (addr == 0x3bu) // TEXA, FOGCOL: the game's values for materials built from its data
                             m_gameTexa = data;
                         else if (addr == 0x3du)
