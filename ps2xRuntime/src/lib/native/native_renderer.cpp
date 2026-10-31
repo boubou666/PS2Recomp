@@ -163,6 +163,12 @@ void main()
 
     void Renderer::draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count)
     {
+        draw(material, matrix, vertices, count, nullptr);
+    }
+
+    void Renderer::draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count,
+                        std::shared_ptr<const TextureCache::Texture> texture)
+    {
         if (count == 0u)
             return;
         Batch batch;
@@ -181,6 +187,8 @@ void main()
         }();
         if (material.textured && !material.fromGsContext && !(s_atDraw && m_streamDraws))
             batch.texture = ps2x::native::textures().texture(material.tex0, batch.material.texa, material.region);
+        if (texture)
+            batch.texture = std::move(texture);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
         batch.key = m_key;

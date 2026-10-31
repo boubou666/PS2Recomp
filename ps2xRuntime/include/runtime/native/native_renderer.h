@@ -93,6 +93,11 @@ namespace ps2x::native
         // Triangles (three vertices each) with an object-to-screen matrix: column c is matrix[4c..4c+3], screen
         // point = M * (x, y, z, 1), then divided by w (as a VU's projection).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count);
+        // The same with the texture handed over, decoded by the port from its game's own data (its texture assets in EE
+        // RAM): no texture cache lookup for this batch (material.textured still says whether it is textured; material.tex0
+        // keys its GPU copy, so each asset needs its own value there).
+        void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count,
+                  std::shared_ptr<const TextureCache::Texture> texture);
         // The GS's TEXA as the game last wrote it (GS front end): a draw whose material sets no TEXA of its own (texa
         // 0, not fromGsContext) decodes its texture with it, as the GS would (16- and 24-bit texels take their alpha
         // from it; a game may write TEXA once, outside the stream a port reads).
