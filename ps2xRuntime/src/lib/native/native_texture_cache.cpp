@@ -426,7 +426,11 @@ namespace ps2x::native
         static uint64_t s_lookups = 0;
         static std::unordered_map<uint64_t, uint32_t> s_decoded;
         ++s_lookups;
-        if (const auto it = m_storeTextures.find(key); it != m_storeTextures.end() && it->second.signature == signature)
+        // Each content a TEX0 shows is kept (two assets drawn in turn with one TEX0 are decoded once each).
+        const uint64_t cached = key ^ (signature * 0x9e3779b97f4a7c15ull);
+        if (m_storeTextures.size() > 8192u)
+            m_storeTextures.clear();
+        if (const auto it = m_storeTextures.find(cached); it != m_storeTextures.end() && it->second.signature == signature)
         {
             m_lastSource = 3;
             return it->second.texture;
@@ -449,7 +453,7 @@ namespace ps2x::native
         if (!imageCovered)
         {
             ++m_storeMisses;
-            m_storeTextures[key] = {nullptr, signature};
+            m_storeTextures[cached] = {nullptr, signature};
             return nullptr;
         }
 
@@ -512,7 +516,7 @@ namespace ps2x::native
                                  : psm == CT32 ? fromCt32(value) : psm == CT24 ? fromCt24(value, texa) : fromCt16(value, texa);
             }
         auto shared = std::make_shared<const Texture>(std::move(texture));
-        m_storeTextures[key] = {shared, signature};
+        m_storeTextures[cached] = {shared, signature};
         return shared;
     }
 
