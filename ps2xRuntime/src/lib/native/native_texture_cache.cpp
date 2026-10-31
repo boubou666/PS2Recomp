@@ -412,21 +412,35 @@ namespace ps2x::native
                 needed.push_back(static_cast<uint16_t>(block));
             marks[block] |= what;
         };
-        // Every block is at least 8 x 8 pixels.
-        for (uint32_t y = 0; y < height; y += 8u)
-            for (uint32_t x = 0; x < width; x += 8u)
-                need(GSMem::BlockOf(psm, tbp, std::max(tbw, 1u), x, y), 1u);
-        if (indexed(psm))
+        // The blocks a TEX0 reads, worked out once per TEX0 (the layout formulas are the costly part of a lookup).
+        thread_local std::unordered_map<uint64_t, std::vector<uint32_t>> blocksRead; // block | what << 16
+        auto found = blocksRead.find(selected);
+        if (found == blocksRead.end())
         {
-            const uint32_t csa = (tex0 >> 56) & 0x1fu;
-            const bool eight = psm == T8 || psm == T8H;
-            for (uint32_t i = 0; i < (eight ? 256u : 16u); i += 4u)
+            if (blocksRead.size() > 16384u)
+                blocksRead.clear();
+            std::vector<uint32_t> list;
+            // Every block is at least 8 x 8 pixels.
+            for (uint32_t y = 0; y < height; y += 8u)
+                for (uint32_t x = 0; x < width; x += 8u)
+                    list.push_back((GSMem::BlockOf(psm, tbp, std::max(tbw, 1u), x, y) & 0x3fffu) | (1u << 16));
+            if (indexed(psm))
             {
-                uint32_t px = 0, py = 0;
-                csm1Position(eight ? i : (csa * 16u + i) & 0xffu, px, py);
-                need(GSMem::BlockOf(cpsm == CT32 ? CT32 : CT16, cbp, 1, px, py), 2u);
+                const uint32_t csa = (tex0 >> 56) & 0x1fu;
+                const bool eight = psm == T8 || psm == T8H;
+                for (uint32_t i = 0; i < (eight ? 256u : 16u); i += 4u)
+                {
+                    uint32_t px = 0, py = 0;
+                    csm1Position(eight ? i : (csa * 16u + i) & 0xffu, px, py);
+                    list.push_back((GSMem::BlockOf(cpsm == CT32 ? CT32 : CT16, cbp, 1, px, py) & 0x3fffu) | (2u << 16));
+                }
             }
+            std::sort(list.begin(), list.end());
+            list.erase(std::unique(list.begin(), list.end()), list.end());
+            found = blocksRead.emplace(selected, std::move(list)).first;
         }
+        for (const uint32_t entry : found->second)
+            need(entry & 0xffffu, static_cast<uint8_t>(entry >> 16));
         thread_local std::vector<const StoredUpload *> all, parts;
         all.clear();
         parts.clear();

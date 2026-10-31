@@ -71,6 +71,11 @@ namespace ps2x::native
             std::lock_guard<std::mutex> lock(m_mutex);
             return address < m_gameRegisters.size() ? m_gameRegisters[address] : 0u;
         }
+        std::array<uint64_t, 0x80> gameRegisters() const
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return m_gameRegisters;
+        }
 
     private:
         struct StoredUpload
