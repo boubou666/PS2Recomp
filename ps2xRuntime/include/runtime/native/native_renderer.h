@@ -53,6 +53,10 @@ namespace ps2x::native
         bool clampU = false, clampV = false; // CLAMP's WMS / WMT: the texture's edge past 0..1 (else it repeats)
         uint64_t region = 0; // CLAMP, for a REGION_REPEAT window (TextureCache::regionWindow): the texture is that window
         bool fog = false;           // PRIM.FGE: the colour goes toward fogColour by 1 - Vertex::fog, after texturing
+        // The texture is the target being drawn into, as it is when this batch is drawn (a game's screen distortion:
+        // heat haze sampling the frame through TEX0 = the frame buffer); u, v in the target's GS pixels. Stream draws
+        // only (the GS pass): the frame is not in GS memory for the texture cache to decode.
+        bool sampleTarget = false;
         uint32_t fogColour = 0;     // FOGCOL, R in the low byte
         // The GS state where the draw's group sits in the stream (a stream draw, beginGroup) gives tex0, texa, blend,
         // the alpha and depth tests, clampU / clampV and fogColour, for games whose meshes take their material from
