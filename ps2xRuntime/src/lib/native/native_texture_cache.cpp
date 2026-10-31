@@ -257,40 +257,86 @@ namespace ps2x::native
                                    const uint8_t *data, size_t bytes)
     {
         const size_t size = std::min(bytes, (static_cast<size_t>(w) * h * bitsPerPixel(dpsm) + 7u) / 8u);
+        // A block of `psm` in pixels, and whether its uploads write all the bits of the memory they touch.
+        uint32_t blockW = 8u, blockH = 8u;
+        switch (dpsm)
+        {
+        case CT16:
+        case CT16S: blockW = 16u; break;
+        case T8: blockW = 16u; blockH = 16u; break;
+        case T4: blockW = 32u; blockH = 16u; break;
+        default: break;
+        }
+        const bool allBits = dpsm != CT24 && dpsm != T8H && dpsm != T4HL && dpsm != T4HH;
+        const auto blockOf = [&](uint32_t x, uint32_t y) { return GSMem::BlockOf(dpsm, dbp, std::max(dbw, 1u), x, y) & 0x3fffu; };
+
+        StoredUpload *placed = nullptr;
         for (StoredUpload &u : m_stored)
             if (u.dbp == dbp && u.psm == dpsm && u.dx == dx && u.dy == dy && u.w == w && u.h == h && u.dbw == dbw &&
                 u.data.size() == size && std::memcmp(u.data.data(), data, size) == 0)
             {
                 u.seq = ++m_uploadSeq; // the same pixels again: newest at its place, nothing to decode again
-                return;
+                placed = &u;
+                break;
             }
-        StoredUpload upload;
-        upload.dbp = dbp;
-        upload.psm = dpsm;
-        upload.dx = dx;
-        upload.dy = dy;
-        upload.w = w;
-        upload.h = h;
-        upload.dbw = dbw;
-        blockSpan(dpsm, dbp, dbw, dx, dy, w, h, upload.begin, upload.end);
-        upload.data.assign(data, data + size);
-        upload.seq = ++m_uploadSeq;
-        upload.id = ++m_contentSerial;
-        // Older uploads this one hides whole are gone: the same rectangle or less at the same place in the same
-        // format, or pages it fills completely (a format that writes all of a page's bits).
-        uint32_t pw = 0, ph = 0;
-        pageSize(dpsm, pw, ph);
-        const uint32_t across = std::max(1u, std::max(dbw, 1u) * 64u / pw);
-        const bool wholePages = dpsm != CT24 && dpsm != T8H && dpsm != T4HL && dpsm != T4HH && dx % pw == 0u &&
-                                dy % ph == 0u && h % ph == 0u && (w % pw == 0u || dx + w == across * pw);
+        if (!placed)
+        {
+            StoredUpload upload;
+            upload.dbp = dbp;
+            upload.psm = dpsm;
+            upload.dx = dx;
+            upload.dy = dy;
+            upload.w = w;
+            upload.h = h;
+            upload.dbw = dbw;
+            blockSpan(dpsm, dbp, dbw, dx, dy, w, h, upload.begin, upload.end);
+            for (uint32_t y = dy / blockH * blockH; y < dy + h; y += blockH)
+                for (uint32_t x = dx / blockW * blockW; x < dx + w; x += blockW)
+                    upload.blocks.push_back(static_cast<uint16_t>(blockOf(x, y)));
+            std::sort(upload.blocks.begin(), upload.blocks.end());
+            upload.blocks.erase(std::unique(upload.blocks.begin(), upload.blocks.end()), upload.blocks.end());
+            upload.data.assign(data, data + size);
+            upload.seq = ++m_uploadSeq;
+            upload.id = ++m_contentSerial;
+            // The same rectangle or less at the same place in the same format: the same bits again.
+            m_stored.erase(std::remove_if(m_stored.begin(), m_stored.end(), [&](const StoredUpload &u) {
+                               return u.dbp == dbp && u.psm == dpsm && u.dbw == dbw && u.dx >= dx && u.dy >= dy &&
+                                      u.dx + u.w <= dx + w && u.dy + u.h <= dy + h;
+                           }),
+                           m_stored.end());
+            m_stored.push_back(std::move(upload));
+            static size_t s_reported = 256u;
+            if (m_stored.size() >= s_reported * 2u)
+            {
+                s_reported = m_stored.size();
+                std::fprintf(stderr, "[native-textures] %zu uploads kept\n", m_stored.size());
+            }
+            placed = &m_stored.back();
+        }
+
+        // The blocks it fills whole are its own from now on; an older upload left without a block of its own is gone.
+        if (!allBits)
+            return;
+        bool filled = false;
+        for (uint32_t y = (dy + blockH - 1u) / blockH * blockH; y + blockH <= dy + h; y += blockH)
+            for (uint32_t x = (dx + blockW - 1u) / blockW * blockW; x + blockW <= dx + w; x += blockW)
+            {
+                m_blockSeq[blockOf(x, y)] = placed->seq;
+                filled = true;
+            }
+        if (!filled)
+            return;
+        const uint64_t seq = placed->seq;
+        const uint32_t begin = placed->begin, end = placed->end;
         m_stored.erase(std::remove_if(m_stored.begin(), m_stored.end(), [&](const StoredUpload &u) {
-                           if (u.dbp == dbp && u.psm == dpsm && u.dbw == dbw && u.dx >= dx && u.dy >= dy &&
-                               u.dx + u.w <= dx + w && u.dy + u.h <= dy + h)
-                               return true;
-                           return wholePages && w == across * pw && u.begin >= upload.begin && u.end <= upload.end;
+                           if (u.seq >= seq || u.end <= begin || end <= u.begin)
+                               return false;
+                           for (const uint16_t block : u.blocks)
+                               if (m_blockSeq[block] <= u.seq)
+                                   return false;
+                           return true;
                        }),
                        m_stored.end());
-        m_stored.push_back(std::move(upload));
     }
 
     std::shared_ptr<const TextureCache::Texture> TextureCache::textureFromStore(uint64_t tex0, uint64_t texa)
@@ -455,8 +501,8 @@ namespace ps2x::native
     {
         static int left = [] { const char *v = std::getenv("PS2X_NATIVE_TEX_COMPARE"); return v ? std::atoi(v) : 0; }();
         static uint64_t compared = 0, differing = 0;
-        ++compared;
-        if (left <= 0)
+        // One texture in 16 (the GS memory decode is slow): enough to find a store that goes wrong.
+        if (++compared % 16u != 0u || left <= 0)
             return;
         const auto reference = memoryTexture(tex0, texa);
         size_t wrong = 0, first = 0;
