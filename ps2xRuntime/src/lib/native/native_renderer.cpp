@@ -215,6 +215,36 @@ void main()
             m_building.batches.push_back(batch);
     }
 
+    void Renderer::drawOverlay(const Material &material, const Vertex *vertices, uint32_t count,
+                               std::shared_ptr<const TextureCache::Texture> texture)
+    {
+        if (count == 0u)
+            return;
+        Batch batch;
+        batch.material = material;
+        batch.material.depthTest = false;
+        batch.material.depthWrite = false;
+        static constexpr float kScreenSpace[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        std::memcpy(batch.matrix, kScreenSpace, sizeof(batch.matrix));
+        batch.texture = std::move(texture);
+        batch.first = static_cast<uint32_t>(m_overlayBuilding.vertices.size());
+        batch.count = count;
+        m_overlayBuilding.vertices.insert(m_overlayBuilding.vertices.end(), vertices, vertices + count);
+        for (uint32_t i = batch.first; i < batch.first + count; ++i)
+            m_overlayBuilding.vertices[i].z = m_building.screen.depthMax; // the nearest: over the whole frame
+        m_overlayBuilding.batches.push_back(batch);
+    }
+
+    void Renderer::publishOverlay()
+    {
+        auto overlay = std::make_shared<Frame>(std::move(m_overlayBuilding));
+        m_overlayBuilding = Frame{};
+        overlay->screen = m_building.screen;
+        overlay->time = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_overlayPublished = std::move(overlay);
+    }
+
     void Renderer::endFrame()
     {
         auto frame = std::make_shared<Frame>(std::move(m_building));
@@ -288,9 +318,17 @@ void main()
                 m_shown = std::move(next);
             }
         }
-        const std::shared_ptr<Frame> frame = m_shown, previous = m_shownPrevious;
-        if (!frame || !m_enabled || m_drewIntoGs.load(std::memory_order_relaxed))
-            return false; // or the GS frame has the native draws already (drawn into it in the GS stream)
+        std::shared_ptr<Frame> overlay;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            overlay = m_overlayPublished;
+        }
+        // The GS frame has the native draws already (drawn into it in the GS stream): only the port's 2D over it.
+        const bool overlayOnly = m_drewIntoGs.load(std::memory_order_relaxed) && overlay && !overlay->batches.empty();
+        if (!m_enabled || (!overlayOnly && (!m_shown || m_drewIntoGs.load(std::memory_order_relaxed))))
+            return false;
+        const std::shared_ptr<Frame> frame = overlayOnly ? overlay : m_shown;
+        const std::shared_ptr<Frame> previous = overlayOnly ? nullptr : m_shownPrevious;
         if (!m_gpu)
         {
             m_gpu = std::make_unique<Gpu>();
@@ -481,7 +519,7 @@ void main()
             rlDrawVertexArray(static_cast<int>(batch.first), static_cast<int>(batch.count));
         }
         rlDisableScissorTest();
-        if (secondsNow() - m_depthWantedAt.load(std::memory_order_relaxed) < 1.0)
+        if (!overlayOnly && secondsNow() - m_depthWantedAt.load(std::memory_order_relaxed) < 1.0)
         {
             std::vector<float> depth;
             if (readFramebufferDepth(w, h, depth))

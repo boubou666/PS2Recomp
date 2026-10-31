@@ -98,6 +98,13 @@ namespace ps2x::native
         // keys its GPU copy, so each asset needs its own value there).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count,
                   std::shared_ptr<const TextureCache::Texture> texture);
+        // A port's 2D drawn natively (its HUD, text, menus, from the game's own routines): screen-space triangles (x, y
+        // the GS's primitive coordinates over 16, as a draw with no matrix gets them) over the frame, in submission order,
+        // without depth; publishOverlay at the game frame's end shows them from the next present() on, over the frame
+        // (the GS's, or this renderer's own) until the next publish.
+        void drawOverlay(const Material &material, const Vertex *vertices, uint32_t count,
+                         std::shared_ptr<const TextureCache::Texture> texture);
+        void publishOverlay();
         // The GS's TEXA as the game last wrote it (GS front end): a draw whose material sets no TEXA of its own (texa
         // 0, not fromGsContext) decodes its texture with it, as the GS would (16- and 24-bit texels take their alpha
         // from it; a game may write TEXA once, outside the stream a port reads).
@@ -196,6 +203,8 @@ namespace ps2x::native
         void drawGroups(uint64_t group, const GsDrawTarget &target);
 
         Frame m_building;
+        Frame m_overlayBuilding;                  // game thread (drawOverlay)
+        std::shared_ptr<Frame> m_overlayPublished; // under m_mutex
         std::mutex m_mutex;
         std::shared_ptr<Frame> m_published;
         std::shared_ptr<Frame> m_previous; // the one before m_published (interpolation)
