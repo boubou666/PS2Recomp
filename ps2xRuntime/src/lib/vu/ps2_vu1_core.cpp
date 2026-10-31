@@ -1226,13 +1226,43 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             compiled = m_compiledImage->byPair.data();
     }
 
+    // PS2X_VU1_TRACE=<lines>: each pair VU1 runs (interpreted), its pc and the registers it changed (vf, vi, Q, P, R),
+    // up to <lines> lines in all: a translation's reference (with ps2_vu1_replay on a PS2X_VU1_RECORD trace).
+    static const long s_traceLines = []
+    {
+        const char *value = std::getenv("PS2X_VU1_TRACE");
+        return value && *value ? std::atol(value) : 0L;
+    }();
+    static long s_traced = 0;
+    const bool trace = s_traceLines > 0 && m_unit == Unit::VU1 && s_traced < s_traceLines;
+    if (trace)
+        compiled = nullptr;
     while (canIssue(context))
     {
         StepResult result;
+        const VU1State before = m_state;
         if (compiled && (m_state.pc & 7u) == 0u && compiled[m_state.pc >> 3])
             result = compiled[m_state.pc >> 3](*this, context);
         else
             result = stepPair(getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc), context);
+        if (trace && s_traced < s_traceLines)
+        {
+            ++s_traced;
+            std::fprintf(stderr, "[vu1] %04x", before.pc);
+            for (int r = 1; r < 32; ++r)
+                if (std::memcmp(before.vf[r], m_state.vf[r], sizeof(m_state.vf[r])) != 0)
+                    std::fprintf(stderr, " vf%d=(%.9g %.9g %.9g %.9g)", r, m_state.vf[r][0], m_state.vf[r][1], m_state.vf[r][2], m_state.vf[r][3]);
+            for (int r = 1; r < 16; ++r)
+                if (before.vi[r] != m_state.vi[r])
+                    std::fprintf(stderr, " vi%d=%d", r, m_state.vi[r]);
+            if (before.q != m_state.q)
+                std::fprintf(stderr, " Q=%.9g", m_state.q);
+            if (before.p != m_state.p)
+                std::fprintf(stderr, " P=%.9g", m_state.p);
+            if (before.r != m_state.r)
+                std::fprintf(stderr, " R=%08x", m_state.r);
+            std::fprintf(stderr, "\n");
+        }
         if (result == StepResult::Continue)
             continue;
         programEnded = result == StepResult::Ended;
