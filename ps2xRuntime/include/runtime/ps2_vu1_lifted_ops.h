@@ -15,6 +15,15 @@
 #include <cstring>
 #include <limits>
 
+// MSVC (x64: SSE only, no x87 code to round) or GCC / Clang.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PS2X_LIFTED_COLD __declspec(noinline)
+#define PS2X_LIFTED_X87 0
+#else
+#define PS2X_LIFTED_COLD __attribute__((noinline, cold))
+#define PS2X_LIFTED_X87 1
+#endif
+
 namespace ps2x::vu1lift
 {
     // Where a lifted program hands each XGKICK packet.
@@ -143,7 +152,7 @@ namespace ps2x::vu1lift
         return K::None;
     }
 
-    __attribute__((noinline, cold)) inline __m128 fmacCold(Fmac &f, __m128 value, int dest, ps2_vu1_detail::FmacKind kind, __m128 left,
+    PS2X_LIFTED_COLD inline __m128 fmacCold(Fmac &f, __m128 value, int dest, ps2_vu1_detail::FmacKind kind, __m128 left,
                                                          __m128 right, __m128 acc, uint32_t &mac, uint32_t &cur)
     {
         alignas(16) float result[4];
@@ -570,15 +579,21 @@ namespace ps2x::vu1lift
         uint16_t cw = 0u;
         RoundTowardZero()
         {
+#if PS2X_LIFTED_X87
             __asm__ volatile("fnstcw %0" : "=m"(cw));
+#endif
             _mm_setcsr(csr | 0x6000u);
+#if PS2X_LIFTED_X87
             const uint16_t towardZero = static_cast<uint16_t>(cw | 0x0C00u);
             __asm__ volatile("fldcw %0" : : "m"(towardZero));
+#endif
         }
         ~RoundTowardZero()
         {
             _mm_setcsr(csr);
+#if PS2X_LIFTED_X87
             __asm__ volatile("fldcw %0" : : "m"(cw));
+#endif
         }
     };
 }
