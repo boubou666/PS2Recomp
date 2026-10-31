@@ -687,6 +687,44 @@ void main()
                 glBlendEquation(GL_FUNC_ADD);
                 glBlendFuncSeparate(GL_DST_COLOR, GL_ONE, GL_ZERO, GL_ONE);
                 break;
+            case Material::Blend::Gs:
+            {
+                // (A - B) * C + D, A B D: 0 Cs, 1 Cd, 2 zero; C: 0 As, 1 Ad, 2 FIX (0x80 = 1).
+                const uint32_t a = m.gsAlpha & 3u, b = (m.gsAlpha >> 2) & 3u, c = (m.gsAlpha >> 4) & 3u, d = (m.gsAlpha >> 6) & 3u;
+                const GLenum cf = c == 0u ? GL_SRC_ALPHA : c == 1u ? GL_DST_ALPHA : GL_CONSTANT_ALPHA;
+                const GLenum oneMinusCf = c == 0u ? GL_ONE_MINUS_SRC_ALPHA : c == 1u ? GL_ONE_MINUS_DST_ALPHA : GL_ONE_MINUS_CONSTANT_ALPHA;
+                if (c == 2u)
+                    glBlendColor(0.0f, 0.0f, 0.0f, std::min(1.0f, static_cast<float>(m.gsFix) / 128.0f));
+                GLenum src = GL_ONE, dst = GL_ZERO, equation = GL_FUNC_ADD;
+                const auto pick = [&](GLenum s, GLenum t, GLenum e) { src = s, dst = t, equation = e; };
+                const uint32_t key = a | (b << 2) | (d << 4); // terms: Cs 0, Cd 1, zero 2
+                switch (key)
+                {
+                case 0 | (1 << 2) | (1 << 4): pick(cf, oneMinusCf, GL_FUNC_ADD); break;             // (Cs - Cd) C + Cd
+                case 0 | (1 << 2) | (2 << 4): pick(cf, cf, GL_FUNC_SUBTRACT); break;               // (Cs - Cd) C
+                case 0 | (1 << 2) | (0 << 4): pick(GL_ONE, cf, GL_FUNC_SUBTRACT); break;           // Cs (1 + C) - Cd C
+                case 0 | (2 << 2) | (1 << 4): pick(cf, GL_ONE, GL_FUNC_ADD); break;                // Cs C + Cd
+                case 0 | (2 << 2) | (2 << 4): pick(cf, GL_ZERO, GL_FUNC_ADD); break;               // Cs C
+                case 0 | (2 << 2) | (0 << 4): pick(GL_ONE, GL_ZERO, GL_FUNC_ADD); break;           // Cs (1 + C)
+                case 1 | (0 << 2) | (0 << 4): pick(oneMinusCf, cf, GL_FUNC_ADD); break;            // (Cd - Cs) C + Cs
+                case 1 | (0 << 2) | (2 << 4): pick(cf, cf, GL_FUNC_REVERSE_SUBTRACT); break;       // (Cd - Cs) C
+                case 1 | (0 << 2) | (1 << 4): pick(cf, GL_ONE, GL_FUNC_REVERSE_SUBTRACT); break;   // Cd (1 + C) - Cs C
+                case 1 | (2 << 2) | (0 << 4): pick(GL_ONE, cf, GL_FUNC_ADD); break;                // Cd C + Cs
+                case 1 | (2 << 2) | (2 << 4): pick(GL_ZERO, cf, GL_FUNC_ADD); break;               // Cd C
+                case 1 | (2 << 2) | (1 << 4): pick(GL_ZERO, GL_ONE, GL_FUNC_ADD); break;           // Cd (1 + C)
+                case 2 | (0 << 2) | (1 << 4): pick(cf, GL_ONE, GL_FUNC_REVERSE_SUBTRACT); break;   // Cd - Cs C
+                case 2 | (0 << 2) | (0 << 4): pick(oneMinusCf, GL_ZERO, GL_FUNC_ADD); break;       // Cs (1 - C)
+                case 2 | (1 << 2) | (1 << 4): pick(GL_ZERO, oneMinusCf, GL_FUNC_ADD); break;       // Cd (1 - C)
+                case 2 | (1 << 2) | (0 << 4): pick(GL_ONE, cf, GL_FUNC_SUBTRACT); break;           // Cs - Cd C
+                default: // A = B: D alone
+                    pick(d == 0u ? GL_ONE : GL_ZERO, d == 1u ? GL_ONE : GL_ZERO, GL_FUNC_ADD);
+                    break;
+                }
+                glEnable(GL_BLEND);
+                glBlendEquationSeparate(equation, GL_FUNC_ADD);
+                glBlendFuncSeparate(src, dst, GL_ZERO, GL_ONE);
+                break;
+            }
             default:
                 glEnable(GL_BLEND);
                 glBlendEquation(GL_FUNC_ADD);

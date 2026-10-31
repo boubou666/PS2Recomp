@@ -48,7 +48,11 @@ namespace ps2x::native
             // seen from the front +1, from the back -1), then the target darkened once where the count is not 0, by
             // the alpha of the vertices' colour (0x80 = black).
             ShadowVolume,
+            // The GS's (A - B) * C + D as gsAlpha (ALPHA's low byte) and gsFix (its FIX) give it, every combination
+            // a GPU blend can do (those with a factor of 1 + C keep only their C part).
+            Gs,
         } blend = Blend::Alpha;
+        uint8_t gsAlpha = 0, gsFix = 0x80;
         uint8_t alphaRef = 0;   // texels at or below are discarded when alphaTest
         bool alphaTest = false;
         bool depthTest = true;  // GS depth: larger is nearer (GEQUAL)
