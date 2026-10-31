@@ -342,7 +342,26 @@ namespace ps2x::native
                         upload.full.push_back(static_cast<uint16_t>(blockOf(x, y)));
             upload.data.assign(data, data + size);
             upload.seq = ++m_uploadSeq;
-            upload.id = ++m_contentSerial;
+            // Its pixels and where they go, as a hash: the same asset sent again after other uploads hid it has the same
+            // id, so the textures made of it are found decoded.
+            {
+                uint64_t id = 1469598103934665603ull;
+                const uint64_t place[3] = {(uint64_t{dbp} << 32) | (uint64_t{dpsm} << 16) | dbw, (uint64_t{dx} << 32) | dy,
+                                           (uint64_t{w} << 32) | h};
+                for (const uint64_t p : place)
+                    id = (id ^ p) * 1099511628211ull;
+                size_t b = 0;
+                for (; b + 8u <= upload.data.size(); b += 8u)
+                {
+                    uint64_t v;
+                    std::memcpy(&v, upload.data.data() + b, 8u);
+                    id = (id ^ v) * 1099511628211ull;
+                }
+                for (; b < upload.data.size(); ++b)
+                    id = (id ^ upload.data[b]) * 1099511628211ull;
+                upload.id = id | 1u;
+                ++m_contentSerial;
+            }
             // Laid out once, as the GS keeps it: its blocks, and a mask of the bits it writes in them (a 4-bit or
             // high-bits format writes part of a byte, a rectangle part of a block). A decode copies blocks.
             {
