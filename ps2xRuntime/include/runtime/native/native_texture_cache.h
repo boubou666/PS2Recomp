@@ -51,10 +51,11 @@ namespace ps2x::native
         uint64_t decodes() const { return m_decodes; }
 
         // Store mode (a port that takes its textures from the game's own data, no GS memory): each upload is kept as
-        // the game sent it (destination base, width and format, rectangle, pixels); texture() rebuilds an image from
-        // the uploads made to its TBP in its format, and its palette from the upload to its CBP (CSM1 order). An
-        // upload identical to the last one at the same place changes nothing. textureMisses() counts the textures no
-        // upload covers (a sub-image read at another base, a format read as another).
+        // the game sent it (destination base, width and format, rectangle, pixels); texture() lays out the uploads
+        // touching its pages and its palette's, oldest first, in a scratch image by the GS's layout formulas, and reads
+        // it back in its format (an asset sent as CT32 and read as T4, a palette sent in parts). Nothing of the scratch
+        // is kept; an upload identical to one already kept changes nothing. textureMisses() counts the textures no
+        // upload covers.
         void setStoreMode(bool on);
         bool storeMode() const { return m_storeMode; }
         uint64_t textureMisses() const { return m_storeMisses; }
@@ -66,35 +67,25 @@ namespace ps2x::native
     private:
         struct StoredUpload
         {
-            uint32_t dx = 0, dy = 0, w = 0, h = 0, dbw = 0;
+            uint32_t dbp = 0, psm = 0, dx = 0, dy = 0, w = 0, h = 0, dbw = 0;
+            uint32_t begin = 0, end = 0; // the blocks of the pages it touches
             uint64_t seq = 0; // when the game last sent it (an identical upload again counts)
             uint64_t id = 0;  // its pixels: new for every upload that changes them
             std::vector<uint8_t> data;
-        };
-        // (base << 6 | psm) -> the uploads there, oldest first, and a serial bumped when one changes.
-        struct StoredBase
-        {
-            std::vector<StoredUpload> uploads;
-            uint64_t serial = 0;
         };
         std::shared_ptr<const Texture> textureFromStore(uint64_t tex0, uint64_t texa);
         std::shared_ptr<const Texture> memoryTexture(uint64_t tex0, uint64_t texa);
         static bool compareStore();
         void compareWithMemory(uint64_t tex0, uint64_t texa, const Texture *stored);
-        int m_lastSource = 0; // the last store decode: 0 none, 1 an upload in its format, 2 a laid-out CT32 asset, 3 cached
+        int m_lastSource = 0; // the last store decode: 0 nothing, 1 one upload, 2 several, 3 cached
         void storeUpload(uint32_t dbp, uint32_t dbw, uint32_t dpsm, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                          const uint8_t *data, size_t bytes);
-        // A CT32 upload holding `base` in the GS's layout (an asset stored that way), and that asset read back at
-        // `relativeBase` (blocks from the upload's base) in `psm`, `bw` pages wide.
-        const StoredUpload *laidOutSource(uint32_t base, uint32_t &sourceBase, uint64_t &serial) const;
-        static void laidOut(const StoredUpload &source, uint32_t relativeBase, uint32_t psm, uint32_t bw, uint32_t width,
-                            uint32_t height, std::vector<uint32_t> &values);
         bool m_storeMode = false;
-        std::unordered_map<uint64_t, StoredBase> m_store;
+        std::vector<StoredUpload> m_stored; // oldest first
         struct StoredTexture
         {
             std::shared_ptr<const Texture> texture;
-            uint64_t imageSerial = 0, paletteSerial = 0;
+            uint64_t signature = 0; // the uploads it was decoded from
         };
         std::unordered_map<uint64_t, StoredTexture> m_storeTextures;
         uint64_t m_storeMisses = 0;
