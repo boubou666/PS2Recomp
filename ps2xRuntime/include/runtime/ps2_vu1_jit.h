@@ -647,6 +647,20 @@ struct Vu1Jit
             right = _mm_set1_ps(vu.normalizeOperand(vu.m_state.i));
         else
             right = vt;
+        // Operands with the exponent at 255 are +-FLT_MAX on the VU, which has no infinity or NaN: SSE would carry an
+        // infinity or a NaN and lose the sign at the result clamp (VP2's lights at pc 0x1410).
+        const auto finite = [](__m128 value) PS2X_VU_LAMBDA_INLINE
+        {
+            const __m128i bits = _mm_castps_si128(value);
+            const __m128i exponent = _mm_set1_epi32(0x7F800000);
+            const __m128i huge = _mm_cmpeq_epi32(_mm_and_si128(bits, exponent), exponent);
+            const __m128i clamped = _mm_or_si128(_mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u))),
+                                                 _mm_set1_epi32(0x7F7FFFFF));
+            return _mm_castsi128_ps(_mm_blendv_epi8(bits, clamped, huge));
+        };
+        right = finite(right);
+        vs = finite(vs);
+        acc = finite(acc);
         __m128 left = vs;
         if constexpr (kOperation.kind == FmacKind::CrossMul || kOperation.kind == FmacKind::CrossMsub)
         {

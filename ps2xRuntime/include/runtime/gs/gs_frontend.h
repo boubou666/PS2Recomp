@@ -170,9 +170,16 @@ public:
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
     // A game paced by its own frame ends (a native loop) shows the newest finished picture at each of them: the last
-    // buffer drawn with the width and format of the one DISPFB shows replaces it, whatever buffer the game's vblank
+    // buffer drawn with the width and format of the one DISPFB shows, among the last ones DISPFB showed (not a work
+    // buffer of the same shape), replaces it, whatever buffer the game's vblank
     // handler pointed DISPFB at (an interlaced game flips per field, at vblanks that no longer follow its frames).
     void setPresentNewestDisplayBuffer(bool on) { m_presentNewest = on; }
+    // An interlaced game that draws its picture at full height and copies it into a half-height buffer per field
+    // (every other line, the next field starting a line lower; VP2): the full-height picture is shown instead, as a
+    // progressive frame at its own size. Found from the copy: sprites into a displayed buffer in field mode, from a
+    // buffer of the same format (at least 256 wide) at least 1.5 times as tall: VP2's menus copy a 640x448 picture, its
+    // field a 512x480 one.
+    void setPresentProgressiveSource(bool on) { m_presentProgressive = on; }
     // A native renderer's draws for a skipped VU1 program (runtime/native/native_gs_hook.h): a marker in the queue,
     // in the order of the PATH1 packets around it, that calls the hook on the GS thread with context 0 or 1's
     // render target. Does not wait.
@@ -286,6 +293,12 @@ private:
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     bool m_presentNewest = false;          // setPresentNewestDisplayBuffer
     uint32_t m_newestDisplayFbp = ~0u;     // the last buffer drawn with the displayed buffer's width and format
+    std::array<uint32_t, 4> m_shownDisplayFbps{~0u, ~0u, ~0u, ~0u}; // the last distinct FBPs DISPFB showed, newest first
+    bool m_presentProgressive = false;                                // setPresentProgressiveSource
+    GSFrameReg m_progressiveSource{};                                 // the full-height picture last copied into a field
+    uint32_t m_progressiveHeight = 0;                                 // its rows; 0 = none
+    uint32_t m_progressiveDest = ~0u;                                 // the field buffer it was copied into
+    uint32_t m_progressiveAge = ~0u;                                  // presentations since that copy
     GSPresentationRequest buildPresentationRequestUnlocked() const;
     void latchHostPresentationFrame(const GSPresentationRequest *displayRegisters);
     std::atomic<uint64_t> m_queuedLatchesDone{0};

@@ -44,7 +44,12 @@ namespace ps2x::native
 
         // The texture a draw selects: TEX0 (the CLD bits are ignored), and TEXA for the alpha of CT24 / CT16 texels.
         // Shared, never modified once decoded: uploads may arrive from the GS thread while another thread draws.
-        std::shared_ptr<const Texture> texture(uint64_t tex0, uint64_t texa = 0);
+        // With a CLAMP whose region is a window (regionWindow), only that window is decoded, as the texture.
+        std::shared_ptr<const Texture> texture(uint64_t tex0, uint64_t texa = 0, uint64_t clamp = 0);
+        // The texels the GS reads on one axis of a texture `size` texels wide, when they are the window
+        // [offset, offset + extent): REGION_CLAMP's [MINU, MAXU] (clamped to), or a REGION_REPEAT that only masks
+        // (MINU 2^n - 1, MAXU an offset clear of it; repeated).
+        static bool regionWindow(uint64_t clamp, bool v, uint32_t size, uint32_t &offset, uint32_t &extent);
 
         const uint8_t *memory() const { return m_memory.data(); }
         uint64_t uploads() const { return m_uploads; }
@@ -77,6 +82,12 @@ namespace ps2x::native
     TextureCache &textures();
     bool uploadsWanted();
     void setUploadsWanted(bool wanted);
+    // In GS stream order (a renderer drawing in the GS stream and decoding there: Renderer::setStreamDraws): the GS
+    // front end feeds each upload as its queue reaches it, not when the EE submits it, so a draw decoded at its place
+    // in the stream sees GS memory as the GS has it there (a game rewriting a CLUT ring every frame).
+    void setUploadsInStreamOrder(bool inOrder);
+    bool uploadsAtSubmit();      // wanted, fed when submitted
+    bool uploadsInStreamOrder(); // wanted, fed in stream order
 
     // Index of palette entry `index` in a CSM1 palette stored as a 16-pixel-wide CT32 / CT16 image: (x, y).
     inline void csm1Position(uint32_t index, uint32_t &x, uint32_t &y)

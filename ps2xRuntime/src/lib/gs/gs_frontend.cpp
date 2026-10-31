@@ -1,6 +1,7 @@
 #include "runtime/native/native_texture_cache.h"
 #include "runtime/native/native_renderer.h"
 #include "ThreadNaming.h"
+#include <unordered_map>
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_parallel.h"
@@ -581,8 +582,9 @@ void GS::workerLoop()
             {
                 const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
                 // No image transfer in flight: none set up, or the last one complete (a game uploading every frame
-                // never goes back to "none").
-                if (transfer.direction == 3u || transfer.totalPixels == 0u || transfer.copiedPixels >= transfer.totalPixels)
+                // never goes back to "none"), or a readback (VRAM unchanged: TMB's flares read the Z buffer back).
+                if (transfer.direction == 3u || transfer.direction == 1u || transfer.totalPixels == 0u ||
+                    transfer.copiedPixels >= transfer.totalPixels)
                 {
                     GsTraceHeader header;
                     m_backend->SnapshotVram(header.vram);
@@ -607,6 +609,14 @@ void GS::workerLoop()
         }
         if (queueTraceActive())
             traceQueuedCommand(command);
+        // The native textures in stream order (setUploadsInStreamOrder): the uploads as the GS reaches them.
+        if (!m_isShadow && ps2x::native::uploadsInStreamOrder() && size != 0u)
+        {
+            if (command.kind == QueuedCommand::Kind::GifPacket || command.kind == QueuedCommand::Kind::NativePackedGifPacket)
+                ps2x::native::textures().scanGifPacket(data, size);
+            else if (command.kind == QueuedCommand::Kind::NativeImageUpload && (command.registers[3] & 3u) == 0u)
+                ps2x::native::textures().upload(command.registers[0], command.registers[1], command.registers[2], data, size);
+        }
         if (m_parallel)
             processWithParallel(command);
         else
@@ -673,10 +683,12 @@ void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     if (!data || sizeBytes < 16u)
         return;
-    if (ps2x::native::uploadsWanted()) // the native textures: the game's own uploads
+    if (ps2x::native::uploadsAtSubmit()) // the native textures: the game's own uploads
         ps2x::native::textures().scanGifPacket(data, sizeBytes);
     if (!shouldQueue())
     {
+        if (ps2x::native::uploadsInStreamOrder())
+            ps2x::native::textures().scanGifPacket(data, sizeBytes);
         processGIFPacket(data, sizeBytes);
         return;
     }
@@ -1496,6 +1508,22 @@ void GS::latchHostPresentationFrame(const GSPresentationRequest *displayRegister
         else if ((request.pmode & 0x1u) != 0u)
             request.dispfb1 = newest(request.dispfb1);
     }
+    // The full-height picture the fields are copied from, as a progressive frame, while the game keeps copying it.
+    if (m_presentProgressive && m_progressiveHeight != 0u && (request.smode2 & 0x3u) == 0x3u &&
+        m_progressiveAge != ~0u && m_progressiveAge++ <= 2u)
+    {
+        const bool second = (request.pmode & 0x2u) != 0u;
+        uint64_t &dispfb = second ? request.dispfb2 : request.dispfb1;
+        uint64_t &display = second ? request.display2 : request.display1;
+        dispfb = static_cast<uint64_t>(m_progressiveSource.fbp) | static_cast<uint64_t>(m_progressiveSource.fbw) << 9 |
+                 static_cast<uint64_t>(m_progressiveSource.psm) << 15;
+        // Its own width (VP2's field picture is 512 wide, stretched to 640 by the copy; the window scales it to 4:3).
+        const uint64_t magh = (display >> 23 & 0xFu) + 1u;
+        const uint64_t width = static_cast<uint64_t>(std::max<uint32_t>(m_progressiveSource.fbw, 1u)) * 64u;
+        display = (display & ~(0x7FFull << 44 | 0x3ull << 27 | 0xFFFull << 32)) |
+                  static_cast<uint64_t>(m_progressiveHeight - 1u) << 44 | ((width * magh - 1u) & 0xFFFu) << 32;
+        request.smode2 &= ~0x2ull; // frame mode: each line of the picture once
+    }
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         if (request.dispfb1 != m_lastLatchedDispfb1 || request.dispfb2 != m_lastLatchedDispfb2)
@@ -1749,10 +1777,14 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (data && sizeBytes >= 16u && ps2x::native::uploadsWanted())
+    if (data && sizeBytes >= 16u && ps2x::native::uploadsAtSubmit())
         ps2x::native::textures().scanGifPacket(data, sizeBytes);
     if (!shouldQueue())
+    {
+        if (data && sizeBytes >= 16u && ps2x::native::uploadsInStreamOrder())
+            ps2x::native::textures().scanGifPacket(data, sizeBytes);
         return processNativePackedGIFPacketNow(data, sizeBytes);
+    }
     // Validation only looks at the packet, so the EE can still fall back when it fails.
     if (!data || sizeBytes < 16u || !m_backend || !validatePackedGifPacket(data, sizeBytes))
         return false;
@@ -1822,10 +1854,12 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
-    if (data && sizeBytes != 0u && (trxdir & 3u) == 0u && ps2x::native::uploadsWanted())
+    if (data && sizeBytes != 0u && (trxdir & 3u) == 0u && ps2x::native::uploadsAtSubmit())
         ps2x::native::textures().upload(bitbltbuf, trxpos, trxreg, data, sizeBytes);
     if (!shouldQueue())
     {
+        if (data && sizeBytes != 0u && (trxdir & 3u) == 0u && ps2x::native::uploadsInStreamOrder())
+            ps2x::native::textures().upload(bitbltbuf, trxpos, trxreg, data, sizeBytes);
         uploadImageNativeNow(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
         return;
     }
@@ -2465,6 +2499,18 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        // PS2X_LOG_GS_WRITERS=1: each transfer (TRXDIR 0 upload, 1 readback, 2 GS-to-GS copy), once per BITBLTBUF.
+        if (static const bool logWriters = std::getenv("PS2X_LOG_GS_WRITERS") != nullptr; logWriters && m_trxdir != 3u)
+        {
+            static std::unordered_map<uint64_t, uint32_t> s_seen;
+            const uint64_t bitbltbuf = static_cast<uint64_t>(m_bitbltbuf.sbp) | static_cast<uint64_t>(m_bitbltbuf.sbw) << 16 |
+                                       static_cast<uint64_t>(m_bitbltbuf.spsm) << 24 | static_cast<uint64_t>(m_bitbltbuf.dbp) << 32 |
+                                       static_cast<uint64_t>(m_bitbltbuf.dbw) << 48 | static_cast<uint64_t>(m_bitbltbuf.dpsm) << 56;
+            if (s_seen[bitbltbuf ^ m_trxdir]++ == 0u)
+                std::fprintf(stderr, "[gs:writers] trxdir %u sbp %u sbw %u spsm 0x%x -> dbp %u dbw %u dpsm 0x%x, %ux%u\n", m_trxdir,
+                             m_bitbltbuf.sbp, m_bitbltbuf.sbw, m_bitbltbuf.spsm, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                             m_trxreg.rrw, m_trxreg.rrh);
+        }
 
         if (m_backend)
         {
@@ -2528,6 +2574,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         m_texa.ta0 = static_cast<uint8_t>(value & 0xFFu);
         m_texa.aem = ((value >> 15) & 0x1u) != 0u;
         m_texa.ta1 = static_cast<uint8_t>((value >> 32) & 0xFFu);
+        ps2x::native::Renderer::instance().setGsTexa(value & 0xFF000080FFull); // TA0, AEM, TA1
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t texaIndex = s_debugTexaWriteCount.fetch_add(1u, std::memory_order_relaxed);
             if (texaIndex < 24u)
@@ -2810,11 +2857,45 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
-    if (m_presentNewest && m_privRegs)
+    if ((m_presentNewest || m_presentProgressive) && m_privRegs)
     {
         const uint64_t dispfb = (m_privRegs->pmode & 0x2u) != 0u ? m_privRegs->dispfb2 : m_privRegs->dispfb1;
-        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u))
+        // Only buffers the game has shown: VP2's menus also draw a work copy with the display's width and format
+        // (FBP 220), which showed zoomed in, its bottom cut off.
+        const uint32_t shownFbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        if (std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), shownFbp) == m_shownDisplayFbps.end())
+        {
+            std::rotate(m_shownDisplayFbps.rbegin(), m_shownDisplayFbps.rbegin() + 1, m_shownDisplayFbps.rend());
+            m_shownDisplayFbps[0] = shownFbp;
+        }
+        if (ctx.frame.fbw == ((dispfb >> 9) & 0x3Fu) && (ctx.frame.psm | 1u) == (((dispfb >> 15) & 0x1Fu) | 1u) &&
+            std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), ctx.frame.fbp) != m_shownDisplayFbps.end())
             m_newestDisplayFbp = ctx.frame.fbp;
+        // A field made from a full-height picture (setPresentProgressiveSource): VP2 copies its 640x448 picture into
+        // a 640x256 buffer per field, starting a line lower for the second one.
+        if (m_presentProgressive && (m_privRegs->smode2 & 0x3u) == 0x3u && state.prim.type == GS_PRIM_SPRITE &&
+            state.prim.tme && state.prim.fst && batch.vertexCount >= 2u && ctx.tex0.tbw >= 4u &&
+            (ctx.tex0.psm | 1u) == (ctx.frame.psm | 1u) && (ctx.tex0.tbp0 & 31u) == 0u &&
+            ctx.tex0.tbp0 / 32u != ctx.frame.fbp &&
+            std::find(m_shownDisplayFbps.begin(), m_shownDisplayFbps.end(), ctx.frame.fbp) != m_shownDisplayFbps.end())
+        {
+            float yMin = batch.vertices[0].y, yMax = yMin, vMin = batch.vertices[0].v / 16.0f, vMax = vMin;
+            for (size_t i = 1; i < batch.vertexCount; ++i)
+            {
+                yMin = std::min(yMin, batch.vertices[i].y), yMax = std::max(yMax, batch.vertices[i].y);
+                vMin = std::min(vMin, batch.vertices[i].v / 16.0f), vMax = std::max(vMax, batch.vertices[i].v / 16.0f);
+            }
+            if (yMax - yMin >= 2.0f && vMax - vMin >= 1.5f * (yMax - yMin))
+            {
+                const GSFrameReg source{ctx.tex0.tbp0 / 32u, ctx.tex0.tbw, ctx.tex0.psm, 0u};
+                if (source.fbp != m_progressiveSource.fbp || source.psm != m_progressiveSource.psm)
+                    m_progressiveHeight = 0u;
+                m_progressiveSource = source;
+                m_progressiveHeight = std::max(m_progressiveHeight, static_cast<uint32_t>(vMax));
+                m_progressiveDest = ctx.frame.fbp;
+                m_progressiveAge = 0u;
+            }
+        }
     }
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
         m_hasPreferredDisplaySource = false;

@@ -45,7 +45,8 @@ void main()
 )";
 
     // GS colour arithmetic with 0x80 as 1.0. The render target keeps alpha as the GS stores it (0x80 for 1.0), so a
-    // texture read back from a render target doubles it (uTexAlphaScale 2), one from the texture cache does not.
+    // texture read back from a render target doubles it (uTexAlphaScale 2), one from the texture cache (the GS's
+    // alpha in a byte) scales it by 255 / 128.
     constexpr const char *kFragmentShader = R"(#version 330 core
 in vec4 vColor;
 noperspective in vec3 vTex;
@@ -67,7 +68,7 @@ uniform int uAlphaFail; // 1: the AFAIL pass, which draws the pixels that fail t
 uniform int uBlendOut;
 uniform sampler2D uDest; // a copy of the render target: the destination alpha test, the blend's Ad
 uniform int uDate;       // 0 off, 1 pass where the stored alpha's top bit is 0, 2 where it is 1
-uniform int uAlphaKeep;  // FBMSK's alpha bits when it keeps only some: those come from uDest
+uniform int uColorKeep;  // FBMSK when it keeps part of a channel: those bits come from uDest
 uniform int uBlendFactor;
 uniform float uBlendFix;
 
@@ -150,7 +151,7 @@ vec4 gsSample(vec2 t)
 void main()
 {
     vec4 vc = vColor * (255.0 / 128.0);
-    vec4 c = vc;
+    vec4 c = uTextured != 0 ? vc : vec4(vColor.rgb, vc.a);
     if (uTextured != 0)
     {
         vec2 tc = vTex.xy / vTex.z;
@@ -208,13 +209,16 @@ void main()
         rgb = vec3(factor);
     else if (uBlendOut == 2)
         rgb = c.rgb * (1.0 + factor);
+    else if (uBlendOut == 3)
+        rgb = c.rgb * factor;
     outColor = vec4(clamp(rgb, 0.0, 1.0), clamp(c.a, 0.0, 2.0) * (128.0 / 255.0));
-    if (uAlphaKeep != 0)
+    if (uColorKeep != 0)
     {
-        uint source = uint(min(floor(clamp(c.a, 0.0, 2.0) * 128.0 + 0.5), 255.0));
-        uint stored = uint(texelFetch(uDest, ivec2(gl_FragCoord.xy), 0).a * 255.0 + 0.5);
-        uint keep = uint(uAlphaKeep);
-        outColor.a = float((source & ~keep) | (stored & keep)) / 255.0;
+        uvec4 source = uvec4(round(outColor * 255.0));
+        uvec4 stored = uvec4(round(texelFetch(uDest, ivec2(gl_FragCoord.xy), 0) * 255.0));
+        uint k = uint(uColorKeep);
+        uvec4 keep = uvec4(k & 0xFFu, (k >> 8u) & 0xFFu, (k >> 16u) & 0xFFu, k >> 24u);
+        outColor = vec4((source & ~keep) | (stored & keep)) / 255.0;
     }
     outFactor = vec4(clamp(factor, 0.0, 1.0));
 }
@@ -269,13 +273,57 @@ void main()
 }
 )";
 
+    // A render target's depth written into the GPU copy of GS memory as its ZBUF format stores it: each output word
+    // is a word of a Z buffer page, its depth (Z times the format's scale) found through the inverse swizzle. Z24
+    // keeps the word's top byte from uOld (T8H / T4HL textures share those words).
+    constexpr const char *kDepthResolveFragmentShader = R"(#version 330 core
+layout(location = 0) out uint outWord;
+uniform sampler2D uDepth;    // the render target's depth, GL row 0 = GS row 0
+uniform usampler2D uInverse; // page pixel offset -> x | y << 16
+uniform usampler2D uOld;     // GS memory's words before the resolve
+uniform int uZbp;
+uniform int uFbw;
+uniform int uKind;           // 0 Z32, 1 Z24, 2 Z16, 3 Z16S
+uniform int uScale;
+uniform float uRange;        // 2^32, 2^24 or 2^16: the Z of depth 1.0
+
+uint z(ivec2 p)
+{
+    float d = texelFetch(uDepth, p * uScale + uScale / 2, 0).r;
+    return uint(clamp(round(d * uRange), 0.0, uRange - 1.0));
+}
+
+void main()
+{
+    ivec2 f = ivec2(gl_FragCoord.xy);
+    int word = f.y * 1024 + f.x;
+    int rel = word / 2048 - uZbp;
+    int inPage = word % 2048;
+    int prow = rel / uFbw, pcol = rel % uFbw;
+    if (uKind < 2)
+    {
+        uint e = texelFetch(uInverse, ivec2(inPage % 128, 80 + inPage / 128), 0).r;
+        uint value = z(ivec2(pcol * 64 + int(e & 0xFFFFu), prow * 32 + int(e >> 16u)));
+        outWord = uKind == 1 ? (texelFetch(uOld, f, 0).r & 0xFF000000u) | (value & 0xFFFFFFu) : value;
+        return;
+    }
+    int row = uKind == 2 ? 96 : 128;
+    int i0 = inPage * 2, i1 = inPage * 2 + 1;
+    uint e0 = texelFetch(uInverse, ivec2(i0 % 128, row + i0 / 128), 0).r;
+    uint e1 = texelFetch(uInverse, ivec2(i1 % 128, row + i1 / 128), 0).r;
+    outWord = z(ivec2(pcol * 64 + int(e0 & 0xFFFFu), prow * 64 + int(e0 >> 16u))) |
+              (z(ivec2(pcol * 64 + int(e1 & 0xFFFFu), prow * 64 + int(e1 >> 16u))) << 16u);
+}
+)";
+
     constexpr const char *kResolveFragmentShader = R"(#version 330 core
 layout(location = 0) out uint outWord;
 uniform sampler2D uTarget;   // the render target's colour, GL row 0 = GS row 0, alpha as the GS stores it
 uniform usampler2D uInverse; // page pixel offset -> x | y << 16
 uniform int uFbp;
 uniform int uFbw;
-uniform int uKind;           // 0 CT32, 1 CT16, 2 CT16S
+uniform int uKind;           // 0 CT32, 1 CT16, 2 CT16S, 3 CT24 (the top byte kept from uOld)
+uniform usampler2D uOld;     // CT24: a copy of GS memory's words before the resolve
 uniform int uUsedHeight;     // rows drawn: words of pixels below them keep what GS memory holds
 uniform int uScale;          // the target's internal scale: a GS pixel is the middle texel of its block
 
@@ -296,14 +344,15 @@ void main()
     int rel = word / 2048 - uFbp;
     int inPage = word % 2048;
     int prow = rel / uFbw, pcol = rel % uFbw;
-    if (uKind == 0)
+    if (uKind == 0 || uKind == 3)
     {
         uint e = texelFetch(uInverse, ivec2(inPage % 128, inPage / 128), 0).r;
         ivec2 p = ivec2(pcol * 64 + int(e & 0xFFFFu), prow * 32 + int(e >> 16u));
         if (p.y >= uUsedHeight)
             discard;
         uvec4 c = bytes(p);
-        outWord = c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+        uint top = uKind == 3 ? texelFetch(uOld, f, 0).r & 0xFF000000u : c.a << 24u;
+        outWord = c.r | (c.g << 8u) | (c.b << 16u) | top;
         return;
     }
     int row = uKind == 1 ? 16 : 48;
@@ -318,19 +367,73 @@ void main()
 }
 )";
 
-    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment.
+    // A render target's depth as the colour texels a Z-format texture read gives (bindDepthAsTexture), at 1x.
+    constexpr const char *kDepthAsColorFragmentShader = R"(#version 330 core
+layout(location = 0) out vec4 outColor;
+uniform sampler2D uDepth;
+uniform int uKind;   // 0 Z32 as CT32, 1 Z24 as CT24, 2 Z16 as CT16
+uniform int uScale;
+uniform float uRange; // the Z buffer's 2^32, 2^24 or 2^16
+uniform ivec3 uTexa;  // TA0, TA1, AEM
+void main()
+{
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float d = texelFetch(uDepth, p * uScale + uScale / 2, 0).r;
+    uint z = uint(min(floor(d * uRange), uRange - 1.0));
+    uvec4 t;
+    if (uKind == 0)
+        t = uvec4(z & 0xFFu, (z >> 8u) & 0xFFu, (z >> 16u) & 0xFFu, z >> 24u);
+    else if (uKind == 1)
+        t = uvec4(z & 0xFFu, (z >> 8u) & 0xFFu, (z >> 16u) & 0xFFu,
+                  uTexa.z != 0 && (z & 0xFFFFFFu) == 0u ? 0u : uint(uTexa.x));
+    else
+        t = uvec4((z & 0x1Fu) << 3u, ((z >> 5u) & 0x1Fu) << 3u, ((z >> 10u) & 0x1Fu) << 3u,
+                  (z & 0x8000u) != 0u ? uint(uTexa.y) : (uTexa.z != 0 && (z & 0x7FFFu) == 0u ? 0u : uint(uTexa.x)));
+    outColor = vec4(t) / 255.0;
+}
+)";
+
+    // A colour target's pixels read as the Z buffer the GS sees at the same address, into the depth attachment. Z
+    // formats order a page's blocks unlike the colour ones: Z pixel (x, y) is the colour pixel stored in the word Z
+    // puts (x, y) in (uColorRow -1: pixel sizes differ, read in place). One Z per GS pixel, from its middle texel as a
+    // resolve takes it: a mask the GS drew at 1x leaves the texels a scaled sprite's half-pixel edges skip.
     constexpr const char *kDepthFromColorFragmentShader = R"(#version 330 core
 uniform sampler2D uColor;
+uniform usampler2D uSwizzle;
+uniform usampler2D uInverse;
+uniform int uZRow;
+uniform int uColorRow;
+uniform ivec2 uPage;
+uniform int uScale;
 uniform int uSixteen;
 uniform uint uZMask;
 uniform float uZScale;
 void main()
 {
-    ivec2 p = min(ivec2(gl_FragCoord.xy), textureSize(uColor, 0) - 1);
+    ivec2 g = ivec2(gl_FragCoord.xy) / uScale;
+    if (uColorRow >= 0)
+    {
+        ivec2 inPage = g % uPage;
+        uint address = texelFetch(uSwizzle, ivec2(inPage.x, uZRow + inPage.y), 0).r;
+        uint e = texelFetch(uInverse, ivec2(int(address % 128u), uColorRow + int(address / 128u)), 0).r;
+        g += ivec2(int(e & 0xFFFFu), int(e >> 16u)) - inPage;
+    }
+    ivec2 p = min(g * uScale + uScale / 2, textureSize(uColor, 0) - 1);
     uvec4 c = uvec4(round(texelFetch(uColor, p, 0) * 255.0));
     uint z = uSixteen != 0 ? (c.r >> 3u) | (c.g >> 3u) << 5u | (c.b >> 3u) << 10u | (c.a >> 7u) << 15u
                            : c.r | c.g << 8u | c.b << 16u | c.a << 24u;
     gl_FragDepth = clamp(float(z & uZMask) * uZScale, 0.0, 1.0);
+}
+)";
+
+    constexpr const char *kWrapFragmentShader = R"(#version 330 core
+uniform sampler2D uWrapped;
+out vec4 outColor;
+void main()
+{
+    vec4 c = texelFetch(uWrapped, ivec2(gl_FragCoord.xy), 0);
+    vec3 v = round(c.rgb * 255.0);
+    outColor = vec4((v - 256.0 * floor(v / 256.0)) / 255.0, c.a);
 }
 )";
 
@@ -496,6 +599,18 @@ void main()
         return alpha;
     }
 
+    // COLCLAMP off with a blend that adds or subtracts two colours: the GS keeps the low 8 bits of what leaves 0-255.
+    bool blendWraps(const GSDrawState &state)
+    {
+        if (!state.prim.abe || (state.colclamp & 0x1u) != 0u)
+            return false;
+        const uint64_t alpha = effectiveAlpha(state.context);
+        const uint32_t a = alpha & 0x3u, b = alpha >> 2 & 0x3u, d = alpha >> 6 & 0x3u;
+        constexpr uint32_t zero = 2u;
+        return a != b && ((b == zero && a != d && d != zero) || (a == zero && b != d && d != zero) ||
+                          (d == zero && a != zero && b != zero));
+    }
+
     // Everything in a draw's state that changes how it is drawn, compared to decide when a batch ends.
     bool sameDrawState(const GSDrawState &a, const GSDrawState &b)
     {
@@ -507,7 +622,7 @@ void main()
             return false;
         if (a.prim.tme != b.prim.tme || a.prim.fge != b.prim.fge || a.prim.abe != b.prim.abe || a.prim.fst != b.prim.fst)
             return false;
-        if (a.prim.abe && x.alpha != y.alpha)
+        if (a.prim.abe && (x.alpha != y.alpha || ((a.colclamp ^ b.colclamp) & 0x1u) != 0u))
             return false;
         if (a.prim.fge && (a.fogR != b.fogR || a.fogG != b.fogG || a.fogB != b.fogB))
             return false;
@@ -613,7 +728,7 @@ bool GSNativeBackend::ensureContext(bool create)
     m_uniforms.fst = glGetUniformLocation(m_program, "uTexAlphaScale");
     m_uniforms.dest = glGetUniformLocation(m_program, "uDest");
     m_uniforms.date = glGetUniformLocation(m_program, "uDate");
-    m_uniforms.alphaKeep = glGetUniformLocation(m_program, "uAlphaKeep");
+    m_uniforms.colorKeep = glGetUniformLocation(m_program, "uColorKeep");
     m_uniforms.vram = glGetUniformLocation(m_program, "uVram");
     m_uniforms.swizzle = glGetUniformLocation(m_program, "uSwizzle");
     m_uniforms.decode = glGetUniformLocation(m_program, "uDecode");
@@ -648,19 +763,8 @@ bool GSNativeBackend::ensureContext(bool create)
     return true;
 }
 
-namespace
-{
-    // PS2X_GS_NATIVE_NOCOHERENCE=1: no reload of targets from GS memory (format changes, overlapping targets).
-    bool coherenceOff()
-    {
-        static const bool off = std::getenv("PS2X_GS_NATIVE_NOCOHERENCE") != nullptr;
-        return off;
-    }
-}
-
 GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &frame)
 {
-    uint32_t refillRows = 0; // a target replacing another at the same address: the rows that one held
     auto it = m_targets.find(frame.fbp);
     if (it != m_targets.end())
     {
@@ -668,8 +772,8 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
         const bool sameLayout = existing.psm == frame.psm || ((existing.psm | frame.psm) & ~0x1u) == 0u;
         if (sameLayout && existing.fbw == frame.fbw)
             return existing;
-        // The same memory drawn in another format or width (a CT32 buffer reused as CT16): its pixels go to GS
-        // memory first, where the new target's readers will find them, and the target starts over.
+        // The same memory drawn in another format or width (a CT32 buffer reused as CT16): the pages it holds newest
+        // go to GS memory first, where the new target reloads them from.
         if (static const bool log = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; log)
         {
             static uint32_t s_logged = 0;
@@ -677,21 +781,34 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
                 std::fprintf(stderr, "[gs:native] target fbp=%u redrawn as psm=0x%x fbw=%u (was psm=0x%x fbw=%u)\n",
                              frame.fbp, frame.psm, frame.fbw, existing.psm, existing.fbw);
         }
-        if (existing.dirty && existing.usedHeight != 0u)
-            resolveTarget(existing);
-        refillRows = existing.usedHeight;
-        glDeleteFramebuffers(1, &existing.framebuffer);
-        glDeleteTextures(1, &existing.color);
-        glDeleteTextures(1, &existing.depth);
+        syncMemoryPages(existing.fbp, existing.fbp + static_cast<uint32_t>(existing.pages.size()));
+        // Its GL objects wait for the next target of the same size (VP2 switches one buffer between CT16 and CT32
+        // several times a frame: deleting and allocating them each time stalled the GS thread in the driver).
+        m_spareTargets.push_back({existing.width, existing.height, existing.color, existing.depth, existing.framebuffer});
         m_targets.erase(it);
     }
 
+    // PS2X_LOG_GS_WRITERS=1: each GS memory area drawn into, once (a port's textures drawn by the GS, which the
+    // native texture cache, fed by uploads, never sees).
+    if (static const bool logWriters = std::getenv("PS2X_LOG_GS_WRITERS") != nullptr; logWriters)
+        std::fprintf(stderr, "[gs:writers] target fbp=%u (block %u) psm=0x%x fbw=%u\n", frame.fbp, frame.fbp * 32u, frame.psm, frame.fbw);
     RenderTarget target;
     target.fbp = frame.fbp;
     target.fbw = frame.fbw;
     target.psm = frame.psm;
     target.width = std::clamp<uint32_t>(frame.fbw * 64u, 64u, kMaxTargetWidth);
     target.height = kTargetHeight;
+    const auto spare = std::find_if(m_spareTargets.begin(), m_spareTargets.end(), [&](const SpareTarget &t) {
+        return t.width == target.width && t.height == target.height;
+    });
+    if (spare != m_spareTargets.end())
+    {
+        target.color = spare->color, target.depth = spare->depth, target.framebuffer = spare->framebuffer;
+        m_spareTargets.erase(spare);
+        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    }
+    else
+    {
     glGenTextures(1, &target.color);
     glBindTexture(GL_TEXTURE_2D, target.color);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width * m_scale, target.height * m_scale, 0, GL_RGBA, GL_UNSIGNED_BYTE,
@@ -707,113 +824,284 @@ GSNativeBackend::RenderTarget &GSNativeBackend::renderTarget(const GSFrameReg &f
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, target.depth, 0);
+    }
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClearDepth(0.0);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    RenderTarget &created = m_targets.emplace(frame.fbp, target).first->second;
-    if (refillRows != 0u && !coherenceOff())
-        fillTargetFromMemory(frame, std::min(refillRows, created.height));
-    return created;
+    target.pages.assign(targetPageCount(target), 0u); // nothing held yet: drawn pages reload from GS memory first
+    return m_targets.emplace(frame.fbp, std::move(target)).first->second;
 }
 
 namespace
 {
-    // A target's blocks in GS memory, as far as it drew: pages of 64 x 32 pixels (64 x 64 in CT16).
-    std::pair<uint64_t, uint64_t> targetBlocks(uint32_t fbp, uint32_t fbw, uint8_t psm, uint32_t rows)
+    constexpr uint32_t kPages = 512u; // GS memory: 4 MiB in pages of 8 KiB
+    uint32_t pageRowsOf(uint32_t psm) { return (psm == 0x02u || psm == 0x0Au) ? 64u : 32u; }
+
+    // PS2X_GS_NATIVE_TARGETLOG=<n>: the first n resolves and reloads of target pages.
+    bool logTargetPages()
     {
-        const uint32_t pageRows = (psm == 0x02u || psm == 0x0Au) ? 64u : 32u;
-        const uint64_t begin = static_cast<uint64_t>(fbp) * 32u;
-        return {begin, begin + static_cast<uint64_t>(std::max(fbw, 1u)) * ((rows + pageRows - 1u) / pageRows) * 32u};
+        static const int s_limit = [] { const char *v = std::getenv("PS2X_GS_NATIVE_TARGETLOG"); return v ? std::atoi(v) : 0; }();
+        static int s_logged = 0;
+        return s_logged < s_limit && ++s_logged > 0;
     }
 }
 
-void GSNativeBackend::resolveInDrawOrder(std::vector<RenderTarget *> &targets)
+uint32_t GSNativeBackend::targetPageCount(const RenderTarget &target) const
 {
-    std::sort(targets.begin(), targets.end(), [](const RenderTarget *a, const RenderTarget *b) { return a->lastDraw < b->lastDraw; });
-    for (RenderTarget *target : targets)
-        if (target->dirty && target->usedHeight != 0u)
-            resolveTarget(*target);
+    if (target.fbp >= kPages)
+        return 0u;
+    const uint32_t columns = std::min(std::max(target.fbw, 1u), target.width / 64u);
+    return std::min(columns * (target.height / pageRowsOf(target.psm)), kPages - target.fbp);
 }
 
-
-void GSNativeBackend::ensureCoherent(RenderTarget &target)
+bool GSNativeBackend::holdsNewest(const RenderTarget &target, uint32_t page) const
 {
-    if (m_fillingFromMemory || target.usedHeight == 0u || coherenceOff())
+    return page >= target.fbp && page - target.fbp < target.pages.size() && target.pages[page - target.fbp] == m_pageVersion[page];
+}
+
+void GSNativeBackend::targetPagesIn(const RenderTarget &target, int x0, int y0, int x1, int y1, std::vector<uint32_t> &pages) const
+{
+    pages.clear();
+    const int columns = static_cast<int>(std::min(std::max(target.fbw, 1u), target.width / 64u));
+    const int pageRows = static_cast<int>(pageRowsOf(target.psm));
+    x0 = std::max(x0, 0), y0 = std::max(y0, 0);
+    x1 = std::min(x1, columns * 64), y1 = std::min(y1, static_cast<int>(target.height));
+    if (x1 <= x0 || y1 <= y0)
         return;
-    const auto [begin, end] = targetBlocks(target.fbp, target.fbw, target.psm, target.usedHeight);
-    std::vector<RenderTarget *> overlapping;
+    const uint32_t fbw = std::max(target.fbw, 1u);
+    for (int row = y0 / pageRows; row <= (y1 - 1) / pageRows; ++row)
+        for (int column = x0 / 64; column <= (x1 - 1) / 64; ++column)
+        {
+            const uint32_t local = static_cast<uint32_t>(row) * fbw + static_cast<uint32_t>(column);
+            if (local < target.pages.size())
+                pages.push_back(target.fbp + local);
+        }
+}
+
+void GSNativeBackend::syncMemoryPages(uint32_t firstPage, uint32_t endPage)
+{
+    endPage = std::min(endPage, kPages);
+    for (uint32_t page = firstPage; page < endPage; ++page)
+    {
+        if (m_memoryVersion[page] == m_pageVersion[page])
+            continue;
+        RenderTarget *owner = nullptr;
+        for (auto &[fbp, target] : m_targets)
+            if (holdsNewest(target, page))
+            {
+                owner = &target;
+                break;
+            }
+        if (!owner)
+        {
+            m_memoryVersion[page] = m_pageVersion[page]; // not expected: no target has it, memory is all there is
+            continue;
+        }
+        // The run of following pages the same target holds newest, in one resolve.
+        uint32_t end = page + 1u;
+        while (end < endPage && m_memoryVersion[end] != m_pageVersion[end] && holdsNewest(*owner, end))
+            ++end;
+        resolveTargetPages(*owner, page, end);
+        for (uint32_t p = page; p < end; ++p)
+            m_memoryVersion[p] = m_pageVersion[p];
+        page = end - 1u;
+    }
+}
+
+bool GSNativeBackend::textureCacheRead(const std::vector<uint32_t> &pages)
+{
+    static const bool s_off = std::getenv("PS2X_GS_NATIVE_NOTEXCACHE") != nullptr;
+    if (s_off)
+        return false;
+    // A read wider than the cache leaves its last pages in it, as an LRU cache does.
+    const size_t keepFrom = pages.size() > m_texCache.size() ? pages.size() - m_texCache.size() : 0u;
     bool stale = false;
-    for (auto &[fbp, other] : m_targets)
+    for (size_t i = 0; i < pages.size(); ++i)
     {
-        if (&other == &target || other.usedHeight == 0u)
+        const uint32_t page = pages[i];
+        TexCachePage *slot = nullptr, *victim = &m_texCache[0];
+        for (TexCachePage &entry : m_texCache)
+        {
+            if (entry.page == page)
+                slot = &entry;
+            if (entry.lastUse < victim->lastUse)
+                victim = &entry;
+        }
+        if (slot)
+        {
+            slot->lastUse = ++m_texCacheClock;
+            stale |= slot->saved && slot->version != m_pageVersion[page];
             continue;
-        const auto [otherBegin, otherEnd] = targetBlocks(other.fbp, other.fbw, other.psm, other.usedHeight);
-        if (otherBegin >= end || begin >= otherEnd)
-            continue;
-        overlapping.push_back(&other);
-        stale |= other.lastDraw > target.lastDraw;
+        }
+        if (i >= keepFrom)
+            *victim = {page, m_pageVersion[page], ++m_texCacheClock, false};
     }
-    if (!stale)
-        return;
-    overlapping.push_back(&target);
-    resolveInDrawOrder(overlapping);
-    GSFrameReg frame{};
-    frame.fbp = target.fbp;
-    frame.fbw = target.fbw;
-    frame.psm = target.psm;
-    fillTargetFromMemory(frame, std::min(target.usedHeight, target.height));
+    return stale;
 }
 
-void GSNativeBackend::fillTargetFromMemory(const GSFrameReg &frame, uint32_t rows)
+void GSNativeBackend::textureCacheBeforeWrite(uint32_t firstPage, uint32_t endPage)
 {
-    // The same memory read in its new format, as the GS would see it: a game alternating one buffer between CT16 and
-    // CT32 (VP2's blur levels) reads back rows it did not redraw since. Runs inside flushBatch (its renderTarget call):
-    // the pending batch is set aside, this one goes through the same path, sampling GS memory, not the new target.
-    if (const char *v = std::getenv("PS2X_GS_NATIVE_TARGETLOG"); v && std::atoi(v) > 0)
-        std::fprintf(stderr, "[gs:native] reload fbp=%u fbw=%u psm=0x%x rows=%u serial=%llu\n", frame.fbp, frame.fbw, frame.psm,
-                     rows, static_cast<unsigned long long>(m_drawSerial));
+    std::vector<uint32_t> pages;
+    for (uint32_t page = firstPage; page < std::min(endPage, kPages); ++page)
+        pages.push_back(page);
+    textureCacheBeforeWrite(pages);
+}
+
+void GSNativeBackend::textureCacheBeforeWrite(const std::vector<uint32_t> &pages)
+{
+    std::vector<uint32_t> save;
+    for (TexCachePage &entry : m_texCache)
+        if (entry.page != ~0u && !entry.saved && entry.version == m_pageVersion[entry.page] &&
+            std::find(pages.begin(), pages.end(), entry.page) != pages.end())
+        {
+            save.push_back(entry.page);
+            entry.saved = true;
+        }
+    if (!save.empty())
+        copyPagesToTextureCache(save);
+}
+
+void GSNativeBackend::copyPagesToTextureCache(const std::vector<uint32_t> &pages)
+{
+    if (pages.empty() || !ensureContext())
+        return;
+    ensureVram();
+    for (const uint32_t page : pages)
+        syncMemoryPages(page, page + 1u);
+    syncVramToGpu();
+    const GlStateRestore restore;
+    if (!m_texCacheTexture)
+    {
+        glGenTextures(1, &m_texCacheTexture);
+        glBindTexture(GL_TEXTURE_2D, m_texCacheTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glGenFramebuffers(1, &m_texCacheFramebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_texCacheFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texCacheTexture, 0);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_texCacheFramebuffer);
+    for (const uint32_t page : pages) // a page is two rows of the 1024-word-wide copy
+        glBlitFramebuffer(0, static_cast<GLint>(page * 2u), 1024, static_cast<GLint>(page * 2u + 2u), 0,
+                          static_cast<GLint>(page * 2u), 1024, static_cast<GLint>(page * 2u + 2u), GL_COLOR_BUFFER_BIT,
+                          GL_NEAREST);
+}
+
+void GSNativeBackend::syncTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages)
+{
+    std::vector<uint32_t> stale;
+    for (const uint32_t page : pages)
+        if (!holdsNewest(target, page))
+        {
+            syncMemoryPages(page, page + 1u);
+            stale.push_back(page);
+        }
+    if (!stale.empty())
+        reloadTargetPages(target, stale);
+}
+
+void GSNativeBackend::wroteTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages)
+{
+    const uint64_t version = ++m_version;
+    for (const uint32_t page : pages)
+    {
+        m_pageVersion[page] = version;
+        target.pages[page - target.fbp] = version;
+    }
+}
+
+void GSNativeBackend::wroteMemoryPages(uint32_t firstPage, uint32_t endPage)
+{
+    const uint64_t version = ++m_version;
+    for (uint32_t page = firstPage; page < std::min(endPage, kPages); ++page)
+        m_pageVersion[page] = m_memoryVersion[page] = version;
+}
+
+void GSNativeBackend::reloadTargetPages(RenderTarget &target, const std::vector<uint32_t> &pages)
+{
+    // Each page drawn as a sprite sampling GS memory in the target's format, through flushBatch's own path (the
+    // pending batch set aside meanwhile): a game alternating one buffer between CT16 and CT32 (VP2's blur levels)
+    // reads back what the other view drew, as the GS would.
+    if (logTargetPages())
+        std::fprintf(stderr, "[gs:native] reload fbp=%u fbw=%u psm=0x%x pages=%zu (first %u) serial=%llu\n", target.fbp,
+                     target.fbw, target.psm, pages.size(), pages.front(), static_cast<unsigned long long>(m_drawSerial));
     std::vector<Vertex> pending;
     pending.swap(m_batch);
     const GSDrawState pendingState = m_batchState;
     const float pendingMaxY = m_batchMaxY;
-    const uint32_t width = std::clamp<uint32_t>(frame.fbw * 64u, 64u, kMaxTargetWidth);
     GSPrimitiveBatch fill{};
     GSContext &context = fill.state.context;
-    context.frame = frame;
+    context.frame.fbp = target.fbp;
+    context.frame.fbw = target.fbw;
+    context.frame.psm = target.psm;
     context.frame.fbmsk = 0u;
-    context.scissor.x1 = static_cast<uint16_t>(width - 1u);
-    context.scissor.y1 = static_cast<uint16_t>(rows - 1u);
-    context.tex0.tbp0 = frame.fbp * 32u;
-    context.tex0.tbw = static_cast<uint8_t>(frame.fbw);
-    context.tex0.psm = frame.psm;
+    context.scissor.x1 = static_cast<uint16_t>(target.width - 1u);
+    context.scissor.y1 = static_cast<uint16_t>(target.height - 1u);
+    context.tex0.tbp0 = target.fbp * 32u;
+    context.tex0.tbw = static_cast<uint8_t>(target.fbw);
+    context.tex0.psm = target.psm;
     const auto log2Ceil = [](uint32_t n) { uint8_t b = 0; while ((1u << b) < n && b < 10u) ++b; return b; };
-    context.tex0.tw = log2Ceil(width);
-    context.tex0.th = log2Ceil(rows);
+    context.tex0.tw = log2Ceil(target.width);
+    context.tex0.th = log2Ceil(target.height);
     context.tex0.tcc = 1u;
     context.tex0.tfx = 1u; // decal
     context.clamp = 0x5u;  // clamp, nearest (TEX1 0)
     fill.state.prim.type = GS_PRIM_SPRITE;
     fill.state.prim.tme = true;
     fill.state.prim.fst = true;
-    fill.state.texa.ta0 = 0x80u;
+    // CT16's alpha bit as stored (0 or 0x80: a resolve writes it back as it was; VP2's CT32 green byte holds it in
+    // the low halves of its CT16 view), CT24's alpha as 0x80.
+    fill.state.texa.ta0 = (target.psm == 0x02u || target.psm == 0x0Au) ? 0x00u : 0x80u;
     fill.state.texa.ta1 = 0x80u;
     fill.vertexCount = 2u;
-    fill.vertices[1].x = static_cast<float>(width);
-    fill.vertices[1].y = static_cast<float>(rows);
-    fill.vertices[1].u = static_cast<uint16_t>(std::min<uint32_t>(width * 16u, 0xFFFFu));
-    fill.vertices[1].v = static_cast<uint16_t>(std::min<uint32_t>(rows * 16u, 0xFFFFu));
-    fill.vertices[1].r = fill.vertices[1].g = fill.vertices[1].b = fill.vertices[1].a = 0x80u;
+    const uint32_t fbw = std::max(target.fbw, 1u), pageRows = pageRowsOf(target.psm);
     m_batchMaxY = 0.0f;
     m_fillingFromMemory = true;
-    appendPrimitive(fill);
+    for (const uint32_t page : pages)
+    {
+        const uint32_t x = (page - target.fbp) % fbw * 64u, y = (page - target.fbp) / fbw * pageRows;
+        for (int corner = 0; corner < 2; ++corner)
+        {
+            GSVertex &v = fill.vertices[corner];
+            // The page's exact edges in host pixels (the vertex shader moves GS geometry by 31/64 of a pixel: without
+            // this, at an internal scale the first host column and row of each page were left out).
+            v.x = static_cast<float>(x + (corner ? 64u : 0u)) - 31.0f / 64.0f;
+            v.y = static_cast<float>(y + (corner ? pageRows : 0u)) - 31.0f / 64.0f;
+            v.u = static_cast<uint16_t>(std::min<uint32_t>((x + (corner ? 64u : 0u)) * 16u, 0xFFFFu));
+            v.v = static_cast<uint16_t>(std::min<uint32_t>((y + (corner ? pageRows : 0u)) * 16u, 0xFFFFu));
+            v.r = v.g = v.b = v.a = 0x80u;
+        }
+        appendPrimitive(fill);
+    }
     flushBatch();
     m_fillingFromMemory = false;
+    for (const uint32_t page : pages)
+        target.pages[page - target.fbp] = m_pageVersion[page];
     m_batch.swap(pending);
     m_batchState = pendingState;
     m_batchMaxY = pendingMaxY;
+}
+
+GSNativeBackend::RenderTarget *GSNativeBackend::directSource(const GSDrawState &state)
+{
+    // Only a read in the target's own layout and width samples it directly (CT24 reads CT32 pixels as they are);
+    // another format or width (a CT32 buffer read as CT16 to split its channels) sees GS memory.
+    // PS2X_GS_NATIVE_MEMORY_READS=1: never sample a target directly, always GS memory (diagnosis).
+    static const bool s_memoryReads = std::getenv("PS2X_GS_NATIVE_MEMORY_READS") != nullptr;
+    const GSTex0Reg &tex0 = state.context.tex0;
+    if (m_fillingFromMemory || s_memoryReads || !colorFormat(tex0.psm))
+        return nullptr;
+    RenderTarget *source = renderTargetAtBlock(tex0.tbp0);
+    const auto sameLayout = [](uint32_t a, uint32_t b) { return a == b || ((a | b) & ~0x1u) == 0u; };
+    if (!source || !sameLayout(source->psm, tex0.psm) || std::max<uint32_t>(source->fbw, 1u) != std::max<uint32_t>(tex0.tbw, 1u))
+        return nullptr;
+    return source;
 }
 
 GSNativeBackend::RenderTarget *GSNativeBackend::renderTargetAtBlock(uint32_t block)
@@ -823,6 +1111,24 @@ GSNativeBackend::RenderTarget *GSNativeBackend::renderTargetAtBlock(uint32_t blo
         return nullptr;
     auto it = m_targets.find(block / 32u);
     return it == m_targets.end() ? nullptr : &it->second;
+}
+
+bool GSNativeBackend::spriteSpan(float p0, float p1, float t0, float t1, uint32_t scale, SpriteSpan &out)
+{
+    out = {p0, p1, t0, t1};
+    if (scale <= 1u)
+        return true;
+    // The vertex shader samples scaled pixel k of GS pixel X within (X - 1/2, X + 1/2), and the GS covers X when
+    // p0 <= X < p1.
+    const float low = std::ceil(std::min(p0, p1)) - 0.5f, high = std::ceil(std::max(p0, p1)) - 0.5f;
+    if (low >= high)
+        return false;
+    const float slope = (t1 - t0) / (p1 - p0);
+    out.p0 = p0 > p1 ? high : low;
+    out.p1 = p0 > p1 ? low : high;
+    out.t0 = t0 + (out.p0 - p0) * slope;
+    out.t1 = t0 + (out.p1 - p0) * slope;
+    return true;
 }
 
 void GSNativeBackend::appendPrimitive(const GSPrimitiveBatch &batch)
@@ -900,12 +1206,17 @@ void GSNativeBackend::appendPrimitive(const GSPrimitiveBatch &batch)
             {
                 s0 /= q0, t0 /= q0, s1 /= q1, t1 /= q1;
             }
-            vertex(b, b, a.x, a.y, s0, t0, 1.0f);
-            vertex(b, b, b.x, a.y, s1, t0, 1.0f);
-            vertex(b, b, a.x, b.y, s0, t1, 1.0f);
-            vertex(b, b, b.x, a.y, s1, t0, 1.0f);
-            vertex(b, b, b.x, b.y, s1, t1, 1.0f);
-            vertex(b, b, a.x, b.y, s0, t1, 1.0f);
+            SpriteSpan sx, sy;
+            if (!spriteSpan(a.x - ofx, b.x - ofx, s0, s1, m_scale, sx) ||
+                !spriteSpan(a.y - ofy, b.y - ofy, t0, t1, m_scale, sy))
+                break;
+            const float ax = sx.p0 + ofx, bx = sx.p1 + ofx, ay = sy.p0 + ofy, by = sy.p1 + ofy;
+            vertex(b, b, ax, ay, sx.t0, sy.t0, 1.0f);
+            vertex(b, b, bx, ay, sx.t1, sy.t0, 1.0f);
+            vertex(b, b, ax, by, sx.t0, sy.t1, 1.0f);
+            vertex(b, b, bx, ay, sx.t1, sy.t0, 1.0f);
+            vertex(b, b, bx, by, sx.t1, sy.t1, 1.0f);
+            vertex(b, b, ax, by, sx.t0, sy.t1, 1.0f);
         }
         break;
     case GS_PRIM_POINT:
@@ -1041,6 +1352,13 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
         m_borrowedDepthWidth = width;
         m_borrowedDepthHeight = height;
     }
+    ensureVram();
+    const bool sixteen = (source.psm & 0x2u) != 0u;
+    const GpuLayout zLayout = (zbuf.psm & 0x0Fu) == 0x2u ? kLayoutZ16 : (zbuf.psm & 0x0Fu) == 0xAu ? kLayoutZ16S : kLayoutZ32;
+    const int colorRow = (zLayout.bits == 16) != sixteen ? -1
+                         : !sixteen                      ? kInverseRowC32
+                         : source.psm == 0x0Au           ? kInverseRowC16S
+                                                         : kInverseRowC16;
     GlStateRestore restore;
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_borrowedDepth, 0);
@@ -1054,14 +1372,116 @@ bool GSNativeBackend::depthFromColorTarget(const RenderTarget &target, const GSZ
     glUseProgram(m_depthFromColorProgram);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, source.color);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glActiveTexture(GL_TEXTURE0);
     const uint32_t zMask = (zbuf.psm & 0x0Fu) == 0x0u ? 0xFFFFFFFFu : (zbuf.psm & 0x0Fu) == 0x1u ? 0xFFFFFFu : 0xFFFFu;
     glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColor"), 0);
-    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), (source.psm & 0x2u) != 0u ? 1 : 0);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSwizzle"), 3);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uInverse"), 4);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uZRow"), zLayout.row);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uColorRow"), colorRow);
+    glUniform2i(glGetUniformLocation(m_depthFromColorProgram, "uPage"), zLayout.pageWidth, zLayout.pageHeight);
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(glGetUniformLocation(m_depthFromColorProgram, "uSixteen"), sixteen ? 1 : 0);
     glUniform1ui(glGetUniformLocation(m_depthFromColorProgram, "uZMask"), zMask);
     glUniform1f(glGetUniformLocation(m_depthFromColorProgram, "uZScale"), static_cast<float>(depthScale(zbuf.psm)));
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     return true;
+}
+
+void GSNativeBackend::beginWrappedBlend(RenderTarget &target, const GSScissorReg &scissor)
+{
+    const uint32_t width = target.width * m_scale, height = target.height * m_scale;
+    if (!m_wrapTexture || m_wrapWidth != width || m_wrapHeight != height)
+    {
+        if (!m_wrapTexture)
+        {
+            glGenTextures(1, &m_wrapTexture);
+            glGenFramebuffers(1, &m_wrapFramebuffer);
+        }
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, m_wrapTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glActiveTexture(GL_TEXTURE0);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_wrapFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_wrapTexture, 0);
+        m_wrapWidth = width;
+        m_wrapHeight = height;
+    }
+    const GLint s = static_cast<GLint>(m_scale);
+    const GLint x0 = scissor.x0 * s, y0 = scissor.y0 * s, x1 = (scissor.x1 + 1) * s, y1 = (scissor.y1 + 1) * s;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_wrapFramebuffer);
+    glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_wrapTexture, 0);
+    m_wrapOpen = true;
+    m_wrapDrawn = false;
+    m_wrapFbp = target.fbp;
+    m_wrapScissor = scissor;
+}
+
+bool GSNativeBackend::continuesWrappedBlend() const
+{
+    if (m_batch.empty() || m_fillingFromMemory)
+        return false;
+    const GSDrawState &state = m_batchState;
+    const GSContext &context = state.context;
+    const auto it = m_targets.find(m_wrapFbp);
+    static const char *s_off = std::getenv("PS2X_GS_NATIVE_OFF");
+    const uint32_t keptAlpha = context.frame.fbmsk >> 24;
+    return it != m_targets.end() && context.frame.fbp == m_wrapFbp && context.frame.psm == it->second.psm &&
+           context.frame.fbw == it->second.fbw &&
+           std::memcmp(&context.scissor, &m_wrapScissor, sizeof(GSScissorReg)) == 0 && blendWraps(state) &&
+           !state.prim.tme && (context.test >> 14 & 0x1u) == 0u && (keptAlpha == 0u || keptAlpha == 0xFFu) &&
+           (effectiveAlpha(context) >> 4 & 0x3u) != 1u && !(s_off && std::strstr(s_off, "blend"));
+}
+
+void GSNativeBackend::closeWrappedBlend()
+{
+    if (!m_wrapOpen)
+        return;
+    m_wrapOpen = false;
+    const auto it = m_targets.find(m_wrapFbp);
+    if (it == m_targets.end())
+        return;
+    RenderTarget &target = it->second;
+    const GlStateRestore restore;
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
+    if (!m_wrapDrawn)
+        return;
+    const GSScissorReg &scissor = m_wrapArea;
+    if (!m_wrapProgram)
+    {
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kWrapFragmentShader);
+        m_wrapProgram = glCreateProgram();
+        glAttachShader(m_wrapProgram, vertex);
+        glAttachShader(m_wrapProgram, fragment);
+        glLinkProgram(m_wrapProgram);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+    }
+    const GLint s = static_cast<GLint>(m_scale);
+    glViewport(0, 0, static_cast<GLsizei>(target.width * m_scale), static_cast<GLsizei>(target.height * m_scale));
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(scissor.x0 * s, scissor.y0 * s, (scissor.x1 - scissor.x0 + 1) * s, (scissor.y1 - scissor.y0 + 1) * s);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_wrapProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_wrapTexture);
+    glUniform1i(glGetUniformLocation(m_wrapProgram, "uWrapped"), 0);
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
 void GSNativeBackend::syncVramToGpu()
@@ -1123,11 +1543,10 @@ void GSNativeBackend::pullGpuPages(uint32_t firstPage, uint32_t endPage)
     m_anyGpuNewer = left;
 }
 
-bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
+bool GSNativeBackend::resolveTargetPagesGpu(RenderTarget &target, uint32_t firstPage, uint32_t endPage)
 {
-    const int kind = target.psm == 0x00u ? 0 : target.psm == 0x02u ? 1 : target.psm == 0x0Au ? 2 : -1;
-    // A CT32 target whose alpha was never drawn (FBMSK kept it): GS memory's top bytes must stay, the CPU path does.
-    if (kind < 0 || !m_vram || (kind == 0 && !target.alphaWritten))
+    const int kind = target.psm == 0x00u ? 0 : target.psm == 0x02u ? 1 : target.psm == 0x0Au ? 2 : target.psm == 0x01u ? 3 : -1;
+    if (kind < 0 || !m_vram)
         return false;
     ensureVram();
     if (!m_resolveProgram)
@@ -1135,16 +1554,34 @@ bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
     const GlStateRestore restore;
     // Transfers before this resolve land first, then the target's pixels over them, all on the GPU copy.
     syncVramToGpu();
-    const uint32_t pageRows = kind == 0 ? 32u : 64u;
-    const uint32_t first = target.fbp;
-    const uint32_t end = std::min<uint32_t>(
-        512u, target.fbp + std::max<uint32_t>(target.fbw, 1u) * ((target.usedHeight + pageRows - 1u) / pageRows));
-    if (end <= first)
-        return true;
+    if (kind == 3)
+    {
+        // CT24 keeps GS memory's top bytes (T8H / T4HL / T4HH textures): the shader reads them from a copy of the
+        // pages' words, which it cannot read from the texture it writes.
+        if (!m_vramOld)
+        {
+            glGenTextures(1, &m_vramOld);
+            glBindTexture(GL_TEXTURE_2D, m_vramOld);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glGenFramebuffers(1, &m_vramOldFramebuffer);
+            glBindFramebuffer(GL_FRAMEBUFFER, m_vramOldFramebuffer);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_vramOld, 0);
+        }
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_vramOldFramebuffer);
+        const GLint y0 = static_cast<GLint>(firstPage * 2u), y1 = static_cast<GLint>(endPage * 2u);
+        glBlitFramebuffer(0, y0, 1024, y1, 0, y0, 1024, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, m_vramOld);
+        glActiveTexture(GL_TEXTURE0);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, m_vramFramebuffer);
     glViewport(0, 0, 1024, 1024);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(0, static_cast<GLint>(first * 2u), 1024, static_cast<GLsizei>((end - first) * 2u));
+    glScissor(0, static_cast<GLint>(firstPage * 2u), 1024, static_cast<GLsizei>((endPage - firstPage) * 2u));
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
@@ -1160,90 +1597,147 @@ bool GSNativeBackend::resolveTargetGpu(RenderTarget &target)
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbp"), static_cast<GLint>(target.fbp));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uKind"), kind);
-    glUniform1i(glGetUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.usedHeight));
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uOld"), 5);
+    glUniform1i(glGetUniformLocation(m_resolveProgram, "uUsedHeight"), static_cast<GLint>(target.height));
     glUniform1i(glGetUniformLocation(m_resolveProgram, "uScale"), static_cast<GLint>(m_scale));
     glBindVertexArray(m_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    for (uint32_t page = first; page < end; ++page)
+    for (uint32_t page = firstPage; page < endPage; ++page)
         m_gpuNewer[page] = 1u;
     m_anyGpuNewer = true;
     return true;
 }
 
-void GSNativeBackend::resolveTarget(RenderTarget &target)
+void GSNativeBackend::resolveDepthPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage)
 {
-    const uint32_t width = target.fbw * 64u;
-    const uint32_t height = target.usedHeight;
-    target.dirty = false;
-    // PS2X_GS_NATIVE_TARGETLOG=<n>: the first n resolves and reloads (fbp, width, format, rows, draw serial).
-    static const int s_targetLog = [] { const char *v = std::getenv("PS2X_GS_NATIVE_TARGETLOG"); return v ? std::atoi(v) : 0; }();
-    static int s_targetLogged = 0;
-    if (s_targetLogged < s_targetLog)
+    if (!m_vram || endPage <= firstPage || !target.depth)
+        return;
+    ensureVram();
+    if (!m_depthResolveProgram)
     {
-        ++s_targetLogged;
-        std::fprintf(stderr, "[gs:native] resolve fbp=%u fbw=%u psm=0x%x rows=%u last=%llu serial=%llu\n", target.fbp, target.fbw,
-                     target.psm, height, static_cast<unsigned long long>(target.lastDraw), static_cast<unsigned long long>(m_drawSerial));
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kDepthResolveFragmentShader);
+        m_depthResolveProgram = glCreateProgram();
+        glAttachShader(m_depthResolveProgram, vertex);
+        glAttachShader(m_depthResolveProgram, fragment);
+        glLinkProgram(m_depthResolveProgram);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
     }
+    const GlStateRestore restore;
+    syncVramToGpu();
+    // The words before the resolve, for Z24's top byte (the shader cannot read the texture it writes).
+    if (!m_vramOld)
+    {
+        glGenTextures(1, &m_vramOld);
+        glBindTexture(GL_TEXTURE_2D, m_vramOld);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glGenFramebuffers(1, &m_vramOldFramebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_vramOldFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_vramOld, 0);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_vramFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_vramOldFramebuffer);
+    const GLint y0 = static_cast<GLint>(firstPage * 2u), y1 = static_cast<GLint>(endPage * 2u);
+    glBlitFramebuffer(0, y0, 1024, y1, 0, y0, 1024, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_vramFramebuffer);
+    glViewport(0, 0, 1024, 1024);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, y0, 1024, y1 - y0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_depthResolveProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, target.depth);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, m_inverseTexture);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, m_vramOld);
+    glActiveTexture(GL_TEXTURE0);
+    const uint32_t format = target.zpsm & 0x0Fu;
+    const int kind = format == 0x0u ? 0 : format == 0x1u ? 1 : format == 0xAu ? 3 : 2;
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uDepth"), 0);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uInverse"), 4);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uOld"), 5);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uZbp"), static_cast<GLint>(target.zbp));
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uFbw"), static_cast<GLint>(std::max<uint32_t>(target.fbw, 1u)));
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uKind"), kind);
+    glUniform1i(glGetUniformLocation(m_depthResolveProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1f(glGetUniformLocation(m_depthResolveProgram, "uRange"), static_cast<float>(1.0 / depthScale(target.zpsm)));
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    for (uint32_t page = firstPage; page < endPage; ++page)
+        m_gpuNewer[page] = 1u;
+    m_anyGpuNewer = true;
+}
+
+void GSNativeBackend::resolveTargetPages(RenderTarget &target, uint32_t firstPage, uint32_t endPage)
+{
+    if (logTargetPages())
+        std::fprintf(stderr, "[gs:native] resolve fbp=%u fbw=%u psm=0x%x pages %u-%u serial=%llu\n", target.fbp, target.fbw,
+                     target.psm, firstPage, endPage - 1u, static_cast<unsigned long long>(m_drawSerial));
+    target.dirty = false;
     // PS2X_GS_NATIVE_NORESOLVE=1: skip resolves (wrong pictures), to time what they cost.
     static const bool noResolve = std::getenv("PS2X_GS_NATIVE_NORESOLVE") != nullptr;
-    if (noResolve || width == 0u || height == 0u || width > target.width)
+    if (noResolve || endPage <= firstPage)
         return;
     static const bool cpuDecode = std::getenv("PS2X_GS_NATIVE_CPUDECODE") != nullptr;
     static const bool cpuResolve = std::getenv("PS2X_GS_NATIVE_CPURESOLVE") != nullptr; // diagnostics
-    if (!cpuDecode && !cpuResolve && resolveTargetGpu(target))
+    if (!cpuDecode && !cpuResolve && resolveTargetPagesGpu(target, firstPage, endPage))
         return;
-    pullGpuPages();
-    // The pixels as a host-to-local CT32 transfer at the frame's base: rows top first (GL row 0 is GS row 0), alpha
-    // as the GS stores it.
-    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(target, 0u, 0u, width, height));
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE,
-                 pixels.data());
-    uint32_t dpsm = 0x00u;
-    if (target.psm == 0x02u || target.psm == 0x0Au)
+    if (!m_vram)
+        return;
+    // Through the CPU, page by page: the pixels read back and written in the target's format (CT24 keeps GS
+    // memory's top byte, where a game keeps T8H / T4HL / T4HH textures), then into the texture cache for the CPU
+    // decoding path as a host-to-local transfer of that rectangle.
+    pullGpuPages(firstPage, endPage);
+    const uint32_t fbw = std::max<uint32_t>(target.fbw, 1u), pageRows = pageRowsOf(target.psm), bp = target.fbp * 32u;
+    const bool sixteen = target.psm == 0x02u || target.psm == 0x0Au;
+    std::vector<uint8_t> pixels(64u * pageRows * 4u);
+    for (uint32_t page = firstPage; page < endPage; ++page)
     {
-        // A 16-bit target: RGB5A1 (alpha bit from the GS alpha's top bit, 0x80), written in its own format.
-        dpsm = target.psm;
-        for (size_t i = 0, n = static_cast<size_t>(width) * height; i < n; ++i)
-        {
-            const uint8_t *p = &pixels[i * 4u];
-            const uint16_t v = static_cast<uint16_t>((p[0] >> 3) | (p[1] >> 3) << 5 | (p[2] >> 3) << 10 |
-                                                     ((p[3] & 0x80u) ? 0x8000u : 0u));
-            std::memcpy(&pixels[i * 2u], &v, 2u);
-        }
-        pixels.resize(static_cast<size_t>(width) * height * 2u);
-    }
-    // Into GS memory (where draws in another format and the GPU copy of it read), and into the texture cache for the
-    // CPU decoding path.
-    if (m_vram)
-    {
-        const uint32_t bp = target.fbp * 32u, bw = std::max<uint32_t>(target.fbw, 1u);
-        for (uint32_t y = 0; y < height; ++y)
-            for (uint32_t x = 0; x < width; ++x)
+        const uint32_t x0 = (page - target.fbp) % fbw * 64u, y0 = (page - target.fbp) / fbw * pageRows;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(target, x0, y0, 64u, pageRows));
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(static_cast<GLint>(x0), static_cast<GLint>(y0), 64, static_cast<GLsizei>(pageRows), GL_RGBA,
+                     GL_UNSIGNED_BYTE, pixels.data());
+        std::vector<uint8_t> upload(64u * pageRows * (sixteen ? 2u : 4u));
+        for (uint32_t y = 0; y < pageRows; ++y)
+            for (uint32_t x = 0; x < 64u; ++x)
             {
-                const size_t i = static_cast<size_t>(y) * width + x;
-                if (dpsm == 0x00u)
+                const size_t i = static_cast<size_t>(y) * 64u + x;
+                const uint8_t *p = &pixels[i * 4u];
+                if (sixteen)
                 {
-                    uint32_t v = 0;
-                    std::memcpy(&v, &pixels[i * 4u], 4u);
-                    // CT24 leaves the top byte alone (where a game keeps T8H / T4HL / T4HH textures, the GS too).
-                    (target.psm == 0x01u || !target.alphaWritten ? GSMem::WriteCT24 : GSMem::WriteCT32)(m_vram, bp, bw, x,
-                                                                                                         y, v);
+                    // RGB5A1: the alpha bit from the GS alpha's top bit (0x80).
+                    const uint16_t v = static_cast<uint16_t>((p[0] >> 3) | (p[1] >> 3) << 5 | (p[2] >> 3) << 10 |
+                                                             ((p[3] & 0x80u) ? 0x8000u : 0u));
+                    (target.psm == 0x0Au ? GSMem::WriteCT16S : GSMem::WriteCT16)(m_vram, bp, fbw, x0 + x, y0 + y, v);
+                    std::memcpy(&upload[i * 2u], &v, 2u);
                 }
                 else
                 {
-                    uint16_t v = 0;
-                    std::memcpy(&v, &pixels[i * 2u], 2u);
-                    (dpsm == 0x0Au ? GSMem::WriteCT16S : GSMem::WriteCT16)(m_vram, bp, bw, x, y, v);
+                    uint32_t v = 0;
+                    std::memcpy(&v, p, 4u);
+                    (target.psm == 0x01u ? GSMem::WriteCT24 : GSMem::WriteCT32)(m_vram, bp, fbw, x0 + x, y0 + y, v);
+                    std::memcpy(&upload[i * 4u], &v, 4u);
                 }
             }
-        markDirty(dpsm, bp, bw, 0u, 0u, width, height);
+        markDirty(target.psm, bp, fbw, x0, y0, 64u, pageRows);
+        const uint64_t bitbltbuf = static_cast<uint64_t>(bp) << 32 | static_cast<uint64_t>(fbw) << 48 |
+                                   static_cast<uint64_t>(sixteen ? target.psm : 0x00u) << 56;
+        const uint64_t trxpos = static_cast<uint64_t>(x0) << 32 | static_cast<uint64_t>(y0) << 48;
+        const uint64_t trxreg = 64ull | static_cast<uint64_t>(pageRows) << 32;
+        ps2x::native::textures().upload(bitbltbuf, trxpos, trxreg, upload.data(), upload.size());
     }
-    const uint64_t bitbltbuf = static_cast<uint64_t>(target.fbp * 32u) << 32 | static_cast<uint64_t>(target.fbw) << 48 |
-                               static_cast<uint64_t>(dpsm) << 56;
-    const uint64_t trxreg = static_cast<uint64_t>(width) | static_cast<uint64_t>(height) << 32;
-    ps2x::native::textures().upload(bitbltbuf, 0u, trxreg, pixels.data(), pixels.size());
 }
 
 GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf, uint32_t rows)
@@ -1261,7 +1755,11 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     // GS memory below the picture, where a game uploads its textures, and each upload there dropped the target with
     // the native draws in it (TMB's 3D frame came out black).
     target.usedHeight = std::min(target.height, std::max(target.usedHeight, rows));
-    target.alphaWritten = true;
+    targetPagesIn(target, 0, 0, static_cast<int>(target.width), static_cast<int>(rows), m_scratchPages);
+    const std::vector<uint32_t> pages = m_scratchPages;
+    syncTargetPages(target, pages);
+    textureCacheBeforeWrite(pages);
+    wroteTargetPages(target, pages);
     target.zbp = zbuf.zbp;
     target.zpsm = zbuf.psm;
     out.framebuffer = target.framebuffer;
@@ -1279,6 +1777,44 @@ void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
     const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
     if (!hook)
         return;
+    // PS2X_NATIVE_VRAM_DIFF=1: every 500th native group, GS memory against the native texture cache's copy, page by
+    // page (8 KiB): each page that differs, logged the first time, with the first differing word in each (the
+    // textures and CLUTs a port's draws decode, where the cache is not the GS's).
+    if (static const bool s_vramDiff = std::getenv("PS2X_NATIVE_VRAM_DIFF") != nullptr; s_vramDiff)
+    {
+        static uint64_t s_calls = 0;
+        static std::vector<uint8_t> s_vram;
+        static std::vector<bool> s_logged(512, false);
+        if (s_calls++ % 500u == 0u)
+        {
+            SnapshotVram(s_vram);
+            const uint8_t *cache = ps2x::native::textures().memory();
+            uint32_t differing = 0;
+            for (uint32_t page = 0; page < 512u && s_vram.size() >= 512u * 8192u; ++page)
+            {
+                const uint8_t *g = s_vram.data() + page * 8192u, *c = cache + page * 8192u;
+                if (std::memcmp(g, c, 8192u) == 0)
+                    continue;
+                ++differing;
+                if (s_logged[page])
+                    continue;
+                s_logged[page] = true;
+                uint32_t at = 0, words = 0;
+                for (uint32_t i = 0; i < 8192u; i += 4u)
+                    if (std::memcmp(g + i, c + i, 4u) != 0)
+                    {
+                        if (words++ == 0u)
+                            at = i;
+                    }
+                uint32_t gw, cw;
+                std::memcpy(&gw, g + at, 4u);
+                std::memcpy(&cw, c + at, 4u);
+                std::fprintf(stderr, "[native:vramdiff] page %u (blocks %u-%u): %u words differ, first at +%u: GS %08x cache %08x\n",
+                             page, page * 32u, page * 32u + 31u, words, at, gw, cw);
+            }
+            std::fprintf(stderr, "[native:vramdiff] call %llu: %u pages differ\n", static_cast<unsigned long long>(s_calls), differing);
+        }
+    }
     const FrameTarget frame = frameTarget(context.frame, context.zbuf, context.scissor.y1 + 1u);
     ps2x::native::GsDrawTarget target;
     fillNativeRegisters(target, context);
@@ -1327,73 +1863,70 @@ void GSNativeBackend::resolveAllTargets()
         }
         std::fprintf(stderr, "[gs:native] vram check: %u blocks differ\n", differing);
     }
-    std::vector<RenderTarget *> all;
-    for (auto &[fbp, target] : m_targets)
-        all.push_back(&target);
-    resolveInDrawOrder(all);
+    syncMemoryPages(0u, kPages);
     pullGpuPages();
 }
 
-void GSNativeBackend::resolveTargetsUnder(const GSTex0Reg &tex0)
+namespace
 {
-    // The texture's blocks: TBW * 64 texels by its height, at its format's size (a conservative extent).
-    static constexpr uint32_t kBits[64] = {32, 24, 16, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 4, 0, 0, 0,
-                                           0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4};
-    const uint32_t bits = kBits[tex0.psm & 0x3Fu] ? kBits[tex0.psm & 0x3Fu] : 32u;
-    const uint64_t texRows = 1ull << std::min<uint32_t>(tex0.th, 10u);
-    const uint64_t texBlocks = (std::max<uint32_t>(tex0.tbw, 1u) * 64ull * texRows * bits / 8u + 255u) / 256u;
-    std::vector<RenderTarget *> under;
-    for (auto &[fbp, target] : m_targets)
+    // The rows a texture read may reach: 2^TH, or further with REGION_CLAMP (up to MAXV) or REGION_REPEAT (up to
+    // MINV | MAXV), which address the texture beyond its size (SC3 samples 448 rows of a TH = 32 buffer).
+    uint32_t textureRows(const GSTex0Reg &tex0, uint64_t clamp)
     {
-        if (!target.dirty || target.usedHeight == 0u)
-            continue;
-        const uint64_t base = static_cast<uint64_t>(fbp) * 32u;
-        // Pages of 32 blocks: 64 x 32 pixels in CT32/CT24, 64 x 64 in CT16.
-        const uint32_t pageRows = (target.psm == 0x02u || target.psm == 0x0Au) ? 64u : 32u;
-        const uint64_t blocks = static_cast<uint64_t>(target.fbw) * ((target.usedHeight + pageRows - 1u) / pageRows) * 32u;
-        if (tex0.tbp0 < base + blocks && base < tex0.tbp0 + texBlocks)
-            under.push_back(&target);
+        uint32_t rows = 1u << std::min<uint32_t>(tex0.th, 10u);
+        const uint32_t wmt = clamp >> 2 & 0x3u, minv = clamp >> 24 & 0x3FFu, maxv = clamp >> 34 & 0x3FFu;
+        if (wmt == 2u)
+            rows = std::max(rows, maxv + 1u);
+        else if (wmt == 3u)
+            rows = std::max(rows, (minv | maxv) + 1u);
+        return rows;
     }
-    resolveInDrawOrder(under);
+
+    // The GS memory pages a texture may read: TBW * 64 texels by its rows at its format's size, from TBP0 (a
+    // conservative extent).
+    std::pair<uint32_t, uint32_t> texturePages(const GSTex0Reg &tex0, uint64_t clamp)
+    {
+        static constexpr uint32_t kBits[64] = {32, 24, 16, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 4, 0, 0, 0,
+                                               0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4};
+        const uint32_t bits = kBits[tex0.psm & 0x3Fu] ? kBits[tex0.psm & 0x3Fu] : 32u;
+        const uint64_t rows = textureRows(tex0, clamp);
+        const uint64_t blocks = (std::max<uint32_t>(tex0.tbw, 1u) * 64ull * rows * bits / 8u + 255u) / 256u;
+        const uint64_t first = tex0.tbp0 / 32u, end = (tex0.tbp0 + blocks + 31u) / 32u;
+        return {static_cast<uint32_t>(std::min<uint64_t>(first, kPages)), static_cast<uint32_t>(std::min<uint64_t>(end, kPages))};
+    }
+
+    // The GS memory pages a transfer's rectangle in a buffer touches: rows y to y + h at the format's page size.
+    std::pair<uint32_t, uint32_t> transferPages(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t y, uint32_t h)
+    {
+        const bool fourBit = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
+        const bool eightBit = psm == 0x13u || psm == 0x1Bu;
+        const bool sixteen = psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au;
+        const uint32_t pageWidth = (fourBit || eightBit) && psm != 0x1Bu && psm != 0x24u && psm != 0x2Cu ? 128u : 64u;
+        const uint32_t pageHeight = psm == 0x14u ? 128u : (psm == 0x13u || sixteen) ? 64u : 32u;
+        const uint32_t pagesPerRow = std::max<uint32_t>(std::max<uint32_t>(bw, 1u) * 64u / pageWidth, 1u);
+        const uint64_t first = bp / 32u + static_cast<uint64_t>(y / pageHeight) * pagesPerRow;
+        const uint64_t end = (bp + 31u) / 32u + static_cast<uint64_t>((y + std::max<uint32_t>(h, 1u) + pageHeight - 1u) / pageHeight) * pagesPerRow;
+        return {static_cast<uint32_t>(std::min<uint64_t>(first, kPages)), static_cast<uint32_t>(std::min<uint64_t>(end, kPages))};
+    }
+
+    // The GS memory pages a rectangle of texels (x0..x1, y0..y1 inclusive) lies in, row by row of pages.
+    void texelPages(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                    std::vector<uint32_t> &pages)
+    {
+        const bool fourBit = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
+        const bool eightBit = psm == 0x13u || psm == 0x1Bu;
+        const bool sixteen = psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au;
+        const uint32_t pageWidth = (fourBit || eightBit) && psm != 0x1Bu && psm != 0x24u && psm != 0x2Cu ? 128u : 64u;
+        const uint32_t pageHeight = psm == 0x14u ? 128u : (psm == 0x13u || sixteen) ? 64u : 32u;
+        const uint32_t pagesPerRow = std::max<uint32_t>(std::max<uint32_t>(bw, 1u) * 64u / pageWidth, 1u);
+        pages.clear();
+        for (uint32_t py = y0 / pageHeight; py <= y1 / pageHeight; ++py)
+            for (uint32_t px = x0 / pageWidth; px <= std::min(x1 / pageWidth, pagesPerRow - 1u); ++px)
+                pages.push_back((bp / 32u + py * pagesPerRow + px) % kPages);
+    }
 }
 
-void GSNativeBackend::dropTargetsUnder(const GSTransferCommand &command)
-{
-    // The transfer's pages: rows TRXPOS.DSAY to + TRXREG.RRH at the destination format's page size.
-    const uint32_t psm = command.bitbltbuf.dpsm;
-    const bool fourBit = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
-    const bool eightBit = psm == 0x13u || psm == 0x1Bu;
-    const bool sixteen = psm == 0x02u || psm == 0x0Au;
-    const uint32_t pageWidth = (fourBit || eightBit) && psm != 0x1Bu && psm != 0x24u && psm != 0x2Cu ? 128u : 64u;
-    const uint32_t pageHeight = psm == 0x14u ? 128u : (psm == 0x13u || sixteen) ? 64u : 32u;
-    const uint32_t width = std::max<uint32_t>(command.bitbltbuf.dbw, 1u) * 64u;
-    const uint32_t pagesPerRow = std::max<uint32_t>(width / pageWidth, 1u);
-    const uint32_t y0 = command.trxpos.dsay, y1 = y0 + std::max<uint32_t>(command.trxreg.rrh, 1u);
-    const uint64_t first = command.bitbltbuf.dbp / 32u + static_cast<uint64_t>(y0 / pageHeight) * pagesPerRow;
-    const uint64_t last = command.bitbltbuf.dbp / 32u + static_cast<uint64_t>((y1 + pageHeight - 1u) / pageHeight) * pagesPerRow;
-    for (auto it = m_targets.begin(); it != m_targets.end();)
-    {
-        const RenderTarget &target = it->second;
-        const uint64_t begin = target.fbp;
-        const uint64_t end = begin + static_cast<uint64_t>(target.fbw) * std::max<uint32_t>((target.usedHeight + 31u) / 32u, 1u);
-        if (target.usedHeight != 0u && first < end && begin < last)
-        {
-            if (ensureContext())
-            {
-                glDeleteFramebuffers(1, &target.framebuffer);
-                glDeleteTextures(1, &target.color);
-                glDeleteTextures(1, &target.depth);
-            }
-            it = m_targets.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
-    }
-}
-
-bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
+bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state, uint32_t vram)
 {
     const GSContext &context = state.context;
     const GSTex0Reg &tex0 = context.tex0;
@@ -1418,6 +1951,8 @@ bool GSNativeBackend::bindDecodedTexture(const GSDrawState &state)
     }
     ensureVram();
     syncVramToGpu();
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, vram ? vram : m_vramTexture);
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, m_swizzleTexture);
     glActiveTexture(GL_TEXTURE0);
@@ -1453,42 +1988,65 @@ bool GSNativeBackend::bindDepthAsTexture(const GSDrawState &state, float &width,
             source = &target;
     if (!source)
         return false;
+    // On the GPU: a pass turns the target's depth back into GS Z in the Z buffer's range and lays it out as the texture
+    // format reads it (Z32 as CT32, Z24 as CT24 with TEXA's alpha, Z16 as CT16) into m_depthTexture, at 1x. (It was
+    // read back to the CPU and converted there: 65% of the GS thread in VP2's first dungeon.)
     const uint32_t w = source->width, h = source->usedHeight;
-    std::vector<float> depth(static_cast<size_t>(w) * h);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(*source, 0u, 0u, w, h, true));
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
-    // Back to GS Z in the Z buffer's range, then laid out as the texture format reads it: Z32 as CT32, Z24 as CT24
-    // (alpha from TEXA), Z16 as CT16.
-    const double range = 1.0 / depthScale(source->zpsm);
-    const uint8_t ta0 = static_cast<uint8_t>(state.texa.ta0), ta1 = static_cast<uint8_t>(state.texa.ta1);
-    std::vector<uint8_t> texels(depth.size() * 4u);
-    for (size_t i = 0; i < depth.size(); ++i)
+    if (!m_depthTextureProgram)
     {
-        const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(depth[i]) * range, range - 1.0));
-        uint8_t *t = &texels[i * 4u];
-        switch (tex0.psm)
+        const GLuint vertex = compileShader(GL_VERTEX_SHADER, kResolveVertexShader);
+        const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kDepthAsColorFragmentShader);
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glLinkProgram(program);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE)
         {
-        case 0x30u:
-            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu, t[3] = z >> 24 & 0xFFu;
-            break;
-        case 0x31u:
-            t[0] = z & 0xFFu, t[1] = z >> 8 & 0xFFu, t[2] = z >> 16 & 0xFFu;
-            t[3] = state.texa.aem && (z & 0xFFFFFFu) == 0u ? 0u : ta0;
-            break;
-        default:
-            t[0] = static_cast<uint8_t>((z & 0x1Fu) << 3), t[1] = static_cast<uint8_t>((z >> 5 & 0x1Fu) << 3);
-            t[2] = static_cast<uint8_t>((z >> 10 & 0x1Fu) << 3);
-            t[3] = (z & 0x8000u) ? ta1 : (state.texa.aem && (z & 0x7FFFu) == 0u ? 0u : ta0);
-            break;
+            glDeleteProgram(program);
+            return false;
         }
+        m_depthTextureProgram = program;
     }
     if (!m_depthTexture)
+    {
         glGenTextures(1, &m_depthTexture);
+        glGenFramebuffers(1, &m_depthTextureFramebuffer);
+    }
+    const GlStateRestore restore;
     glBindTexture(GL_TEXTURE_2D, m_depthTexture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, texels.data());
+    if (m_depthTextureWidth != w || m_depthTextureHeight != h)
+    {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        m_depthTextureWidth = w;
+        m_depthTextureHeight = h;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, m_depthTextureFramebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_depthTexture, 0);
+    glViewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_depthTextureProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source->depth);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    const int kind = tex0.psm == 0x30u ? 0 : tex0.psm == 0x31u ? 1 : 2;
+    glUniform1i(glGetUniformLocation(m_depthTextureProgram, "uDepth"), 0);
+    glUniform1i(glGetUniformLocation(m_depthTextureProgram, "uKind"), kind);
+    glUniform1i(glGetUniformLocation(m_depthTextureProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1f(glGetUniformLocation(m_depthTextureProgram, "uRange"), static_cast<float>(1.0 / depthScale(source->zpsm)));
+    glUniform3i(glGetUniformLocation(m_depthTextureProgram, "uTexa"), static_cast<GLint>(state.texa.ta0),
+                static_cast<GLint>(state.texa.ta1), state.texa.aem ? 1 : 0);
+    glBindVertexArray(m_vertexArray);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     width = static_cast<float>(w);
     height = static_cast<float>(h);
     return true;
@@ -1521,6 +2079,48 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
                              context.tex0.tw, context.tex0.th, target.fbp);
         }
     }
+    // The GS texture buffer (textureCacheRead): pages drawn over since this TEXFLUSH interval first read them read as
+    // they were then, decoded from the copy saved before that write; the texture's other pages and its CLUT as now.
+    if (!m_fillingFromMemory && !m_batch.empty())
+    {
+        // The texels the batch reads (a texel's margin for bilinear taps), not the texture's whole extent: the cache
+        // keeps the pages read, and 2^TW x 2^TH texels would push them out.
+        float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
+        for (const Vertex &v : m_batch)
+        {
+            const float s = v.q != 0.0f ? v.s / v.q : v.s, t = v.q != 0.0f ? v.t / v.q : v.t;
+            u0 = std::min(u0, s), u1 = std::max(u1, s), v0 = std::min(v0, t), v1 = std::max(v1, t);
+        }
+        const float columns = static_cast<float>(1u << std::min<uint32_t>(context.tex0.tw, 10u));
+        const float rows = static_cast<float>(textureRows(context.tex0, context.clamp));
+        const auto texel = [](float c, float last) { return static_cast<uint32_t>(std::clamp(c, 0.0f, last)); };
+        std::vector<uint32_t> readPages;
+        texelPages(context.tex0.tbp0, context.tex0.tbw, context.tex0.psm, texel(std::floor(u0) - 1.0f, columns - 1.0f),
+                   texel(std::floor(v0) - 1.0f, rows - 1.0f), texel(std::ceil(u1) + 1.0f, columns - 1.0f),
+                   texel(std::ceil(v1) + 1.0f, rows - 1.0f), readPages);
+        if (textureCacheRead(readPages))
+        {
+            std::vector<uint32_t> current;
+            const auto keepsOld = [this](uint32_t page) {
+                for (const TexCachePage &entry : m_texCache)
+                    if (entry.page == page)
+                        return entry.saved && entry.version != m_pageVersion[page];
+                return false;
+            };
+            for (const uint32_t page : readPages)
+                if (!keepsOld(page))
+                    current.push_back(page);
+            for (uint32_t page = context.tex0.cbp / 32u; page <= (context.tex0.cbp + 4u) / 32u && page < kPages; ++page)
+                if (!keepsOld(page))
+                    current.push_back(page);
+            copyPagesToTextureCache(current);
+            if (bindDecodedTexture(state, m_texCacheTexture))
+            {
+                width = height = 1.0f;
+                return true;
+            }
+        }
+    }
     if ((context.tex0.psm & 0x30u) == 0x30u && bindDepthAsTexture(state, width, height))
     {
         fromTarget = true;
@@ -1530,14 +2130,9 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     }
     else if (colorFormat(context.tex0.psm))
     {
-        // Only a read in the target's own layout samples it directly (CT24 reads CT32 pixels as they are); another
-        // format (a CT32 buffer read as CT16 to split its channels) sees GS memory, through resolveTargetsUnder.
-        // PS2X_GS_NATIVE_MEMORY_READS=1: never sample a target directly, always GS memory (diagnosis).
-        static const bool s_memoryReads = std::getenv("PS2X_GS_NATIVE_MEMORY_READS") != nullptr;
-        RenderTarget *source = m_fillingFromMemory || s_memoryReads ? nullptr : renderTargetAtBlock(context.tex0.tbp0);
-        const auto sameLayout = [](uint32_t a, uint32_t b) { return a == b || ((a | b) & ~0x1u) == 0u; };
-        if (source && !sameLayout(source->psm, context.tex0.psm))
-            source = nullptr;
+        // A read in the target's own layout and width samples it (directSource); flushBatch brought the pages it
+        // covers up to date. Another format sees GS memory.
+        RenderTarget *source = directSource(state);
         if (source)
         {
             // A render target sampled as a texture (copies, blurs, depth of field). When the draw also writes it,
@@ -1556,13 +2151,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
             }
             fromTarget = true;
             drawnWidth = source->width;
-            drawnHeight = std::max(source->usedHeight, 1u);
-            // Its rows stop where the next buffer in GS memory starts (VP2's 512x480 scene at FBP 200 ends at the
-            // display buffer at FBP 320), whatever a taller pass once drew into the GL texture.
-            // (Only a buffer a whole row of pages lower: VP2's blur levels share page rows, side by side.)
-            for (const auto &[fbp, other] : m_targets)
-                if (source->fbw != 0u && fbp >= source->fbp + source->fbw)
-                    drawnHeight = std::min(drawnHeight, (fbp - source->fbp) / source->fbw * 32u);
+            drawnHeight = source->height;
             width = static_cast<float>(source->width);
             height = static_cast<float>(source->height);
             texture = source->color;
@@ -1591,7 +2180,11 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     glUniform1i(m_uniforms.decode, 0);
     if (!fromTarget)
     {
-        resolveTargetsUnder(context.tex0);
+        // (A reload's own read: reloadTargetPages brought its pages up to date.)
+        const auto [firstPage, endPage] = m_fillingFromMemory ? std::pair<uint32_t, uint32_t>{0u, 0u} : texturePages(context.tex0, context.clamp);
+        syncMemoryPages(firstPage, endPage);
+        if (const uint32_t psm = context.tex0.psm; psm == 0x13u || psm == 0x14u || psm == 0x1Bu || psm == 0x24u || psm == 0x2Cu)
+            syncMemoryPages(std::min(context.tex0.cbp / 32u, kPages), std::min((context.tex0.cbp + 4u) / 32u + 1u, kPages));
         if (static const bool cpuDecode = std::getenv("PS2X_GS_NATIVE_CPUDECODE") != nullptr;
             !cpuDecode && bindDecodedTexture(state))
         {
@@ -1674,7 +2267,7 @@ bool GSNativeBackend::bindTexture(const GSDrawState &state, const RenderTarget &
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-    glUniform1f(m_uniforms.fst, fromTarget ? 2.0f : 1.0f);
+    glUniform1f(m_uniforms.fst, fromTarget ? 2.0f : 255.0f / 128.0f); // the cache keeps the GS's alpha (0x80 is 1.0)
     return true;
 }
 
@@ -1705,12 +2298,14 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
     }
     else if (a == Cs && b == Cd && d == Cd)
         source = factor, destination = inverse;
+    // Cs * C in the shader: GL clamps a blend factor to 1, and C reaches 2 (As or FIX up to 0xFF; VP2 doubles its
+    // depth of field's blur with Cs * As, As 0xFF).
     else if (a == Cs && b == Zero && d == Cd)
-        source = factor, destination = GL_ONE;
+        m_blendOut = 3, source = GL_ONE, destination = GL_ONE;
     else if (a == Cs && b == Zero && d == Zero)
-        source = factor, destination = GL_ZERO;
+        m_blendOut = 3, source = GL_ONE, destination = GL_ZERO;
     else if (a == Zero && b == Cs && d == Cd)
-        equation = GL_FUNC_REVERSE_SUBTRACT, source = factor, destination = GL_ONE;
+        m_blendOut = 3, equation = GL_FUNC_REVERSE_SUBTRACT, source = GL_ONE, destination = GL_ONE;
     else if (a == Cd && b == Cs && d == Cs)
         source = inverse, destination = factor;
     else if (a == Cd && b == Zero && d == Cs)
@@ -1747,6 +2342,8 @@ void GSNativeBackend::applyBlend(const GSDrawState &state)
 
 void GSNativeBackend::flushBatch()
 {
+    if (m_wrapOpen && !continuesWrappedBlend())
+        closeWrappedBlend();
     if (m_batch.empty())
         return;
     if (!ensureContext(true))
@@ -1755,16 +2352,53 @@ void GSNativeBackend::flushBatch()
             m_batch.clear();
         return;
     }
+    // PS2X_GS_NATIVE_STOPDRAW=<n>: no batch drawn after the first n (diagnostics: which batch breaks a buffer).
+    if (static const long long s_stop = [] { const char *v = std::getenv("PS2X_GS_NATIVE_STOPDRAW"); return v ? std::atoll(v) : -1ll; }();
+        s_stop >= 0 && !m_fillingFromMemory)
+    {
+        static long long s_batches = 0;
+        if (s_batches++ >= s_stop)
+        {
+            m_batch.clear();
+            return;
+        }
+    }
     const GSDrawState &state = m_batchState;
     const GSContext &context = state.context;
     RenderTarget &target = renderTarget(context.frame);
-    // Shared memory: the target drawn into and a target sampled directly first get what overlapping ones drew since.
+    // Shared memory: the pages the batch draws over, and those of a target it samples directly, first get what was
+    // written there since (other targets, transfers), through GS memory. A read in another format resolves into GS
+    // memory in bindTexture.
+    std::vector<uint32_t> drawnPages;
     if (!m_fillingFromMemory)
     {
         if (state.prim.tme)
-            if (RenderTarget *source = renderTargetAtBlock(context.tex0.tbp0); source && source != &target)
-                ensureCoherent(*source);
-        ensureCoherent(target);
+            if (RenderTarget *source = directSource(state))
+            {
+                const int w = std::max(1 << std::min<uint32_t>(context.tex0.tw, 10u), static_cast<int>((context.clamp & 0x3u) == 2u ? (context.clamp >> 14 & 0x3FFu) + 1u : 0u));
+                const int h = static_cast<int>(textureRows(context.tex0, context.clamp));
+                targetPagesIn(*source, 0, 0, w, h, m_scratchPages);
+                const std::vector<uint32_t> sourcePages = m_scratchPages;
+                syncTargetPages(*source, sourcePages);
+            }
+        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+        for (const Vertex &v : m_batch)
+            x0 = std::min(x0, v.x), y0 = std::min(y0, v.y), x1 = std::max(x1, v.x), y1 = std::max(y1, v.y);
+        const int left = std::max(static_cast<int>(std::floor(x0)), static_cast<int>(context.scissor.x0));
+        const int top = std::max(static_cast<int>(std::floor(y0)), static_cast<int>(context.scissor.y0));
+        const int right = std::min(static_cast<int>(std::ceil(x1)) + 1, static_cast<int>(context.scissor.x1) + 1);
+        const int bottom = std::min(static_cast<int>(std::ceil(y1)) + 1, static_cast<int>(context.scissor.y1) + 1);
+        // A colour target the draw tests as its Z buffer (depthFromColorTarget, read only): its pages under the draw.
+        if ((context.test >> 16 & 0x1u) != 0u && context.zbuf.zmask && context.zbuf.zbp != context.frame.fbp)
+            if (auto z = m_targets.find(context.zbuf.zbp); z != m_targets.end() && colorFormat(z->second.psm))
+            {
+                targetPagesIn(z->second, left, top, right, bottom, m_scratchPages);
+                const std::vector<uint32_t> depthPages = m_scratchPages;
+                syncTargetPages(z->second, depthPages);
+            }
+        targetPagesIn(target, left, top, right, bottom, drawnPages);
+        syncTargetPages(target, drawnPages);
+        textureCacheBeforeWrite(drawnPages);
     }
     target.dirty = true;
     target.lastDraw = ++m_drawSerial;
@@ -1812,11 +2446,19 @@ void GSNativeBackend::flushBatch()
     {
         glDisable(GL_DEPTH_TEST);
     }
-    // FBMSK bits set keep the frame buffer's bits; whole bytes map to channel masks. CT24 has no alpha to write.
-    const uint32_t fbmsk = context.frame.fbmsk;
+    // FBMSK bits set keep the frame buffer's bits; whole bytes map to channel masks (a channel whose stored bits are
+    // all kept counts as a whole byte: CT16 stores bits 3-7 of RGB and the alpha's top bit). CT24 has no alpha.
+    const bool sixteenTarget = context.frame.psm == 0x02u || context.frame.psm == 0x0Au;
+    const uint32_t storedBits = sixteenTarget ? 0x80F8F8F8u : context.frame.psm == 0x01u ? 0x00FFFFFFu : 0xFFFFFFFFu;
+    uint32_t fbmsk = context.frame.fbmsk;
+    for (int channel = 0; channel < 4; ++channel)
+    {
+        const uint32_t all = storedBits >> (8 * channel) & 0xFFu;
+        if (((fbmsk >> (8 * channel)) & all) == all)
+            fbmsk |= 0xFFu << (8 * channel);
+    }
     const bool keepAlpha = (fbmsk >> 24) == 0xFFu || context.frame.psm == 0x01u;
     glColorMask((fbmsk & 0xFFu) != 0xFFu, (fbmsk >> 8 & 0xFFu) != 0xFFu, (fbmsk >> 16 & 0xFFu) != 0xFFu, !keepAlpha);
-    target.alphaWritten = target.alphaWritten || !keepAlpha;
     glDisable(GL_CULL_FACE);
     if (offBlend)
         glDisable(GL_BLEND);
@@ -1848,7 +2490,7 @@ void GSNativeBackend::flushBatch()
                          "[gs:draw] #%llu fbp=%u psm=0x%x fbmsk=0x%x prim=%d tme=%d textured=%d tex0 psm=0x%x tbp=%u tbw=%u "
                          "tw=%u th=%u tfx=%u tcc=%u cbp=%u abe=%d alpha=0x%llx test=0x%llx fst=%d verts=%zu "
                          "v0=(%.1f,%.1f z=%.6f rgba=%u,%u,%u,%u st=%.1f,%.1f,%.2f) zbuf=%u/0x%x/%d ctxt=%d iip=%d "
-                         "scissor=%u-%u,%u-%u\n",
+                         "scissor=%u-%u,%u-%u colclamp=%d xyoffset=%u,%u\n",
                          static_cast<unsigned long long>(index), context.frame.fbp, context.frame.psm,
                          context.frame.fbmsk, static_cast<int>(state.prim.type), state.prim.tme ? 1 : 0,
                          textured ? 1 : 0, context.tex0.psm, context.tex0.tbp0, context.tex0.tbw, context.tex0.tw,
@@ -1857,7 +2499,9 @@ void GSNativeBackend::flushBatch()
                          state.prim.fst ? 1 : 0, m_batch.size(), m_batch[0].x, m_batch[0].y, m_batch[0].z, m_batch[0].r,
                          m_batch[0].g, m_batch[0].b, m_batch[0].a, m_batch[0].s, m_batch[0].t, m_batch[0].q,
                          context.zbuf.zbp, context.zbuf.psm, context.zbuf.zmask ? 1 : 0, state.prim.ctxt ? 1 : 0,
-                         state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1);
+                         state.prim.iip ? 1 : 0, context.scissor.x0, context.scissor.x1, context.scissor.y0, context.scissor.y1,
+                         static_cast<int>(state.colclamp & 0x1u), static_cast<unsigned>(context.xyoffset.ofx),
+                         static_cast<unsigned>(context.xyoffset.ofy));
     }
     glUniform1i(m_uniforms.textured, textured ? 1 : 0);
     glUniform1f(m_uniforms.sampleShift,
@@ -1904,13 +2548,25 @@ void GSNativeBackend::flushBatch()
     const bool date = (context.test >> 14 & 0x1u) != 0u;
     const bool blendReadsDest = state.prim.abe && (alpha >> 4 & 0x3u) == 1u;
     glUniform1i(m_uniforms.date, date ? ((context.test >> 15 & 0x1u) ? 2 : 1) : 0);
-    // An alpha byte FBMSK keeps only partly (SCTPT2 0x7F: the top bit written, the font in the bits below kept): the
-    // kept bits from a copy of the target, which such a draw never changes, so one copy serves the whole batch.
-    const uint32_t alphaKeep = fbmsk >> 24;
-    const bool partialAlpha = !keepAlpha && alphaKeep != 0u && !offColor;
-    glUniform1i(m_uniforms.alphaKeep, partialAlpha ? static_cast<int>(alphaKeep) : 0);
+    // FBMSK keeping part of a channel (VP2 writes CT16 bits 14-15 alone with 0x3FFF to split channels, SCTPT2 the
+    // top alpha bit with 0x7F000000): the kept bits come from a copy of the target, which such a draw never
+    // changes, so one copy serves the batch. In CT16 only the stored bits count (3-7 of RGB, the alpha's top bit).
+    // The shader's output is the written value only for what is not blended: RGB when the batch does not blend, alpha
+    // always (the GS never blends alpha; GL's alpha factors are ONE, ZERO). A blended RGB channel kept in part is
+    // masked whole, as before.
+    uint32_t kept = fbmsk & storedBits;
+    if (state.prim.abe)
+        kept &= 0xFF000000u;
+    bool partialMask = false;
+    for (int channel = 0; channel < 4; ++channel)
+    {
+        const uint32_t bits = kept >> (8 * channel) & 0xFFu, all = storedBits >> (8 * channel) & 0xFFu;
+        partialMask |= bits != 0u && bits != all;
+    }
+    partialMask = partialMask && !offColor;
+    glUniform1i(m_uniforms.colorKeep, partialMask ? static_cast<int>(kept) : 0);
     glUniform1i(m_uniforms.dest, 1);
-    if (date || partialAlpha || blendReadsDest)
+    if (date || partialMask || blendReadsDest)
     {
         const uint32_t destWidth = target.width * m_scale, destHeight = target.height * m_scale;
         if (!m_destTexture || m_destWidth != destWidth || m_destHeight != destHeight)
@@ -1929,6 +2585,26 @@ void GSNativeBackend::flushBatch()
         glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, destWidth, destHeight);
         glActiveTexture(GL_TEXTURE0);
+    }
+    if (!offBlend && !m_fillingFromMemory && blendWraps(state))
+    {
+        if (!m_wrapOpen)
+            beginWrappedBlend(target, context.scissor);
+        float minX = m_batch[0].x, maxX = minX, minY = m_batch[0].y, maxY = minY;
+        for (const Vertex &v : m_batch)
+            minX = std::min(minX, v.x), maxX = std::max(maxX, v.x), minY = std::min(minY, v.y), maxY = std::max(maxY, v.y);
+        const auto clip = [](float v, uint16_t lo, uint16_t hi) {
+            return static_cast<uint16_t>(std::clamp(v, static_cast<float>(lo), static_cast<float>(hi)));
+        };
+        const GSScissorReg &sc = context.scissor;
+        const uint16_t x0 = clip(std::floor(minX), sc.x0, sc.x1), x1 = clip(std::ceil(maxX), sc.x0, sc.x1);
+        const uint16_t y0 = clip(std::floor(minY), sc.y0, sc.y1), y1 = clip(std::ceil(maxY), sc.y0, sc.y1);
+        if (!m_wrapDrawn)
+            m_wrapArea = {x0, x1, y0, y1};
+        else
+            m_wrapArea = {std::min(m_wrapArea.x0, x0), std::max(m_wrapArea.x1, x1), std::min(m_wrapArea.y0, y0),
+                          std::max(m_wrapArea.y1, y1)};
+        m_wrapDrawn = true;
     }
 
     glBindVertexArray(m_vertexArray);
@@ -1993,6 +2669,8 @@ void GSNativeBackend::flushBatch()
         }
     }
     glBindVertexArray(0);
+    if (!drawnPages.empty())
+        wroteTargetPages(target, drawnPages);
     m_batch.clear();
     m_batchMaxY = 0.0f;
 }
@@ -2025,6 +2703,16 @@ void GSNativeBackend::Submit(const GSPrimitiveBatch &batch)
 
 void GSNativeBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
+    // The GPU decoding path reads the CLUT from the GPU copy of GS memory at CBP itself (bindTexture brings those
+    // pages up to date); only the CPU paths read it from GS memory on the CPU, and need a target's pixels there first
+    // (a read back for each CLUT load: SC3 loads dozens a frame).
+    static const bool cpuDecode = std::getenv("PS2X_GS_NATIVE_CPUDECODE") != nullptr;
+    if (cpuDecode && tex0.cld >= 1u && tex0.cld <= 5u)
+    {
+        const uint32_t first = std::min(tex0.cbp / 32u, kPages), end = std::min((tex0.cbp + 4u) / 32u + 1u, kPages);
+        syncMemoryPages(first, end);
+        pullGpuPages(first, end);
+    }
     m_memory->LoadClut(tex0, texclut);
 }
 
@@ -2050,19 +2738,41 @@ void GSNativeBackend::markDirty(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t
 void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
 {
     flushBatch();
-    // A transfer that reads GS memory on the CPU side (local to host, local to local) needs the resolved pixels
-    // there; one into GS memory only replaces blocks, which reach the GPU copy by themselves.
+    // A transfer that reads GS memory on the CPU side (local to host, local to local) needs the newest pixels
+    // there: only the source's pages (a game reading back a few pixels every frame, VP2's light level, should not
+    // wait for every page the targets drew).
     if (command.direction == 1u || command.direction == 2u)
     {
-        // Only the source's pages (a game reading back a few pixels every frame, VP2's light level, should not
-        // wait for every page the targets resolved): its first page to the last row's, generously.
-        const uint32_t first = command.bitbltbuf.sbp / 32u;
-        const uint32_t pageRows = 32u; // CT32's page height, the smallest: covers the others
-        const uint32_t rows = static_cast<uint32_t>(command.trxpos.ssay) + command.trxreg.rrh;
-        const uint32_t end = first + std::max<uint32_t>(command.bitbltbuf.sbw, 1u) * ((rows + pageRows - 1u) / pageRows + 1u);
+        const auto [first, end] = transferPages(command.bitbltbuf.sbp, command.bitbltbuf.sbw, command.bitbltbuf.spsm,
+                                                command.trxpos.ssay, command.trxreg.rrh);
         m_readFirstPage = first;
         m_readEndPage = end;
+        syncMemoryPages(first, end);
+        // A read of Z pages (TMB's lens flares read a few Z24 pixels around each light): the depth of the targets
+        // whose Z buffer covers them, which GS memory never gets otherwise.
+        if (const uint8_t spsm = command.bitbltbuf.spsm; (spsm & 0x30u) == 0x30u)
+            for (auto &[fbp, target] : m_targets)
+            {
+                if (target.zbp == ~0u || (target.zpsm & 0x30u) != 0x30u)
+                    continue;
+                const uint32_t rows = (target.zpsm & 0x0Fu) >= 2u ? 64u : 32u;
+                const uint32_t zEnd = target.zbp + (std::max(target.usedHeight, 1u) + rows - 1u) / rows *
+                                                       std::max<uint32_t>(target.fbw, 1u);
+                const uint32_t lo = std::max(first, target.zbp), hi = std::min(end, std::min(zEnd, kPages));
+                if (lo < hi)
+                    resolveDepthPages(target, lo, hi);
+            }
         pullGpuPages(first, end);
+    }
+    // One into GS memory replaces part of its pages: what a target drew in the rest goes there first; the
+    // targets over them reload those pages when they are next drawn or read.
+    std::pair<uint32_t, uint32_t> written{0u, 0u};
+    if (command.direction == 0u || command.direction == 2u)
+    {
+        written = transferPages(command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsay,
+                                command.trxreg.rrh);
+        syncMemoryPages(written.first, written.second);
+        textureCacheBeforeWrite(written.first, written.second);
     }
     if (static const bool logTransfers = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logTransfers)
     {
@@ -2083,8 +2793,8 @@ void GSNativeBackend::BeginTransfer(const GSTransferCommand &command)
         m_memory->BeginTransfer(command);
         return;
     }
-    if (command.direction == 0u || command.direction == 2u)
-        dropTargetsUnder(command);
+    if (written.second > written.first)
+        wroteMemoryPages(written.first, written.second);
     m_memory->BeginTransfer(command);
 }
 
@@ -2093,21 +2803,34 @@ bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
     // A local-to-local copy out of a render target (a frame copied to the displayed buffer, a region saved for
     // later): the same copy on the GPU, into the destination render target (made if need be).
     const GSBitBltBuf &b = command.bitbltbuf;
-    const bool colour = [](uint8_t psm) { return psm == 0x00u || psm == 0x01u; }(b.spsm);
+    // Any colour layout a target has (CT32 / CT24 / CT16 / CT16S): a copy through the CPU reads the source back.
+    const bool colour = [](uint8_t psm) { return psm == 0x00u || psm == 0x01u || psm == 0x02u || psm == 0x0Au; }(b.spsm);
     if (!colour || b.spsm != b.dpsm || b.sbp % 32u != 0u || b.dbp % 32u != 0u || !ensureContext())
         return false;
     auto source = m_targets.find(b.sbp / 32u);
-    if (source == m_targets.end() || source->second.fbw != b.sbw)
+    const auto sameLayout = [](uint32_t x, uint32_t y) { return x == y || ((x | y) & ~0x1u) == 0u; };
+    if (source == m_targets.end() || source->second.fbw != b.sbw || !sameLayout(source->second.psm, b.spsm))
         return false;
     GSFrameReg frame{};
     frame.fbp = b.dbp / 32u;
     frame.fbw = b.dbw;
     frame.psm = b.dpsm;
     RenderTarget &destination = renderTarget(frame);
-    const RenderTarget &from = m_targets.find(b.sbp / 32u)->second; // renderTarget may have rehashed the map
+    auto fromIt = m_targets.find(b.sbp / 32u); // renderTarget may have replaced it (the same address)
+    if (fromIt == m_targets.end())
+        return false;
+    RenderTarget &from = fromIt->second;
     const GLint sx = command.trxpos.ssax, sy = command.trxpos.ssay;
     const GLint dx = command.trxpos.dsax, dy = command.trxpos.dsay;
     const GLint w = command.trxreg.rrw, h = command.trxreg.rrh;
+    // Both rectangles' pages up to date first (the destination keeps what it held around the copy).
+    targetPagesIn(from, sx, sy, sx + w, sy + h, m_scratchPages);
+    const std::vector<uint32_t> sourcePages = m_scratchPages;
+    syncTargetPages(from, sourcePages);
+    std::vector<uint32_t> destinationPages;
+    targetPagesIn(destination, dx, dy, dx + w, dy + h, destinationPages);
+    syncTargetPages(destination, destinationPages);
+    textureCacheBeforeWrite(destinationPages);
     const GLint s = static_cast<GLint>(m_scale);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination.framebuffer);
@@ -2118,6 +2841,7 @@ bool GSNativeBackend::copyBetweenTargets(const GSTransferCommand &command)
     destination.dirty = true;
     destination.usedHeight = std::min(destination.height,
                                       std::max(destination.usedHeight, static_cast<uint32_t>(dy + h)));
+    wroteTargetPages(destination, destinationPages);
     return true;
 }
 
@@ -2138,6 +2862,8 @@ void GSNativeBackend::Flush()
 
 void GSNativeBackend::TextureFlush()
 {
+    flushBatch();
+    m_texCache.fill(TexCachePage{});
     m_memory->TextureFlush();
 }
 
@@ -2156,11 +2882,16 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
     auto it = m_targets.find(read.fbp);
     if (it != m_targets.end())
     {
-        const RenderTarget &target = it->second;
+        RenderTarget &target = it->second;
         width = std::min(read.width, target.width - std::min(read.x, target.width));
         height = std::min(lines, target.height - std::min(read.y, target.height));
         if (width == 0u || height == 0u)
             return false;
+        // What was written over the displayed rectangle since the target drew it (a movie uploaded there).
+        std::vector<uint32_t> pages;
+        targetPagesIn(target, static_cast<int>(read.x), static_cast<int>(read.y), static_cast<int>(read.x + width),
+                      static_cast<int>(read.y + height), pages);
+        syncTargetPages(target, pages);
         const size_t bytes = static_cast<size_t>(width) * height * 4u;
         pixels.resize(bytes);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebufferAt1x(target, read.x, read.y, width, height));
@@ -2200,9 +2931,11 @@ bool GSNativeBackend::readCircuit(int circuit, uint64_t dispfb, uint64_t display
     // Not drawn by us (an image the game uploaded straight into the displayed buffer): read GS memory, CT32 / CT24.
     if (!m_vram)
         return false;
-    pullGpuPages();
     const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
     const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
+    const auto [firstPage, endPage] = transferPages(read.fbp * 32u, fbw, psm, read.y, lines);
+    syncMemoryPages(firstPage, endPage);
+    pullGpuPages(firstPage, endPage);
     width = std::min<uint32_t>(read.width, 2048u);
     height = std::min<uint32_t>(lines, 1024u);
     if (width == 0u || height == 0u || fbw == 0u || (psm != 0x00u && psm != 0x01u))
@@ -2267,11 +3000,15 @@ bool GSNativeBackend::circuitSource(int circuit, uint64_t dispfb, uint64_t displ
     const auto it = m_targets.find(read.fbp);
     if (it != m_targets.end())
     {
-        const RenderTarget &target = it->second;
+        RenderTarget &target = it->second;
         out.width = static_cast<int>(std::min(read.width, target.width - std::min(read.x, target.width)));
         out.height = static_cast<int>(std::min(lines, target.height - std::min(read.y, target.height)));
         if (out.width == 0 || out.height == 0)
             return false;
+        std::vector<uint32_t> pages;
+        targetPagesIn(target, static_cast<int>(read.x), static_cast<int>(read.y), static_cast<int>(read.x) + out.width,
+                      static_cast<int>(read.y) + out.height, pages);
+        syncTargetPages(target, pages);
         out.texture = target.color;
         out.x = static_cast<int>(read.x);
         out.y = static_cast<int>(read.y);
@@ -2370,6 +3107,20 @@ bool GSNativeBackend::presentOnGpu(const GSPresentationRequest &request, Present
     const uint32_t lines = static_cast<uint32_t>(std::max(haveTop ? top.height : 0, haveBottom ? bottom.height : 0));
     const uint32_t height = (fieldMode ? lines * 2u : lines) * m_scale;
     const uint32_t outWidth = width * m_scale;
+    if (static const bool logPresents = std::getenv("PS2X_GS_NATIVE_LOG") != nullptr; logPresents)
+    {
+        static uint32_t s_presents = 0;
+        if ((s_presents++ % 100u) == 0u)
+            std::fprintf(stderr,
+                         "[gs:native] gpu present #%u pmode=0x%llx smode2=0x%llx dispfb1=0x%llx display1=0x%llx "
+                         "dispfb2=0x%llx display2=0x%llx top=%d %d,%d %dx%d s%d bottom=%d %d,%d %dx%d out %ux%u\n",
+                         s_presents, static_cast<unsigned long long>(pmode),
+                         static_cast<unsigned long long>(request.smode2), static_cast<unsigned long long>(request.dispfb1),
+                         static_cast<unsigned long long>(request.display1), static_cast<unsigned long long>(request.dispfb2),
+                         static_cast<unsigned long long>(request.display2), haveTop ? 1 : 0, top.x, top.y, top.width,
+                         top.height, top.scale, haveBottom ? 1 : 0, bottom.x, bottom.y, bottom.width, bottom.height,
+                         outWidth, height);
+    }
 
     PresentSlot &slot = m_presentSlots[m_presentNext];
     if (slot.fence)
@@ -2562,6 +3313,7 @@ bool GSNativeBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     if (!ensureContext())
         return false;
     RenderTarget &target = renderTarget(context.frame);
+    textureCacheBeforeWrite(target.fbp, target.fbp + static_cast<uint32_t>(target.pages.size()));
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -2569,7 +3321,10 @@ bool GSNativeBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  static_cast<float>(rgba >> 16 & 0xFFu) / 255.0f, static_cast<float>(rgba >> 24 & 0xFFu) / 255.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     target.dirty = true;
-    target.alphaWritten = true;
+    std::vector<uint32_t> pages(target.pages.size());
+    for (uint32_t i = 0; i < pages.size(); ++i)
+        pages[i] = target.fbp + i;
+    wroteTargetPages(target, pages);
     return true;
 }
 
@@ -2586,7 +3341,14 @@ uint32_t GSNativeBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uin
 
 void GSNativeBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
-    pullGpuPages();
+    const uint32_t page = GSMem::BlockOf(psm, base, std::max<uint32_t>(bw, 1u), x, y) / 32u % kPages;
+    if (ensureContext()) // GL work only on the drawing thread
+    {
+        syncMemoryPages(page, page + 1u);
+        pullGpuPages(page, page + 1u);
+        textureCacheBeforeWrite(page, page + 1u);
+    }
+    wroteMemoryPages(page, page + 1u);
     markDirty(psm, base, bw, x, y, 1u, 1u);
     m_memory->WriteVram(psm, base, bw, x, y, value);
 }

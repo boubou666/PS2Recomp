@@ -2620,7 +2620,13 @@ void EeScheduler::waitForEvent()
         hostDeadline = next->hostDeadline;
         // Native frames leave EE time ahead of the vblank timeline whenever a frame accounts more cycles than it
         // took: waiting for the timeline's host time would stall the game for the whole lead.
-        if (m_nativeFrames)
+        // PS2X_NATIVE_IDLE_EE=0: the timeline's host time as before (to compare).
+        static const bool s_idleEe = []
+        {
+            const char *value = std::getenv("PS2X_NATIVE_IDLE_EE");
+            return !(value && *value == '0');
+        }();
+        if (m_nativeFrames && s_idleEe)
             hostDeadline = std::chrono::steady_clock::now() +
                            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                eeCyclesToHostDuration(deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u));

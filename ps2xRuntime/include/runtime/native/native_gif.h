@@ -36,6 +36,13 @@ namespace ps2x::native
         // register writes its packet made since the batch before (Material::gsWrites). Textures, CLUTs, render
         // targets and blending are then the GS renderer's, as for the GS's own draws.
         void setGsWrites(bool on) { m_gsWrites = on; }
+        // Triangles kept here instead of drawn (with each batch's material, one per triangle), for a port checking its
+        // own translation of a microprogram against the program run here (null: drawn, the default).
+        void setCapture(std::vector<Vertex> *vertices, std::vector<Material> *materials)
+        {
+            m_captureVertices = vertices;
+            m_captureMaterials = materials;
+        }
 
     private:
         struct Kick
@@ -63,6 +70,8 @@ namespace ps2x::native
         std::vector<Vertex> m_triangles;
         uint32_t m_source = 0;
         bool m_gsWrites = false;
+        std::vector<Vertex> *m_captureVertices = nullptr;
+        std::vector<Material> *m_captureMaterials = nullptr;
         std::vector<std::pair<uint8_t, uint64_t>> m_pendingWrites; // setGsWrites: the packets' writes not yet drawn with
     };
 }
