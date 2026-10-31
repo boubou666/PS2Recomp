@@ -343,6 +343,40 @@ namespace ps2x::native
             upload.data.assign(data, data + size);
             upload.seq = ++m_uploadSeq;
             upload.id = ++m_contentSerial;
+            // Laid out once, as the GS keeps it: its blocks, and a mask of the bits it writes in them (a 4-bit or
+            // high-bits format writes part of a byte, a rectangle part of a block). A decode copies blocks.
+            {
+                thread_local std::vector<uint8_t> lay(kMemoryBytes, 0u), bits(kMemoryBytes, 0u);
+                const uint32_t bpp = bitsPerPixel(dpsm);
+                const uint32_t ones = bpp >= 32u ? 0xffffffffu : (1u << bpp) - 1u;
+                const size_t pixels = std::min<size_t>(static_cast<size_t>(w) * h, size * 8u / bpp);
+                const uint8_t *d = upload.data.data();
+                for (size_t i = 0; i < pixels; ++i)
+                {
+                    uint32_t value = 0u;
+                    switch (bpp)
+                    {
+                    case 32: std::memcpy(&value, d + i * 4u, 4u); break;
+                    case 24: value = d[i * 3u] | (d[i * 3u + 1u] << 8) | (d[i * 3u + 2u] << 16); break;
+                    case 16: value = d[i * 2u] | (d[i * 2u + 1u] << 8); break;
+                    case 8: value = d[i]; break;
+                    default: value = (d[i >> 1] >> ((i & 1u) * 4u)) & 0xfu; break;
+                    }
+                    const uint32_t x = dx + static_cast<uint32_t>(i % w), y = dy + static_cast<uint32_t>(i / w);
+                    write(lay.data(), dpsm, dbp, dbw, x, y, value);
+                    write(bits.data(), dpsm, dbp, dbw, x, y, ones);
+                }
+                upload.laid.resize(upload.blocks.size() * 256u);
+                upload.mask.resize(upload.blocks.size() * 256u);
+                for (size_t k = 0; k < upload.blocks.size(); ++k)
+                {
+                    const size_t at = static_cast<size_t>(upload.blocks[k]) * 256u;
+                    std::memcpy(upload.laid.data() + k * 256u, lay.data() + at, 256u);
+                    std::memcpy(upload.mask.data() + k * 256u, bits.data() + at, 256u);
+                    std::memset(lay.data() + at, 0, 256u);
+                    std::memset(bits.data() + at, 0, 256u);
+                }
+            }
             // The same rectangle or less at the same place in the same format: the same bits again.
             m_stored.erase(std::remove_if(m_stored.begin(), m_stored.end(), [&](const StoredUpload &u) {
                                return u.dbp == dbp && u.psm == dpsm && u.dbw == dbw && u.dx >= dx && u.dy >= dy &&
@@ -537,26 +571,22 @@ namespace ps2x::native
         clear(imageBegin, imageEnd);
         if (paletteEnd != 0u)
             clear(paletteBegin, paletteEnd);
+        // Each part's blocks as storeUpload laid them out, over what is there, only the bits the upload wrote.
         for (const StoredUpload *u : parts)
-        {
-            const uint32_t bpp = bitsPerPixel(u->psm);
-            const size_t pixels = std::min<size_t>(static_cast<size_t>(u->w) * u->h, u->data.size() * 8u / bpp);
-            const uint8_t *d = u->data.data();
-            for (size_t i = 0; i < pixels; ++i)
+            for (size_t k = 0; k < u->blocks.size(); ++k)
             {
-                uint32_t value = 0u;
-                switch (bpp)
+                uint8_t *to = scratch.data() + static_cast<size_t>(u->blocks[k]) * 256u;
+                const uint8_t *from = u->laid.data() + k * 256u, *mask = u->mask.data() + k * 256u;
+                for (size_t b = 0; b < 256u; b += 8u)
                 {
-                case 32: std::memcpy(&value, d + i * 4u, 4u); break;
-                case 24: value = d[i * 3u] | (d[i * 3u + 1u] << 8) | (d[i * 3u + 2u] << 16); break;
-                case 16: value = d[i * 2u] | (d[i * 2u + 1u] << 8); break;
-                case 8: value = d[i]; break;
-                default: value = (d[i >> 1] >> ((i & 1u) * 4u)) & 0xfu; break;
+                    uint64_t t, f, m;
+                    std::memcpy(&t, to + b, 8u);
+                    std::memcpy(&f, from + b, 8u);
+                    std::memcpy(&m, mask + b, 8u);
+                    t = (t & ~m) | (f & m);
+                    std::memcpy(to + b, &t, 8u);
                 }
-                write(scratch.data(), u->psm, u->dbp, u->dbw, u->dx + static_cast<uint32_t>(i % u->w),
-                      u->dy + static_cast<uint32_t>(i / u->w), value);
             }
-        }
 
         uint32_t colours[256] = {};
         if (indexed(psm))

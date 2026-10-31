@@ -86,6 +86,7 @@ namespace ps2x::native
             uint64_t id = 0;  // its pixels: new for every upload that changes them
             std::vector<uint16_t> blocks; // the blocks it writes
             std::vector<uint16_t> full;   // those it writes whole
+            std::vector<uint8_t> laid, mask; // its blocks (in `blocks` order) as the GS lays them out, the bits written
             std::vector<uint8_t> data;
         };
         std::shared_ptr<const Texture> textureFromStore(uint64_t tex0, uint64_t texa);
