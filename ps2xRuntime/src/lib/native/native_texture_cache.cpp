@@ -295,6 +295,10 @@ namespace ps2x::native
                     upload.blocks.push_back(static_cast<uint16_t>(blockOf(x, y)));
             std::sort(upload.blocks.begin(), upload.blocks.end());
             upload.blocks.erase(std::unique(upload.blocks.begin(), upload.blocks.end()), upload.blocks.end());
+            if (allBits)
+                for (uint32_t y = (dy + blockH - 1u) / blockH * blockH; y + blockH <= dy + h; y += blockH)
+                    for (uint32_t x = (dx + blockW - 1u) / blockW * blockW; x + blockW <= dx + w; x += blockW)
+                        upload.full.push_back(static_cast<uint16_t>(blockOf(x, y)));
             upload.data.assign(data, data + size);
             upload.seq = ++m_uploadSeq;
             upload.id = ++m_contentSerial;
@@ -349,24 +353,70 @@ namespace ps2x::native
         const uint32_t width = 1u << std::min<uint32_t>(10u, (tex0 >> 26) & 0xfu);
         const uint32_t height = 1u << std::min<uint32_t>(10u, (tex0 >> 30) & 0xfu);
 
-        // The uploads the texture is made of: those touching its pages or its palette's, in the order the game sent
-        // them (an asset is often sent as one format and read as another, a palette in parts).
+        // The uploads the texture is made of, in the order the game sent them (an asset is often sent as one format and
+        // read as another, a palette in parts): newest first, those still showing in a block the texture or its
+        // palette reads, until every such block is filled whole. The game cycles assets through the same area, so
+        // what is under the newest one does not count.
         uint32_t imageBegin = 0, imageEnd = 0, paletteBegin = 0, paletteEnd = 0;
         blockSpan(psm, tbp, tbw, 0, 0, width, height, imageBegin, imageEnd);
         if (indexed(psm))
             blockSpan(cpsm == CT32 ? CT32 : CT16, cbp, 1, 0, 0, 16, 16, paletteBegin, paletteEnd);
-        thread_local std::vector<const StoredUpload *> parts;
-        parts.clear();
-        bool imageCovered = false;
-        for (const StoredUpload &u : m_stored)
+        // Marks of the blocks read: 1 the image, 2 the palette, 4 filled whole by a newer upload.
+        thread_local std::vector<uint8_t> marks(kMemoryBytes / 256u, 0u);
+        thread_local std::vector<uint16_t> needed;
+        needed.clear();
+        const auto need = [&](uint32_t block, uint8_t what) {
+            block &= 0x3fffu;
+            if (marks[block] == 0u)
+                needed.push_back(static_cast<uint16_t>(block));
+            marks[block] |= what;
+        };
+        // Every block is at least 8 x 8 pixels.
+        for (uint32_t y = 0; y < height; y += 8u)
+            for (uint32_t x = 0; x < width; x += 8u)
+                need(GSMem::BlockOf(psm, tbp, std::max(tbw, 1u), x, y), 1u);
+        if (indexed(psm))
         {
-            const bool image = u.begin < imageEnd && imageBegin < u.end;
-            const bool palette = paletteEnd != 0u && u.begin < paletteEnd && paletteBegin < u.end;
-            if (image || palette)
-                parts.push_back(&u);
-            imageCovered |= image;
+            const uint32_t csa = (tex0 >> 56) & 0x1fu;
+            const bool eight = psm == T8 || psm == T8H;
+            for (uint32_t i = 0; i < (eight ? 256u : 16u); i += 4u)
+            {
+                uint32_t px = 0, py = 0;
+                csm1Position(eight ? i : (csa * 16u + i) & 0xffu, px, py);
+                need(GSMem::BlockOf(cpsm == CT32 ? CT32 : CT16, cbp, 1, px, py), 2u);
+            }
         }
-        std::sort(parts.begin(), parts.end(), [](const StoredUpload *a, const StoredUpload *b) { return a->seq < b->seq; });
+        thread_local std::vector<const StoredUpload *> all, parts;
+        all.clear();
+        parts.clear();
+        for (const StoredUpload &u : m_stored)
+            if ((u.begin < imageEnd && imageBegin < u.end) || (paletteEnd != 0u && u.begin < paletteEnd && paletteBegin < u.end))
+                all.push_back(&u);
+        std::sort(all.begin(), all.end(), [](const StoredUpload *a, const StoredUpload *b) { return a->seq > b->seq; });
+        size_t open = needed.size();
+        bool imageCovered = false;
+        for (const StoredUpload *u : all)
+        {
+            if (open == 0u)
+                break;
+            uint8_t shows = 0u;
+            for (const uint16_t block : u->blocks)
+                if (marks[block] != 0u && !(marks[block] & 4u))
+                    shows |= marks[block];
+            if (shows == 0u)
+                continue;
+            parts.push_back(u);
+            imageCovered |= (shows & 1u) != 0u;
+            for (const uint16_t block : u->full)
+                if (marks[block] != 0u && !(marks[block] & 4u))
+                {
+                    marks[block] |= 4u;
+                    --open;
+                }
+        }
+        for (const uint16_t block : needed)
+            marks[block] = 0u;
+        std::reverse(parts.begin(), parts.end()); // oldest first
         uint64_t signature = 1469598103934665603ull;
         for (const StoredUpload *u : parts)
             signature = (signature ^ u->id) * 1099511628211ull;
