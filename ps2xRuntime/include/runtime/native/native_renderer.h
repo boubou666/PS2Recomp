@@ -201,6 +201,7 @@ namespace ps2x::native
         };
         static void gsDraw(uint64_t group, const GsDrawTarget &target);
         void drawGroups(uint64_t group, const GsDrawTarget &target);
+        void drawOverlay(const Frame &overlay, float x, float y, float width, float height); // present thread
 
         Frame m_building;
         Frame m_overlayBuilding;                  // game thread (drawOverlay)

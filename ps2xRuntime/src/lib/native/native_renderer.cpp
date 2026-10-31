@@ -97,6 +97,28 @@ void main()
             std::shared_ptr<const TextureCache::Texture> source; // held, so its address is not reused while compared
         };
         std::unordered_map<uint64_t, GpuTexture> textures;
+        // The overlay's textures, their alpha from the GS's (0x80 is 1.0) to 255: raylib's own shader draws them.
+        std::unordered_map<const TextureCache::Texture *, GpuTexture> overlayTextures;
+        unsigned int overlayTexture(const std::shared_ptr<const TextureCache::Texture> &source)
+        {
+            GpuTexture &slot = overlayTextures[source.get()];
+            if (slot.id == 0 || slot.source != source)
+            {
+                if (slot.id != 0)
+                    rlUnloadTexture(slot.id);
+                std::vector<uint32_t> rgba(source->rgba);
+                for (uint32_t &c : rgba)
+                    c = (c & 0xffffffu) | (std::min<uint32_t>(255u, ((c >> 24) * 255u + 64u) / 128u) << 24);
+                slot.id = rlLoadTexture(rgba.data(), static_cast<int>(source->width), static_cast<int>(source->height),
+                                        RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+                rlTextureParameters(slot.id, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_LINEAR);
+                rlTextureParameters(slot.id, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_LINEAR);
+                rlTextureParameters(slot.id, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
+                rlTextureParameters(slot.id, RL_TEXTURE_WRAP_T, RL_TEXTURE_WRAP_CLAMP);
+                slot.source = source;
+            }
+            return slot.id;
+        }
 
         bool init()
         {
@@ -218,8 +240,8 @@ void main()
     void Renderer::drawOverlay(const Material &material, const Vertex *vertices, uint32_t count,
                                std::shared_ptr<const TextureCache::Texture> texture)
     {
-        if (count == 0u)
-            return;
+        if (count == 0u || m_overlayBuilding.vertices.size() > (1u << 20))
+            return; // (never published: a port that does not publish keeps the latest million vertices' worth out)
         Batch batch;
         batch.material = material;
         batch.material.depthTest = false;
@@ -230,15 +252,52 @@ void main()
         batch.first = static_cast<uint32_t>(m_overlayBuilding.vertices.size());
         batch.count = count;
         m_overlayBuilding.vertices.insert(m_overlayBuilding.vertices.end(), vertices, vertices + count);
-        for (uint32_t i = batch.first; i < batch.first + count; ++i)
-            m_overlayBuilding.vertices[i].z = m_building.screen.depthMax; // the nearest: over the whole frame
         m_overlayBuilding.batches.push_back(batch);
+    }
+
+    // The overlay onto the window (raylib's immediate mode over what is there): GS coordinates to the window
+    // rectangle, colours from the GS's (0x80 is 1.0), in submission order.
+    void Renderer::drawOverlay(const Frame &overlay, float x, float y, float width, float height)
+    {
+        const Screen &screen = overlay.screen;
+        const float sx = width / screen.width, sy = height / screen.height;
+        rlDrawRenderBatchActive();
+        rlDisableDepthTest();
+        rlDisableBackfaceCulling();
+        const auto scale = [](uint32_t c) { return static_cast<unsigned char>(std::min<uint32_t>(255u, (c * 255u + 64u) / 128u)); };
+        for (const Batch &batch : overlay.batches)
+        {
+            const Material &m = batch.material;
+            BeginBlendMode(m.blend == Material::Blend::Additive || m.blend == Material::Blend::AdditiveByDestination ? BLEND_ADDITIVE
+                                                                                                                   : BLEND_ALPHA);
+            const unsigned int id = m.textured && batch.texture ? m_gpu->overlayTexture(batch.texture) : rlGetTextureIdDefault();
+            rlBegin(RL_TRIANGLES); // first: a new mode's draw starts with the default texture
+            rlSetTexture(id);
+            for (uint32_t i = batch.first; i < batch.first + batch.count; ++i)
+            {
+                const Vertex &v = overlay.vertices[i];
+                rlColor4ub(scale(v.rgba & 0xffu), scale((v.rgba >> 8) & 0xffu), scale((v.rgba >> 16) & 0xffu),
+                           m.blend == Material::Blend::Opaque ? 255 : scale(v.rgba >> 24));
+                rlTexCoord2f(v.u, v.v);
+                rlVertex2f(x + (v.x - screen.originX) * sx, y + (v.y - screen.originY) * sy);
+            }
+            rlEnd();
+            rlSetTexture(0);
+            EndBlendMode();
+        }
+        rlDrawRenderBatchActive();
     }
 
     void Renderer::publishOverlay()
     {
         auto overlay = std::make_shared<Frame>(std::move(m_overlayBuilding));
         m_overlayBuilding = Frame{};
+        // PS2X_NATIVE_STATS=1: the overlay's batches every 250 publishes.
+        static const bool s_stats = std::getenv("PS2X_NATIVE_STATS") != nullptr;
+        static uint32_t s_publishes = 0;
+        if (s_stats && ++s_publishes % 250u == 0u)
+            std::fprintf(stderr, "[native] overlay publish %u: %zu batches, %zu vertices\n", s_publishes, overlay->batches.size(),
+                         overlay->vertices.size());
         overlay->screen = m_building.screen;
         overlay->time = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -327,8 +386,21 @@ void main()
         const bool overlayOnly = m_drewIntoGs.load(std::memory_order_relaxed) && overlay && !overlay->batches.empty();
         if (!m_enabled || (!overlayOnly && (!m_shown || m_drewIntoGs.load(std::memory_order_relaxed))))
             return false;
-        const std::shared_ptr<Frame> frame = overlayOnly ? overlay : m_shown;
-        const std::shared_ptr<Frame> previous = overlayOnly ? nullptr : m_shownPrevious;
+        if (overlayOnly)
+        {
+            if (!m_gpu)
+            {
+                m_gpu = std::make_unique<Gpu>();
+                if (!m_gpu->init())
+                {
+                    m_enabled = false;
+                    return false;
+                }
+            }
+            drawOverlay(*overlay, x, y, width, height);
+            return true;
+        }
+        const std::shared_ptr<Frame> frame = m_shown, previous = m_shownPrevious;
         if (!m_gpu)
         {
             m_gpu = std::make_unique<Gpu>();
@@ -519,7 +591,7 @@ void main()
             rlDrawVertexArray(static_cast<int>(batch.first), static_cast<int>(batch.count));
         }
         rlDisableScissorTest();
-        if (!overlayOnly && secondsNow() - m_depthWantedAt.load(std::memory_order_relaxed) < 1.0)
+        if (secondsNow() - m_depthWantedAt.load(std::memory_order_relaxed) < 1.0)
         {
             std::vector<float> depth;
             if (readFramebufferDepth(w, h, depth))
