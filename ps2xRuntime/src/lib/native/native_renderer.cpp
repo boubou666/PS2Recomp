@@ -163,6 +163,12 @@ void main()
 
     void Renderer::draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count)
     {
+        draw(material, matrix, vertices, count, nullptr);
+    }
+
+    void Renderer::draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count,
+                        std::shared_ptr<const TextureCache::Texture> texture)
+    {
         if (count == 0u)
             return;
         Batch batch;
@@ -179,7 +185,12 @@ void main()
             const char *value = std::getenv("PS2X_NATIVE_DECODE_AT_DRAW");
             return !(value && *value == '0');
         }();
-        if (material.textured && !material.fromGsContext && !(s_atDraw && m_streamDraws))
+        if (texture)
+        {
+            batch.texture = std::move(texture);
+            batch.ownTexture = true;
+        }
+        else if (material.textured && !material.fromGsContext && !(s_atDraw && m_streamDraws))
             batch.texture = ps2x::native::textures().texture(material.tex0, batch.material.texa, material.region);
         batch.first = static_cast<uint32_t>(m_building.vertices.size());
         batch.count = count;
@@ -452,7 +463,9 @@ void main()
             rlSetUniform(gpu.locAlphaRef, &alphaRef, RL_SHADER_UNIFORM_FLOAT, 1);
             if (textured)
             {
-                const unsigned int id = gpu.texture(m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull) ^ (m.region * 0xc2b2ae3d27d4eb4full), texture);
+                const unsigned int id = gpu.texture(batch.ownTexture ? (texture->version | 1ull << 63)
+                                                                     : m.tex0 ^ (m.texa * 0x9e3779b97f4a7c15ull) ^ (m.region * 0xc2b2ae3d27d4eb4full),
+                                                    texture);
                 // Wrap per draw (rlTextureParameters binds and unbinds the texture: before enabling it).
                 rlTextureParameters(id, RL_TEXTURE_WRAP_S, m.clampU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
                 rlTextureParameters(id, RL_TEXTURE_WRAP_T, m.clampV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);

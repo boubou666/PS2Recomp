@@ -89,6 +89,10 @@ namespace ps2x::native
         // Triangles (three vertices each) with an object-to-screen matrix: column c is matrix[4c..4c+3], screen
         // point = M * (x, y, z, 1), then divided by w (as a VU's projection).
         void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count);
+        // The same with a texture the port decoded itself from the game's own data (its texture assets in main
+        // memory), used as it is: no lookup in the texture cache, so nothing depends on when GS uploads arrive.
+        void draw(const Material &material, const float matrix[16], const Vertex *vertices, uint32_t count,
+                  std::shared_ptr<const TextureCache::Texture> texture);
         // The GS's TEXA as the game last wrote it (GS front end): a draw whose material sets no TEXA of its own (texa
         // 0, not fromGsContext) decodes its texture with it, as the GS would (16- and 24-bit texels take their alpha
         // from it; a game may write TEXA once, outside the stream a port reads).
@@ -154,6 +158,7 @@ namespace ps2x::native
             uint32_t first = 0, count = 0;
             uint64_t group = 0; // beginGroup's (its clip at present: the GS scissor where that group's marker was)
             uint64_t key = 0; // setKey
+            bool ownTexture = false; // `texture` is the port's own (draw with a texture): never looked up again
             // Taken from the texture cache when the batch is drawn (the game's thread, in stream order): games reuse
             // texture memory before the frame is presented. Null when its upload was not there yet (an upload in the
             // same VIF1 transfer reaches the cache when VIF1 gets to it): looked up again where the batch is drawn,
